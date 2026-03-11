@@ -1,0 +1,17 @@
+[package]
+name = "froglang-core"
+version = "0.1.0"
+edition = "2021"
+default-run = "froglang-core"
+
+[dependencies]
+froglang-macros = { path = "../froglang-macros" } 
+rustyline = "17.0.1"
+
+[[bin]]
+name = "froglang-core"
+path = "src/main.rs"
+
+[dev-dependencies]
+criterion = "0.7.0"
+

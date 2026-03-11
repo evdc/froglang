@@ -21,7 +21,8 @@ pub enum Type {
     Bool,
     Str,
     Function { params: Vec<Type>, result: Box<Type>},
-    TypeVar { name: String }
+    TypeVar { name: String },
+    List(Box<Type>),
 }
 
 impl Display for Type {
@@ -33,7 +34,8 @@ impl Display for Type {
             Type::Str => write!(f, "Str"),
             Type::None => write!(f, "None"),
             Type::Function { params, result} => write!(f, "{} -> {}", format_vec(params), result),
-            Type::TypeVar { name } => write!(f, "~{}", name)
+            Type::TypeVar { name } => write!(f, "~{}", name),
+            Type::List(inner) => write!(f, "[{}]", inner),
         }
     }
 }
@@ -67,7 +69,7 @@ impl TypeChecker {
     }
 
     pub fn add_ctx(mut self, ctx: impl Iterator<Item=(String, Type)>) -> Self {
-        let _ = ctx.map(|(k, v)| self.ctx.insert(k, v));
+        for (k, v) in ctx { self.ctx.insert(k, v); }
         self
     }
 
@@ -92,6 +94,8 @@ impl TypeChecker {
             ("<=".to_string(), Type::Function { params: vec![Type::Int, Type::Int], result: Box::new(Type::Bool) }),
             ("<".to_string(), Type::Function { params: vec![Type::Int, Type::Int], result: Box::new(Type::Bool) }),
             (">".to_string(), Type::Function { params: vec![Type::Int, Type::Int], result: Box::new(Type::Bool) }),
+            ("and".to_string(), Type::Function { params: vec![Type::Bool, Type::Bool], result: Box::new(Type::Bool) }),
+            ("or".to_string(), Type::Function { params: vec![Type::Bool, Type::Bool], result: Box::new(Type::Bool) }),
         ])
     }
 
@@ -104,6 +108,33 @@ impl TypeChecker {
             Expression::Assign(inner) => inner.infer(self, expr.span),
             Expression::Function(inner) => inner.infer(self, expr.span),
             Expression::Call(inner) => self.infer_call(&inner.callable, &inner.args),
+            Expression::Block(stmts) => {
+                if stmts.is_empty() {
+                    return Ok(Type::None);
+                }
+                let mut last = Type::None;
+                for stmt in stmts {
+                    last = self.infer(stmt)?;
+                }
+                Ok(last)
+            },
+            Expression::Tuple(elems) => {
+                if elems.is_empty() {
+                    return Ok(Type::List(Box::new(Type::TypeVar { name: "a".to_string() })));
+                }
+                let first_ty = self.infer(&elems[0])?;
+                for elem in &elems[1..] {
+                    let elem_ty = self.infer(elem)?;
+                    if !self.unify(&first_ty, &elem_ty) {
+                        return Err(Spanned::from(TypeError { msg: format!("List elements must have the same type, got {} and {}", first_ty, elem_ty) }, elem.span));
+                    }
+                }
+                Ok(Type::List(Box::new(self.lookup(&first_ty))))
+            },
+            Expression::Annotated(inner) => {
+                let annotated_ty = self.resolve_annotation(&inner.ty.item, expr.span)?;
+                self.check(&inner.expr, &annotated_ty)
+            },
             _ => return Err(Spanned::from(TypeError { msg: format!("Unhandled expression {}", expr) }, expr.span))
         }
     }
@@ -138,9 +169,7 @@ impl TypeChecker {
     }
 
     fn infer_call(&mut self, callable: &Spanned<Expression>, args: &Vec<Spanned<Expression>>) -> TypeResult {
-        println!("=== Callable: {:?}, Args: {:?} ===", callable.item, args);
         let func_type = self.infer(callable)?;
-        println!("Inferred func type: {:?}", func_type);
 
         if let Type::Function { params, result } = func_type {
             if args.len() != params.len() {
@@ -152,7 +181,6 @@ impl TypeChecker {
                     return Err(Spanned::from(TypeError { msg: format!("Can't unify {:?} and {:?}", arg, param) }, arg.span));
                 }
             };
-            println!("Context after unifying args: {:?}", self.substitutions);
             return Ok(self.lookup(&result));
         } else {
             return Err(Spanned::from(TypeError { msg: format!("Not callable: {}", callable.item) }, callable.span))
@@ -252,14 +280,20 @@ impl TypeChecker {
     fn resolve_annotation(&self, annotation: &Expression, span: Span) -> TypeResult {
         match annotation {
             Expression::Literal(lit) => match &lit.token {
-                Token::Identifier(name) => self.get(&name, span),
+                Token::Identifier(name) => match name.as_str() {
+                    "Int" => Ok(Type::Int),
+                    "Float" => Ok(Type::Float),
+                    "Bool" => Ok(Type::Bool),
+                    "Str" => Ok(Type::Str),
+                    _ => self.get(name, span),
+                },
                 _ => return Err(Spanned::from(
-                    TypeError { msg: format!("Expected identifier for type, got {}", annotation) }, 
+                    TypeError { msg: format!("Expected identifier for type, got {}", annotation) },
                     span
                 ))
             },
             _ => return Err(Spanned::from(
-                TypeError { msg: format!("Invalid type expression: {}", annotation) }, 
+                TypeError { msg: format!("Invalid type expression: {}", annotation) },
                 span
             ))
         }

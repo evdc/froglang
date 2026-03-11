@@ -137,16 +137,18 @@ impl<'a> Lexer<'a> {
         Token::from_keyword(&name).unwrap_or(Token::Identifier(name))
     }
     fn read_operator(&mut self, ch: char) -> Option<Token> {
-        let mut name = String::new();
-        name.push(ch);
-        while let Some(c) = self.input.peek() {
-            if !is_name_char(*c) && !c.is_whitespace() && c != &'\n' {
-                name.push(self.advance().unwrap())      // safe, because we just peeked it
-            } else {
-                break;
+        let single = ch.to_string();
+        // Try to form a two-character operator
+        if let Some(&next) = self.input.peek() {
+            if !is_name_char(next) && !next.is_whitespace() && next != '\n' {
+                let two = format!("{}{}", ch, next);
+                if Token::from_operator(&two).is_some() {
+                    self.advance();
+                    return Token::from_operator(&two);
+                }
             }
         }
-        Token::from_operator(&name)
+        Token::from_operator(&single)
     }
 
     fn read_number(&mut self, ch: char) -> Result<Token, LexerError> {

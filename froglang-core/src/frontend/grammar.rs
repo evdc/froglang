@@ -35,7 +35,7 @@ impl Grammar {
     }
 
     pub fn binary(parser: &mut Parser, token: Spanned<Token>, left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
-        let right = parser.expression(precedence)?;
+        let right = parser.expression(precedence.next())?;
         Ok(Spanned {
             span: left.span.merge(right.span),
             item: Expression::binary(token.item, left, right)

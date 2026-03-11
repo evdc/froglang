@@ -38,6 +38,25 @@ pub enum Precedence {
     Primary
 }
 
+impl Precedence {
+    pub fn next(self) -> Self {
+        match self {
+            Precedence::None => Precedence::Assign,
+            Precedence::Assign => Precedence::TypeAnnotation,
+            Precedence::TypeAnnotation => Precedence::Or,
+            Precedence::Or => Precedence::And,
+            Precedence::And => Precedence::Equality,
+            Precedence::Equality => Precedence::Comparison,
+            Precedence::Comparison => Precedence::Term,
+            Precedence::Term => Precedence::Factor,
+            Precedence::Factor => Precedence::Unary,
+            Precedence::Unary => Precedence::Call,
+            Precedence::Call => Precedence::Primary,
+            Precedence::Primary => Precedence::Primary,
+        }
+    }
+}
+
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     pub current_token: Spanned<Token>,

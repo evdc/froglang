@@ -392,3 +392,47 @@ fn test_check() {
     let expected_ty = Type::Function { params: vec![Type::Int, Type::Int], result: Box::new(Type::Int) };
     t.check(&func, &expected_ty).unwrap();
 }
+
+#[test]
+fn test_logical_ops() {
+    let mut t = TypeChecker::new();
+    // and: Bool, Bool -> Bool
+    let expr = spanned(Expression::binary(Token::And, bool_lit(true), bool_lit(false)));
+    assert_eq!(t.infer(&expr).unwrap(), Type::Bool);
+    // or: Bool, Bool -> Bool
+    let expr = spanned(Expression::binary(Token::Or, bool_lit(false), bool_lit(true)));
+    assert_eq!(t.infer(&expr).unwrap(), Type::Bool);
+}
+
+#[test]
+fn test_block_type_inference() {
+    let mut t = TypeChecker::new();
+    // { x = 1; x + 2 } :: Int (block type = type of last expression)
+    let block = spanned(Expression::Block(vec![
+        spanned(Expression::assign(ident("x"), None, int(1))),
+        spanned(Expression::binary(Token::Plus, ident("x"), int(2))),
+    ]));
+    assert_eq!(t.infer(&block).unwrap(), Type::Int);
+}
+
+#[test]
+fn test_list_type_inference() {
+    let mut t = TypeChecker::new();
+    // [1, 2, 3] :: List(Int)
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    assert_eq!(t.infer(&list).unwrap(), Type::List(Box::new(Type::Int)));
+}
+
+#[test]
+fn test_assignment_with_type_annotation() {
+    let mut t = TypeChecker::new();
+    // let x: Int = 5
+    let ann_type = spanned(Expression::literal(Token::Identifier("Int".to_string())));
+    let assign = spanned(Expression::assign(ident("x"), Some(ann_type), int(5)));
+    assert_eq!(t.infer(&assign).unwrap(), Type::Int);
+    // Type mismatch: let x: Bool = 5 should fail
+    let mut t2 = TypeChecker::new();
+    let ann_type2 = spanned(Expression::literal(Token::Identifier("Bool".to_string())));
+    let assign2 = spanned(Expression::assign(ident("x"), Some(ann_type2), int(5)));
+    assert!(t2.infer(&assign2).is_err());
+}

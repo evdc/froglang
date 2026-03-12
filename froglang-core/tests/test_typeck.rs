@@ -617,3 +617,103 @@ fn test_is_subtype_via_check() {
     let res = t.check(&int(1), &expected).unwrap();
     assert_eq!(res, Type::Int);
 }
+
+// --- Union normalization ---
+
+#[test]
+fn test_union_dedup() {
+    // Int | Str | Int  →  Int | Str
+    let u = Type::Union(vec![Type::Int, Type::Str, Type::Int]).normalize();
+    assert_eq!(u, Type::Union(vec![Type::Int, Type::Str]));
+}
+
+#[test]
+fn test_union_order_independent() {
+    // Int | Str  ==  Str | Int  (after normalization both are canonically sorted)
+    let u1 = Type::Union(vec![Type::Int, Type::Str]).normalize();
+    let u2 = Type::Union(vec![Type::Str, Type::Int]).normalize();
+    assert_eq!(u1, u2);
+}
+
+#[test]
+fn test_union_flatten_nested() {
+    // Int | (Str | Bool)  →  Bool | Int | Str  (flattened + sorted)
+    let u = Type::Union(vec![
+        Type::Int,
+        Type::Union(vec![Type::Str, Type::Bool]),
+    ]).normalize();
+    assert_eq!(u, Type::Union(vec![Type::Bool, Type::Int, Type::Str]));
+}
+
+#[test]
+fn test_union_singleton_collapses() {
+    // Union of one type collapses to that type.
+    assert_eq!(Type::Union(vec![Type::Int]).normalize(), Type::Int);
+}
+
+#[test]
+fn test_union_dedup_to_scalar() {
+    // Int | Int  →  Int  (collapses after dedup)
+    assert_eq!(Type::Union(vec![Type::Int, Type::Int]).normalize(), Type::Int);
+}
+
+#[test]
+fn test_union_triple_dedup() {
+    // Bool | Int | Str | Bool | Int  →  Bool | Int | Str
+    let u = Type::Union(vec![
+        Type::Bool, Type::Int, Type::Str, Type::Bool, Type::Int,
+    ]).normalize();
+    assert_eq!(u, Type::Union(vec![Type::Bool, Type::Int, Type::Str]));
+}
+
+// --- Union subtyping ---
+
+#[test]
+fn test_union_subtype_of_wider_union() {
+    // Int | Str  <:  Int | Str | Bool
+    let tc = TypeChecker::new();
+    let sub = Type::Union(vec![Type::Int, Type::Str]);
+    let sup = Type::Union(vec![Type::Int, Type::Str, Type::Bool]);
+    assert!(tc.is_subtype(&sub, &sup));
+}
+
+#[test]
+fn test_union_subtype_reflexive() {
+    // Int | Str  <:  Int | Str  (trivially)
+    let tc = TypeChecker::new();
+    let u = Type::Union(vec![Type::Int, Type::Str]);
+    assert!(tc.is_subtype(&u, &u));
+}
+
+#[test]
+fn test_union_subtype_not_wider() {
+    // Int | Str | Bool  is NOT <:  Int | Str  (Bool has no home)
+    let tc = TypeChecker::new();
+    let sub = Type::Union(vec![Type::Int, Type::Str, Type::Bool]);
+    let sup = Type::Union(vec![Type::Int, Type::Str]);
+    assert!(!tc.is_subtype(&sub, &sup));
+}
+
+#[test]
+fn test_scalar_subtype_of_union() {
+    // Int  <:  Int | Str | Bool
+    let tc = TypeChecker::new();
+    assert!(tc.is_subtype(&Type::Int, &Type::Union(vec![Type::Int, Type::Str, Type::Bool])));
+}
+
+#[test]
+fn test_scalar_not_subtype_of_disjoint_union() {
+    // Float  is NOT <:  Int | Str
+    let tc = TypeChecker::new();
+    assert!(!tc.is_subtype(&Type::Float, &Type::Union(vec![Type::Int, Type::Str])));
+}
+
+#[test]
+fn test_union_order_independent_subtype() {
+    // Subtype check works regardless of variant order.
+    // Str | Int  <:  Bool | Int | Str
+    let tc = TypeChecker::new();
+    let sub = Type::Union(vec![Type::Str, Type::Int]);
+    let sup = Type::Union(vec![Type::Bool, Type::Int, Type::Str]);
+    assert!(tc.is_subtype(&sub, &sup));
+}

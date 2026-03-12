@@ -60,6 +60,45 @@ pub enum Type {
     Union(Vec<Type>),
 }
 
+impl Type {
+    /// Normalize a union type: flatten nested unions, deduplicate, and sort
+    /// variants into a canonical order. Non-union types are returned unchanged.
+    ///
+    /// Examples:
+    ///   `Int | Str | Int`       → `Int | Str`
+    ///   `Str | Int`             → `Int | Str`
+    ///   `Int | (Str | Bool)`    → `Bool | Int | Str`
+    pub fn normalize(self) -> Type {
+        match self {
+            Type::Union(variants) => {
+                // 1. Recursively normalize and flatten nested unions.
+                let mut flat: Vec<Type> = Vec::new();
+                for v in variants {
+                    match v.normalize() {
+                        Type::Union(inner) => flat.extend(inner),
+                        other => flat.push(other),
+                    }
+                }
+                // 2. Deduplicate, preserving first occurrence.
+                let mut seen: Vec<Type> = Vec::new();
+                for ty in flat {
+                    if !seen.contains(&ty) {
+                        seen.push(ty);
+                    }
+                }
+                // 3. Sort canonically by display string (stable, readable).
+                seen.sort_by(|a, b| format!("{}", a).cmp(&format!("{}", b)));
+                match seen.len() {
+                    0 => Type::None,
+                    1 => seen.remove(0),
+                    _ => Type::Union(seen),
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -214,13 +253,17 @@ impl TypeChecker {
     ///   T ≤ T
     ///   T ≤ T | U  (T is a member of any union it belongs to)
     ///   T | U ≤ V  iff T ≤ V and U ≤ V
-    fn is_subtype(&self, sub: &Type, sup: &Type) -> bool {
+    pub fn is_subtype(&self, sub: &Type, sup: &Type) -> bool {
         let sub = self.lookup(sub);
         let sup = self.lookup(sup);
         if sub == sup { return true; }
         match (&sub, &sup) {
-            (_, Type::Union(variants))       => variants.iter().any(|v| self.is_subtype(&sub, v)),
-            (Type::Union(sub_variants), _)   => sub_variants.iter().all(|v| self.is_subtype(v, &sup)),
+            // Union on left: every variant must be a subtype of sup.
+            // This arm must come first so it takes priority over the next arm
+            // when both sides are unions.
+            (Type::Union(sub_variants), _) => sub_variants.iter().all(|v| self.is_subtype(v, &sup)),
+            // Scalar on left, union on right: sub must fit at least one variant.
+            (_, Type::Union(variants))     => variants.iter().any(|v| self.is_subtype(&sub, v)),
             _ => false,
         }
     }

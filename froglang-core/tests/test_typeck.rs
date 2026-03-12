@@ -1,5 +1,6 @@
 use std::{fmt::Debug, vec};
 use froglang_core::frontend::{expression::{Expression, Parameter}, tokens::{Span, Spanned, Token}, typeck::{Trait, Type, TypeChecker}};
+use froglang_core::frontend::parser::Parser;
 
 // Helper function to create a spanned item
 fn spanned<T: Debug>(item: T) -> Spanned<T> {
@@ -716,4 +717,64 @@ fn test_union_order_independent_subtype() {
     let sub = Type::Union(vec![Type::Str, Type::Int]);
     let sup = Type::Union(vec![Type::Bool, Type::Int, Type::Str]);
     assert!(tc.is_subtype(&sub, &sup));
+}
+
+// ── Named function declarations ───────────────────────────────────────────────
+
+fn infer_src(src: &str) -> Result<Type, String> {
+    let ast = Parser::parse(src).map_err(|e| format!("{:?}", e))?;
+    let mut tc = TypeChecker::new();
+    tc.infer(&ast).map_err(|e| format!("{}", e))
+}
+
+#[test]
+fn test_func_decl_inferred_return() {
+    // func double(x: Int) = x + x  →  (Int) -> Int, stored in context
+    let src = "func double(x: Int) = x + x";
+    let ty = infer_src(src).unwrap();
+    // The statement type is the function type
+    assert_eq!(ty, Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) });
+}
+
+#[test]
+fn test_func_decl_annotated_return() {
+    // func double(x: Int): Int = x + x
+    let ty = infer_src("func double(x: Int): Int = x + x").unwrap();
+    assert_eq!(ty, Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) });
+}
+
+#[test]
+fn test_func_decl_return_type_mismatch() {
+    // func f(x: Int): Bool = x + 1  →  type error
+    assert!(infer_src("func f(x: Int): Bool = x + 1").is_err());
+}
+
+#[test]
+fn test_func_decl_no_params() {
+    // func answer(): Int = 42  →  () -> Int
+    let ty = infer_src("func answer(): Int = 42").unwrap();
+    assert_eq!(ty, Type::Function { params: vec![], result: Box::new(Type::Int) });
+}
+
+#[test]
+fn test_func_decl_multiple_params() {
+    // func add(x: Int, y: Int): Int = x + y
+    let ty = infer_src("func add(x: Int, y: Int): Int = x + y").unwrap();
+    assert_eq!(ty, Type::Function { params: vec![Type::Int, Type::Int], result: Box::new(Type::Int) });
+}
+
+#[test]
+fn test_func_decl_callable_after_decl() {
+    // func double(x: Int): Int = x + x
+    // double(21)
+    let src = "func double(x: Int): Int = x + x\ndouble(21)";
+    let ty = infer_src(src).unwrap();
+    assert_eq!(ty, Type::Int);
+}
+
+#[test]
+fn test_func_decl_polymorphic_param() {
+    // func id(x) = x  →  ~t -> ~t  (identity)
+    let ty = infer_src("func id(x) = x").unwrap();
+    assert!(matches!(ty, Type::Function { .. }));
 }

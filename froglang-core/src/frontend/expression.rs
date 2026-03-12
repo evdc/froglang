@@ -1,7 +1,7 @@
 // expression.rs
 
 use std::{fmt, ops::Range};
-use crate::frontend::{tokens::{Position, Spanned, Token}, typeck::Type};
+use crate::frontend::tokens::{Position, Spanned, Token};
 
 // alias for conciseness
 type ExprRef = Box<Spanned<Expression>>;
@@ -50,7 +50,7 @@ pub struct Parameter {
 pub struct FunctionExpr {
     pub params: Vec<Parameter>,
     pub body: ExprRef,
-    pub return_type: Option<Type>
+    pub return_type: Option<ExprRef>
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +107,10 @@ impl Expression {
 
     pub fn function(params: Vec<Parameter>, body: Spanned<Expression>) -> Expression {
         Expression::Function(FunctionExpr { params, body: Box::new(body), return_type: None })
+    }
+
+    pub fn function_with_return(params: Vec<Parameter>, body: Spanned<Expression>, return_type: Option<Spanned<Expression>>) -> Expression {
+        Expression::Function(FunctionExpr { params, body: Box::new(body), return_type: return_type.map(Box::new) })
     }
 
     pub fn call(func: Spanned<Expression>, args: Vec<Spanned<Expression>>) -> Expression {

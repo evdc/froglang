@@ -115,6 +115,57 @@ impl Grammar {
         ))
     }
 
+    /// Parse a named function declaration: `func name(p1: T1, p2: T2, ...): RetType = body`
+    /// Desugars to an assignment: `name = (p1, p2, ...) -> body`
+    pub fn func_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let name_tok = parser.identifier()?;
+        parser.consume(Token::LeftParen)?;
+
+        let mut params = Vec::new();
+        while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
+            let param_tok = parser.identifier()?;
+            let param_name = match &param_tok.item {
+                Token::Identifier(s) => s.clone(),
+                _ => unreachable!(),
+            };
+            let ty = if parser.check(&Token::Colon) {
+                parser.advance()?;
+                let ty_tok = parser.identifier()?;
+                Some(Box::new(ty_tok.map(Expression::literal)))
+            } else {
+                None
+            };
+            params.push(Parameter { name: param_name, ty });
+            if parser.check(&Token::Comma) {
+                parser.advance()?;
+            }
+        }
+        parser.consume(Token::RightParen)?;
+
+        let return_type = if parser.check(&Token::Colon) {
+            parser.advance()?;
+            let ty_tok = parser.identifier()?;
+            Some(ty_tok.map(Expression::literal))
+        } else {
+            None
+        };
+
+        parser.consume(Token::Assign)?;
+        let body = parser.expression(Precedence::Assign)?;
+        let body_span = body.span;
+
+        let func_expr = Spanned::from(
+            Expression::function_with_return(params, body, return_type),
+            body_span,
+        );
+        let name_expr = name_tok.map(Expression::literal);
+
+        Ok(Spanned {
+            span: token.span.merge(body_span),
+            item: Expression::assign(name_expr, None, func_expr),
+        })
+    }
+
     pub fn arrow_func(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
         let params = match &left.item {
             Expression::Literal(lit) => {

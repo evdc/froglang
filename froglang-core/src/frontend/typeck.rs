@@ -588,7 +588,8 @@ impl Infer for FunctionExpr {
 
         let body_type = tc.with_context(param_bindings.into_iter(), |t| {
             if let Some(ret_ann) = &self.return_type {
-                t.check(&self.body, ret_ann)
+                let ret_ty = t.resolve_annotation(&ret_ann.item, span)?;
+                t.check(&self.body, &ret_ty)
             } else {
                 t.infer(&self.body)
             }

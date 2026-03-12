@@ -751,6 +751,88 @@ fn test_error_unclosed_tuple() {
     );
 }
 
+// ── Named function declarations ──────────────────────────────────────────────
+
+#[test]
+fn test_func_decl_no_params() {
+    // func answer(): Int = 42
+    let result = Parser::parse("func answer(): Int = 42");
+    assert!(result.is_ok(), "{:?}", result);
+    let block = result.unwrap();
+    // Block containing a single Assign
+    let stmts = match block.item { Expression::Block(s) => s, other => panic!("{:?}", other) };
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(stmts[0].item, Expression::Assign(_)));
+    // Target is Ident("answer")
+    let assign = match &stmts[0].item { Expression::Assign(a) => a, _ => unreachable!() };
+    assert_eq!(assign.target.item.get_identifier(), Some("answer"));
+    // Value is a Function with no params and a return type annotation
+    let func = match &assign.value.item { Expression::Function(f) => f, _ => panic!("expected Function") };
+    assert_eq!(func.params.len(), 0);
+    assert!(func.return_type.is_some());
+}
+
+#[test]
+fn test_func_decl_one_typed_param() {
+    // func double(x: Int): Int = x + x
+    let result = Parser::parse("func double(x: Int): Int = x + x");
+    assert!(result.is_ok(), "{:?}", result);
+    let block = result.unwrap();
+    let stmts = match block.item { Expression::Block(s) => s, other => panic!("{:?}", other) };
+    let assign = match &stmts[0].item { Expression::Assign(a) => a, _ => unreachable!() };
+    assert_eq!(assign.target.item.get_identifier(), Some("double"));
+    let func = match &assign.value.item { Expression::Function(f) => f, _ => panic!("expected Function") };
+    assert_eq!(func.params.len(), 1);
+    assert_eq!(func.params[0].name, "x");
+    assert!(func.params[0].ty.is_some());
+    assert!(func.return_type.is_some());
+}
+
+#[test]
+fn test_func_decl_multiple_params() {
+    // func add(x: Int, y: Int): Int = x + y
+    let result = Parser::parse("func add(x: Int, y: Int): Int = x + y");
+    assert!(result.is_ok(), "{:?}", result);
+    let block = result.unwrap();
+    let stmts = match block.item { Expression::Block(s) => s, other => panic!("{:?}", other) };
+    let func = match &stmts[0].item {
+        Expression::Assign(a) => match &a.value.item { Expression::Function(f) => f, _ => panic!() },
+        _ => panic!()
+    };
+    assert_eq!(func.params.len(), 2);
+    assert_eq!(func.params[0].name, "x");
+    assert_eq!(func.params[1].name, "y");
+}
+
+#[test]
+fn test_func_decl_no_return_type() {
+    // func identity(x: Int) = x  — return type is inferred
+    let result = Parser::parse("func identity(x: Int) = x");
+    assert!(result.is_ok(), "{:?}", result);
+    let block = result.unwrap();
+    let stmts = match block.item { Expression::Block(s) => s, other => panic!("{:?}", other) };
+    let func = match &stmts[0].item {
+        Expression::Assign(a) => match &a.value.item { Expression::Function(f) => f, _ => panic!() },
+        _ => panic!()
+    };
+    assert!(func.return_type.is_none());
+}
+
+#[test]
+fn test_func_decl_unannotated_params() {
+    // func id(x) = x  — param type is inferred
+    let result = Parser::parse("func id(x) = x");
+    assert!(result.is_ok(), "{:?}", result);
+    let block = result.unwrap();
+    let stmts = match block.item { Expression::Block(s) => s, other => panic!("{:?}", other) };
+    let func = match &stmts[0].item {
+        Expression::Assign(a) => match &a.value.item { Expression::Function(f) => f, _ => panic!() },
+        _ => panic!()
+    };
+    assert_eq!(func.params.len(), 1);
+    assert!(func.params[0].ty.is_none());
+}
+
 #[test]
 fn test_error_missing_comma_in_tuple() {
     // Testing [1 2]

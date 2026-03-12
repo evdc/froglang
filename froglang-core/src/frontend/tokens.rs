@@ -95,6 +95,10 @@ pub enum Token {
     #[lex("else")]
     Else,
 
+    #[prefix(Grammar::func_decl)]
+    #[lex("func")]
+    Func,
+
     #[infix(Grammar::arrow_func, Precedence::Assign)]
     #[lex("->")]
     Arrow,

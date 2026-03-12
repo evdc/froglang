@@ -134,8 +134,7 @@ impl TypeChecker {
             Expression::Annotated(inner) => {
                 let annotated_ty = self.resolve_annotation(&inner.ty.item, expr.span)?;
                 self.check(&inner.expr, &annotated_ty)
-            },
-            _ => return Err(Spanned::from(TypeError { msg: format!("Unhandled expression {}", expr) }, expr.span))
+            }
         }
     }
 

@@ -1,3 +1,4 @@
+use std::process;
 use froglang_core::frontend::expression::Expression;
 use froglang_core::frontend::parser::Parser;
 use froglang_core::frontend::typeck::TypeChecker;
@@ -141,6 +142,44 @@ fn print_parse_errors(errors: &[Spanned<ParseError>]) {
     }
 }
 
+fn check(src: &str) {
+    match Parser::parse(src) {
+        Err(errs) => {
+            print_parse_errors(&errs);
+            process::exit(1);
+        }
+        Ok(ast) => {
+            let mut tc = TypeChecker::new();
+            match tc.infer(&ast) {
+                Ok(ty)  => println!(":: {}", ty),
+                Err(e)  => { println!("Type error: {}", e); process::exit(1); }
+            }
+        }
+    }
+}
+
 fn main() {
-    repl();
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.as_slice() {
+        // frog check <expr-or-file>
+        [_, cmd, input] if cmd == "check" => {
+            let src = if std::path::Path::new(input).is_file() {
+                match std::fs::read_to_string(input) {
+                    Ok(s)  => s,
+                    Err(e) => { eprintln!("Error reading {}: {}", input, e); process::exit(1); }
+                }
+            } else {
+                input.clone()
+            };
+            check(&src);
+        }
+        // unknown subcommand
+        [_, cmd, ..] if !cmd.starts_with('-') && cmd != "check" => {
+            eprintln!("Unknown subcommand '{}'. Usage: frog [check <expr|file>]", cmd);
+            process::exit(1);
+        }
+        // no args → REPL
+        _ => repl(),
+    }
 }

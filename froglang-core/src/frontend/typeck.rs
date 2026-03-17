@@ -240,11 +240,16 @@ impl TypeChecker {
         };
 
         let inferred = self.infer(expr)?;
-        if self.is_subtype(&inferred, expected_ty) {
-            Ok(inferred)
+        let resolved = self.lookup(&inferred);
+        if self.is_subtype(&resolved, expected_ty) {
+            Ok(resolved)
+        } else if matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, expected_ty) {
+            // TypeVar inferred for the expression: unify it with the expected type
+            // rather than a subtype check, which would always fail for unbound vars.
+            Ok(self.lookup(&resolved))
         } else {
             Err(Spanned::from(TypeError {
-                msg: format!("Expected {} got {}", expected_ty, inferred)
+                msg: format!("Expected {} got {}", expected_ty, resolved)
             }, expr.span))
         }
     }
@@ -269,7 +274,20 @@ impl TypeChecker {
     }
 
     fn infer_call(&mut self, callable: &Spanned<Expression>, args: &Vec<Spanned<Expression>>) -> TypeResult {
-        let func_type = self.infer(callable)?;
+        let raw_type = self.infer(callable)?;
+        let func_type = self.lookup(&raw_type);
+
+        // If the callee is an unbound TypeVar (e.g. a lambda parameter used as a function),
+        // bind it to a fresh function type whose arity matches this call site.
+        let func_type = if let Type::TypeVar { name, .. } = &func_type {
+            let param_types: Vec<Type> = args.iter().map(|_| self.fresh_var()).collect();
+            let result_type = self.fresh_var();
+            let fn_ty = Type::Function { params: param_types, result: Box::new(result_type) };
+            self.substitutions.insert(name.clone(), fn_ty.clone());
+            fn_ty
+        } else {
+            func_type
+        };
 
         if let Type::Function { params, result } = func_type {
             if args.len() != params.len() {
@@ -445,6 +463,24 @@ impl TypeChecker {
                 }
                 true
             },
+            // Union ↔ bounded TypeVar: accept if every union member satisfies every bound,
+            // e.g. `Int | Float` satisfies `Num`. Must come before the generic TypeVar arms.
+            (Type::Union(variants), Type::TypeVar { name, bounds }) => {
+                if bounds.iter().all(|b| variants.iter().all(|v| type_implements(v, b))) {
+                    self.substitutions.insert(name.clone(), t1.clone());
+                    true
+                } else {
+                    false
+                }
+            },
+            (Type::TypeVar { name, bounds }, Type::Union(variants)) => {
+                if bounds.iter().all(|b| variants.iter().all(|v| type_implements(v, b))) {
+                    self.substitutions.insert(name.clone(), t2.clone());
+                    true
+                } else {
+                    false
+                }
+            },
             // Bounded TypeVar on left, concrete type on right.
             (Type::TypeVar { name, bounds }, _) => {
                 if !bounds.iter().all(|b| type_implements(&t2, b)) {
@@ -461,6 +497,11 @@ impl TypeChecker {
                 self.substitutions.insert(name.clone(), t1.clone());
                 true
             },
+            // Concrete type on left, Union on right:
+            // accept (without binding) if the concrete is a member of the union.
+            // This handles e.g. the second operand of `(Int|Float) + 2` after the first
+            // operand already bound the operator TypeVar to the union.
+            (_, Type::Union(variants)) => variants.iter().any(|v| t1 == *v),
             // Structural unification for functions.
             (Type::Function { params: p1, result: r1 }, Type::Function { params: p2, result: r2 }) => {
                 if p1.len() != p2.len() {
@@ -487,6 +528,22 @@ impl TypeChecker {
                     TypeError { msg: format!("Expected identifier for type, got {}", annotation) },
                     span
                 )),
+            },
+            // `(T -> U)` in a type annotation parses as a FunctionExpr.
+            // Parameter *names* are the input type names; body is the return type.
+            // e.g. `(Int -> Int)` → params=[Parameter{name:"Int"}], body=Literal("Int")
+            // e.g. `(Int -> Int -> Bool)` → right-associative nesting is handled recursively.
+            Expression::Function(func) => {
+                let param_types: Result<Vec<Type>, _> = func.params.iter()
+                    .map(|p| self.resolve_annotation(
+                        &Expression::Literal(crate::frontend::expression::LiteralExpr {
+                            token: Token::Identifier(p.name.clone())
+                        }),
+                        span
+                    ))
+                    .collect();
+                let result_type = self.resolve_annotation(&func.body.item, span)?;
+                Ok(Type::Function { params: param_types?, result: Box::new(result_type) })
             },
             _ => Err(Spanned::from(
                 TypeError { msg: format!("Invalid type expression: {}", annotation) },
@@ -538,7 +595,12 @@ impl Infer for AssignExpr {
         let name = &self.target.item.get_identifier().expect("should have validated in parsing");
         let ty = if let Some(annotation) = &self.typ {
             let annotated_ty = tc.resolve_annotation(&annotation.item, span)?;
-            tc.check(&*self.value, &annotated_ty)?
+            // Validate the value against the annotation, then store the annotation
+            // type (not the check return value). For function types this matters:
+            // check() returns the body type, but the variable's type is the full
+            // function type declared in the annotation.
+            tc.check(&*self.value, &annotated_ty)?;
+            annotated_ty
         } else {
             tc.infer(&self.value)?
         };

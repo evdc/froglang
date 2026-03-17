@@ -14,6 +14,10 @@ pub enum ParseError {
     ExpectedOperator,   // aka no infix rule
     ExpectedIdentifier,
     LexError(LexerError),
+    /// Emitted when a function type appears in annotation position without parentheses,
+    /// e.g. `f : Int -> Int` or `let f: Int -> Int = ...`.
+    /// Use parentheses: `f : (Int -> Int)` or `let f: (Int -> Int) = ...`.
+    FunctionTypeNeedsParens,
     Other(String)
 }
 

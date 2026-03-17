@@ -46,10 +46,17 @@ impl Grammar {
         // parse a pattern - a name, optional colon&type, then an =, then an expr
         // later(?) add destructuring assignment here
         let name = parser.identifier()?;
-        // todo - for now, types can only be a name. We will want type-level expressions eventually.
+        // Parse type annotation at TypeAnnotation precedence so `->` doesn't fire bare;
+        // parenthesised function types like `(Int -> Int)` still work via grouping.
         let ty = if parser.check(&Token::Colon) {
             parser.advance()?;
-            Some(parser.identifier()?)
+            let ty_expr = parser.expression(Precedence::TypeAnnotation)?;
+            // If `->` follows the type annotation, the user wrote `let f: Int -> Int = ...`
+            // without parentheses around the function type.
+            if parser.check(&Token::Arrow) {
+                return Err(ty_expr.to(ParseError::FunctionTypeNeedsParens));
+            }
+            Some(ty_expr)
         } else { None };
         parser.consume(Token::Assign)?;
 
@@ -58,7 +65,7 @@ impl Grammar {
             span: token.span.merge(expr.span),
             item: Expression::assign(
                 name.map(Expression::literal),
-                ty.map(|t| t.map(Expression::literal)), 
+                ty,
                 expr)
         })
     }
@@ -168,6 +175,11 @@ impl Grammar {
 
     pub fn arrow_func(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
         let params = match &left.item {
+            // `f : Int -> Int` — the annotation absorbed `f : Int`, now `->` fires with
+            // `Annotated(f, Int)` as the left-hand side. Tell the user to add parens.
+            Expression::Annotated(_) => {
+                return Err(left.to(ParseError::FunctionTypeNeedsParens))
+            },
             Expression::Literal(lit) => {
                 match &lit.token {
                     Token::Identifier(name) => vec![name],
@@ -208,9 +220,14 @@ impl Grammar {
         })
     }
 
-    pub fn type_annotation(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, p: Precedence) -> ParseResult {
-        let type_expr = parser.expression(p)?;
-        Ok(Spanned { span: left.span.merge(left.span), item: Expression::annotated(left, type_expr) })
+    pub fn type_annotation(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _p: Precedence) -> ParseResult {
+        // Parse the type expression at TypeAnnotation precedence (one level above Assign).
+        // This prevents `->` (Assign precedence) from firing here, so `f : Int -> Int`
+        // is a parse error — the user must parenthesise: `f : (Int -> Int)`.
+        // Parenthesised types work because `(` triggers grouping, which parses its
+        // interior at Assign level where `->` fires normally.
+        let type_expr = parser.expression(Precedence::TypeAnnotation)?;
+        Ok(Spanned { span: left.span.merge(type_expr.span), item: Expression::annotated(left, type_expr) })
     }
 
     pub fn call(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {

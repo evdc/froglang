@@ -834,6 +834,30 @@ fn test_func_decl_unannotated_params() {
 }
 
 #[test]
+fn test_error_function_type_needs_parens_annotation() {
+    // `f : Int -> Int` should emit FunctionTypeNeedsParens, not a confusing Other(...)
+    let result = Parser::parse("f : Int -> Int");
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.item == ParseError::FunctionTypeNeedsParens),
+        "expected FunctionTypeNeedsParens, got {:?}", errors
+    );
+}
+
+#[test]
+fn test_error_function_type_needs_parens_let() {
+    // `let f: Int -> Int = n -> n` should emit FunctionTypeNeedsParens
+    let result = Parser::parse("let f: Int -> Int = n -> n");
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.item == ParseError::FunctionTypeNeedsParens),
+        "expected FunctionTypeNeedsParens, got {:?}", errors
+    );
+}
+
+#[test]
 fn test_error_missing_comma_in_tuple() {
     // Testing [1 2]
     // The Pratt parser's expression loop tries to use `2` as an infix operator and

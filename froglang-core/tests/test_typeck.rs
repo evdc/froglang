@@ -778,3 +778,153 @@ fn test_func_decl_polymorphic_param() {
     let ty = infer_src("func id(x) = x").unwrap();
     assert!(matches!(ty, Type::Function { .. }));
 }
+
+// ── Higher-order functions ────────────────────────────────────────────────────
+
+#[test]
+fn test_hof_param_called_with_int() {
+    // f -> f(1)  →  ([Int] -> ~r) -> ~r
+    let ty = infer_src("f -> f(1)").unwrap();
+    assert!(matches!(ty, Type::Function { .. }));
+    if let Type::Function { params, .. } = ty {
+        assert_eq!(params.len(), 1);
+        assert!(matches!(&params[0], Type::Function { params: inner_p, .. } if inner_p == &vec![Type::Int]));
+    }
+}
+
+#[test]
+fn test_hof_apply() {
+    // f -> x -> f(x)  — apply combinator
+    let ty = infer_src("f -> x -> f(x)").unwrap();
+    assert!(matches!(ty, Type::Function { .. }));
+}
+
+#[test]
+fn test_hof_compose() {
+    // f -> g -> x -> f(g(x))
+    let ty = infer_src("f -> g -> x -> f(g(x))").unwrap();
+    assert!(matches!(ty, Type::Function { .. }));
+}
+
+#[test]
+fn test_hof_constraint_propagated_from_call_site() {
+    // f -> f(1) + f(2): both calls constrain f to Int->Num, result is Num
+    let ty = infer_src("f -> f(1) + f(2)").unwrap();
+    assert!(matches!(ty, Type::Function { .. }));
+}
+
+#[test]
+fn test_hof_inconsistent_args_err() {
+    // f -> f(true) + f(1): first call binds f to Bool->_, second call tries Int — type error
+    assert!(infer_src("f -> f(true) + f(1)").is_err());
+}
+
+#[test]
+fn test_hof_with_named_func() {
+    // func apply(f, x: Int) = f(x)   (return type inferred)
+    // apply(n -> n + 1, 5)  →  Int
+    let src = "func apply(f, x: Int) = f(x)\napply(n -> n + 1, 5)";
+    let ty = infer_src(src).unwrap();
+    assert_eq!(ty, Type::Int);
+}
+
+// ── Bug #2: annotation unification ───────────────────────────────────────────
+
+#[test]
+fn test_annotation_constrains_typevar() {
+    // x -> (x : Int)  should constrain x to Int, giving Int -> Int
+    let ty = infer_src("x -> (x : Int)").unwrap();
+    assert_eq!(ty, Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) });
+}
+
+#[test]
+fn test_return_type_annotation_constrains_body() {
+    // func apply(f, x: Int): Int = f(x)  — body infers ~t, annotation constrains to Int
+    let ty = infer_src("func apply(f, x: Int): Int = f(x)").unwrap();
+    assert!(matches!(ty, Type::Function { .. }));
+    if let Type::Function { result, .. } = ty {
+        assert_eq!(*result, Type::Int);
+    }
+}
+
+#[test]
+fn test_annotation_wrong_type_still_errors() {
+    assert!(infer_src("5 : Bool").is_err());
+    assert!(infer_src("true : Int").is_err());
+}
+
+// ── Bug #3: union satisfies trait bounds ─────────────────────────────────────
+
+#[test]
+fn test_union_num_satisfies_arithmetic() {
+    // Int | Float satisfies Num, so (Int|Float) + 2 is valid → Int | Float
+    let ty = infer_src("(if true then 1 else 1.0) + 2").unwrap();
+    // The union comes directly from the conditional branches (not normalized),
+    // so order matches branch order: true=Int, else=Float.
+    assert_eq!(ty, Type::Union(vec![Type::Int, Type::Float]));
+}
+
+#[test]
+fn test_union_num_both_operands() {
+    // Both operands are Int|Float — result is the same union
+    let ty = infer_src("(if true then 1 else 1.0) * (if false then 2 else 2.0)").unwrap();
+    assert_eq!(ty, Type::Union(vec![Type::Int, Type::Float]));
+}
+
+#[test]
+fn test_union_partial_num_still_errors() {
+    // Int | Str does not satisfy Num
+    assert!(infer_src("(if true then 1 else \"hi\") + 2").is_err());
+}
+
+#[test]
+fn test_union_eq_constraint() {
+    // Bool | Str satisfies Eq, so == is valid
+    let ty = infer_src("(if true then true else \"hi\") == true").unwrap();
+    assert_eq!(ty, Type::Bool);
+}
+
+// ── Bug #4: colon no longer absorbs arrow ────────────────────────────────────
+
+#[test]
+fn test_annotation_does_not_absorb_arrow() {
+    // `x : Int -> x + 1` used to silently parse as `x : (Int -> x+1)`.
+    // Now `:` parses its RHS at TypeAnnotation precedence (above Assign), so
+    // `->` doesn't fire there. The outer `->` then tries arrow_func on
+    // `Annotated(x, Int)` which is not a valid lambda param → parse error.
+    assert!(Parser::parse("x : Int -> x + 1").is_err());
+}
+
+#[test]
+fn test_lambda_body_annotation_parsed_correctly() {
+    // `x -> x : Int` should parse as `x -> (x : Int)`, constraining x to Int
+    let ty = infer_src("x -> x : Int").unwrap();
+    assert_eq!(ty, Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) });
+}
+
+#[test]
+fn test_function_type_annotation_let() {
+    // `let f: (Int -> Int) = n -> n + 1` — parenthesised function type in let annotation
+    let ty = infer_src("let f: (Int -> Int) = n -> n + 1").unwrap();
+    assert_eq!(ty, Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) });
+}
+
+#[test]
+fn test_function_type_annotation_wrong_type() {
+    // Annotation mismatch: declared (Int -> Int) but body returns Bool
+    assert!(infer_src("let f: (Int -> Int) = n -> true").is_err());
+}
+
+#[test]
+fn test_function_type_annotation_expr() {
+    // `f : (Int -> Int)` — resolves the function type even in expression position
+    // (f is unbound, but the annotation itself must parse and resolve correctly)
+    assert!(Parser::parse("f : (Int -> Int)").is_ok());
+}
+
+#[test]
+fn test_curried_function_type_annotation() {
+    // `(Int -> Int -> Int)` is a valid curried function type annotation
+    let ty = infer_src("let f: (Int -> Int -> Int) = x -> y -> x + y").unwrap();
+    assert!(matches!(ty, Type::Function { .. }));
+}

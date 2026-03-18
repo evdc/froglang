@@ -150,9 +150,35 @@ fn check(src: &str) {
         }
         Ok(ast) => {
             let mut tc = TypeChecker::new();
-            match tc.infer(&ast) {
-                Ok(ty)  => println!(":: {}", ty),
-                Err(e)  => { println!("Type error: {}", e); process::exit(1); }
+            match tc.check_and_lower(ast) {
+                Ok(typed) => println!(":: {}", typed.item.ty),
+                Err(e)    => { println!("Type error: {}", e); process::exit(1); }
+            }
+        }
+    }
+}
+
+fn run(src: &str) {
+    match Parser::parse(src) {
+        Err(errs) => {
+            print_parse_errors(&errs);
+            process::exit(1);
+        }
+        Ok(ast) => {
+            let mut tc = TypeChecker::new();
+            match tc.check_and_lower(ast) {
+                Err(e) => { println!("Type error: {}", e); process::exit(1); }
+                Ok(typed) => {
+                    let mut codegen = froglang_core::codegen::Codegen::new();
+                    let main_id = codegen.compile(typed);
+                    let ptr = codegen.module.get_finalized_function(main_id);
+                    let f: fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+                    let t0 = std::time::Instant::now();
+                    let result = f();
+                    let elapsed = t0.elapsed();
+                    println!("{}", result);
+                    eprintln!("({:?})", elapsed);
+                }
             }
         }
     }
@@ -162,6 +188,18 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     match args.as_slice() {
+        // frog run <expr-or-file>
+        [_, cmd, input] if cmd == "run" => {
+            let src = if std::path::Path::new(input).is_file() {
+                match std::fs::read_to_string(input) {
+                    Ok(s)  => s,
+                    Err(e) => { eprintln!("Error reading {}: {}", input, e); process::exit(1); }
+                }
+            } else {
+                input.clone()
+            };
+            run(&src);
+        }
         // frog check <expr-or-file>
         [_, cmd, input] if cmd == "check" => {
             let src = if std::path::Path::new(input).is_file() {
@@ -175,8 +213,8 @@ fn main() {
             check(&src);
         }
         // unknown subcommand
-        [_, cmd, ..] if !cmd.starts_with('-') && cmd != "check" => {
-            eprintln!("Unknown subcommand '{}'. Usage: frog [check <expr|file>]", cmd);
+        [_, cmd, ..] if !cmd.starts_with('-') && cmd != "check" && cmd != "run" => {
+            eprintln!("Unknown subcommand '{}'. Usage: frog [check|run <expr|file>]", cmd);
             process::exit(1);
         }
         // no args → REPL

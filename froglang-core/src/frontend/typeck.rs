@@ -4,6 +4,7 @@ use crate::frontend::{
     expression::{AssignExpr, BinaryExpr, ConditionalExpr, Expression, FunctionExpr, LiteralExpr, UnaryExpr},
     tokens::{Span, Spanned, Token},
 };
+use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
 use crate::utils::format_vec;
 
 #[derive(Debug)]
@@ -514,6 +515,121 @@ impl TypeChecker {
         }
     }
 
+    /// Type-check and lower an untyped `Spanned<Expression>` into a
+    /// `Spanned<TypedExpr>`, consuming the source node by move.
+    ///
+    /// Every node in the output carries a fully-resolved `Type` (no unbound
+    /// `TypeVar`s at leaf positions once concrete call-sites constrain them).
+    pub fn check_and_lower(
+        &mut self,
+        expr: Spanned<Expression>,
+    ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let span = expr.span;
+        // Borrow expr for inference, then consume it for lowering.
+        let ty          = self.infer(&expr)?;
+        let resolved_ty = self.lookup(&ty);
+
+        let kind = match expr.item {
+            Expression::Literal(lit) => match lit.token {
+                Token::Int(n)         => TypedExprKind::IntLit(n),
+                Token::Float(f)       => TypedExprKind::FloatLit(f),
+                Token::String(s)      => TypedExprKind::StrLit(s),
+                Token::True           => TypedExprKind::BoolLit(true),
+                Token::False          => TypedExprKind::BoolLit(false),
+                Token::Identifier(nm) => TypedExprKind::Var(nm),
+                _ => unreachable!("unexpected literal token"),
+            },
+
+            Expression::Unary(u) => {
+                let inner = self.check_and_lower(*u.expr)?;
+                TypedExprKind::Unary { op: u.op, expr: Box::new(inner) }
+            },
+
+            Expression::Binary(b) => {
+                let left  = self.check_and_lower(*b.left)?;
+                let right = self.check_and_lower(*b.right)?;
+                TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
+            },
+
+            Expression::Conditional(c) => {
+                let cond        = self.check_and_lower(*c.cond)?;
+                let true_branch = self.check_and_lower(*c.true_branch)?;
+                let false_branch = match c.false_branch {
+                    Some(fb) => Some(Box::new(self.check_and_lower(*fb)?)),
+                    None     => None,
+                };
+                TypedExprKind::Conditional {
+                    cond:         Box::new(cond),
+                    true_branch:  Box::new(true_branch),
+                    false_branch,
+                }
+            },
+
+            Expression::Assign(a) => {
+                let name  = a.target.item.get_identifier()
+                    .expect("assignment target must be identifier").to_string();
+                let value = self.check_and_lower(*a.value)?;
+                TypedExprKind::Assign { name, value: Box::new(value) }
+            },
+
+            Expression::Function(f) => {
+                let (param_types, return_type) = match &resolved_ty {
+                    Type::Function { params, result } => (params.clone(), (**result).clone()),
+                    _ => unreachable!("function expression must have Function type"),
+                };
+                let params: Vec<(String, Type)> = f.params.iter()
+                    .zip(param_types.iter())
+                    .map(|(p, ty)| (p.name.clone(), ty.clone()))
+                    .collect();
+
+                // Temporarily bind parameters so the body can look them up.
+                let prev_ctx = self.ctx.clone();
+                for (name, ty) in &params {
+                    self.ctx.insert(name.clone(), ty.clone());
+                }
+                let body_result = self.check_and_lower(*f.body);
+                self.ctx = prev_ctx;
+                let body = body_result?;
+
+                TypedExprKind::Function { params, return_type, body: Box::new(body) }
+            },
+
+            Expression::Call(c) => {
+                let callable = self.check_and_lower(*c.callable)?;
+                let mut args = Vec::with_capacity(c.args.len());
+                for arg in c.args {
+                    args.push(self.check_and_lower(arg)?);
+                }
+                TypedExprKind::Call { callable: Box::new(callable), args }
+            },
+
+            Expression::Tuple(elems) => {
+                let mut items = Vec::with_capacity(elems.len());
+                for e in elems {
+                    items.push(self.check_and_lower(e)?);
+                }
+                TypedExprKind::List(items)
+            },
+
+            Expression::Block(stmts) => {
+                let mut lowered = Vec::with_capacity(stmts.len());
+                for s in stmts {
+                    lowered.push(self.check_and_lower(s)?);
+                }
+                TypedExprKind::Block(lowered)
+            },
+
+            // The annotation expression is absorbed into `resolved_ty`.
+            // Lower the inner expression and reuse its kind directly;
+            // the outer Spanned<TypedExpr> carries the annotated type.
+            Expression::Annotated(a) => {
+                self.check_and_lower(*a.expr)?.item.kind
+            },
+        };
+
+        Ok(Spanned::from(TypedExpr { ty: resolved_ty, kind }, span))
+    }
+
     fn resolve_annotation(&self, annotation: &Expression, span: Span) -> TypeResult {
         match annotation {
             Expression::Literal(lit) => match &lit.token {
@@ -602,6 +718,18 @@ impl Infer for AssignExpr {
             tc.check(&*self.value, &annotated_ty)?;
             annotated_ty
         } else {
+            // Pre-bind fully-annotated functions so the body can reference the
+            // function by name (enabling recursion).
+            if let Expression::Function(func) = &self.value.item {
+                if func.return_type.is_some() && func.params.iter().all(|p| p.ty.is_some()) {
+                    let param_tys: Result<Vec<Type>, _> = func.params.iter()
+                        .map(|p| tc.resolve_annotation(&p.ty.as_ref().unwrap().item, span))
+                        .collect();
+                    let ret_ty = tc.resolve_annotation(&func.return_type.as_ref().unwrap().item, span)?;
+                    let func_ty = Type::Function { params: param_tys?, result: Box::new(ret_ty) };
+                    tc.ctx.insert(name.to_string(), func_ty);
+                }
+            }
             tc.infer(&self.value)?
         };
         tc.ctx.insert(name.to_string(), ty.clone());

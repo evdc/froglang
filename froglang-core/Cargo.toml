@@ -5,8 +5,13 @@ edition = "2021"
 default-run = "froglang-core"
 
 [dependencies]
-froglang-macros = { path = "../froglang-macros" } 
+froglang-macros = { path = "../froglang-macros" }
 rustyline = "17.0.1"
+cranelift-codegen  = "0.113"
+cranelift-frontend = "0.113"
+cranelift-module   = "0.113"
+cranelift-jit      = "0.113"
+cranelift-native   = "0.113"
 
 [[bin]]
 name = "froglang-core"
@@ -14,4 +19,8 @@ path = "src/main.rs"
 
 [dev-dependencies]
 criterion = "0.7.0"
+
+[[bench]]
+name = "bench_fib"
+harness = false
 

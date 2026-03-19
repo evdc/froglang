@@ -1,0 +1,4 @@
+func max(a: Int, b: Int): Int = if a > b then a else b
+func min(a: Int, b: Int): Int = if a < b then a else b
+func clamp(val: Int, lo: Int, hi: Int): Int = min(max(val, lo), hi)
+clamp(150, 0, 100)

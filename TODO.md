@@ -1,7 +1,4 @@
-- Make a cli tool that acts as the repl does - factor common code out - e.g. `frog check "1 + 2 * 3"` - so Claude can test snippets as a tool easier
-- Look for more edge cases in parsing and type system, around unions and functions and polymorphism and stuff
 - Integrate parsing and type checking, so we can produce a Typed AST, as a prereq for compilation
-- Implement named function declarations (currently lambdas are the only functions)
 - Stretch: MVP of integrating Cranelift to compile the simple core (operators, variables, functions, calls, conditionals) to native
     - don't implement GC / runtime, or native functions, on the backend yet. Let everything leak memory. As a hack, whatever main() returns will be formatted and printed to stdout. Fix later.
 - Improve error messaging, integrate a crate for rustc-style display

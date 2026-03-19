@@ -869,3 +869,45 @@ fn test_error_missing_comma_in_tuple() {
         ParseError::ExpectedOperator
     );
 }
+
+// ── Block expression syntax ───────────────────────────────────────────────────
+
+#[test]
+fn test_block_multi_stmt_semicolons() {
+    // { let x = 1; x + 1 } should parse as Block([let x = 1, x + 1])
+    let result = Parser::new("{ let x = 1; x + 1 }").expression(Precedence::Assign);
+    assert!(result.is_ok(), "{:?}", result);
+    match result.unwrap().item {
+        Expression::Block(stmts) => assert_eq!(stmts.len(), 2),
+        other => panic!("expected Block, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_block_multi_stmt_newlines() {
+    // Multi-line block with newline separators
+    let result = Parser::new("{\nlet x = 1\nx + 1\n}").expression(Precedence::Assign);
+    assert!(result.is_ok(), "{:?}", result);
+    match result.unwrap().item {
+        Expression::Block(stmts) => assert_eq!(stmts.len(), 2),
+        other => panic!("expected Block, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_block_single_expr_unwraps() {
+    // { expr } should unwrap to just expr, not a Block
+    let result = Parser::new("{ 42 }").expression(Precedence::Assign);
+    assert!(result.is_ok(), "{:?}", result);
+    match result.unwrap().item {
+        Expression::Block(_) => panic!("single-expr block should unwrap"),
+        expr => assert_eq!(expr, Expression::literal(Token::Int(42))),
+    }
+}
+
+#[test]
+fn test_block_empty_is_error() {
+    // {} should produce ExpectedExpression
+    let result = Parser::new("{}").expression(Precedence::Assign);
+    assert_eq!(result.unwrap_err().item, ParseError::ExpectedExpression);
+}

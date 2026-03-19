@@ -59,6 +59,7 @@ impl Grammar {
             Some(ty_expr)
         } else { None };
         parser.consume(Token::Assign)?;
+        parser.skip_newlines();
 
         let expr: Spanned<Expression> = parser.expression(Precedence::Assign)?;
         Ok(Spanned {
@@ -79,22 +80,41 @@ impl Grammar {
         })
     }
 
-    pub fn grouping(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
-        // Sequence of expressions separated by newlines forms a block. A single-expr block is just returned directly
-        // TODO: we should allow a leading sep, e.g. `x = ( \n y = 1 \n y + 2 )`
+    pub fn grouping(parser: &mut Parser, _t: Spanned<Token>) -> ParseResult {
+        let expr = parser.expression(Precedence::Assign)?;
+        parser.consume(Token::RightParen)?;
+        Ok(expr)
+    }
 
-        let exprs = parser.expression_list(&Token::Newline, &Token::RightParen);
-        let closing = parser.consume(Token::RightParen)?;
-        if exprs.len() == 0 {
+    pub fn block_expr(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
+        let mut stmts = vec![];
+        // skip leading blank lines / semicolons
+        while parser.check(&Token::Newline) || parser.check(&Token::Semicolon) {
+            let _ = parser.advance();
+        }
+        while !parser.check(&Token::RightBrace) && !parser.check(&Token::EOF) {
+            let expr = parser.expression(Precedence::Assign)?;
+            stmts.push(expr);
+            // stop if we see `}` next
+            if parser.check(&Token::RightBrace) || parser.check(&Token::EOF) { break; }
+            // require at least one separator (newline or `;`)
+            if !parser.check(&Token::Newline) && !parser.check(&Token::Semicolon) {
+                return Err(parser.current_token.clone()
+                    .map(|t| ParseError::ExpectedButFound(Token::Newline, t)));
+            }
+            // consume all consecutive separators
+            while parser.check(&Token::Newline) || parser.check(&Token::Semicolon) {
+                let _ = parser.advance();
+            }
+        }
+        let closing = parser.consume(Token::RightBrace)?;
+        if stmts.is_empty() {
             return Err(Spanned::new(ParseError::ExpectedExpression, t.span.start, closing.span.end));
         }
-        if exprs.len() == 1 {
-            Ok(exprs[0].clone())
+        if stmts.len() == 1 {
+            Ok(stmts.into_iter().next().unwrap())
         } else {
-            Ok(Spanned { 
-                span: t.span.merge(closing.span), 
-                item: Expression::Block(exprs)
-            })
+            Ok(Spanned { span: t.span.merge(closing.span), item: Expression::Block(stmts) })
         }
     }
 
@@ -102,10 +122,14 @@ impl Grammar {
         // TODO: we have the opportunity to map each ? to a more specific error here
         // e.g. "Missing conditional expression after `if`"
         let cond = parser.expression(Precedence::Assign)?;
+        parser.skip_newlines();
         parser.consume(Token::Then)?;
+        parser.skip_newlines();
         let true_branch = parser.expression(Precedence::Assign)?;
+        parser.skip_newlines();
         let false_branch = if parser.check(&Token::Else) {
             parser.consume(Token::Else).unwrap(); // just checked it
+            parser.skip_newlines();
             Some(parser.expression(Precedence::Assign)?)
         } else {
             None
@@ -158,6 +182,7 @@ impl Grammar {
         };
 
         parser.consume(Token::Assign)?;
+        parser.skip_newlines();
         let body = parser.expression(Precedence::Assign)?;
         let body_span = body.span;
 

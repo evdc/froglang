@@ -1,0 +1,8 @@
+func collatz(n: Int): Int = 
+    if n == 1 
+        then 0 
+    else if n - 2 * (n / 2) == 0 
+        then collatz(n / 2) + 1 
+    else collatz(3 * n + 1) + 1
+
+collatz(27)

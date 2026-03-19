@@ -1,7 +1,7 @@
 use std::process;
 use froglang_core::frontend::expression::Expression;
 use froglang_core::frontend::parser::Parser;
-use froglang_core::frontend::typeck::TypeChecker;
+use froglang_core::frontend::typeck::{Type, TypeChecker};
 use froglang_core::frontend::{parser::ParseError, tokens::{Spanned, Token}};
 
 use rustyline::error::ReadlineError;
@@ -169,14 +169,19 @@ fn run(src: &str) {
             match tc.check_and_lower(ast) {
                 Err(e) => { println!("Type error: {}", e); process::exit(1); }
                 Ok(typed) => {
+                    let result_ty = typed.item.ty.clone();
                     let mut codegen = froglang_core::codegen::Codegen::new();
                     let main_id = codegen.compile(typed);
                     let ptr = codegen.module.get_finalized_function(main_id);
                     let f: fn() -> i64 = unsafe { std::mem::transmute(ptr) };
                     let t0 = std::time::Instant::now();
-                    let result = f();
+                    let bits = f();
                     let elapsed = t0.elapsed();
-                    println!("{}", result);
+                    if result_ty == Type::Float {
+                        println!("{:?}", f64::from_bits(bits as u64));
+                    } else {
+                        println!("{}", bits);
+                    }
                     eprintln!("({:?})", elapsed);
                 }
             }

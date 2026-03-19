@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::{condcodes::IntCC, types, AbiParam, InstBuilder, Value};
+use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, InstBuilder, MemFlags, Value};
 use cranelift_codegen::{settings, settings::Configurable, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -63,8 +63,12 @@ fn compile_expr(
             let v = compile_expr(inner, bcx, vars, func_ids, module);
             match op {
                 Token::Minus => {
-                    let zero = bcx.ins().iconst(types::I64, 0);
-                    bcx.ins().isub(zero, v)
+                    if inner.item.ty == Type::Float {
+                        bcx.ins().fneg(v)
+                    } else {
+                        let zero = bcx.ins().iconst(types::I64, 0);
+                        bcx.ins().isub(zero, v)
+                    }
                 },
                 _ => unimplemented!("unary op {:?}", op),
             }
@@ -73,17 +77,21 @@ fn compile_expr(
         TypedExprKind::Binary { op, left, right } => {
             let lv = compile_expr(left,  bcx, vars, func_ids, module);
             let rv = compile_expr(right, bcx, vars, func_ids, module);
+            let is_float = left.item.ty == Type::Float || right.item.ty == Type::Float;
+            // Coerce Int operands to F64 when the other side is Float.
+            let lv = if is_float && left.item.ty == Type::Int { bcx.ins().fcvt_from_sint(types::F64, lv) } else { lv };
+            let rv = if is_float && right.item.ty == Type::Int { bcx.ins().fcvt_from_sint(types::F64, rv) } else { rv };
             match op {
-                Token::Plus  => bcx.ins().iadd(lv, rv),
-                Token::Minus => bcx.ins().isub(lv, rv),
-                Token::Star  => bcx.ins().imul(lv, rv),
-                Token::Slash => bcx.ins().sdiv(lv, rv),
-                Token::EqEq  => bcx.ins().icmp(IntCC::Equal,                      lv, rv),
-                Token::NotEq => bcx.ins().icmp(IntCC::NotEqual,                   lv, rv),
-                Token::Lt    => bcx.ins().icmp(IntCC::SignedLessThan,             lv, rv),
-                Token::Gt    => bcx.ins().icmp(IntCC::SignedGreaterThan,          lv, rv),
-                Token::LtEq  => bcx.ins().icmp(IntCC::SignedLessThanOrEqual,      lv, rv),
-                Token::GtEq  => bcx.ins().icmp(IntCC::SignedGreaterThanOrEqual,   lv, rv),
+                Token::Plus  => if is_float { bcx.ins().fadd(lv, rv) } else { bcx.ins().iadd(lv, rv) },
+                Token::Minus => if is_float { bcx.ins().fsub(lv, rv) } else { bcx.ins().isub(lv, rv) },
+                Token::Star  => if is_float { bcx.ins().fmul(lv, rv) } else { bcx.ins().imul(lv, rv) },
+                Token::Slash => if is_float { bcx.ins().fdiv(lv, rv) } else { bcx.ins().sdiv(lv, rv) },
+                Token::EqEq  => if is_float { bcx.ins().fcmp(FloatCC::Equal,            lv, rv) } else { bcx.ins().icmp(IntCC::Equal,                    lv, rv) },
+                Token::NotEq => if is_float { bcx.ins().fcmp(FloatCC::NotEqual,         lv, rv) } else { bcx.ins().icmp(IntCC::NotEqual,                 lv, rv) },
+                Token::Lt    => if is_float { bcx.ins().fcmp(FloatCC::LessThan,         lv, rv) } else { bcx.ins().icmp(IntCC::SignedLessThan,            lv, rv) },
+                Token::Gt    => if is_float { bcx.ins().fcmp(FloatCC::GreaterThan,      lv, rv) } else { bcx.ins().icmp(IntCC::SignedGreaterThan,         lv, rv) },
+                Token::LtEq  => if is_float { bcx.ins().fcmp(FloatCC::LessThanOrEqual,    lv, rv) } else { bcx.ins().icmp(IntCC::SignedLessThanOrEqual,   lv, rv) },
+                Token::GtEq  => if is_float { bcx.ins().fcmp(FloatCC::GreaterThanOrEqual, lv, rv) } else { bcx.ins().icmp(IntCC::SignedGreaterThanOrEqual, lv, rv) },
                 Token::And   => bcx.ins().band(lv, rv),
                 Token::Or    => bcx.ins().bor(lv, rv),
                 _ => unimplemented!("binary op {:?}", op),
@@ -274,6 +282,7 @@ impl Codegen {
 
         let mut vars: HashMap<String, Value> = HashMap::new();
         let mut last_val = bcx.ins().iconst(types::I64, 0);
+        let mut last_ty = &Type::Int;
 
         for stmt in stmts {
             // Skip top-level function-definition assigns; they're compiled in pass 2.
@@ -283,6 +292,12 @@ impl Codegen {
                 }
             }
             last_val = compile_expr(stmt, &mut bcx, &mut vars, func_ids, module);
+            last_ty = &stmt.item.ty;
+        }
+
+        // __frog_main always returns i64; bitcast floats so the signature stays uniform.
+        if *last_ty == Type::Float {
+            last_val = bcx.ins().bitcast(types::I64, MemFlags::new(), last_val);
         }
 
         bcx.ins().return_(&[last_val]);

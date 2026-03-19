@@ -1,0 +1,4 @@
+func square(n: Int): Int = n * n
+func cube(n: Int): Int = n * square(n)
+let base = 7
+cube(base)

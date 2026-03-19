@@ -53,7 +53,12 @@ impl<'a> Lexer<'a> {
                 '"' => Token::String(self.read_string().map_err(|e| self.error_at(e, start))?),
                 '0'..='9' => self.read_number(c).map_err(|e| self.error_at(e, start))?,
                 '/' => if let Some('/') = self.input.peek() {
-                    self.read_comment()
+                    self.input.next(); // consume second '/'
+                    while let Some(&c) = self.input.peek() {
+                        if c == '\n' { break; }
+                        self.input.next();
+                    }
+                    return self.next_token(); // skip comment, return next real token
                 } else {
                     Token::Slash
                 },
@@ -110,18 +115,6 @@ impl<'a> Lexer<'a> {
         } {
             self.advance();
         };
-    }
-
-    fn read_comment(&mut self) -> Token {
-        self.input.next(); // Consume the second '-'
-        let mut comment = String::new();
-        while let Some(&c) = self.input.peek() {
-            if c == '\n' {
-                break;
-            }
-            comment.push(self.advance().unwrap());
-        }
-        Token::Comment(comment)
     }
 
     fn read_name(&mut self, ch: char) -> Token {
@@ -276,11 +269,10 @@ mod tests {
         let (spans, errors) = lex_and_collect(input);
         assert!(errors.is_empty());
         let tokens: Vec<_> = spans.into_iter().map(|s| s.item).collect();
+        // Comments are skipped by the lexer; the newline after the first comment is preserved
         assert_eq!(tokens, vec![
-            Token::Comment(" This is a comment".to_string()),
             Token::Newline,
             Token::Identifier("foo".to_string()),
-            Token::Comment(" Another comment".to_string()),
         ]);
     }
 

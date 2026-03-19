@@ -37,10 +37,14 @@ impl Display for Trait {
 /// Only makes sense for non-TypeVar types; TypeVar-TypeVar unification is
 /// handled separately so we never call this on a TypeVar.
 fn type_implements(ty: &Type, tr: &Trait) -> bool {
-    match tr {
-        Trait::Num => matches!(ty, Type::Int | Type::Float),
-        Trait::Eq  => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
-        Trait::Ord => matches!(ty, Type::Int | Type::Float | Type::Str),
+    match ty {
+        // A union satisfies a trait iff every variant does.
+        Type::Union(variants) => variants.iter().all(|v| type_implements(v, tr)),
+        _ => match tr {
+            Trait::Num => matches!(ty, Type::Int | Type::Float),
+            Trait::Eq  => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
+            Trait::Ord => matches!(ty, Type::Int | Type::Float | Type::Str),
+        }
     }
 }
 
@@ -343,21 +347,37 @@ impl TypeChecker {
             },
 
             "+" | "-" | "*" | "/" | "<unaryminus>" => {
-                let t = self.fresh_bounded_var(vec![Trait::Num]);
+                // Infer all argument types first so we can detect Int/Float mixing.
+                let mut arg_types: Vec<Type> = Vec::new();
                 for arg in args {
                     let argt = self.infer(arg)?;
-                    if !self.unify(&argt, &t) {
-                        let resolved_t    = self.lookup(&t);
-                        let resolved_argt = self.lookup(&argt);
-                        let msg = if matches!(resolved_t, Type::TypeVar { .. }) {
-                            format!("Operator '{}' requires Num, got {}", op, resolved_argt)
-                        } else {
-                            format!("Operator '{}' got incompatible types: expected {}, got {}", op, resolved_t, resolved_argt)
-                        };
-                        return Err(Spanned::from(TypeError { msg }, arg.span));
+                    let resolved = self.lookup(&argt);
+                    if !matches!(&resolved, Type::TypeVar { .. }) && !type_implements(&resolved, &Trait::Num) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Operator '{}' requires Num, got {}", op, resolved)
+                        }, arg.span));
                     }
+                    arg_types.push(resolved);
                 }
-                Ok(self.lookup(&t))
+                // If any operand is Float, the result widens to Float (implicit Int→Float coercion).
+                if arg_types.iter().any(|t| *t == Type::Float) {
+                    Ok(Type::Float)
+                } else {
+                    // All Int or TypeVars — unify normally.
+                    let t = self.fresh_bounded_var(vec![Trait::Num]);
+                    for (arg, argt) in args.iter().zip(arg_types.iter()) {
+                        if !self.unify(argt, &t) {
+                            let resolved_t = self.lookup(&t);
+                            let msg = if matches!(resolved_t, Type::TypeVar { .. }) {
+                                format!("Operator '{}' requires Num, got {}", op, argt)
+                            } else {
+                                format!("Operator '{}' got incompatible types: expected {}, got {}", op, resolved_t, argt)
+                            };
+                            return Err(Spanned::from(TypeError { msg }, arg.span));
+                        }
+                    }
+                    Ok(self.lookup(&t))
+                }
             },
 
             "==" | "!=" => {
@@ -379,18 +399,30 @@ impl TypeChecker {
             },
 
             "<" | ">" | "<=" | ">=" => {
-                let t = self.fresh_bounded_var(vec![Trait::Ord]);
+                let mut arg_types: Vec<Type> = Vec::new();
                 for arg in args {
                     let argt = self.infer(arg)?;
-                    if !self.unify(&argt, &t) {
-                        let resolved_t    = self.lookup(&t);
-                        let resolved_argt = self.lookup(&argt);
-                        let msg = if matches!(resolved_t, Type::TypeVar { .. }) {
-                            format!("Operator '{}' requires Ord, got {}", op, resolved_argt)
-                        } else {
-                            format!("Operator '{}' got incompatible types: expected {}, got {}", op, resolved_t, resolved_argt)
-                        };
-                        return Err(Spanned::from(TypeError { msg }, arg.span));
+                    let resolved = self.lookup(&argt);
+                    if !matches!(&resolved, Type::TypeVar { .. }) && !type_implements(&resolved, &Trait::Ord) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Operator '{}' requires Ord, got {}", op, resolved)
+                        }, arg.span));
+                    }
+                    arg_types.push(resolved);
+                }
+                // Allow mixed Int/Float comparisons (coerce Int to Float).
+                if !arg_types.iter().any(|t| *t == Type::Float) {
+                    let t = self.fresh_bounded_var(vec![Trait::Ord]);
+                    for (arg, argt) in args.iter().zip(arg_types.iter()) {
+                        if !self.unify(argt, &t) {
+                            let resolved_t = self.lookup(&t);
+                            let msg = if matches!(resolved_t, Type::TypeVar { .. }) {
+                                format!("Operator '{}' requires Ord, got {}", op, argt)
+                            } else {
+                                format!("Operator '{}' got incompatible types: expected {}, got {}", op, resolved_t, argt)
+                            };
+                            return Err(Spanned::from(TypeError { msg }, arg.span));
+                        }
                     }
                 }
                 Ok(Type::Bool)

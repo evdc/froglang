@@ -1,0 +1,7 @@
+// Multi-statement body using block syntax
+func hypotenuse(a: Int, b: Int): Int = {
+  let a2 = a * a
+  let b2 = b * b
+  a2 + b2
+}
+hypotenuse(3, 4)

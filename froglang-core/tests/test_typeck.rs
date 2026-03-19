@@ -134,12 +134,12 @@ fn test_division_type_mismatch() {
 }
 
 #[test]
-fn test_mixed_arithmetic_error() {
+fn test_mixed_arithmetic_coercion() {
     let mut t = TypeChecker::new();
-    // Mixing Int and Float is a type error (can't unify).
+    // Mixing Int and Float widens to Float.
     let expr = spanned(Expression::binary(Token::Plus, int(1), float(2.0)));
     let res = t.infer(&expr);
-    assert!(res.is_err());
+    assert_eq!(res.unwrap(), Type::Float);
 }
 
 #[test]
@@ -520,11 +520,11 @@ fn test_num_polymorphism_float() {
 }
 
 #[test]
-fn test_mixed_num_error() {
+fn test_mixed_num_coercion() {
     let mut t = TypeChecker::new();
-    // 1 + 2.0  →  type error: can't unify Int and Float
+    // 1 + 2.0  →  Float (Int widens to Float)
     let res = t.infer(&spanned(Expression::binary(Token::Plus, int(1), float(2.0))));
-    assert!(res.is_err());
+    assert_eq!(res.unwrap(), Type::Float);
 }
 
 #[test]

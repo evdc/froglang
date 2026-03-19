@@ -95,6 +95,11 @@ impl<'a> Parser<'a> {
         let mut exprs = vec![];
         let start = self.current_token.span;
         while !self.check(&Token::EOF) {
+            // Skip blank lines (including comment-only lines, which emit a bare Newline)
+            while self.check(&Token::Newline) {
+                let _ = self.advance();
+            }
+            if self.check(&Token::EOF) { break; }
             let maybe_expr = self.statement();
             match maybe_expr {
                 Ok(expr) => exprs.push(expr),
@@ -250,5 +255,11 @@ impl<'a> Parser<'a> {
     #[inline]
     pub fn check(&mut self, expected: &Token) -> bool {
         self.current_token.item == *expected
+    }
+
+    pub fn skip_newlines(&mut self) {
+        while self.check(&Token::Newline) {
+            let _ = self.advance();
+        }
     }
 }

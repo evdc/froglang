@@ -1,0 +1,6 @@
+// Fibonacci using multi-line body and multi-line if-then-else
+func fib(n: Int): Int =
+  if n <= 1
+  then n
+  else fib(n - 1) + fib(n - 2)
+fib(10)

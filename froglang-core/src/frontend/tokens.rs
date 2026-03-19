@@ -116,18 +116,25 @@ pub enum Token {
     #[lex("[")]
     LeftBracket,
 
+    #[prefix(Grammar::block_expr)]
+    #[lex("{")]
+    LeftBrace,
+
     // tokens that should not appear in either prefix or infix expr position
     #[lex(")")]
     RightParen,
     #[lex("]")]
     RightBracket,
+    #[lex("}")]
+    RightBrace,
     #[lex(",")]
     Comma,
     #[lex("!")]
     Exclamation,
+    #[lex(";")]
+    Semicolon,
 
     // Special handling by the lexer - don't use lex() attr
-    Comment(String),
     Newline,
     EOF,
 }
@@ -140,9 +147,9 @@ impl std::fmt::Display for Token {
             Token::Float(n) => write!(f, "{}", n),
             Token::String(s) => write!(f, "\"{}\"", s),
             Token::Identifier(i) => write!(f, "{}", i),
-            Token::Comment(s) => write!(f, "// {}", s),
             Token::Newline => write!(f, "\n"),
             Token::EOF => write!(f, "<EOF>"),
+            Token::Semicolon => write!(f, ";"),
             _ => self.display(f)
         }
     }

@@ -1,134 +1,137 @@
 # froglang
 
-A compiled, statically typed language designed for LLM-assisted coding — terse enough
-to keep the context window lean, explicit enough that generated code is trustworthy.
+🐸 A cute little compiled, statically typed language designed for LLM-assisted coding.
+inspirations include "Go but nicer to use".
 
-See `DESIGN.md` for the full language vision.
+See `DESIGN.md` for more scattered thoughts on language vision.
 
 ---
 
-## Current state
+## Syntax (so far)
 
-The frontend pipeline (lexer → parser → type checker) is working and interactive via a REPL.
-No backend / code generation exists yet.
+```
+// Named function declarations with typed parameters and return type
+func fib(n: Int): Int =
+  if n <= 1 then n
+  else fib(n - 1) + fib(n - 2)
 
-### What's implemented
+// Multi-statement block bodies — newlines and ; both separate statements
+func hypotenuse(a: Int, b: Int): Int = {
+  let a2 = a * a
+  let b2 = b * b
+  a2 + b2
+}
 
-#### Lexer (`lexer.rs`)
-Tokenises the full expression syntax: literals, identifiers, operators, keywords (`if`, `then`,
-`else`, `not`, `and`, `or`, `true`, `false`), and punctuation. Recovers from errors and collects
-multiple lex errors before aborting.
+// Inline block with semicolons
+func clamp_pos(x: Int): Int = { let z = 0; if x < 0 then z else x }
 
-#### Parser (`parser.rs`)
-Pratt (top-down operator precedence) parser producing a `Spanned<Expression>` AST.
+// Multi-line if-then-else
+func ack(m: Int, n: Int): Int =
+  if m == 0 then n + 1
+  else if n == 0 then ack(m - 1, 1)
+  else ack(m - 1, ack(m, n - 1))
 
-Supported expression forms:
-- Literals: integers, floats, strings, booleans
-- Arithmetic / comparison / logical binary operators, with correct precedence
+// Top-level let bindings
+let x = 42
+let f: (Int -> Int) = n -> n * 2
+```
+
+**Supported expression forms:**
+- Literals: `Int`, `Float`, `Bool` (`true`/`false`), `Str`
+- Arithmetic / comparison / logical operators with correct precedence
 - Unary `-` and `not`
-- Variable assignment with optional type annotation: `x: Int = 5`
-- Lambda / anonymous functions: `x -> x + 1`, `(x, y) -> x + y`
+- Let bindings with optional type annotation: `let x: Int = 5`
+- Lambdas: `x -> x + 1`, `(x, y) -> x + y`
+- Named function declarations: `func f(x: T, y: T): T = body`
 - Function calls: `f(x, y)`
-- Conditionals: `if cond then a else b` (else optional)
-- Blocks: `{ stmt; stmt; expr }`
-- Lists (tuple syntax): `[1, 2, 3]`
-- Type-annotated expressions: `expr : Type`
+- Conditionals: `if cond then a else b` (`else` optional)
+- Block expressions: `{ stmt; stmt; expr }` — newlines and `;` both work as separators
+- Tuples/lists: `[1, 2, 3]`
+- Type annotations: `expr : Type`
+- Comments: `// ...`
+- Multi-line expressions: newlines are skipped after `=`, `then`, and `else`
 
-#### Type checker (`typeck.rs`)
-Bidirectional type checker with Robinson unification and the following type system:
+## Type system
+
+your basic bidirectional type checker with unification. no HKTs, we're not Haskell.
 
 **Primitive types:** `Int`, `Float`, `Bool`, `Str`, `None`
 
 **Compound types:**
-- `Function { params, result }` — inferred for lambdas, checked against annotations
+- `(T1, T2, ...) -> R` function types, inferred for lambdas, checked against annotations
 - `List(T)` — homogeneous lists
-- `TypeVar { name, bounds }` — type variables with optional trait bounds (see below)
-- `Union(Vec<Type>)` — sum / union types (see below)
+- Type variables with optional trait bounds
+- `T1 | T2` — sum / union types
 
-**Trait-bounded polymorphism (Phase B complete):**
+**Trait-bounded polymorphism:**
 
-Operators are polymorphic via explicit trait bounds on type variables, Rust-style:
+A few built-in traits or bounds exist to demonstrate polymorphism works
+we don't have the ability for user-defined traits yet.
 
-| Trait | Implements     | Operators          |
-|-------|----------------|--------------------|
-| `Num` | `Int`, `Float` | `+` `-` `*` `/` unary `-` |
-| `Eq`  | `Int`, `Float`, `Bool`, `Str` | `==` `!=` |
-| `Ord` | `Int`, `Float`, `Str` | `<` `>` `<=` `>=` |
+| Trait | Satisfying types              | Operators                   |
+|-------|-------------------------------|-----------------------------|
+| `Num` | `Int`, `Float`                | `+` `-` `*` `/` unary `-`  |
+| `Eq`  | `Int`, `Float`, `Bool`, `Str` | `==` `!=`                   |
+| `Ord` | `Int`, `Float`, `Str`         | `<` `>` `<=` `>=`          |
 
-```
-1 + 2       :: Int        ✓  (Int implements Num)
-1.0 + 2.0   :: Float      ✓  (Float implements Num)
-1 + 2.0     → type error  ✗  (can't unify Int and Float)
-"a" + "b"   → type error  ✗  (Str does not implement Num)
-"a" == "b"  :: Bool       ✓  (Str implements Eq)
-"a" < "b"   :: Bool       ✓  (Str implements Ord)
-true < false → type error ✗  (Bool does not implement Ord)
-```
+Bound propagation: `x -> x + x` infers as `(Num t) => t -> t`.
 
-Bound propagation: `x -> x + x` correctly infers as `(Num t) => t -> t` — the lambda
-parameter inherits the `Num` bound from the operator.
+**Union types:**
+- Mismatched if-else branches produce a union: `if c then 1 else "hi"` has type `Int | Str`
+- An `if` without an `else` has an implicit `else None` and so has type `T | None`
+  - which will have a convenient alias `T?` when we get around to that
+- Unions normalize (flatten, deduplicate, sort): `Str | Int | Int` → `Int | Str`
+- Subtype relation: `T ≤ (T | U)`; values are accepted wherever a wider union is expected
 
-**Union types (Phase A complete):**
+## Cranelift JIT backend
 
-`Type::Union(Vec<Type>)` is the representation for sum types.
+Compiles to native code via Cranelift. Supported:
+- All arithmetic, comparison, and logical operators on `Int` and `Bool`
+- Let bindings and variable references
+- Named and anonymous functions, including mutual recursion
+- Function calls (direct and via value)
+- `if-then-else` expressions
+- Block expressions (sequenced statements; result is the final expression)
+- Two-pass compilation: forward-declares all functions so mutual recursion works
 
-- If-expressions with mismatched branch types produce a union rather than an error:
-  `if cond then 1 else "hello"  →  Int | Str`
-- If-expressions without an else branch return `T | None`
-- `Type::normalize()` canonicalises unions: flattens nesting, deduplicates, sorts
-  variants alphabetically. `Int | Str | Int` → `Int | Str`, `Str | Int` → `Int | Str`.
-- Subtype relation `A ≤ B`: `T ≤ T | U`, `T | U ≤ V` iff each variant ≤ V.
-  `check()` uses `is_subtype` so values are accepted wherever a wider union is expected.
+## Test suite
 
-#### REPL (`main.rs`)
-`cargo run` starts an interactive session that parses input, prints the AST, and infers
-the type:
-
-```
->> 1 + 2
-...
-:: Int
-
->> x -> x + x
-...
-:: ~t1:Num -> ~t1:Num
-
->> if true then 1 else "hello"
-...
-:: Int | Str
-```
-
----
-
-## What's next
-
-Roughly in priority order:
-
-### Near-term
-
-- **Named function declarations** — currently only anonymous lambdas exist. Add `func f(x: Int): Int = x + 1` syntax, parsed and type-checked at the top level.
-- **Typed AST** — integrate parsing and type checking to produce a typed IR as a prerequisite for any backend work. Right now the AST is untyped and type checking is a separate pass.
-- **CLI check tool** — `frog check "1 + 2"` (or reading from a file) so snippets can be tested non-interactively. Useful for scripting and for Claude to use as a tool.
-- **Better error messages** — span-aware, rustc-style rendered errors (consider `miette` or `ariadne`).
-
-### Type system
-
-- **User-defined traits and impls (Phase D)** — `trait Add { fn add(self, other: Self) -> Self }`, `impl Add for MyType`, and explicit `T: Trait` bounds in function signatures. No let-generalisation — generic parameters must be declared explicitly.
-- **Pattern matching / narrowing** — `match` expressions that narrow union types at each arm, the primary way to consume `Union` values.
-- **Named struct and enum types** — `type Shape = Circle { r: Int } | Rect { w: Int, h: Int }`, with field access and exhaustive match.
-- **Intersection function types (Phase C, optional)** — represent built-in operators as `(Int,Int)->Int & (Float,Float)->Float` instead of trait bounds. Formally cleaner but adds a subtype-based dispatch algorithm; the user-visible behaviour is identical to Phase B. Worth considering if set-theoretic types become a first-class design goal.
-- **Result / Option built-ins** — `Result(T, E)` and `Option(T)` as sugar over union types, plus `?` propagation syntax.
-
-### Backend (stretch)
-
-- **Cranelift codegen MVP** — compile the core expression language (arithmetic, variables, conditionals, function calls) to native via Cranelift. No GC or runtime yet; let memory leak. `main()` return value printed to stdout.
-- **Runtime and GC** — minimal GC sufficient for strings and heap-allocated structs/lists.
+12 end-to-end programs in `tests/programs/`, exercising:
+Fibonacci, factorial, sum-to-N, power, GCD, Collatz, Ackermann, multi-function programs,
+let bindings, block expressions, and multi-line syntax.
 
 ---
 
 ## Running
 
 ```sh
-cargo run          # REPL
-cargo test         # all tests (lexer, parser, type checker)
+cargo run -- run <file.frog>   # compile and run a program
+cargo test                      # all tests (lexer, parser, type checker, codegen)
 ```
+
+---
+
+## Up Next
+
+Roughly in priority order:
+
+### Usability
+
+- **Better error messages** — span-aware, rustc-style rendered errors (consider `miette`
+  or `ariadne`). Currently errors print as raw debug output.
+
+### Types and constructs
+
+- **Named struct and enum types** — `type Shape = Circle { r: Int } | Rect { w: Int, h: Int }`,
+  with field access and exhaustive `match`.
+- **User-defined traits and impls** — `trait Foo { ... }`, `impl Foo for MyType`, and
+  explicit `T: Trait` bounds in function signatures.
+- **`Result` / `Option` built-ins** — sugar over union types, plus `?` propagation syntax.
+- **`match` expressions** — the primary way to consume `Union` types and destructure
+  enums. Needed before user-facing union types are fully usable.
+
+### Runtime
+
+- **GC and heap allocation** — minimal GC sufficient for strings and heap-allocated
+  structs and lists.
+- **Standard library stubs** — `print`, basic string operations, list operations.

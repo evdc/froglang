@@ -9,49 +9,60 @@ use rustyline::DefaultEditor;
 
 pub fn repl() {
     let mut rl = DefaultEditor::new().expect("Couldn't open rustyline");
+    println!("🐸 froglang repl");
 
-    println!("🐸 froglang alpha repl");
+    // Accumulate successfully compiled lines so bindings persist across entries.
+    let mut history: Vec<String> = Vec::new();
 
     loop {
         let readline = rl.readline(">> ");
         match readline {
             Ok(line) => {
-                let trimmed = line.trim();
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() { continue; }
+                let _ = rl.add_history_entry(&line);
 
-                if trimmed.is_empty() {
-                    continue;
-                }
+                // Build the full program: all prior lines + this one.
+                let full_src = history.iter().chain(std::iter::once(&trimmed))
+                    .cloned().collect::<Vec<_>>().join("\n");
 
-                match rl.add_history_entry(&line) {
-                    Ok(_) => (),
-                    Err(e) => eprintln!("Couldn't add to history: {}", e)
-                };
-
-                let result = Parser::parse(trimmed);
-                match result {
-                    Ok(expr) => {
-                        print_ast_tree(&expr, 0);
+                match Parser::parse(&full_src) {
+                    Err(errs) => print_parse_errors(&errs),
+                    Ok(ast) => {
                         let mut tc = TypeChecker::new();
-                        match tc.infer(&expr) {
-                            Ok(ty) => println!(":: {}", ty),
+                        match tc.check_and_lower(ast) {
                             Err(e) => println!("Type error: {}", e),
+                            Ok(typed) => {
+                                let result_ty = typed.item.ty.clone();
+                                let mut codegen = froglang_core::codegen::Codegen::new();
+                                let main_id = codegen.compile(typed);
+                                let ptr = codegen.module.get_finalized_function(main_id);
+                                let f: fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+                                let bits = f();
+
+                                let value_str = match &result_ty {
+                                    Type::Float    => format!("{:?}", f64::from_bits(bits as u64)),
+                                    Type::Bool     => format!("{}", bits != 0),
+                                    Type::None     => String::new(),
+                                    Type::Function { .. } => String::new(),
+                                    _              => format!("{}", bits),
+                                };
+
+                                if value_str.is_empty() {
+                                    println!(":: {}", result_ty);
+                                } else {
+                                    println!("{} :: {}", value_str, result_ty);
+                                }
+
+                                history.push(trimmed);
+                            }
                         }
-                    },
-                    Err(parse_errs) => print_parse_errors(&parse_errs),
+                    }
                 }
             },
-            Err(ReadlineError::Interrupted) => {
-                println!("^C");
-                continue;
-            },
-            Err(ReadlineError::Eof) => {
-                println!("Goodbye!");
-                break;
-            },
-            Err(err) => {
-                eprintln!("Error reading input: {}", err);
-                break;
-            }
+            Err(ReadlineError::Interrupted) => { println!("^C"); continue; },
+            Err(ReadlineError::Eof)         => { println!("Goodbye!"); break; },
+            Err(err) => { eprintln!("Error: {}", err); break; },
         }
     }
 }

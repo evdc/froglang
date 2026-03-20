@@ -8,7 +8,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::tokens::{Spanned, Token};
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
-use crate::frontend::typeck::Type;
+use crate::frontend::typeck::{Type, numeric_join};
 
 pub struct Codegen {
     pub module: JITModule,
@@ -34,6 +34,20 @@ fn ensure_width(val: Value, from_ty: &Type, to: types::Type, bcx: &mut FunctionB
         bcx.ins().uextend(types::I64, val)
     } else {
         val
+    }
+}
+
+/// Emit Cranelift IR to widen `val` from `from_ty` to `to_ty`.
+/// No-op when types are equal. Panics if no widening path exists
+/// (type checker should have caught this before codegen).
+fn coerce_value(val: Value, from_ty: &Type, to_ty: &Type, bcx: &mut FunctionBuilder) -> Value {
+    use crate::frontend::typeck::widens_to;
+    if from_ty == to_ty { return val; }
+    assert!(widens_to(from_ty, to_ty), "no widening from {:?} to {:?}", from_ty, to_ty);
+    match (from_ty, to_ty) {
+        (Type::Int, Type::Float) => bcx.ins().fcvt_from_sint(types::F64, val),
+        // Future: (Type::Int32, Type::Int64) => bcx.ins().sextend(types::I64, val),
+        _ => unreachable!(),
     }
 }
 
@@ -77,10 +91,10 @@ fn compile_expr(
         TypedExprKind::Binary { op, left, right } => {
             let lv = compile_expr(left,  bcx, vars, func_ids, module);
             let rv = compile_expr(right, bcx, vars, func_ids, module);
-            let is_float = left.item.ty == Type::Float || right.item.ty == Type::Float;
-            // Coerce Int operands to F64 when the other side is Float.
-            let lv = if is_float && left.item.ty == Type::Int { bcx.ins().fcvt_from_sint(types::F64, lv) } else { lv };
-            let rv = if is_float && right.item.ty == Type::Int { bcx.ins().fcvt_from_sint(types::F64, rv) } else { rv };
+            let op_ty = numeric_join(&left.item.ty, &right.item.ty).unwrap_or_else(|| left.item.ty.clone());
+            let lv = coerce_value(lv, &left.item.ty, &op_ty, bcx);
+            let rv = coerce_value(rv, &right.item.ty, &op_ty, bcx);
+            let is_float = op_ty == Type::Float;
             match op {
                 Token::Plus  => if is_float { bcx.ins().fadd(lv, rv) } else { bcx.ins().iadd(lv, rv) },
                 Token::Minus => if is_float { bcx.ins().fsub(lv, rv) } else { bcx.ins().isub(lv, rv) },
@@ -162,9 +176,18 @@ fn compile_expr(
             let func_id = func_ids[&func_name];
             let local_callee = module.declare_func_in_func(func_id, bcx.func);
 
-            let arg_vals: Vec<Value> = args.iter()
-                .map(|a| compile_expr(a, bcx, vars, func_ids, module))
-                .collect();
+            let param_types: Vec<Type> = match &callable.item.ty {
+                Type::Function { params, .. } => params.clone(),
+                _ => vec![],
+            };
+            let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
+            for (i, a) in args.iter().enumerate() {
+                let mut v = compile_expr(a, bcx, vars, func_ids, module);
+                if let Some(param_ty) = param_types.get(i) {
+                    v = coerce_value(v, &a.item.ty, param_ty, bcx);
+                }
+                arg_vals.push(v);
+            }
 
             let call = bcx.ins().call(local_callee, &arg_vals);
             bcx.inst_results(call)[0]
@@ -295,9 +318,11 @@ impl Codegen {
             last_ty = &stmt.item.ty;
         }
 
-        // __frog_main always returns i64; bitcast floats so the signature stays uniform.
+        // __frog_main always returns i64; coerce other numeric types to match.
         if *last_ty == Type::Float {
             last_val = bcx.ins().bitcast(types::I64, MemFlags::new(), last_val);
+        } else if *last_ty == Type::Bool {
+            last_val = bcx.ins().uextend(types::I64, last_val);
         }
 
         bcx.ins().return_(&[last_val]);

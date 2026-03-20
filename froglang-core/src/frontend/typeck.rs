@@ -134,6 +134,28 @@ impl Display for Type {
     }
 }
 
+/// Returns true iff `from` can be implicitly widened to `to`.
+/// Directed and acyclic — NOT symmetric. Only safe (non-lossy) promotions.
+/// To add Int32/Int64/UInt8 etc, add cases here only.
+pub fn widens_to(from: &Type, to: &Type) -> bool {
+    matches!(
+        (from, to),
+        (Type::Int, Type::Float)
+        // Future: (Type::Int32, Type::Int64)
+        //         (Type::Int32, Type::Float)
+        //         (Type::Int64, Type::Float)
+    )
+}
+
+/// Least upper bound of t1 and t2 in the widening lattice.
+/// Returns Some(join) if compatible, None if incompatible (type error at call site).
+pub fn numeric_join(t1: &Type, t2: &Type) -> Option<Type> {
+    if t1 == t2           { return Some(t1.clone()); }
+    if widens_to(t1, t2)  { return Some(t2.clone()); }
+    if widens_to(t2, t1)  { return Some(t1.clone()); }
+    None
+}
+
 pub struct TypeChecker {
     // Variable (value level) name -> Type
     ctx: HashMap<String, Type>,
@@ -302,6 +324,12 @@ impl TypeChecker {
             }
             for (arg, param) in args.iter().zip(params) {
                 let argt = self.infer(arg)?;
+                let resolved_argt  = self.lookup(&argt);
+                let resolved_param = self.lookup(&param);
+                // Allow implicit widening coercions at call sites (e.g. Int→Float).
+                if widens_to(&resolved_argt, &resolved_param) {
+                    continue;
+                }
                 if !self.unify(&argt, &param) {
                     return Err(Spanned::from(TypeError {
                         msg: format!("Can't unify {:?} and {:?}", argt, param)
@@ -347,7 +375,6 @@ impl TypeChecker {
             },
 
             "+" | "-" | "*" | "/" | "<unaryminus>" => {
-                // Infer all argument types first so we can detect Int/Float mixing.
                 let mut arg_types: Vec<Type> = Vec::new();
                 for arg in args {
                     let argt = self.infer(arg)?;
@@ -359,25 +386,35 @@ impl TypeChecker {
                     }
                     arg_types.push(resolved);
                 }
-                // If any operand is Float, the result widens to Float (implicit Int→Float coercion).
-                if arg_types.iter().any(|t| *t == Type::Float) {
-                    Ok(Type::Float)
-                } else {
-                    // All Int or TypeVars — unify normally.
+                let has_union = arg_types.iter().any(|t| matches!(t, Type::Union(..)));
+                let concrete: Vec<&Type> = arg_types.iter().filter(|t| !matches!(t, Type::TypeVar { .. })).collect();
+                let result_ty = if concrete.is_empty() || has_union {
+                    // All TypeVars, or union operand present — unify via fresh Num-bounded var.
+                    // Unions satisfy Num if all their variants do (handled by unify).
                     let t = self.fresh_bounded_var(vec![Trait::Num]);
-                    for (arg, argt) in args.iter().zip(arg_types.iter()) {
+                    for (arg, argt) in args.iter().zip(&arg_types) {
                         if !self.unify(argt, &t) {
-                            let resolved_t = self.lookup(&t);
-                            let msg = if matches!(resolved_t, Type::TypeVar { .. }) {
-                                format!("Operator '{}' requires Num, got {}", op, argt)
-                            } else {
-                                format!("Operator '{}' got incompatible types: expected {}, got {}", op, resolved_t, argt)
-                            };
-                            return Err(Spanned::from(TypeError { msg }, arg.span));
+                            return Err(Spanned::from(TypeError {
+                                msg: format!("Operator '{}' requires Num, got {}", op, argt)
+                            }, arg.span));
                         }
                     }
-                    Ok(self.lookup(&t))
+                    return Ok(self.lookup(&t));
+                } else {
+                    // All scalar operands — fold through the widening lattice.
+                    let mut join = concrete[0].clone();
+                    for ty in &concrete[1..] {
+                        join = numeric_join(&join, ty).ok_or_else(|| Spanned::from(TypeError {
+                            msg: format!("Operator '{}' got incompatible types: {} and {}", op, join, ty)
+                        }, span))?;
+                    }
+                    join
+                };
+                // Bind any TypeVars to the join type so lambda params get concrete types.
+                for argt in &arg_types {
+                    if matches!(argt, Type::TypeVar { .. }) { self.unify(argt, &result_ty); }
                 }
+                Ok(result_ty)
             },
 
             "==" | "!=" => {
@@ -410,20 +447,33 @@ impl TypeChecker {
                     }
                     arg_types.push(resolved);
                 }
-                // Allow mixed Int/Float comparisons (coerce Int to Float).
-                if !arg_types.iter().any(|t| *t == Type::Float) {
+                let has_union = arg_types.iter().any(|t| matches!(t, Type::Union(..)));
+                let concrete: Vec<&Type> = arg_types.iter().filter(|t| !matches!(t, Type::TypeVar { .. })).collect();
+                let join = if concrete.is_empty() || has_union {
+                    // All TypeVars, or union operand present — unify via fresh Ord-bounded var.
                     let t = self.fresh_bounded_var(vec![Trait::Ord]);
-                    for (arg, argt) in args.iter().zip(arg_types.iter()) {
+                    for (arg, argt) in args.iter().zip(&arg_types) {
                         if !self.unify(argt, &t) {
-                            let resolved_t = self.lookup(&t);
-                            let msg = if matches!(resolved_t, Type::TypeVar { .. }) {
-                                format!("Operator '{}' requires Ord, got {}", op, argt)
-                            } else {
-                                format!("Operator '{}' got incompatible types: expected {}, got {}", op, resolved_t, argt)
-                            };
-                            return Err(Spanned::from(TypeError { msg }, arg.span));
+                            return Err(Spanned::from(TypeError {
+                                msg: format!("Operator '{}' requires Ord, got {}", op, argt)
+                            }, arg.span));
                         }
                     }
+                    return Ok(Type::Bool);
+                } else if concrete.len() >= 2 {
+                    // Multiple scalar operands — fold through the widening lattice.
+                    let mut j = concrete[0].clone();
+                    for ty in &concrete[1..] {
+                        j = numeric_join(&j, ty).ok_or_else(|| Spanned::from(TypeError {
+                            msg: format!("Operator '{}' got incompatible types: {} and {}", op, j, ty)
+                        }, span))?;
+                    }
+                    j
+                } else {
+                    concrete[0].clone()
+                };
+                for argt in &arg_types {
+                    if matches!(argt, Type::TypeVar { .. }) { self.unify(argt, &join); }
                 }
                 Ok(Type::Bool)
             },

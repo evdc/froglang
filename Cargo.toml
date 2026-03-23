@@ -2,5 +2,6 @@
 resolver = "2"
 members = [
     "froglang-core",
-    "froglang-macros"
+    "froglang-macros",
+    "playground-server"
 ]

@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frog Playground</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 12px 24px;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 {
+      font-size: 1.3rem;
+      font-weight: 600;
+      color: #7ec8e3;
+      letter-spacing: 0.02em;
+    }
+    header h1 span { color: #50fa7b; }
+    select {
+      background: #0f3460;
+      color: #e0e0e0;
+      border: 1px solid #1a4a7a;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+    button#run-btn {
+      margin-left: auto;
+      background: #50fa7b;
+      color: #1a1a2e;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 22px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button#run-btn:hover { background: #69ff94; }
+    button#run-btn:disabled { background: #3a8a52; cursor: default; }
+    .main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+    .editor-pane {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      border-right: 2px solid #0f3460;
+    }
+    .pane-label {
+      padding: 6px 12px;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #7ec8e3;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+    }
+    #editor { flex: 1; }
+    .output-pane {
+      width: 42%;
+      display: flex;
+      flex-direction: column;
+    }
+    .output-header {
+      padding: 6px 12px;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #7ec8e3;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #elapsed { color: #888; font-size: 0.72rem; margin-left: auto; }
+    #output {
+      flex: 1;
+      padding: 14px 16px;
+      font-family: 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 0.88rem;
+      white-space: pre-wrap;
+      overflow-y: auto;
+      background: #12122a;
+    }
+    #output .stdout { color: #f8f8f2; }
+    #output .stderr { color: #ff5555; }
+    #output .info   { color: #6272a4; font-style: italic; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span>frog</span> playground</h1>
+    <select id="examples">
+      <option value="">— examples —</option>
+      <option value="hello">Hello world</option>
+      <option value="arith">Arithmetic</option>
+      <option value="fib">Fibonacci</option>
+      <option value="list">Lists</option>
+      <option value="string">Strings</option>
+    </select>
+    <button id="run-btn">&#9654; Run</button>
+  </header>
+
+  <div class="main">
+    <div class="editor-pane">
+      <div class="pane-label">Source</div>
+      <div id="editor"></div>
+    </div>
+    <div class="output-pane">
+      <div class="output-header">
+        Output
+        <span id="elapsed"></span>
+      </div>
+      <div id="output"><span class="info">Click Run to execute your program.</span></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.47.0/min/vs/loader.js"></script>
+  <script>
+    const EXAMPLES = {
+      hello: `print("Hello, world!")`,
+      arith: `let x = 10\nlet y = 3\nprint(x + y)\nprint(x * y)\nprint(x / y)\nprint(x % y)`,
+      fib: `fn fib(n) {\n  if n <= 1 {\n    n\n  } else {\n    fib(n - 1) + fib(n - 2)\n  }\n}\n\nlet i = 0\nwhile i < 10 {\n  print(fib(i))\n  i = i + 1\n}`,
+      list: `let xs = [1, 2, 3, 4, 5]\nprint(xs)`,
+      string: `let greeting = "Hello"\nlet name = "frog"\nprint(greeting)`,
+    };
+
+    require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.47.0/min/vs' } });
+    require(['vs/editor/editor.main'], function () {
+      const editor = monaco.editor.create(document.getElementById('editor'), {
+        value: EXAMPLES.hello,
+        language: 'plaintext',
+        theme: 'vs-dark',
+        fontSize: 14,
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+        lineNumbers: 'on',
+        automaticLayout: true,
+      });
+
+      document.getElementById('examples').addEventListener('change', e => {
+        const key = e.target.value;
+        if (key && EXAMPLES[key]) {
+          editor.setValue(EXAMPLES[key]);
+          e.target.value = '';
+        }
+      });
+
+      document.getElementById('run-btn').addEventListener('click', async () => {
+        const source = editor.getValue();
+        const btn = document.getElementById('run-btn');
+        const output = document.getElementById('output');
+        const elapsed = document.getElementById('elapsed');
+
+        btn.disabled = true;
+        btn.textContent = 'Running…';
+        output.innerHTML = '<span class="info">Running…</span>';
+        elapsed.textContent = '';
+
+        try {
+          const resp = await fetch('/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source }),
+          });
+          const data = await resp.json();
+
+          let html = '';
+          if (data.stdout) html += `<span class="stdout">${escHtml(data.stdout)}</span>`;
+          if (data.stderr) html += `<span class="stderr">${escHtml(data.stderr)}</span>`;
+          if (!data.stdout && !data.stderr) html = '<span class="info">(no output)</span>';
+          output.innerHTML = html;
+          elapsed.textContent = `${data.elapsed_ms} ms`;
+        } catch (err) {
+          output.innerHTML = `<span class="stderr">Network error: ${escHtml(String(err))}</span>`;
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '▶ Run';
+        }
+      });
+    });
+
+    function escHtml(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+  </script>
+</body>
+</html>

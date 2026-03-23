@@ -1,4 +1,6 @@
 use froglang_core::codegen::compile_and_run;
+use froglang_core::runtime::ffi::{frog_str_len, frog_list_len, frog_list_get};
+use froglang_core::runtime::gc::{frog_str_as_str, FrogStr};
 
 // ── helper: load a .frog program from tests/programs/ ────────────────────────
 
@@ -108,4 +110,63 @@ fn test_block_func() {
 #[test]
 fn test_block_inline() {
     assert_eq!(compile_and_run(&prog("block_inline.frog")), 0);
+}
+
+// ── string / list integration tests ──────────────────────────────────────────
+
+#[test]
+fn test_str_concat_len() {
+    let bits = compile_and_run(r#""hello" + " " + "world""#);
+    assert_eq!(frog_str_len(bits), 11);
+}
+
+#[test]
+fn test_str_content() {
+    let bits = compile_and_run(r#""froglang""#);
+    let s = unsafe { frog_str_as_str(bits as *const FrogStr) };
+    assert_eq!(s, "froglang");
+}
+
+#[test]
+fn test_str_eq_true() {
+    let bits = compile_and_run(r#""abc" == "abc""#);
+    assert_eq!(bits, 1);
+}
+
+#[test]
+fn test_str_eq_false() {
+    let bits = compile_and_run(r#""abc" == "xyz""#);
+    assert_eq!(bits, 0);
+}
+
+#[test]
+fn test_str_neq() {
+    let bits = compile_and_run(r#""abc" != "xyz""#);
+    assert_eq!(bits, 1);
+}
+
+#[test]
+fn test_list_len() {
+    let bits = compile_and_run("[1, 2, 3, 4, 5]");
+    assert_eq!(frog_list_len(bits), 5);
+}
+
+#[test]
+fn test_list_get() {
+    let bits = compile_and_run("[10, 20, 30]");
+    assert_eq!(frog_list_get(bits, 1),20);
+}
+
+#[test]
+fn test_list_get_first_last() {
+    let bits = compile_and_run("[100, 200, 300]");
+    assert_eq!(frog_list_get(bits, 0),100);
+    assert_eq!(frog_list_get(bits, 2),300);
+}
+
+#[test]
+fn test_str_in_let() {
+    let bits = compile_and_run(r#"let s = "hello" + " world"
+s"#);
+    assert_eq!(frog_str_len(bits), 11);
 }

@@ -53,9 +53,9 @@ let shape = Circle(position=(3, 2), color=Red, r=4)
 shape.color     // No need to pattern match here, this field is common to all variants
 shape.r         // error, need to match on it
 
-func area(s: Shape): Int = match s (
-    when Circle(r) then r * r
-    when Rectangle(w, h) then  
+func area(s: Shape): Int = when s (
+    is Circle(r) then r * r
+    is Rectangle(w, h) then w * h
 )
 ```
 
@@ -86,9 +86,8 @@ data Color {
 For working with immutable records/structs, some conveniences
 ```
 let alice = (name="Alice", age=42)
-let alice2 = alice <- (age = alice.age + 1)     // Merge/update operator, produces a new record
 let bob = (...alice, name="Bob")        // make a record with fields from another, override some
-let ageless = alice del .age             
+let ageless = alice -- age             
 ```
 
 Some questions

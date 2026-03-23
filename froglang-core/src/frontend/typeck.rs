@@ -164,6 +164,12 @@ pub struct TypeChecker {
     next_id: u32,
 }
 
+pub struct TypeCheckerCheckpoint {
+    ctx: HashMap<String, Type>,
+    substitutions: HashMap<String, Type>,
+    next_id: u32,
+}
+
 impl TypeChecker {
     pub fn empty() -> Self {
         TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0 }
@@ -187,6 +193,20 @@ impl TypeChecker {
         v
     }
 
+    pub fn checkpoint(&self) -> TypeCheckerCheckpoint {
+        TypeCheckerCheckpoint {
+            ctx: self.ctx.clone(),
+            substitutions: self.substitutions.clone(),
+            next_id: self.next_id,
+        }
+    }
+
+    pub fn restore(&mut self, cp: TypeCheckerCheckpoint) {
+        self.ctx = cp.ctx;
+        self.substitutions = cp.substitutions;
+        self.next_id = cp.next_id;
+    }
+
     pub fn add_ctx(mut self, ctx: impl Iterator<Item=(String, Type)>) -> Self {
         for (k, v) in ctx { self.ctx.insert(k, v); }
         self
@@ -197,9 +217,16 @@ impl TypeChecker {
     }
 
     fn default_context() -> HashMap<String, Type> {
-        // Polymorphic operators are handled in infer_builtin_op; this context
-        // holds only user-visible bindings added via assignment or add_ctx.
-        HashMap::new()
+        let mut ctx = HashMap::new();
+        ctx.insert("print".to_string(), Type::Function {
+            params: vec![Type::Str],
+            result: Box::new(Type::None),
+        });
+        ctx.insert("gc_dump".to_string(), Type::Function {
+            params: vec![],
+            result: Box::new(Type::None),
+        });
+        ctx
     }
 
     pub fn infer(&mut self, expr: &Spanned<Expression>) -> TypeResult {
@@ -375,6 +402,22 @@ impl TypeChecker {
             },
 
             "+" | "-" | "*" | "/" | "<unaryminus>" => {
+                // String concatenation: `Str + Str -> Str`
+                if op == "+" && args.len() == 2 {
+                    let left_ty = self.infer(args[0])?;
+                    let resolved_left = self.lookup(&left_ty);
+                    if resolved_left == Type::Str {
+                        let right_ty = self.infer(args[1])?;
+                        let resolved_right = self.lookup(&right_ty);
+                        if resolved_right == Type::Str {
+                            return Ok(Type::Str);
+                        }
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Operator '+' on Str requires Str on both sides, got {}", resolved_right)
+                        }, args[1].span));
+                    }
+                }
+
                 let mut arg_types: Vec<Type> = Vec::new();
                 for arg in args {
                     let argt = self.infer(arg)?;

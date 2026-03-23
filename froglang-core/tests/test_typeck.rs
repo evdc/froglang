@@ -145,11 +145,13 @@ fn test_mixed_arithmetic_coercion() {
 #[test]
 fn test_str_arithmetic_error() {
     let mut t = TypeChecker::new();
-    // Str does not implement Num.
+    // Str + Str is now valid (string concatenation) and returns Str.
     let expr = spanned(Expression::binary(Token::Plus, string("a"), string("b")));
     let res = t.infer(&expr);
-    assert!(res.is_err());
-    assert!(res.unwrap_err().item.msg.contains("Num"));
+    assert_eq!(res.unwrap(), Type::Str);
+    // Other arithmetic on Str is still an error.
+    let sub = spanned(Expression::binary(Token::Minus, string("a"), string("b")));
+    assert!(t.infer(&sub).is_err());
 }
 
 #[test]
@@ -530,11 +532,12 @@ fn test_mixed_num_coercion() {
 #[test]
 fn test_str_not_num() {
     let mut t = TypeChecker::new();
-    // "a" + "b"  →  type error: Str does not implement Num
+    // "a" + "b"  →  Str (string concatenation is now valid)
     let res = t.infer(&spanned(Expression::binary(Token::Plus, string("a"), string("b"))));
-    assert!(res.is_err());
-    let msg = res.unwrap_err().item.msg;
-    assert!(msg.contains("Num"), "expected 'Num' in error: {}", msg);
+    assert_eq!(res.unwrap(), Type::Str);
+    // "a" - "b"  →  still an error
+    let sub = t.infer(&spanned(Expression::binary(Token::Minus, string("a"), string("b"))));
+    assert!(sub.is_err());
 }
 
 #[test]

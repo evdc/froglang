@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 default-run = "froglang-core"
 
+[features]
+# Enable verbose GC tracing to stderr (allocations, collections, marks, frees).
+# Usage: cargo test --features gc_trace
+gc_trace = []
+
 [dependencies]
 froglang-macros = { path = "../froglang-macros" }
 rustyline = "17.0.1"

@@ -6,7 +6,7 @@ use crate::frontend::tokens::{Spanned, Token};
 use crate::frontend::expression::Expression;
 
 // remember, errors don't have to track the token/expr they found instead of what they expected;
-// they come with a Span, which accomplishes the same thingß
+// they come with a Span, which accomplishes the same thing
 #[derive(Debug, PartialEq, Clone)]
 pub enum ParseError {
     ExpectedButFound(Token, Token),

@@ -159,17 +159,86 @@ db.connect("test.sqlite").insert(alice)
 - Function body is one expression, which may be a block. `return` kw can still be used for early return.
     - Bonus: `tailcall` kw to make tail-return explicit to compiler
 
-# Error handling
+# Error handling, Pattern Matching
 
 - Errors as values, Result type, no exceptions (panic is still possible of course for things like OOM).
 - Use a `?` operator for propagation, like Rust. no `if err != nil`. Look to Zig's design here, they do it well
-- Options can be thought of as Results with `()` for their error type? If we want to keep the set of core primitives smaller
-- More syntax sugar than Rust. Result should be built-in, understood by compiler, as it's so pervasive, whereas in Rust it's "just another enum" even though it is implemented in prelude. 
-- `!` operator for unwrap?
-- all errors are members of the type/set Error, so conversion should be easy, defining new variants extends this type
-- Error types are "falsey" in a boolean context, so something like `let x = foo() or get_default()` works
+- There is a built in type/set Error which the compiler knows how to handle specially, so `Result<T, E>` is actually just `T | E where E: Error`
+- `Option<T>` is `T | None`, or equivalent to `Result<T, None>`.
+- More syntax sugar than Rust. Result should be built-in, understood by compiler, as it's so pervasive, whereas in Rust it's "just another enum" even though it is implemented in prelude. E.g. `T?` as shorthand for option.
+- `?` operator for propagation, `!` operator for unwrap?
+
+- Error types are "falsey" in a boolean context, so something like `let x = foo() else get_default()` works
     - In the case of ambiguity eg foo() returns a boolean, we should be able to do a more explicit and verbose check: `let x = if foo() is Ok(boolean_value) then boolean_value else get_default()`
     - Otherwise we want a separate keyword like "or"/"else" but checks if operand is error, rather than operand is falsey
+
+- `else` as a short-circuiting infix boolean op unifies if-expressions & error handling
+    - But also special syntax within else blocks? e.g.:
+```
+get_user(id) else {
+    // pattern matching syntax, but the subject of the match is implicit (it's the falsey value)
+    if Error(e) then log("DB error", e)
+    if None   then log("Not found")
+}
+```
+
+Guards with `and`:
+```
+value match {
+    if Int(i) and i < 0 then "negative"
+    if Int(i)            then "non-negative"
+}
+```
+
+nb. above we used `when value { is Pattern1(binding) then ...; is Pattern2(binding) then ... }` for matching instead
+Decide on a single consistent syntax here
+
+Error conversion should be more implicit than Rust:
+```
+type CompileError : Error
+// possibly in a different module:
+type ParseError : CompileError
+
+func parse(source: Str): AST ? ParseError = ...
+func typecheck(ast: AST): TypedAST ? TypeError = ...
+func codegen(ast: TypedAST): Code? CodegenError = ...
+
+// Implicitly ? can convert e.g. ParseError -> CompileError
+func compile(source: Str): Code ? CompileError = {
+    let ast = parse(source)?
+    let checked = typecheck(ast)?
+    return codegen(checked)?
+}
+```
+
+if we have `type CompileError = ParseError | TypeError | CodegenError` (closed nominal sum typing), then the rule is:
+- we can automatically convert from ParseError to CompileError by wrapping: `CompileError::ParseError(parse_error)`
+- the type declaration above is basically expanded to something like the following Rust
+```rust
+enum CompileError {
+    ParseError(ParseError),
+    TypeError(TypeError),
+    CodegenError(CodegenError)
+}
+```
+i.e. variants are implicitly tagged with their name.
+
+if we have `type ParseError : CompileError` (open subtyping), then the conversion is just an upcast, basically, right
+
+In general perhaps the type system supports both, e.g.:
+
+```
+// closed — exhaustive match guaranteed
+type Shape(color: Color) = Circle(r: Int) | Rectangle(w: Int, h: Int)
+
+// open — exhaustive match not possible, must have catch-all
+type Shape = (color: Color)
+type Circle : Shape = (r: Int)
+type Rectangle : Shape = (w: Int, h: Int)
+```
+
+Based on syntax for common fields in enums (in Data Structures, above), in both cases, Circle and Rectangle have a .color,
+and the .color field is accessible on any Shape.
 
 # Effects, Capabilities, Concurrency
 
@@ -190,7 +259,7 @@ func do_stuff(urls: list[str], path: str): str can fs.Write, http.Request, Suspe
 or
 ```
 func do_stuff(urls: list[str], path: str): str {
-    scope(errors=.collect) {
+    with Scope(errors=#collect) {
         results = for url in urls {
             spawn http.Get(url)
         }
@@ -200,6 +269,21 @@ func do_stuff(urls: list[str], path: str): str {
 }
 ```
 
+or even
+```
+func do_stuff(urls: list[str], path: str): str = {
+    let results = with Scope(errors=#collect) {
+        for url in urls {
+            spawn http.Get(url)
+        }
+    }
+    final = combobulate(results)
+    do fs.Write(final, path)
+}
+```
+
+all tasks spawned within a scope exit by the time the scope exits
+scope-level policies for gathering results/errors (join all, exit on first settled, exit on first error, collect all errors, yield as completed, ...)
 
 ---
 

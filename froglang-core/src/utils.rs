@@ -1,14 +1,6 @@
 use std::fmt::Display;
 
-pub fn format_vec<T: Display>(v: &Vec<T>) -> String {
-    let mut s = "[".to_string();
-    for (i, it) in v.iter().enumerate() {
-        if i == 0 {
-            s = format!("{}{}", s, it);
-        } else {
-            s = format!("{}, {}", s, it);
-        }
-        
-    }
-    format!("{}]", s)
+pub fn format_vec<T: Display>(v: &[T]) -> String {
+    let items: Vec<String> = v.iter().map(|it| it.to_string()).collect();
+    format!("[{}]", items.join(", "))
 }

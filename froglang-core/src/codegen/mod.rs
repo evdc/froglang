@@ -301,6 +301,36 @@ fn compile_expr(
                 };
             }
 
+            // ── Logical and/or (must short-circuit — `right` can have side
+            // effects, e.g. `print`, and must not run when `left` already
+            // decides the result) ────────────────────────────────────────
+            if *op == Token::And || *op == Token::Or {
+                let lv = compile_expr(left, bcx, vars, ctx);
+
+                let rhs_bb   = bcx.create_block();
+                let merge_bb = bcx.create_block();
+                bcx.append_block_param(merge_bb, types::I8);
+
+                if *op == Token::And {
+                    // `false and right` == false, without evaluating `right`.
+                    let zero = bcx.ins().iconst(types::I8, 0);
+                    bcx.ins().brif(lv, rhs_bb, &[], merge_bb, &[zero]);
+                } else {
+                    // `true or right` == true, without evaluating `right`.
+                    let one = bcx.ins().iconst(types::I8, 1);
+                    bcx.ins().brif(lv, merge_bb, &[one], rhs_bb, &[]);
+                }
+
+                bcx.switch_to_block(rhs_bb);
+                bcx.seal_block(rhs_bb);
+                let rv = compile_expr(right, bcx, vars, ctx);
+                bcx.ins().jump(merge_bb, &[rv]);
+
+                bcx.switch_to_block(merge_bb);
+                bcx.seal_block(merge_bb);
+                return bcx.block_params(merge_bb)[0];
+            }
+
             // ── Numeric operations ──────────────────────────────────────────
             let lv = compile_expr(left,  bcx, vars, ctx);
             let rv = compile_expr(right, bcx, vars, ctx);
@@ -319,8 +349,8 @@ fn compile_expr(
                 Token::Gt    => if is_float { bcx.ins().fcmp(FloatCC::GreaterThan,         lv, rv) } else { bcx.ins().icmp(IntCC::SignedGreaterThan,         lv, rv) },
                 Token::LtEq  => if is_float { bcx.ins().fcmp(FloatCC::LessThanOrEqual,    lv, rv) } else { bcx.ins().icmp(IntCC::SignedLessThanOrEqual,     lv, rv) },
                 Token::GtEq  => if is_float { bcx.ins().fcmp(FloatCC::GreaterThanOrEqual,  lv, rv) } else { bcx.ins().icmp(IntCC::SignedGreaterThanOrEqual,  lv, rv) },
-                Token::And   => bcx.ins().band(lv, rv),
-                Token::Or    => bcx.ins().bor(lv, rv),
+                // Token::And/Or are handled above, before `rv` is computed,
+                // so they short-circuit — they never reach this match.
                 _ => unimplemented!("binary op {:?}", op),
             }
         },
@@ -689,100 +719,11 @@ impl Codegen {
     /// Two-pass compilation of a top-level typed block.
     /// Returns the `FuncId` of `__frog_main` and the ordered list of
     /// top-level bindings it writes to its `out_ptr` parameter.
-    pub fn compile(&mut self, typed: Spanned<TypedExpr>, string_arena: &mut Vec<Vec<u8>>) -> (FuncId, Vec<(String, Type)>) {
-        let stmts: Vec<Spanned<TypedExpr>> = match typed.item.kind {
-            TypedExprKind::Block(s) => s,
-            _ => vec![typed],
-        };
-
-        // ── Pass 1: Declare all top-level functions ───────────────────────────
-        for stmt in &stmts {
-            if let TypedExprKind::Assign { name, value } = &stmt.item.kind {
-                if let TypedExprKind::Function { params, return_type, .. } = &value.item.kind {
-                    let sig = self.make_sig(params, return_type);
-                    let func_id = self.module
-                        .declare_function(name, Linkage::Local, &sig)
-                        .unwrap_or_else(|e| panic!("declare_function '{}' failed: {}", name, e));
-                    self.func_ids.insert(name.clone(), func_id);
-                }
-            }
-        }
-
-        // ── Pass 2: Define all function bodies ───────────────────────────────
-        let func_defs: Vec<(String, FuncId, Vec<(String, Type)>, Type, Box<Spanned<TypedExpr>>)> =
-            stmts.iter().filter_map(|stmt| {
-                if let TypedExprKind::Assign { name, value } = &stmt.item.kind {
-                    if let TypedExprKind::Function { params, return_type, body } = &value.item.kind {
-                        return Some((
-                            name.clone(),
-                            self.func_ids[name],
-                            params.clone(),
-                            return_type.clone(),
-                            body.clone(),
-                        ));
-                    }
-                }
-                None
-            }).collect();
-
-        for (_, func_id, params, return_type, body) in &func_defs {
-            let sig = self.make_sig(params, &return_type);
-            let func_ids_snap = self.func_ids.clone();
-            let mut ctx = self.module.make_context();
-            ctx.func.signature = sig;
-
-            Self::build_func_body(
-                &mut self.builder_ctx,
-                &mut ctx,
-                &mut self.module,
-                &func_ids_snap,
-                params,
-                return_type,
-                body,
-                string_arena,
-            );
-
-            self.module
-                .define_function(*func_id, &mut ctx)
-                .unwrap_or_else(|e| panic!("define_function failed: {}", e));
-            self.module.clear_context(&mut ctx);
-        }
-
-        // ── Pass 3: Build __frog_main ─────────────────────────────────────────
-        let mut main_sig = self.module.make_signature();
-        main_sig.params.push(AbiParam::new(types::I64));  // out_ptr
-        main_sig.returns.push(AbiParam::new(types::I64));
-        let main_id = self.module
-            .declare_function("__frog_main", Linkage::Local, &main_sig)
-            .expect("declare __frog_main failed");
-
-        let func_ids_snap = self.func_ids.clone();
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = main_sig;
-
-        let bindings = Self::build_main_body(
-            &mut self.builder_ctx,
-            &mut ctx,
-            &mut self.module,
-            &func_ids_snap,
-            &stmts,
-            string_arena,
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-
-        self.module
-            .define_function(main_id, &mut ctx)
-            .expect("define __frog_main failed");
-        self.module.clear_context(&mut ctx);
-
-        self.module.finalize_definitions().expect("finalize_definitions failed");
-
-        (main_id, bindings)
-    }
-
-    /// Compile a single REPL entry into a uniquely-named `__frog_main_N` function,
-    /// pre-seeding the variable environment from prior entries.
+    /// Compile a single top-level program or REPL entry into a uniquely-named
+    /// `__frog_main_N` function, pre-seeding the variable environment from
+    /// prior entries (empty for a one-shot compile, e.g. `compile_and_run`).
+    /// Returns its `FuncId` and the ordered list of top-level bindings it
+    /// writes to its `out_ptr` parameter.
     pub fn compile_entry(
         &mut self,
         typed: Spanned<TypedExpr>,
@@ -835,15 +776,18 @@ impl Codegen {
 
         for (_, func_id, params, return_type, body) in &func_defs {
             let sig = self.make_sig(params, &return_type);
-            let func_ids_snap = self.func_ids.clone();
             let mut ctx = self.module.make_context();
             ctx.func.signature = sig;
 
+            // `module` and `func_ids` are disjoint fields, so borrowing them
+            // separately here (rather than cloning `func_ids` — O(n) per
+            // function, O(n^2) per entry) is fine: `func_ids` is read-only
+            // for the whole of Pass 2, only ever written during Pass 1 above.
             Self::build_func_body(
                 &mut self.builder_ctx,
                 &mut ctx,
                 &mut self.module,
-                &func_ids_snap,
+                &self.func_ids,
                 params,
                 return_type,
                 body,
@@ -865,7 +809,6 @@ impl Codegen {
             .declare_function(&entry_name, Linkage::Local, &main_sig)
             .unwrap_or_else(|e| panic!("declare {} failed: {}", entry_name, e));
 
-        let func_ids_snap = self.func_ids.clone();
         let mut ctx = self.module.make_context();
         ctx.func.signature = main_sig;
 
@@ -873,7 +816,7 @@ impl Codegen {
             &mut self.builder_ctx,
             &mut ctx,
             &mut self.module,
-            &func_ids_snap,
+            &self.func_ids,
             &stmts,
             string_arena,
             pre_env,
@@ -903,7 +846,9 @@ pub fn compile_and_run(src: &str) -> i64 {
 
     let mut codegen = Codegen::new();
     let mut string_arena: Vec<Vec<u8>> = Vec::new();
-    let (main_id, bindings) = codegen.compile(typed, &mut string_arena);
+    let (main_id, bindings) = codegen.compile_entry(
+        typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(),
+    );
 
     let ptr = codegen.module.get_finalized_function(main_id);
     let f: fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };

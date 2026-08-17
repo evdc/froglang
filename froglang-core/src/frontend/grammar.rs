@@ -72,8 +72,10 @@ impl Grammar {
     }
 
     pub fn assign(parser: &mut Parser, _token: Spanned<Token>, left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
+        if left.item.get_identifier().is_none() {
+            return Err(left.to(ParseError::InvalidAssignmentTarget));
+        }
         let right = parser.expression(precedence)?;
-        // todo - validate assignment target in here
         Ok(Spanned {
             span: left.span.merge(right.span),
             item: Expression::assign(left, None, right)
@@ -262,7 +264,65 @@ impl Grammar {
         Ok(Spanned { span: left.span.merge(closing.span), item: Expression::call(left, args) })
     }
 
+    pub fn index(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
+        // Parse each bound one level above `Range` precedence (where `..` is
+        // registered) so a bare `..` here is left for us to see and handle
+        // directly, rather than being swallowed by the generic `..` infix
+        // rule (`Grammar::range`), which requires both operands.
+        let start = if parser.check(&Token::DotDot) {
+            None
+        } else {
+            Some(parser.expression(Precedence::Range.next())?)
+        };
+
+        if parser.check(&Token::DotDot) {
+            parser.advance()?;
+            let end = if parser.check(&Token::RightBracket) {
+                None
+            } else {
+                Some(parser.expression(Precedence::Range.next())?)
+            };
+            let closing = parser.consume(Token::RightBracket)?;
+            return Ok(Spanned {
+                span: left.span.merge(closing.span),
+                item: Expression::slice(left, start, end)
+            });
+        }
+
+        let index = start.expect("no '..' seen, so the branch above must have parsed an index expression");
+        let closing = parser.consume(Token::RightBracket)?;
+        Ok(Spanned {
+            span: left.span.merge(closing.span),
+            item: Expression::index(left, index)
+        })
+    }
+
+    /// `start..end` used as a standalone expression, e.g. `1..5`. Both
+    /// operands are required here (unlike `target[start..end]` slicing,
+    /// which allows either to be omitted — see `Grammar::index`) since an
+    /// unbounded range has nothing to eagerly materialize into.
+    pub fn range(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
+        let right = parser.expression(precedence.next())?;
+        Ok(Spanned {
+            span: left.span.merge(right.span),
+            item: Expression::range(left, right)
+        })
+    }
+
     pub fn tuple(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
+        // `[for x in xs ...]` is a list comprehension, not a list literal —
+        // hand off to `for_expr` and wrap the result instead of falling
+        // into the ordinary comma-separated element list below.
+        if parser.check(&Token::For) {
+            let for_tok = parser.advance()?; // consume `for`
+            let for_loop = Grammar::for_expr(parser, for_tok)?;
+            let closing = parser.consume(Token::RightBracket)?;
+            return Ok(Spanned {
+                span: t.span.merge(closing.span),
+                item: Expression::comprehension(for_loop)
+            });
+        }
+
         // n.b. a record expression [a=1, b=2, c=3] parses as a tuple of Assign expressions
         // but we can rewrite it into a record initializer in the compiler, if any of the exprs is an Assign
         // and, I suppose, error if we have a mix
@@ -271,6 +331,36 @@ impl Grammar {
         Ok(Spanned {
             span: t.span.merge(closing.span),
             item: Expression::Tuple(exprs)
+        })
+    }
+
+    /// `for var in iterable (if cond)? do body`. Used both as a bare loop
+    /// statement and (wrapped in `[...]`, see `Grammar::tuple`) as the body
+    /// of a list comprehension. `do`, like `then` in `if`/`then`/`else`,
+    /// is a required delimiter between the header and the body.
+    pub fn for_expr(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
+        // `t` (the `for` token) is already consumed by the time this runs —
+        // both by the normal prefix-rule dispatch in `Parser::expression`,
+        // and by `Grammar::tuple`'s special-cased call for `[for ...]`.
+        let name_tok = parser.identifier()?;
+        let var = match &name_tok.item {
+            Token::Identifier(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        parser.consume(Token::In)?;
+        let iterable = parser.expression(Precedence::Assign)?;
+        let cond = if parser.check(&Token::If) {
+            parser.advance()?;
+            Some(parser.expression(Precedence::Assign)?)
+        } else {
+            None
+        };
+        parser.consume(Token::Do)?;
+        let body = parser.expression(Precedence::Assign)?;
+        let body_span = body.span;
+        Ok(Spanned {
+            span: t.span.merge(body_span),
+            item: Expression::for_loop(var, iterable, cond, body)
         })
     }
 }

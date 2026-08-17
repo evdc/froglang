@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Display, vec};
 
 use crate::frontend::{
-    expression::{AssignExpr, BinaryExpr, ConditionalExpr, Expression, FunctionExpr, LiteralExpr, UnaryExpr},
+    expression::{AssignExpr, BinaryExpr, ConditionalExpr, Expression, ForLoopExpr, FunctionExpr, LiteralExpr, UnaryExpr},
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
@@ -274,7 +274,135 @@ impl TypeChecker {
                 let annotated_ty = self.resolve_annotation(&inner.ty.item, expr.span)?;
                 self.check(&inner.expr, &annotated_ty)
             }
+
+            Expression::Index(idx) => {
+                let target_ty = self.infer(&idx.target)?;
+                let resolved_target = self.lookup(&target_ty);
+                let elem_ty = match &resolved_target {
+                    Type::List(inner) => (**inner).clone(),
+                    Type::TypeVar { .. } => {
+                        let elem = self.fresh_var();
+                        if !self.unify(&target_ty, &Type::List(Box::new(elem.clone()))) {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!("Can't index into {}", resolved_target)
+                            }, idx.target.span));
+                        }
+                        elem
+                    },
+                    _ => return Err(Spanned::from(TypeError {
+                        msg: format!("Can't index into {}, expected a List", resolved_target)
+                    }, idx.target.span)),
+                };
+
+                let index_ty = self.infer(&idx.index)?;
+                if !self.unify(&index_ty, &Type::Int) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("List index must be Int, got {}", self.lookup(&index_ty))
+                    }, idx.index.span));
+                }
+
+                Ok(self.lookup(&elem_ty))
+            }
+
+            Expression::Slice(s) => {
+                let target_ty = self.infer(&s.target)?;
+                let resolved_target = self.lookup(&target_ty);
+                let list_ty = match &resolved_target {
+                    Type::List(_) => resolved_target.clone(),
+                    Type::TypeVar { .. } => {
+                        let elem = self.fresh_var();
+                        let list_ty = Type::List(Box::new(elem));
+                        if !self.unify(&target_ty, &list_ty) {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!("Can't slice {}", resolved_target)
+                            }, s.target.span));
+                        }
+                        list_ty
+                    },
+                    _ => return Err(Spanned::from(TypeError {
+                        msg: format!("Can't slice {}, expected a List", resolved_target)
+                    }, s.target.span)),
+                };
+
+                for bound in [&s.start, &s.end].into_iter().flatten() {
+                    let bound_ty = self.infer(bound)?;
+                    if !self.unify(&bound_ty, &Type::Int) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Slice bound must be Int, got {}", self.lookup(&bound_ty))
+                        }, bound.span));
+                    }
+                }
+
+                Ok(self.lookup(&list_ty))
+            }
+
+            Expression::Range(r) => {
+                let start_ty = self.infer(&r.start)?;
+                if !self.unify(&start_ty, &Type::Int) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Range start must be Int, got {}", self.lookup(&start_ty))
+                    }, r.start.span));
+                }
+                let end_ty = self.infer(&r.end)?;
+                if !self.unify(&end_ty, &Type::Int) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Range end must be Int, got {}", self.lookup(&end_ty))
+                    }, r.end.span));
+                }
+                Ok(Type::List(Box::new(Type::Int)))
+            }
+
+            Expression::ForLoop(fl) => {
+                self.infer_for_loop(fl)?;
+                Ok(Type::None)
+            }
+
+            Expression::Comprehension(inner) => {
+                let fl = match &inner.item {
+                    Expression::ForLoop(fl) => fl,
+                    _ => unreachable!("Comprehension always wraps a ForLoop — see Grammar::tuple"),
+                };
+                let body_ty = self.infer_for_loop(fl)?;
+                Ok(Type::List(Box::new(body_ty)))
+            }
         }
+    }
+
+    /// Shared inference for `for var in iterable (if cond)? body`: unifies
+    /// `iterable` against `List(elem)`, binds `var: elem` for `cond`/`body`
+    /// (popped afterward via `with_context`), and returns `body`'s type —
+    /// used directly by `Comprehension`, ignored (replaced with `Type::None`)
+    /// by a bare `ForLoop`.
+    fn infer_for_loop(&mut self, fl: &ForLoopExpr) -> TypeResult {
+        let iter_ty = self.infer(&fl.iterable)?;
+        let resolved_iter = self.lookup(&iter_ty);
+        let elem_ty = match &resolved_iter {
+            Type::List(inner) => (**inner).clone(),
+            Type::TypeVar { .. } => {
+                let elem = self.fresh_var();
+                if !self.unify(&iter_ty, &Type::List(Box::new(elem.clone()))) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Can't iterate over {}", resolved_iter)
+                    }, fl.iterable.span));
+                }
+                elem
+            },
+            _ => return Err(Spanned::from(TypeError {
+                msg: format!("Can't iterate over {}, expected a List", resolved_iter)
+            }, fl.iterable.span)),
+        };
+
+        self.with_context(std::iter::once((fl.var.clone(), elem_ty)), |t| {
+            if let Some(cond) = &fl.cond {
+                let cond_ty = t.infer(cond)?;
+                if !t.unify(&cond_ty, &Type::Bool) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("for-loop condition must be Bool, got {}", t.lookup(&cond_ty))
+                    }, cond.span));
+                }
+            }
+            t.infer(&fl.body)
+        })
     }
 
     pub fn check(&mut self, expr: &Spanned<Expression>, expected_ty: &Type) -> TypeResult {
@@ -799,9 +927,80 @@ impl TypeChecker {
             Expression::Annotated(a) => {
                 self.check_and_lower(*a.expr)?.item.kind
             },
+
+            Expression::Index(idx) => {
+                let target = self.check_and_lower(*idx.target)?;
+                let index  = self.check_and_lower(*idx.index)?;
+                TypedExprKind::Index { target: Box::new(target), index: Box::new(index) }
+            },
+
+            Expression::Slice(s) => {
+                let target = self.check_and_lower(*s.target)?;
+                let start = match s.start {
+                    Some(e) => Some(Box::new(self.check_and_lower(*e)?)),
+                    None => None,
+                };
+                let end = match s.end {
+                    Some(e) => Some(Box::new(self.check_and_lower(*e)?)),
+                    None => None,
+                };
+                TypedExprKind::Slice { target: Box::new(target), start, end }
+            },
+
+            Expression::Range(r) => {
+                let start = self.check_and_lower(*r.start)?;
+                let end   = self.check_and_lower(*r.end)?;
+                TypedExprKind::Range { start: Box::new(start), end: Box::new(end) }
+            },
+
+            Expression::ForLoop(fl) => {
+                let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
+                TypedExprKind::ForLoop { var, iterable, cond, body }
+            },
+
+            Expression::Comprehension(inner) => {
+                let fl = match inner.item {
+                    Expression::ForLoop(fl) => fl,
+                    _ => unreachable!("Comprehension always wraps a ForLoop — see Grammar::tuple"),
+                };
+                let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
+                TypedExprKind::Comprehension { var, iterable, cond, body }
+            },
         };
 
         Ok(Spanned::from(TypedExpr { ty: resolved_ty, kind }, span))
+    }
+
+    /// Shared lowering for `for var in iterable (if cond)? body`, used by
+    /// both `ForLoop` and `Comprehension`. `var` is bound to the iterable's
+    /// element type for `cond`/`body` only, then popped — mirrors the
+    /// manual save/restore `self.ctx` pattern used for `Block`/`Function`
+    /// above (rather than `infer`'s `with_context`, since lowering needs
+    /// `?` to propagate through multiple steps before restoring).
+    fn lower_for_loop(&mut self, fl: ForLoopExpr) -> Result<
+        (String, Box<Spanned<TypedExpr>>, Option<Box<Spanned<TypedExpr>>>, Box<Spanned<TypedExpr>>),
+        Spanned<TypeError>
+    > {
+        let iterable = self.check_and_lower(*fl.iterable)?;
+        let elem_ty = match &iterable.item.ty {
+            Type::List(inner) => (**inner).clone(),
+            other => unreachable!("for-loop iterable must be List after inference, got {}", other),
+        };
+
+        let prev_ctx = self.ctx.clone();
+        self.ctx.insert(fl.var.clone(), elem_ty);
+        let result = (|| -> Result<_, Spanned<TypeError>> {
+            let cond = match fl.cond {
+                Some(c) => Some(Box::new(self.check_and_lower(*c)?)),
+                None => None,
+            };
+            let body = self.check_and_lower(*fl.body)?;
+            Ok((cond, body))
+        })();
+        self.ctx = prev_ctx;
+
+        let (cond, body) = result?;
+        Ok((fl.var, Box::new(iterable), cond, Box::new(body)))
     }
 
     fn resolve_annotation(&self, annotation: &Expression, span: Span) -> TypeResult {

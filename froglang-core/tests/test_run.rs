@@ -146,6 +146,26 @@ fn test_str_neq() {
 }
 
 #[test]
+fn test_str_lt() {
+    assert_eq!(compile_and_run(r#""abc" < "abd""#), 1);
+    assert_eq!(compile_and_run(r#""abd" < "abc""#), 0);
+}
+
+#[test]
+fn test_str_gt_le_ge() {
+    assert_eq!(compile_and_run(r#""b" > "a""#), 1);
+    assert_eq!(compile_and_run(r#""a" <= "a""#), 1);
+    assert_eq!(compile_and_run(r#""b" >= "a""#), 1);
+    assert_eq!(compile_and_run(r#""a" >= "b""#), 0);
+}
+
+#[test]
+fn test_unary_not() {
+    assert_eq!(compile_and_run("not true"), 0);
+    assert_eq!(compile_and_run("not false"), 1);
+}
+
+#[test]
 fn test_list_len() {
     let bits = compile_and_run("[1, 2, 3, 4, 5]");
     assert_eq!(frog_list_len(bits), 5);
@@ -196,6 +216,230 @@ fn test_bool_list_roundtrips() {
     assert_eq!(frog_list_get(bits, 0) != 0, true);
     assert_eq!(frog_list_get(bits, 1) != 0, false);
     assert_eq!(frog_list_get(bits, 2) != 0, true);
+}
+
+// ── list indexing ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_index_int_list() {
+    assert_eq!(compile_and_run("[10, 20, 30][1]"), 20);
+    assert_eq!(compile_and_run("[10, 20, 30][0]"), 10);
+    assert_eq!(compile_and_run("[10, 20, 30][2]"), 30);
+}
+
+#[test]
+fn test_index_computed() {
+    let src = "let xs = [1, 2, 3]\nlet i = 1 + 1\nxs[i]";
+    assert_eq!(compile_and_run(src), 3);
+}
+
+#[test]
+fn test_index_float_list() {
+    let bits = compile_and_run("[1.5, 2.5, 3.5][2]");
+    assert_eq!(f64::from_bits(bits as u64), 3.5);
+}
+
+#[test]
+fn test_index_bool_list() {
+    assert_eq!(compile_and_run("[true, false, true][1]"), 0);
+    assert_eq!(compile_and_run("[true, false, true][0]"), 1);
+}
+
+#[test]
+fn test_index_str_list() {
+    let bits = compile_and_run(r#"["a", "bb", "ccc"][1]"#);
+    let s = unsafe { frog_str_as_str(bits as *const FrogStr) };
+    assert_eq!(s, "bb");
+}
+
+#[test]
+fn test_index_chained() {
+    // A list of lists; index twice.
+    assert_eq!(compile_and_run("[[1, 2], [3, 4]][1][0]"), 3);
+}
+
+#[test]
+fn test_index_negative() {
+    assert_eq!(compile_and_run("[10, 20, 30][-1]"), 30);
+    assert_eq!(compile_and_run("[10, 20, 30][-3]"), 10);
+}
+
+// ── list slicing ─────────────────────────────────────────────────────────────
+
+fn list_elems(bits: i64) -> Vec<i64> {
+    let n = frog_list_len(bits);
+    (0..n).map(|i| frog_list_get(bits, i)).collect()
+}
+
+#[test]
+fn test_slice_both_bounds() {
+    let bits = compile_and_run("[1, 2, 3, 4, 5][1..3]");
+    assert_eq!(list_elems(bits), vec![2, 3]);
+}
+
+#[test]
+fn test_slice_start_only() {
+    let bits = compile_and_run("[1, 2, 3, 4, 5][2..]");
+    assert_eq!(list_elems(bits), vec![3, 4, 5]);
+}
+
+#[test]
+fn test_slice_end_only() {
+    let bits = compile_and_run("[1, 2, 3, 4, 5][..2]");
+    assert_eq!(list_elems(bits), vec![1, 2]);
+}
+
+#[test]
+fn test_slice_full() {
+    let bits = compile_and_run("[1, 2, 3, 4, 5][..]");
+    assert_eq!(list_elems(bits), vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn test_slice_negative_bounds() {
+    let bits = compile_and_run("[1, 2, 3, 4, 5][-2..]");
+    assert_eq!(list_elems(bits), vec![4, 5]);
+    let bits = compile_and_run("[1, 2, 3, 4, 5][..-2]");
+    assert_eq!(list_elems(bits), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_slice_out_of_range_clamps() {
+    let bits = compile_and_run("[1, 2, 3][0..100]");
+    assert_eq!(list_elems(bits), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_slice_inverted_range_is_empty() {
+    let bits = compile_and_run("[1, 2, 3][2..0]");
+    assert_eq!(list_elems(bits), Vec::<i64>::new());
+}
+
+#[test]
+fn test_slice_chained_with_index() {
+    assert_eq!(compile_and_run("[1, 2, 3, 4, 5][1..4][1]"), 3);
+}
+
+// ── standalone ranges ────────────────────────────────────────────────────────
+
+#[test]
+fn test_range_materializes_list() {
+    let bits = compile_and_run("1..5");
+    assert_eq!(list_elems(bits), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn test_range_reversed_is_empty() {
+    let bits = compile_and_run("5..1");
+    assert_eq!(list_elems(bits), Vec::<i64>::new());
+}
+
+#[test]
+fn test_range_index() {
+    assert_eq!(compile_and_run("(1..10)[3]"), 4);
+}
+
+#[test]
+fn test_range_in_let() {
+    let bits = compile_and_run("let r = 1..5\nr");
+    assert_eq!(list_elems(bits), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn test_slice_str_list() {
+    let bits = compile_and_run(r#"["a", "b", "c", "d"][1..3]"#);
+    assert_eq!(frog_list_len(bits), 2);
+    let s0 = unsafe { frog_str_as_str(frog_list_get(bits, 0) as *const FrogStr) };
+    let s1 = unsafe { frog_str_as_str(frog_list_get(bits, 1) as *const FrogStr) };
+    assert_eq!(s0, "b");
+    assert_eq!(s1, "c");
+}
+
+// ── for-loops and comprehensions ────────────────────────────────────────────
+
+#[test]
+fn test_for_loop_runs_and_evaluates_to_none() {
+    // A bare `for` loop's own value is `Type::None`, wire-represented as 0 —
+    // this just confirms the loop actually runs (rather than, say, being
+    // optimized away) without crashing.
+    assert_eq!(compile_and_run("for x in [1, 2, 3] do x\n0"), 0);
+}
+
+#[test]
+fn test_for_loop_with_if_filter_runs() {
+    assert_eq!(compile_and_run("for x in [1, 2, 3] if x > 1 do x\n0"), 0);
+}
+
+#[test]
+fn test_comprehension_basic() {
+    let bits = compile_and_run("[for x in [1, 2, 3, 4, 5] do x * 2]");
+    assert_eq!(list_elems(bits), vec![2, 4, 6, 8, 10]);
+}
+
+#[test]
+fn test_comprehension_with_filter() {
+    let bits = compile_and_run("[for x in [1, 2, 3, 4, 5, 6] if x > 2 do x * 2]");
+    assert_eq!(list_elems(bits), vec![6, 8, 10, 12]);
+}
+
+#[test]
+fn test_comprehension_over_range() {
+    let bits = compile_and_run("[for i in 1..5 do i * i]");
+    assert_eq!(list_elems(bits), vec![1, 4, 9, 16]);
+}
+
+#[test]
+fn test_comprehension_over_empty_list() {
+    // `[3..3]` slices to an empty list without needing list-type annotation
+    // syntax (which doesn't exist yet).
+    let bits = compile_and_run("[for x in [1, 2, 3][3..3] do x]");
+    assert_eq!(list_elems(bits), Vec::<i64>::new());
+}
+
+#[test]
+fn test_comprehension_chained_with_index() {
+    assert_eq!(compile_and_run("[for x in 1..5 do x][0]"), 1);
+}
+
+#[test]
+fn test_comprehension_over_strings() {
+    let bits = compile_and_run(r#"[for s in ["a", "b", "c"] do s + "!"]"#);
+    assert_eq!(frog_list_len(bits), 3);
+    let s0 = unsafe { frog_str_as_str(frog_list_get(bits, 0) as *const FrogStr) };
+    let s2 = unsafe { frog_str_as_str(frog_list_get(bits, 2) as *const FrogStr) };
+    assert_eq!(s0, "a!");
+    assert_eq!(s2, "c!");
+}
+
+#[test]
+fn test_comprehension_in_let() {
+    let bits = compile_and_run("let ys = [for x in [1, 2, 3] do x * 10]\nys");
+    assert_eq!(list_elems(bits), vec![10, 20, 30]);
+}
+
+/// Regression test: reassigning an existing variable inside a loop body (the
+/// classic accumulator pattern) used to crash codegen with a Cranelift
+/// dominance-verifier error, since `vars` stored raw `Value`s that are only
+/// valid in the block that produced them. Fixed by switching to Cranelift
+/// `Variable`/`declare_var`/`use_var`/`def_var`, which lets Cranelift insert
+/// the phi nodes a loop back-edge needs. See `get_or_declare_var` in
+/// `codegen/mod.rs`.
+#[test]
+fn test_for_loop_accumulator_pattern() {
+    let result = compile_and_run(
+        "let total = 0\nfor x in [1, 2, 3, 4, 5] do { total = total + x }\ntotal"
+    );
+    assert_eq!(result, 15);
+}
+
+/// Same underlying bug, but via `if`/`else` rather than a loop body — a
+/// reassignment inside either branch used to crash the same way.
+#[test]
+fn test_reassignment_inside_if_else_branches() {
+    let result = compile_and_run(
+        "let x = 1\nif true then { x = 99 } else { x = 0 }\nx"
+    );
+    assert_eq!(result, 99);
 }
 
 /// Regression test for the GC shadow stack: a string bound early must survive

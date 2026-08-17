@@ -149,11 +149,20 @@ impl<'a> Lexer<'a> {
         n.push(ch);
         let mut float = false;
         while let Some(c) = self.input.peek() {
-            // Allowing . lets us parse floats. 
+            // Allowing . lets us parse floats.
             // If invalid e.g. `12.34.56` punt to rust's String.parse<f64> and let it error
             if c.is_numeric() {
                 n.push(self.advance().unwrap())      // safe, because we just peeked it
             } else if c == &'.' {
+                // Only a decimal point if followed by a digit — `1..5` is
+                // `Int(1)`, `DotDot`, `Int(5)`, not a malformed float. A
+                // one-token lookahead (via a cheap iterator clone) is enough
+                // to tell the two apart without disturbing `self.input`.
+                let mut lookahead = self.input.clone();
+                lookahead.next();
+                if !matches!(lookahead.peek(), Some(d) if d.is_numeric()) {
+                    break;
+                }
                 float = true;
                 n.push(self.advance().unwrap());
             } else {

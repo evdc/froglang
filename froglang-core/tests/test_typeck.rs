@@ -492,6 +492,139 @@ fn test_list_type_inference() {
 }
 
 #[test]
+fn test_index_type_inference() {
+    let mut t = TypeChecker::new();
+    // [1, 2, 3][0] :: Int
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let idx = spanned(Expression::index(list, int(0)));
+    assert_eq!(t.infer(&idx).unwrap(), Type::Int);
+}
+
+#[test]
+fn test_index_non_list_is_error() {
+    let mut t = TypeChecker::new();
+    // 5[0] is a type error: 5 is not a List
+    let idx = spanned(Expression::index(int(5), int(0)));
+    assert!(t.infer(&idx).is_err());
+}
+
+#[test]
+fn test_index_non_int_index_is_error() {
+    let mut t = TypeChecker::new();
+    // [1, 2, 3][true] is a type error: index must be Int
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let idx = spanned(Expression::index(list, bool_lit(true)));
+    assert!(t.infer(&idx).is_err());
+}
+
+#[test]
+fn test_slice_type_inference() {
+    let mut t = TypeChecker::new();
+    // [1, 2, 3][0:2] :: List(Int)
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let s = spanned(Expression::slice(list, Some(int(0)), Some(int(2))));
+    assert_eq!(t.infer(&s).unwrap(), Type::List(Box::new(Type::Int)));
+}
+
+#[test]
+fn test_slice_omitted_bounds() {
+    let mut t = TypeChecker::new();
+    // [1, 2, 3][:] :: List(Int)
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let s = spanned(Expression::slice(list, None, None));
+    assert_eq!(t.infer(&s).unwrap(), Type::List(Box::new(Type::Int)));
+}
+
+#[test]
+fn test_slice_non_list_is_error() {
+    let mut t = TypeChecker::new();
+    let s = spanned(Expression::slice(int(5), Some(int(0)), None));
+    assert!(t.infer(&s).is_err());
+}
+
+#[test]
+fn test_slice_non_int_bound_is_error() {
+    let mut t = TypeChecker::new();
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let s = spanned(Expression::slice(list, Some(bool_lit(true)), None));
+    assert!(t.infer(&s).is_err());
+}
+
+#[test]
+fn test_range_type_inference() {
+    let mut t = TypeChecker::new();
+    // 1..5 :: List(Int)
+    let r = spanned(Expression::range(int(1), int(5)));
+    assert_eq!(t.infer(&r).unwrap(), Type::List(Box::new(Type::Int)));
+}
+
+#[test]
+fn test_range_non_int_bound_is_error() {
+    let mut t = TypeChecker::new();
+    let r = spanned(Expression::range(bool_lit(true), int(5)));
+    assert!(t.infer(&r).is_err());
+
+    let mut t2 = TypeChecker::new();
+    let r2 = spanned(Expression::range(int(1), bool_lit(true)));
+    assert!(t2.infer(&r2).is_err());
+}
+
+#[test]
+fn test_for_loop_type_inference() {
+    let mut t = TypeChecker::new();
+    // for x in [1, 2, 3] do x  ::  None
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let fl = spanned(Expression::for_loop("x".to_string(), list, None, ident("x")));
+    assert_eq!(t.infer(&fl).unwrap(), Type::None);
+}
+
+#[test]
+fn test_for_loop_var_scoped_to_body() {
+    let mut t = TypeChecker::new();
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let fl = spanned(Expression::for_loop("x".to_string(), list, None, ident("x")));
+    t.infer(&fl).unwrap();
+    // `x` must not leak into the surrounding scope after the loop.
+    assert!(t.infer(&ident("x")).is_err());
+}
+
+#[test]
+fn test_for_loop_non_list_iterable_is_error() {
+    let mut t = TypeChecker::new();
+    let fl = spanned(Expression::for_loop("x".to_string(), int(5), None, ident("x")));
+    assert!(t.infer(&fl).is_err());
+}
+
+#[test]
+fn test_for_loop_non_bool_cond_is_error() {
+    let mut t = TypeChecker::new();
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let fl = spanned(Expression::for_loop("x".to_string(), list, Some(int(1)), ident("x")));
+    assert!(t.infer(&fl).is_err());
+}
+
+#[test]
+fn test_comprehension_type_inference() {
+    let mut t = TypeChecker::new();
+    // [for x in [1, 2, 3] do x]  ::  List(Int)
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let fl = spanned(Expression::for_loop("x".to_string(), list, None, ident("x")));
+    let comp = spanned(Expression::comprehension(fl));
+    assert_eq!(t.infer(&comp).unwrap(), Type::List(Box::new(Type::Int)));
+}
+
+#[test]
+fn test_comprehension_with_filter_type_inference() {
+    let mut t = TypeChecker::new();
+    // [for x in [1, 2, 3] if x do x]  -- `if` cond must be Bool, so this
+    // is a type error (x is Int, not Bool) even though the shape parses.
+    let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
+    let fl = spanned(Expression::for_loop("x".to_string(), list, Some(ident("x")), ident("x")));
+    let comp = spanned(Expression::comprehension(fl));
+    assert!(t.infer(&comp).is_err());
+}
+
+#[test]
 fn test_assignment_with_type_annotation() {
     let mut t = TypeChecker::new();
     // let x: Int = 5

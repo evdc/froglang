@@ -18,6 +18,9 @@ pub enum ParseError {
     /// e.g. `f : Int -> Int` or `let f: Int -> Int = ...`.
     /// Use parentheses: `f : (Int -> Int)` or `let f: (Int -> Int) = ...`.
     FunctionTypeNeedsParens,
+    /// Emitted when the left-hand side of `=` isn't a plain identifier,
+    /// e.g. `1 = 2` or `(a + b) = 3`.
+    InvalidAssignmentTarget,
     Other(String)
 }
 
@@ -31,6 +34,7 @@ pub enum Precedence {
     None = 0,
     Assign,
     TypeAnnotation,
+    Range,
     Or,
     And,
     Equality,
@@ -47,7 +51,8 @@ impl Precedence {
         match self {
             Precedence::None => Precedence::Assign,
             Precedence::Assign => Precedence::TypeAnnotation,
-            Precedence::TypeAnnotation => Precedence::Or,
+            Precedence::TypeAnnotation => Precedence::Range,
+            Precedence::Range => Precedence::Or,
             Precedence::Or => Precedence::And,
             Precedence::And => Precedence::Equality,
             Precedence::Equality => Precedence::Comparison,
@@ -175,7 +180,7 @@ impl<'a> Parser<'a> {
         exprs
     }
 
-    pub fn expression(&mut self, precedence: Precedence) -> ParseResult {        
+    pub fn expression(&mut self, precedence: Precedence) -> ParseResult {
         let mut token = self.advance()?;
 
         let rule = Grammar::get_parse_rule(&token);

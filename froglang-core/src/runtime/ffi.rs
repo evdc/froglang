@@ -76,6 +76,27 @@ pub extern "C" fn frog_str_eq(a: i64, b: i64) -> i64 {
     }
 }
 
+/// Lexicographic byte comparison: -1 if a < b, 0 if a == b, 1 if a > b.
+#[no_mangle]
+pub extern "C" fn frog_str_cmp(a: i64, b: i64) -> i64 {
+    let a_ptr = a as *const FrogStr;
+    let b_ptr = b as *const FrogStr;
+    let struct_size = std::mem::size_of::<FrogStr>();
+    unsafe {
+        let a_len = (*a_ptr).len as usize;
+        let b_len = (*b_ptr).len as usize;
+        let a_data = (a_ptr as *const u8).add(struct_size);
+        let b_data = (b_ptr as *const u8).add(struct_size);
+        let a_bytes = std::slice::from_raw_parts(a_data, a_len);
+        let b_bytes = std::slice::from_raw_parts(b_data, b_len);
+        match a_bytes.cmp(b_bytes) {
+            std::cmp::Ordering::Less    => -1,
+            std::cmp::Ordering::Equal   => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn frog_str_print(s: i64) {
     let ptr = s as *const FrogStr;
@@ -111,11 +132,38 @@ pub extern "C" fn frog_list_len(list: i64) -> i64 {
     unsafe { (*(list as *const FrogList)).len as i64 }
 }
 
+/// Terminate the process with a diagnostic. Called for an out-of-range list
+/// index (after negative-index normalization).
+///
+/// This is a hard exit, not a catchable froglang-level error: the caller is
+/// always JIT-compiled code reached through a raw function-pointer call (see
+/// `FrogState::call_jit`), which has no unwind tables, so panicking here
+/// (unlike the codegen-construction panics caught in `FrogState::eval`)
+/// cannot be safely unwound through — it would corrupt the stack rather than
+/// produce a clean error. `process::exit` never unwinds, so it's the only
+/// safe way out of this call frame.
+fn frog_index_out_of_bounds(idx: i64, len: i64) -> ! {
+    eprintln!("frog: index {} out of bounds for list of length {}", idx, len);
+    std::process::exit(1);
+}
+
+/// Resolve a possibly-negative index (Python-style: -1 is the last element)
+/// against `len`, terminating the process if it's still out of range.
+fn resolve_index(idx: i64, len: i64) -> usize {
+    let real_idx = if idx < 0 { len + idx } else { idx };
+    if real_idx < 0 || real_idx >= len {
+        frog_index_out_of_bounds(idx, len);
+    }
+    real_idx as usize
+}
+
 #[no_mangle]
 pub extern "C" fn frog_list_get(list: i64, idx: i64) -> i64 {
     unsafe {
         let list_ptr = list as *const FrogList;
-        *(*list_ptr).data.add(idx as usize)
+        let len = (*list_ptr).len as i64;
+        let real_idx = resolve_index(idx, len);
+        *(*list_ptr).data.add(real_idx)
     }
 }
 
@@ -123,8 +171,49 @@ pub extern "C" fn frog_list_get(list: i64, idx: i64) -> i64 {
 pub extern "C" fn frog_list_set(list: i64, idx: i64, val: i64) {
     unsafe {
         let list_ptr = list as *mut FrogList;
-        *(*list_ptr).data.add(idx as usize) = val;
+        let len = (*list_ptr).len as i64;
+        let real_idx = resolve_index(idx, len);
+        *(*list_ptr).data.add(real_idx) = val;
     }
+}
+
+/// Clamp a possibly-negative, possibly-out-of-range slice bound against
+/// `len`. Unlike `resolve_index`, this never errors — Python-style slicing
+/// silently clamps to the valid range instead of raising on an out-of-range
+/// bound.
+fn clamp_bound(idx: i64, len: i64) -> i64 {
+    let real_idx = if idx < 0 { len + idx } else { idx };
+    real_idx.clamp(0, len)
+}
+
+/// Slice `list[start..end]` into a freshly-allocated list, following
+/// Python-style semantics: bounds are clamped (never an error), negative
+/// bounds count from the end, and `end < start` yields an empty list.
+///
+/// `start`/`end` use `i64::MIN`/`i64::MAX` as sentinels for "omitted" (i.e.
+/// `list[:end]` / `list[start:]` / `list[:]`) — see codegen's `Slice` arm.
+#[no_mangle]
+pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
+    let list_ptr = list as *const FrogList;
+    let (len, tag) = unsafe { ((*list_ptr).len as i64, (*list_ptr).elem_tag) };
+
+    let s = if start == i64::MIN { 0 } else { clamp_bound(start, len) };
+    let e = if end == i64::MAX { len } else { clamp_bound(end, len) };
+    let e = e.max(s);
+    let slice_len = (e - s) as usize;
+
+    with_heap(|heap| {
+        heap.maybe_collect();
+        let new_list = heap.alloc_list(slice_len.max(1), tag);
+        unsafe {
+            (*new_list).len = slice_len as u32;
+            if slice_len > 0 {
+                let src = (*list_ptr).data.add(s as usize);
+                std::ptr::copy_nonoverlapping(src, (*new_list).data, slice_len);
+            }
+        }
+        new_list as i64
+    })
 }
 
 #[no_mangle]
@@ -151,6 +240,26 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
             (*list_ptr).len += 1;
         }
         list
+    })
+}
+
+/// Materialize `start..end` (end-exclusive) as a freshly-allocated
+/// `List(Int)`. `end <= start` yields an empty list, matching `frog_list_slice`'s
+/// "never errors, just clamps" convention rather than `frog_list_get`'s.
+#[no_mangle]
+pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
+    let len = if end > start { (end - start) as usize } else { 0 };
+
+    with_heap(|heap| {
+        heap.maybe_collect();
+        let list = heap.alloc_list(len.max(1), ElemTag::Scalar);
+        unsafe {
+            (*list).len = len as u32;
+            for i in 0..len {
+                *(*list).data.add(i) = start + i as i64;
+            }
+        }
+        list as i64
     })
 }
 
@@ -209,6 +318,17 @@ mod tests {
         let pc = frog_alloc_str(c.as_ptr() as i64, c.len() as i64);
         assert_eq!(frog_str_eq(pa, pb), 1);
         assert_eq!(frog_str_eq(pa, pc), 0);
+    }
+
+    #[test]
+    fn test_frog_str_cmp() {
+        let a = b"abc";
+        let b = b"abd";
+        let pa = frog_alloc_str(a.as_ptr() as i64, a.len() as i64);
+        let pb = frog_alloc_str(b.as_ptr() as i64, b.len() as i64);
+        assert_eq!(frog_str_cmp(pa, pb), -1);
+        assert_eq!(frog_str_cmp(pb, pa), 1);
+        assert_eq!(frog_str_cmp(pa, pa), 0);
     }
 
     #[test]

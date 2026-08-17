@@ -48,8 +48,37 @@ pub enum TypedExprKind {
 
     Call { callable: TypedExprRef, args: Vec<Spanned<TypedExpr>> },
 
+    /// `target[index]` — list element access.
+    Index { target: TypedExprRef, index: TypedExprRef },
+
+    /// `target[start..end]` — list slice; either bound may be omitted
+    /// (`target[..end]`, `target[start..]`, `target[..]`).
+    Slice { target: TypedExprRef, start: Option<TypedExprRef>, end: Option<TypedExprRef> },
+
+    /// `start..end` — standalone range, eagerly materialized as `List(Int)`.
+    Range { start: TypedExprRef, end: TypedExprRef },
+
     /// Homogeneous list (parsed as `[a, b, c]`, inferred as `List(T)`).
     List(Vec<Spanned<TypedExpr>>),
 
     Block(Vec<Spanned<TypedExpr>>),
+
+    /// `for var in iterable (if cond)? body`, run for effect. Result type
+    /// is always `Type::None`.
+    ForLoop {
+        var:      String,
+        iterable: TypedExprRef,
+        cond:     Option<TypedExprRef>,
+        body:     TypedExprRef,
+    },
+
+    /// `[for var in iterable (if cond)? body]` — same shape as `ForLoop`,
+    /// but each `body` evaluation is collected into a `List` instead of
+    /// discarded. Result type is `List(body's type)`.
+    Comprehension {
+        var:      String,
+        iterable: TypedExprRef,
+        cond:     Option<TypedExprRef>,
+        body:     TypedExprRef,
+    },
 }

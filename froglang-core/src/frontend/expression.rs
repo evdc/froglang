@@ -66,6 +66,41 @@ pub struct AnnotatedExpr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct IndexExpr {
+    pub target: ExprRef,
+    pub index: ExprRef
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SliceExpr {
+    pub target: ExprRef,
+    pub start: Option<ExprRef>,
+    pub end: Option<ExprRef>
+}
+
+/// `start..end` used as a standalone expression (not as an index): both
+/// bounds are required, and it eagerly materializes a `List(Int)`.
+/// See `SliceExpr` for the `target[start..end]` form, which allows either
+/// bound to be omitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeExpr {
+    pub start: ExprRef,
+    pub end: ExprRef
+}
+
+/// `for var in iterable (if cond)? do body`. As a bare statement it runs for
+/// effect and evaluates to `Type::None`; wrapped in `[...]` (see
+/// `Expression::Comprehension`) it collects each `body` evaluation into a
+/// `List` instead. Both forms share this same node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForLoopExpr {
+    pub var: String,
+    pub iterable: ExprRef,
+    pub cond: Option<ExprRef>,
+    pub body: ExprRef
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Literal(LiteralExpr),
     Unary(UnaryExpr),
@@ -76,7 +111,17 @@ pub enum Expression {
     Call(CallExpr),
     Tuple(Vec<Spanned<Expression>>),
     Block(Vec<Spanned<Expression>>),
-    Annotated(AnnotatedExpr)
+    Annotated(AnnotatedExpr),
+    Index(IndexExpr),
+    Slice(SliceExpr),
+    Range(RangeExpr),
+    ForLoop(ForLoopExpr),
+    /// `[for var in iterable (if cond)? body]` — a `ForLoop` wrapped in
+    /// brackets, which changes its meaning from "discard, evaluate to
+    /// None" to "collect each body value into a List". Kept as a distinct
+    /// variant (rather than a flag on `ForLoopExpr`) so typeck/codegen can
+    /// match on it directly instead of a match-inside-a-match.
+    Comprehension(ExprRef)
 }
 
 
@@ -119,6 +164,26 @@ impl Expression {
 
     pub fn annotated(expr: Spanned<Expression>, ty: Spanned<Expression>) -> Expression {
         Expression::Annotated(AnnotatedExpr { expr: Box::new(expr), ty: Box::new(ty) })
+    }
+
+    pub fn index(target: Spanned<Expression>, index: Spanned<Expression>) -> Expression {
+        Expression::Index(IndexExpr { target: Box::new(target), index: Box::new(index) })
+    }
+
+    pub fn slice(target: Spanned<Expression>, start: Option<Spanned<Expression>>, end: Option<Spanned<Expression>>) -> Expression {
+        Expression::Slice(SliceExpr { target: Box::new(target), start: start.map(Box::new), end: end.map(Box::new) })
+    }
+
+    pub fn range(start: Spanned<Expression>, end: Spanned<Expression>) -> Expression {
+        Expression::Range(RangeExpr { start: Box::new(start), end: Box::new(end) })
+    }
+
+    pub fn for_loop(var: String, iterable: Spanned<Expression>, cond: Option<Spanned<Expression>>, body: Spanned<Expression>) -> Expression {
+        Expression::ForLoop(ForLoopExpr { var, iterable: Box::new(iterable), cond: cond.map(Box::new), body: Box::new(body) })
+    }
+
+    pub fn comprehension(for_loop: Spanned<Expression>) -> Expression {
+        Expression::Comprehension(Box::new(for_loop))
     }
 
     pub fn get_identifier(&self) -> Option<&str> {
@@ -226,6 +291,34 @@ impl fmt::Display for Expression {
 
             Expression::Annotated(inner) => {
                 write!(f, "{} : {}", inner.expr, inner.ty)
+            }
+
+            Expression::Index(idx) => {
+                write!(f, "{}[{}]", idx.target, idx.index)
+            }
+
+            Expression::Slice(s) => {
+                write!(f, "{}[", s.target)?;
+                if let Some(start) = &s.start { write!(f, "{}", start)?; }
+                write!(f, "..")?;
+                if let Some(end) = &s.end { write!(f, "{}", end)?; }
+                write!(f, "]")
+            }
+
+            Expression::Range(r) => {
+                write!(f, "{}..{}", r.start, r.end)
+            }
+
+            Expression::ForLoop(fl) => {
+                write!(f, "for {} in {}", fl.var, fl.iterable)?;
+                if let Some(cond) = &fl.cond {
+                    write!(f, " if {}", cond)?;
+                }
+                write!(f, " do {}", fl.body)
+            }
+
+            Expression::Comprehension(inner) => {
+                write!(f, "[{}]", inner)
             }
         }
     }

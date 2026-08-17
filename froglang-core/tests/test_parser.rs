@@ -271,6 +271,156 @@ fn test_unbalanced_grouping() {
 }
 
 #[test]
+fn test_index_expr() {
+    assert_eq!(
+        Parser::new("xs[0]").expression(Precedence::Assign).unwrap().item,
+        Expression::index(
+            Spanned::new(Expression::literal(Token::Identifier("xs".to_string())), pos(0, 0), pos(0, 2)),
+            Spanned::new(Expression::literal(Token::Int(0)), pos(0, 3), pos(0, 4)),
+        )
+    );
+}
+
+#[test]
+fn test_index_chained_and_on_literal() {
+    // `[1, 2, 3][0]` — indexing directly on a list literal.
+    let result = Parser::new("[1, 2, 3][0]").expression(Precedence::Assign);
+    assert!(result.is_ok());
+
+    // `xs[0][1]` — chained indexing.
+    let result = Parser::new("xs[0][1]").expression(Precedence::Assign);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_index_unclosed_bracket() {
+    let result = Parser::new("xs[0").expression(Precedence::Assign);
+    assert_eq!(result.unwrap_err().item, ParseError::ExpectedButFound(Token::RightBracket, Token::EOF));
+}
+
+#[test]
+fn test_slice_both_bounds() {
+    assert_eq!(
+        Parser::new("xs[1..3]").expression(Precedence::Assign).unwrap().item,
+        Expression::slice(
+            Spanned::new(Expression::literal(Token::Identifier("xs".to_string())), pos(0, 0), pos(0, 2)),
+            Some(Spanned::new(Expression::literal(Token::Int(1)), pos(0, 3), pos(0, 4))),
+            Some(Spanned::new(Expression::literal(Token::Int(3)), pos(0, 6), pos(0, 7))),
+        )
+    );
+}
+
+#[test]
+fn test_slice_omitted_bounds_parse() {
+    for src in ["xs[..]", "xs[1..]", "xs[..3]"] {
+        let result = Parser::new(src).expression(Precedence::Assign);
+        assert!(result.is_ok(), "expected {} to parse", src);
+        assert!(matches!(result.unwrap().item, Expression::Slice(_)));
+    }
+}
+
+#[test]
+fn test_range_expr() {
+    assert_eq!(
+        Parser::new("1..5").expression(Precedence::Assign).unwrap().item,
+        Expression::range(
+            Spanned::new(Expression::literal(Token::Int(1)), pos(0, 0), pos(0, 1)),
+            Spanned::new(Expression::literal(Token::Int(5)), pos(0, 3), pos(0, 4)),
+        )
+    );
+}
+
+#[test]
+fn test_range_requires_both_operands() {
+    // `1..` and `..5` are valid inside `[...]` (slicing) but not standalone.
+    let result = Parser::new("1..").expression(Precedence::Assign);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_for_loop_expr() {
+    let result = Parser::new("for x in xs do x").expression(Precedence::Assign).unwrap();
+    assert_eq!(
+        result.item,
+        Expression::for_loop(
+            "x".to_string(),
+            Spanned::new(Expression::literal(Token::Identifier("xs".to_string())), pos(0, 9), pos(0, 11)),
+            None,
+            Spanned::new(Expression::literal(Token::Identifier("x".to_string())), pos(0, 15), pos(0, 16)),
+        )
+    );
+}
+
+#[test]
+fn test_for_loop_with_if_filter() {
+    let result = Parser::new("for x in xs if x do x").expression(Precedence::Assign).unwrap();
+    match result.item {
+        Expression::ForLoop(fl) => {
+            assert_eq!(fl.var, "x");
+            assert!(fl.cond.is_some());
+        },
+        other => panic!("expected ForLoop, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_for_loop_requires_in() {
+    let result = Parser::new("for x xs do x").expression(Precedence::Assign);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_for_loop_requires_do() {
+    let result = Parser::new("for x in xs x").expression(Precedence::Assign);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_for_loop_with_block_body() {
+    let result = Parser::new("for x in xs do { x }").expression(Precedence::Assign);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_comprehension_expr() {
+    let result = Parser::new("[for x in xs do x]").expression(Precedence::Assign).unwrap();
+    assert!(matches!(result.item, Expression::Comprehension(_)));
+}
+
+#[test]
+fn test_comprehension_over_range() {
+    // `[for i in 1..5 do i * i]` — the `if`-adjacent-Unary-precedence bug
+    // this exercises isn't specific to `for`'s own boundary: `Grammar::range`
+    // recurses into `Parser::expression` for its right operand, so this
+    // covers that nested boundary too.
+    let result = Parser::new("[for i in 1..5 if i > 0 do i * i]").expression(Precedence::Assign);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_plain_list_literal_still_parses() {
+    // `Grammar::tuple`'s new `for`-comprehension branch must not affect the
+    // ordinary list-literal path.
+    let result = Parser::new("[1, 2, 3]").expression(Precedence::Assign).unwrap();
+    assert!(matches!(result.item, Expression::Tuple(_)));
+}
+
+#[test]
+fn test_negative_index_parses_as_index_not_slice() {
+    let result = Parser::new("xs[-1]").expression(Precedence::Assign).unwrap();
+    assert!(matches!(result.item, Expression::Index(_)));
+}
+
+#[test]
+fn test_invalid_assignment_target() {
+    let result = Parser::new("1 = 2").expression(Precedence::Assign);
+    assert_eq!(result.unwrap_err().item, ParseError::InvalidAssignmentTarget);
+
+    let result = Parser::new("(a + b) = 3").expression(Precedence::Assign);
+    assert_eq!(result.unwrap_err().item, ParseError::InvalidAssignmentTarget);
+}
+
+#[test]
 fn test_unexpected_character() {
     let result = Parser::new("1 ? 2").expression(Precedence::Assign);
     assert_eq!(result.unwrap_err().item, ParseError::LexError(LexerError::UnexpectedCharacter));

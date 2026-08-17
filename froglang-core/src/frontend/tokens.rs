@@ -79,6 +79,10 @@ pub enum Token {
     #[lex(">=")]
     GtEq,
 
+    #[infix(Grammar::range, Precedence::Range)]
+    #[lex("..")]
+    DotDot,
+
     #[infix(Grammar::binary, Precedence::Or)]
     #[lex("or")]
     Or,
@@ -99,6 +103,14 @@ pub enum Token {
     #[lex("func")]
     Func,
 
+    #[prefix(Grammar::for_expr)]
+    #[lex("for")]
+    For,
+    #[lex("in")]
+    In,
+    #[lex("do")]
+    Do,
+
     #[infix(Grammar::arrow_func, Precedence::Assign)]
     #[lex("->")]
     Arrow,
@@ -113,6 +125,7 @@ pub enum Token {
     LeftParen,
 
     #[prefix(Grammar::tuple)]
+    #[infix(Grammar::index, Precedence::Call)]
     #[lex("[")]
     LeftBracket,
 

@@ -16,6 +16,7 @@ macro_rules! gc_trace {
 pub enum ObjKind { Str = 0, List = 1 }
 
 #[repr(u8)]
+#[derive(Clone, Copy)]
 pub enum ElemTag { Scalar = 0, Ptr = 1 }
 
 // ── GC header (prefix for every heap object) ─────────────────────────────────

@@ -36,7 +36,22 @@ fn _derive_parse_rules2(input: DeriveInput) -> syn::Result<TokenStream> {
             for attr in &variant.attrs {
                 if attr.path().is_ident("prefix") {
                     prefix_fn = extract_prefix_attr(attr)?;
-                    precedence = quote! { Precedence::Unary };                      
+                    // Only value-atom tokens (literals) and dual-role
+                    // unary/binary operators (e.g. `-`, which is also
+                    // infix `Minus` — that `#[infix(...)]` attr overrides
+                    // this default below) need a nonzero default
+                    // precedence here. Without an explicit `#[infix(...)]`,
+                    // this default is only ever consulted when the token
+                    // shows up where a continuation was expected; for a
+                    // pure syntax-starting keyword (`if`, `{`, `let`,
+                    // `for`, ...) that should mean "the previous
+                    // expression just ended here", not "try to parse me
+                    // as an operator" — see `Grammar::for_expr`'s doc
+                    // comment for the confusing `ExpectedOperator` error
+                    // this caused before this check existed.
+                    if matches!(prefix_fn_name(attr)?.as_str(), "unary" | "literal") {
+                        precedence = quote! { Precedence::Unary };
+                    }
                 }
                 if attr.path().is_ident("infix") {
                     (infix_fn, precedence) = extract_infix_attr(attr)?;
@@ -87,6 +102,19 @@ fn extract_prefix_attr(attr: &Attribute) -> syn::Result<proc_macro2::TokenStream
     let first = nested.get(0).ok_or_else(|| syn::Error::new(Span::call_site(), "Expected 1 argument to prefix()"))?;
     let rule_name = first.path().to_token_stream();
     Ok(rule_name.clone())
+}
+
+/// The last path segment of a `#[prefix(...)]` attribute's function, e.g.
+/// `"unary"` for `#[prefix(Grammar::unary)]` — used to decide whether this
+/// token's default precedence (absent an explicit `#[infix(...)]`) should
+/// be `Unary` or `None`.
+fn prefix_fn_name(attr: &Attribute) -> syn::Result<String> {
+    let nested = attr.parse_args_with(Punctuated::<Meta, SynToken![,]>::parse_terminated)?;
+    let first = nested.get(0).ok_or_else(|| syn::Error::new(Span::call_site(), "Expected 1 argument to prefix()"))?;
+    let path = first.path();
+    let last = path.segments.last()
+        .ok_or_else(|| syn::Error::new(Span::call_site(), "Expected a path argument to prefix()"))?;
+    Ok(last.ident.to_string())
 }
 
 fn extract_lex_attr(attr: &Attribute) -> syn::Result<String> {

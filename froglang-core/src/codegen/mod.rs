@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, Value};
 use cranelift_codegen::{settings, settings::Configurable, Context};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
@@ -32,6 +32,11 @@ struct Ctx<'a> {
     string_arena:  &'a mut Vec<Vec<u8>>,
     heap_slot:     Option<StackSlot>,
     heap_cursor:   usize,
+    /// Next unused `Variable` index for mutable-local codegen (see
+    /// `get_or_declare_var`). Each function-body compile starts a fresh
+    /// counter (0-based) — `Variable` indices only need to be unique within
+    /// a single `FunctionBuilder`, not globally.
+    var_counter:   u32,
 }
 
 /// True iff a value of this type is a GC-managed heap pointer.
@@ -74,6 +79,31 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, f: &mut impl FnMut()) {
             if is_heap_ty(&expr.item.ty) { f(); }
         },
 
+        TypedExprKind::Index { target, index } => {
+            for_each_heap_producer(target, f);
+            for_each_heap_producer(index, f);
+            // A heap-typed element read out of a list isn't a fresh
+            // allocation, but it needs its own shadow-stack root all the
+            // same: once read, it's only reachable from the containing
+            // list, which may itself go unrooted (e.g. a temporary list
+            // literal) before this value is done being used.
+            if is_heap_ty(&expr.item.ty) { f(); }
+        },
+
+        TypedExprKind::Slice { target, start, end } => {
+            for_each_heap_producer(target, f);
+            if let Some(s) = start { for_each_heap_producer(s, f); }
+            if let Some(e) = end { for_each_heap_producer(e, f); }
+            // Unlike Index, a slice always allocates a brand-new list.
+            f();
+        },
+
+        TypedExprKind::Range { start, end } => {
+            for_each_heap_producer(start, f);
+            for_each_heap_producer(end, f);
+            f(); // always allocates the materialized list
+        },
+
         TypedExprKind::Assign { value, .. } => {
             // Mirrors compile_expr's Assign arm, which never visits a
             // Function value (it's compiled separately as a top-level fn).
@@ -92,7 +122,33 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, f: &mut impl FnMut()) {
         TypedExprKind::Block(stmts) => {
             for s in stmts { for_each_heap_producer(s, f); }
         },
+
+        TypedExprKind::ForLoop { iterable, cond, body, .. } => {
+            for_each_heap_producer(iterable, f);
+            // Reading a heap-typed element out of the list each iteration
+            // needs its own root, same reasoning as `Index` above — see
+            // `compile_for_loop`'s `root_heap_value(bcx, ctx, elem)` call.
+            if elem_ty_is_heap(iterable) { f(); }
+            if let Some(c) = cond { for_each_heap_producer(c, f); }
+            for_each_heap_producer(body, f);
+        },
+
+        TypedExprKind::Comprehension { iterable, cond, body, .. } => {
+            // The result list is allocated (and rooted) before the loop
+            // starts — see `compile_expr`'s `Comprehension` arm.
+            f();
+            for_each_heap_producer(iterable, f);
+            if elem_ty_is_heap(iterable) { f(); }
+            if let Some(c) = cond { for_each_heap_producer(c, f); }
+            for_each_heap_producer(body, f);
+        },
     }
+}
+
+/// True iff `iterable`'s element type (`iterable.item.ty` is always
+/// `List(elem)` after type checking) is heap-managed.
+fn elem_ty_is_heap(iterable: &Spanned<TypedExpr>) -> bool {
+    matches!(&iterable.item.ty, Type::List(inner) if is_heap_ty(inner))
 }
 
 /// Count the heap-pointer-producing subexpressions in `expr` — the number of
@@ -150,6 +206,52 @@ fn teardown_shadow_frame(
     bcx.ins().call(callee, &[]);
 }
 
+/// Look up `name`'s Cranelift `Variable`, declaring a fresh one (with `ty`'s
+/// Cranelift type) the first time this name is bound. Reusing the same
+/// `Variable` across reassignments — instead of a raw `Value` in a plain
+/// `HashMap`, as this codebase used to do — is what lets Cranelift's own SSA
+/// construction (`use_var`/`def_var`) insert the phi nodes a reassignment
+/// inside a diverging branch or loop body needs; a raw `Value` computed in
+/// one block is only valid in blocks it dominates, which a branch/loop body
+/// generally isn't, and reading it back afterward is a codegen-time
+/// dominance-verifier crash (see [[project_reassignment_dominance_bug]] —
+/// this function exists to fix that class of bug).
+fn get_or_declare_var(
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+    name: &str,
+    ty: &Type,
+) -> Variable {
+    if let Some(&v) = vars.get(name) {
+        return v;
+    }
+    let v = Variable::from_u32(ctx.var_counter);
+    ctx.var_counter += 1;
+    bcx.declare_var(v, cl_type(ty));
+    vars.insert(name.to_string(), v);
+    v
+}
+
+/// Declare-and-bind a name's `Variable` using a plain counter rather than a
+/// `Ctx` — used for function-parameter and pre-seeded-REPL-binding setup,
+/// which both run before `Ctx` is constructed (see `build_func_body`,
+/// `build_main_body`).
+fn declare_and_def_var(
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    counter: &mut u32,
+    name: &str,
+    ty: &Type,
+    val: Value,
+) {
+    let v = Variable::from_u32(*counter);
+    *counter += 1;
+    bcx.declare_var(v, cl_type(ty));
+    vars.insert(name.to_string(), v);
+    bcx.def_var(v, val);
+}
+
 fn cl_type(ty: &Type) -> types::Type {
     match ty {
         Type::Int   => types::I64,
@@ -193,6 +295,17 @@ fn to_i64_repr(bcx: &mut FunctionBuilder, ty: &Type, val: Value) -> Value {
     }
 }
 
+/// Inverse of `to_i64_repr`: convert a raw i64 wire value (e.g. read back out
+/// of a `FrogList`'s flat i64 buffer via `frog_list_get`) into `ty`'s native
+/// Cranelift representation.
+fn from_i64_repr(bcx: &mut FunctionBuilder, ty: &Type, val: Value) -> Value {
+    match ty {
+        Type::Float => bcx.ins().bitcast(types::F64, MemFlags::new(), val),
+        Type::Bool  => bcx.ins().ireduce(types::I8, val),
+        _           => val,
+    }
+}
+
 /// Declare a runtime import function in the module and insert its FuncId.
 fn declare_rt(
     module: &mut JITModule,
@@ -223,7 +336,7 @@ fn declare_rt(
 fn compile_expr(
     expr: &Spanned<TypedExpr>,
     bcx: &mut FunctionBuilder,
-    vars: &mut HashMap<String, Value>,
+    vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
 ) -> Value {
     match &expr.item.kind {
@@ -251,8 +364,9 @@ fn compile_expr(
         },
 
         TypedExprKind::Var(name) => {
-            *vars.get(name.as_str())
-                .unwrap_or_else(|| panic!("unbound variable in codegen: {}", name))
+            let var = *vars.get(name.as_str())
+                .unwrap_or_else(|| panic!("unbound variable in codegen: {}", name));
+            bcx.use_var(var)
         },
 
         TypedExprKind::Unary { op, expr: inner } => {
@@ -265,6 +379,10 @@ fn compile_expr(
                         let zero = bcx.ins().iconst(types::I64, 0);
                         bcx.ins().isub(zero, v)
                     }
+                },
+                Token::Not => {
+                    let one = bcx.ins().iconst(types::I8, 1);
+                    bcx.ins().bxor(v, one)
                 },
                 _ => unimplemented!("unary op {:?}", op),
             }
@@ -296,6 +414,21 @@ fn compile_expr(
                         } else {
                             bcx.ins().ireduce(types::I8, result)
                         }
+                    },
+                    Token::Lt | Token::Gt | Token::LtEq | Token::GtEq => {
+                        let id     = ctx.func_ids["frog_str_cmp"];
+                        let callee = ctx.module.declare_func_in_func(id, bcx.func);
+                        let call   = bcx.ins().call(callee, &[lv, rv]);
+                        let cmp    = bcx.inst_results(call)[0];
+                        let zero   = bcx.ins().iconst(types::I64, 0);
+                        let cc = match op {
+                            Token::Lt   => IntCC::SignedLessThan,
+                            Token::Gt   => IntCC::SignedGreaterThan,
+                            Token::LtEq => IntCC::SignedLessThanOrEqual,
+                            Token::GtEq => IntCC::SignedGreaterThanOrEqual,
+                            _ => unreachable!(),
+                        };
+                        bcx.ins().icmp(cc, cmp, zero)
                     },
                     _ => unimplemented!("string binary op {:?}", op),
                 };
@@ -445,12 +578,63 @@ fn compile_expr(
             }
         },
 
+        TypedExprKind::Index { target, index } => {
+            let list_val = compile_expr(target, bcx, vars, ctx);
+            let idx_val  = compile_expr(index, bcx, vars, ctx);
+
+            let get_id = ctx.func_ids["frog_list_get"];
+            let callee = ctx.module.declare_func_in_func(get_id, bcx.func);
+            let call   = bcx.ins().call(callee, &[list_val, idx_val]);
+            let raw    = bcx.inst_results(call)[0];
+
+            let result = from_i64_repr(bcx, &expr.item.ty, raw);
+            if is_heap_ty(&expr.item.ty) {
+                root_heap_value(bcx, ctx, result);
+            }
+            result
+        },
+
+        TypedExprKind::Slice { target, start, end } => {
+            let list_val = compile_expr(target, bcx, vars, ctx);
+            // `frog_list_slice` treats i64::MIN/i64::MAX as "bound omitted"
+            // sentinels (see its doc comment) — realistic indices never hit
+            // these, so there's no ambiguity with an explicit bound.
+            let start_val = match start {
+                Some(s) => compile_expr(s, bcx, vars, ctx),
+                None => bcx.ins().iconst(types::I64, i64::MIN),
+            };
+            let end_val = match end {
+                Some(e) => compile_expr(e, bcx, vars, ctx),
+                None => bcx.ins().iconst(types::I64, i64::MAX),
+            };
+
+            let id     = ctx.func_ids["frog_list_slice"];
+            let callee = ctx.module.declare_func_in_func(id, bcx.func);
+            let call   = bcx.ins().call(callee, &[list_val, start_val, end_val]);
+            let result = bcx.inst_results(call)[0];
+            root_heap_value(bcx, ctx, result);
+            result
+        },
+
+        TypedExprKind::Range { start, end } => {
+            let start_val = compile_expr(start, bcx, vars, ctx);
+            let end_val   = compile_expr(end, bcx, vars, ctx);
+
+            let id     = ctx.func_ids["frog_range"];
+            let callee = ctx.module.declare_func_in_func(id, bcx.func);
+            let call   = bcx.ins().call(callee, &[start_val, end_val]);
+            let result = bcx.inst_results(call)[0];
+            root_heap_value(bcx, ctx, result);
+            result
+        },
+
         TypedExprKind::Assign { name, value } => {
             if matches!(value.item.kind, TypedExprKind::Function { .. }) {
                 bcx.ins().iconst(types::I64, 0)
             } else {
                 let val = compile_expr(value, bcx, vars, ctx);
-                vars.insert(name.clone(), val);
+                let var = get_or_declare_var(bcx, vars, ctx, name, &value.item.ty);
+                bcx.def_var(var, val);
                 val
             }
         },
@@ -508,7 +692,125 @@ fn compile_expr(
 
             list_ptr
         },
+
+        TypedExprKind::ForLoop { var, iterable, cond, body } => {
+            compile_for_loop(var, iterable, cond, body, None, bcx, vars, ctx);
+            bcx.ins().iconst(types::I64, 0)
+        },
+
+        TypedExprKind::Comprehension { var, iterable, cond, body } => {
+            let elem_tag: i64 = if is_heap_ty(&body.item.ty) { 1 } else { 0 };
+            let cap_val = bcx.ins().iconst(types::I64, 1);
+            let tag_val = bcx.ins().iconst(types::I64, elem_tag);
+
+            let alloc_id = ctx.func_ids["frog_alloc_list"];
+            let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+            let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, tag_val]);
+            let result_list = bcx.inst_results(alloc_call)[0];
+            // Root the result list before the loop runs at all: it must
+            // already be reachable by the time the first pushed element
+            // (or the iterable itself) can trigger a collection.
+            root_heap_value(bcx, ctx, result_list);
+
+            compile_for_loop(var, iterable, cond, body, Some(result_list), bcx, vars, ctx);
+            result_list
+        },
     }
+}
+
+/// Shared codegen for `for var in iterable (if cond)? body`, used by both
+/// `TypedExprKind::ForLoop` (bare loop, `result_list: None`) and
+/// `TypedExprKind::Comprehension` (`result_list: Some(list_ptr)`, into
+/// which each `body` evaluation is pushed).
+///
+/// Uses Cranelift block params to carry the loop index across iterations
+/// (the same pattern as the `Conditional`/short-circuit `and`/`or` merge
+/// blocks above) rather than `Variable`/`declare_var`, which this codebase
+/// doesn't otherwise use.
+#[allow(clippy::too_many_arguments)]
+fn compile_for_loop(
+    var: &str,
+    iterable: &Spanned<TypedExpr>,
+    cond: &Option<Box<Spanned<TypedExpr>>>,
+    body: &Spanned<TypedExpr>,
+    result_list: Option<Value>,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) {
+    let list_val = compile_expr(iterable, bcx, vars, ctx);
+    let elem_ty = match &iterable.item.ty {
+        Type::List(inner) => (**inner).clone(),
+        other => unreachable!("for-loop iterable must be a List after type checking, got {}", other),
+    };
+
+    let len_id = ctx.func_ids["frog_list_len"];
+    let len_callee = ctx.module.declare_func_in_func(len_id, bcx.func);
+    let len_call = bcx.ins().call(len_callee, &[list_val]);
+    let len_val = bcx.inst_results(len_call)[0];
+
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    let exit_bb   = bcx.create_block();
+    bcx.append_block_param(header_bb, types::I64);
+
+    let zero = bcx.ins().iconst(types::I64, 0);
+    bcx.ins().jump(header_bb, &[zero]);
+
+    // `header_bb` has a second predecessor — the back-edge jump emitted at
+    // the end of this function — so it can't be sealed until that jump
+    // exists. Its sole use of `switch_to_block` before that is fine;
+    // sealing (not switching) is what Cranelift requires deferred.
+    bcx.switch_to_block(header_bb);
+    let i = bcx.block_params(header_bb)[0];
+    let in_range = bcx.ins().icmp(IntCC::SignedLessThan, i, len_val);
+    bcx.ins().brif(in_range, body_bb, &[], exit_bb, &[]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+
+    let get_id = ctx.func_ids["frog_list_get"];
+    let get_callee = ctx.module.declare_func_in_func(get_id, bcx.func);
+    let get_call = bcx.ins().call(get_callee, &[list_val, i]);
+    let raw = bcx.inst_results(get_call)[0];
+    let elem = from_i64_repr(bcx, &elem_ty, raw);
+    if is_heap_ty(&elem_ty) {
+        root_heap_value(bcx, ctx, elem);
+    }
+    let var_id = get_or_declare_var(bcx, vars, ctx, var, &elem_ty);
+    bcx.def_var(var_id, elem);
+
+    // Optional `if` filter in the loop header: skip straight to the
+    // increment (without running `body`) when it's false.
+    if let Some(c) = cond {
+        let do_bb   = bcx.create_block();
+        let skip_bb = bcx.create_block();
+        let cond_val = compile_expr(c, bcx, vars, ctx);
+        bcx.ins().brif(cond_val, do_bb, &[], skip_bb, &[]);
+
+        bcx.switch_to_block(skip_bb);
+        bcx.seal_block(skip_bb);
+        let i_next = bcx.ins().iadd_imm(i, 1);
+        bcx.ins().jump(header_bb, &[i_next]);
+
+        bcx.switch_to_block(do_bb);
+        bcx.seal_block(do_bb);
+    }
+
+    let body_val = compile_expr(body, bcx, vars, ctx);
+    if let Some(list_ptr) = result_list {
+        let pushed = to_i64_repr(bcx, &body.item.ty, body_val);
+        let push_id = ctx.func_ids["frog_list_push"];
+        let push_callee = ctx.module.declare_func_in_func(push_id, bcx.func);
+        bcx.ins().call(push_callee, &[list_ptr, pushed]);
+    }
+
+    let i_next = bcx.ins().iadd_imm(i, 1);
+    bcx.ins().jump(header_bb, &[i_next]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(exit_bb);
+    bcx.seal_block(exit_bb);
 }
 
 impl Codegen {
@@ -555,6 +857,7 @@ impl Codegen {
         builder.symbol("frog_str_len",     ffi::frog_str_len     as *const u8);
         builder.symbol("frog_str_concat",  ffi::frog_str_concat  as *const u8);
         builder.symbol("frog_str_eq",      ffi::frog_str_eq      as *const u8);
+        builder.symbol("frog_str_cmp",     ffi::frog_str_cmp     as *const u8);
         builder.symbol("frog_str_print",   ffi::frog_str_print   as *const u8);
         builder.symbol("frog_str_println", ffi::frog_str_println as *const u8);
         builder.symbol("frog_alloc_list",  ffi::frog_alloc_list  as *const u8);
@@ -562,6 +865,8 @@ impl Codegen {
         builder.symbol("frog_list_get",    ffi::frog_list_get    as *const u8);
         builder.symbol("frog_list_set",    ffi::frog_list_set    as *const u8);
         builder.symbol("frog_list_push",   ffi::frog_list_push   as *const u8);
+        builder.symbol("frog_list_slice",  ffi::frog_list_slice  as *const u8);
+        builder.symbol("frog_range",       ffi::frog_range       as *const u8);
         builder.symbol("frog_gc_dump",     ffi::frog_gc_dump     as *const u8);
         builder.symbol("frog_frame_push",  ffi::frog_frame_push  as *const u8);
         builder.symbol("frog_frame_pop",   ffi::frog_frame_pop   as *const u8);
@@ -575,6 +880,7 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_str_len",    "frog_str_len",    &[I64],           Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_str_concat", "frog_str_concat", &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_str_eq",     "frog_str_eq",     &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_str_cmp",    "frog_str_cmp",    &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_str_print",  "frog_str_print",  &[I64],           None);
         // "print" in froglang calls frog_str_println (with newline).
         declare_rt(&mut module, &mut func_ids, "frog_str_println","print",           &[I64],           None);
@@ -583,6 +889,8 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_list_get",   "frog_list_get",   &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_list_set",   "frog_list_set",   &[I64, I64, I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_list_push",  "frog_list_push",  &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_list_slice", "frog_list_slice", &[I64, I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_range",      "frog_range",      &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_gc_dump",    "gc_dump",         &[],               None);
         declare_rt(&mut module, &mut func_ids, "frog_frame_push", "frog_frame_push", &[I64, I64],      None);
         declare_rt(&mut module, &mut func_ids, "frog_frame_pop",  "frog_frame_pop",  &[],              None);
@@ -621,14 +929,15 @@ impl Codegen {
         bcx.switch_to_block(entry);
         bcx.seal_block(entry);
 
-        let mut vars: HashMap<String, Value> = HashMap::new();
+        let mut vars: HashMap<String, Variable> = HashMap::new();
+        let mut var_counter: u32 = 0;
         let entry_params: Vec<Value> = bcx.block_params(entry).to_vec();
-        for ((name, _), val) in params.iter().zip(entry_params) {
-            vars.insert(name.clone(), val);
+        for ((name, ty), val) in params.iter().zip(entry_params) {
+            declare_and_def_var(&mut bcx, &mut vars, &mut var_counter, name, ty, val);
         }
 
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, count_heap_slots(body));
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0 };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter };
         let result = compile_expr(body, &mut bcx, &mut vars, &mut ctx);
         teardown_shadow_frame(&mut bcx, module, func_ids, heap_slot);
 
@@ -666,7 +975,8 @@ impl Codegen {
         bcx.seal_block(entry);
         let out_ptr = bcx.block_params(entry)[0];
 
-        let mut vars: HashMap<String, Value> = HashMap::new();
+        let mut vars: HashMap<String, Variable> = HashMap::new();
+        let mut var_counter: u32 = 0;
 
         // Pre-seed vars from prior REPL entries as iconst values.
         for (name, &bits) in pre_env {
@@ -676,14 +986,14 @@ impl Codegen {
                 Type::Bool  => bcx.ins().iconst(types::I8, bits),
                 _           => bcx.ins().iconst(types::I64, bits),
             };
-            vars.insert(name.clone(), val);
+            declare_and_def_var(&mut bcx, &mut vars, &mut var_counter, name, ty, val);
         }
         let mut last_val = bcx.ins().iconst(types::I64, 0);
         let mut last_ty = &Type::Int;
 
         let n: usize = stmts.iter().map(count_heap_slots).sum();
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0 };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
 

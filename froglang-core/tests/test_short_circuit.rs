@@ -30,8 +30,8 @@ fn run(src: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-// `print` takes a `Str`, so these rely on the CLI's own auto-print of the
-// program's trailing expression value (which handles `Bool` directly) to
+// These rely on the CLI's own auto-print of the program's trailing expression
+// value (which handles `Bool` directly) to
 // surface the `and`/`or` result — `noisy()`'s `print("evaluated")` call is
 // what surfaces whether the right-hand side actually ran.
 

@@ -1,4 +1,0 @@
-- Integrate parsing and type checking, so we can produce a Typed AST, as a prereq for compilation
-- Stretch: MVP of integrating Cranelift to compile the simple core (operators, variables, functions, calls, conditionals) to native
-    - don't implement GC / runtime, or native functions, on the backend yet. Let everything leak memory. As a hack, whatever main() returns will be formatted and printed to stdout. Fix later.
-- Improve error messaging, integrate a crate for rustc-style display

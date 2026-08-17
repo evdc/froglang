@@ -15,10 +15,6 @@ macro_rules! gc_trace {
 #[repr(u8)]
 pub enum ObjKind { Str = 0, List = 1 }
 
-#[repr(u8)]
-#[derive(Clone, Copy)]
-pub enum ElemTag { Scalar = 0, Ptr = 1 }
-
 // ── GC header (prefix for every heap object) ─────────────────────────────────
 
 #[repr(C)]
@@ -38,13 +34,28 @@ pub struct FrogStr {
 }
 
 // ── FrogList — mutable, separate data buffer ──────────────────────────────────
-
+//
+// Elements occupy `stride` consecutive `i64` slots each (`stride == 1` for
+// every non-struct element type — this degenerates to the list's old flat
+// one-slot-per-element layout exactly). `len`/`cap` are raw *slot* counts,
+// not element counts — `frog_list_len` (ffi.rs) divides by `stride` to
+// report the element count callers actually want; `frog_list_push`
+// (ffi.rs) is unchanged and simply keeps appending one raw slot at a time,
+// which is exactly right since codegen always pushes a struct element's
+// `stride` leaf values back-to-back in one go.
+//
+// `ptr_mask` marks which of the `stride` per-element slot offsets are heap
+// pointers (bit `i` set => offset `i` within each element block is a
+// pointer) — `GcHeap::mark`'s List-tracing loop below consults this once
+// per element block instead of assuming every slot (the old `ElemTag`) or
+// no slots are pointers.
 #[repr(C)]
 pub struct FrogList {
     pub header:   GcHeader,
     pub len:      u32,
     pub cap:      u32,
-    pub elem_tag: ElemTag,
+    pub stride:   u32,
+    pub ptr_mask: u64,
     pub data:     *mut i64,
 }
 
@@ -204,11 +215,19 @@ impl GcHeap {
                 match (*obj).kind { ObjKind::Str => "Str", ObjKind::List => "List" });
             if let ObjKind::List = (*obj).kind {
                 let list = obj as *mut FrogList;
-                if let ElemTag::Ptr = (*list).elem_tag {
-                    for i in 0..(*list).len as usize {
-                        let elem = *(*list).data.add(i);
-                        if elem != 0 {
-                            worklist.push(elem as *mut GcHeader);
+                let mask = (*list).ptr_mask;
+                if mask != 0 {
+                    let stride = ((*list).stride as usize).max(1);
+                    let elem_len = (*list).len as usize / stride;
+                    for i in 0..elem_len {
+                        let base = i * stride;
+                        for bit in 0..stride {
+                            if mask & (1u64 << bit) != 0 {
+                                let elem = *(*list).data.add(base + bit);
+                                if elem != 0 {
+                                    worklist.push(elem as *mut GcHeader);
+                                }
+                            }
                         }
                     }
                 }
@@ -297,11 +316,16 @@ impl GcHeap {
         ptr
     }
 
-    /// Allocate a GC-managed FrogList with the given initial capacity and element tag.
+    /// Allocate a GC-managed FrogList with room for `cap` elements, each
+    /// `stride` `i64` slots wide (`stride == 1` for every non-struct element
+    /// type). `ptr_mask` marks which of the `stride` per-element slot
+    /// offsets are heap pointers — see `FrogList`'s doc comment.
     /// The data buffer is separately allocated (not a GC object).
-    pub fn alloc_list(&mut self, cap: usize, elem_tag: ElemTag) -> *mut FrogList {
-        let actual_cap = cap.max(1);
-        let data_layout = Layout::array::<i64>(actual_cap).expect("list data layout");
+    pub fn alloc_list(&mut self, cap: usize, stride: usize, ptr_mask: u64) -> *mut FrogList {
+        let stride = stride.max(1);
+        let actual_elem_cap = cap.max(1);
+        let slot_cap = actual_elem_cap * stride;
+        let data_layout = Layout::array::<i64>(slot_cap).expect("list data layout");
         let data = unsafe { alloc(data_layout) as *mut i64 };
 
         let list_layout = Layout::new::<FrogList>();
@@ -314,8 +338,9 @@ impl GcHeap {
                 kind:   ObjKind::List,
             };
             (*ptr).len      = 0;
-            (*ptr).cap      = actual_cap as u32;
-            (*ptr).elem_tag = elem_tag;
+            (*ptr).cap      = slot_cap as u32;
+            (*ptr).stride   = stride as u32;
+            (*ptr).ptr_mask = ptr_mask;
             (*ptr).data     = data;
         }
 
@@ -346,18 +371,19 @@ impl GcHeap {
                     }
                     ObjKind::List => {
                         let l = current as *const FrogList;
-                        let tag = match (*l).elem_tag {
-                            ElemTag::Scalar => "Scalar",
-                            ElemTag::Ptr    => "Ptr   ",
-                        };
-                        eprint!("  [{:p}] List  len={:<4} cap={:<4} {}  [",
-                            current, (*l).len, (*l).cap, tag);
-                        let show = ((*l).len as usize).min(8);
+                        let stride = ((*l).stride as usize).max(1);
+                        let elem_len = (*l).len as usize / stride;
+                        let tag = if (*l).ptr_mask != 0 { "Ptr   " } else { "Scalar" };
+                        eprint!("  [{:p}] List  len={:<4} cap={:<4} stride={:<2} {}  [",
+                            current, elem_len, (*l).cap as usize / stride, stride, tag);
+                        let show = elem_len.min(8);
                         for i in 0..show {
                             if i > 0 { eprint!(", "); }
-                            eprint!("{}", *(*l).data.add(i));
+                            // Only the first slot of each element is shown —
+                            // a full struct-aware dump isn't implemented.
+                            eprint!("{}", *(*l).data.add(i * stride));
                         }
-                        if (*l).len > 8 { eprint!(", …"); }
+                        if elem_len > 8 { eprint!(", …"); }
                         eprintln!("]");
                     }
                 }

@@ -100,6 +100,25 @@ pub struct ForLoopExpr {
     pub body: ExprRef
 }
 
+/// `data Name(field: Type, ...)`. Field type annotations stay as unresolved
+/// expressions (see `Parameter`) until type checking, mirroring function
+/// params exactly — reuses `Parameter` rather than a new struct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataDeclExpr {
+    pub name:   String,
+    pub fields: Vec<Parameter>,
+}
+
+/// `target.field` — struct field access. Also used, with `target.field`
+/// on the left of `=`, as the desugaring target for the `alice.age = 43`
+/// rebind-sugar (see `Grammar::assign`'s target validation, and
+/// `TypedExprKind::FieldAssign`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldAccessExpr {
+    pub target: ExprRef,
+    pub field:  String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Literal(LiteralExpr),
@@ -121,7 +140,9 @@ pub enum Expression {
     /// None" to "collect each body value into a List". Kept as a distinct
     /// variant (rather than a flag on `ForLoopExpr`) so typeck/codegen can
     /// match on it directly instead of a match-inside-a-match.
-    Comprehension(ExprRef)
+    Comprehension(ExprRef),
+    DataDecl(DataDeclExpr),
+    FieldAccess(FieldAccessExpr),
 }
 
 
@@ -184,6 +205,10 @@ impl Expression {
 
     pub fn comprehension(for_loop: Spanned<Expression>) -> Expression {
         Expression::Comprehension(Box::new(for_loop))
+    }
+
+    pub fn field_access(target: Spanned<Expression>, field: String) -> Expression {
+        Expression::FieldAccess(FieldAccessExpr { target: Box::new(target), field })
     }
 
     pub fn get_identifier(&self) -> Option<&str> {
@@ -319,6 +344,22 @@ impl fmt::Display for Expression {
 
             Expression::Comprehension(inner) => {
                 write!(f, "[{}]", inner)
+            }
+
+            Expression::DataDecl(d) => {
+                write!(f, "data {}(", d.name)?;
+                for (i, p) in d.fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    match &p.ty {
+                        Some(ty) => write!(f, "{}: {}", p.name, ty)?,
+                        None => write!(f, "{}", p.name)?,
+                    }
+                }
+                write!(f, ")")
+            }
+
+            Expression::FieldAccess(fa) => {
+                write!(f, "{}.{}", fa.target, fa.field)
             }
         }
     }

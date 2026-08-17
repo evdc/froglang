@@ -1,4 +1,4 @@
-use crate::frontend::{expression::{Expression, Parameter}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Spanned, Token}};
+use crate::frontend::{expression::{DataDeclExpr, Expression, Parameter}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Spanned, Token}};
 
 pub type PrefixFnType = fn(&mut Parser, Spanned<Token>) -> ParseResult;
 pub type InfixFnType = fn(&mut Parser, Spanned<Token>, Spanned<Expression>, Precedence) -> ParseResult;
@@ -72,7 +72,16 @@ impl Grammar {
     }
 
     pub fn assign(parser: &mut Parser, _token: Spanned<Token>, left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
-        if left.item.get_identifier().is_none() {
+        // Valid targets: a bare identifier (`x = ...`), or a field access
+        // whose own target is a bare identifier (`alice.age = ...` — the
+        // struct rebind-sugar; see `TypedExprKind::FieldAssign`). Deeper
+        // paths (`a.b.c = ...`) and non-identifier bases (`foo().x = ...`)
+        // are rejected here — v1 restriction, not a fundamental limit.
+        let valid = match &left.item {
+            Expression::FieldAccess(fa) => fa.target.item.get_identifier().is_some(),
+            other => other.get_identifier().is_some(),
+        };
+        if !valid {
             return Err(left.to(ParseError::InvalidAssignmentTarget));
         }
         let right = parser.expression(precedence)?;
@@ -361,6 +370,54 @@ impl Grammar {
         Ok(Spanned {
             span: t.span.merge(body_span),
             item: Expression::for_loop(var, iterable, cond, body)
+        })
+    }
+
+    /// `data Name(field: Type, ...)` — every field requires a type
+    /// annotation (unlike function params, where it's optional).
+    pub fn data_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let name_tok = parser.identifier()?;
+        let name = match &name_tok.item {
+            Token::Identifier(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        parser.consume(Token::LeftParen)?;
+
+        let mut fields = Vec::new();
+        let mut end = name_tok.span;
+        while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
+            let field_tok = parser.identifier()?;
+            let field_name = match &field_tok.item {
+                Token::Identifier(s) => s.clone(),
+                _ => unreachable!(),
+            };
+            parser.consume(Token::Colon)?;
+            let ty_tok = parser.identifier()?;
+            end = ty_tok.span;
+            fields.push(Parameter { name: field_name, ty: Some(Box::new(ty_tok.map(Expression::literal))) });
+            if parser.check(&Token::Comma) {
+                parser.advance()?;
+            }
+        }
+        let closing = parser.consume(Token::RightParen)?;
+        let _ = end;
+
+        Ok(Spanned {
+            span: token.span.merge(closing.span),
+            item: Expression::DataDecl(DataDeclExpr { name, fields })
+        })
+    }
+
+    /// `target.field` — infix on `.`.
+    pub fn field_access(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
+        let field_tok = parser.identifier()?;
+        let field = match &field_tok.item {
+            Token::Identifier(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        Ok(Spanned {
+            span: left.span.merge(field_tok.span),
+            item: Expression::field_access(left, field)
         })
     }
 }

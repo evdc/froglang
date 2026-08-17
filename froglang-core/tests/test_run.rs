@@ -174,14 +174,14 @@ fn test_list_len() {
 #[test]
 fn test_list_get() {
     let bits = compile_and_run("[10, 20, 30]");
-    assert_eq!(frog_list_get(bits, 1),20);
+    assert_eq!(frog_list_get(bits, 1, 0),20);
 }
 
 #[test]
 fn test_list_get_first_last() {
     let bits = compile_and_run("[100, 200, 300]");
-    assert_eq!(frog_list_get(bits, 0),100);
-    assert_eq!(frog_list_get(bits, 2),300);
+    assert_eq!(frog_list_get(bits, 0, 0),100);
+    assert_eq!(frog_list_get(bits, 2, 0),300);
 }
 
 #[test]
@@ -203,7 +203,7 @@ s"#);
 fn test_float_list_roundtrips() {
     let bits = compile_and_run("[1.0, 2.5, -3.25]");
     assert_eq!(frog_list_len(bits), 3);
-    let get = |i: i64| f64::from_bits(frog_list_get(bits, i) as u64);
+    let get = |i: i64| f64::from_bits(frog_list_get(bits, i, 0) as u64);
     assert_eq!(get(0), 1.0);
     assert_eq!(get(1), 2.5);
     assert_eq!(get(2), -3.25);
@@ -213,9 +213,9 @@ fn test_float_list_roundtrips() {
 fn test_bool_list_roundtrips() {
     let bits = compile_and_run("[true, false, true]");
     assert_eq!(frog_list_len(bits), 3);
-    assert_eq!(frog_list_get(bits, 0) != 0, true);
-    assert_eq!(frog_list_get(bits, 1) != 0, false);
-    assert_eq!(frog_list_get(bits, 2) != 0, true);
+    assert_eq!(frog_list_get(bits, 0, 0) != 0, true);
+    assert_eq!(frog_list_get(bits, 1, 0) != 0, false);
+    assert_eq!(frog_list_get(bits, 2, 0) != 0, true);
 }
 
 // ── list indexing ────────────────────────────────────────────────────────────
@@ -268,7 +268,7 @@ fn test_index_negative() {
 
 fn list_elems(bits: i64) -> Vec<i64> {
     let n = frog_list_len(bits);
-    (0..n).map(|i| frog_list_get(bits, i)).collect()
+    (0..n).map(|i| frog_list_get(bits, i, 0)).collect()
 }
 
 #[test]
@@ -349,8 +349,8 @@ fn test_range_in_let() {
 fn test_slice_str_list() {
     let bits = compile_and_run(r#"["a", "b", "c", "d"][1..3]"#);
     assert_eq!(frog_list_len(bits), 2);
-    let s0 = unsafe { frog_str_as_str(frog_list_get(bits, 0) as *const FrogStr) };
-    let s1 = unsafe { frog_str_as_str(frog_list_get(bits, 1) as *const FrogStr) };
+    let s0 = unsafe { frog_str_as_str(frog_list_get(bits, 0, 0) as *const FrogStr) };
+    let s1 = unsafe { frog_str_as_str(frog_list_get(bits, 1, 0) as *const FrogStr) };
     assert_eq!(s0, "b");
     assert_eq!(s1, "c");
 }
@@ -405,8 +405,8 @@ fn test_comprehension_chained_with_index() {
 fn test_comprehension_over_strings() {
     let bits = compile_and_run(r#"[for s in ["a", "b", "c"] do s + "!"]"#);
     assert_eq!(frog_list_len(bits), 3);
-    let s0 = unsafe { frog_str_as_str(frog_list_get(bits, 0) as *const FrogStr) };
-    let s2 = unsafe { frog_str_as_str(frog_list_get(bits, 2) as *const FrogStr) };
+    let s0 = unsafe { frog_str_as_str(frog_list_get(bits, 0, 0) as *const FrogStr) };
+    let s2 = unsafe { frog_str_as_str(frog_list_get(bits, 2, 0) as *const FrogStr) };
     assert_eq!(s0, "a!");
     assert_eq!(s2, "c!");
 }
@@ -458,4 +458,158 @@ keep"#;
     let bits = compile_and_run(src);
     let s = unsafe { frog_str_as_str(bits as *const FrogStr) };
     assert_eq!(s, "SENTINEL");
+}
+
+// ── structs ────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_struct_construct_and_field_access() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet alice = Person(name=\"Alice\", age=42)\nalice.age"
+    ), 42);
+}
+
+#[test]
+fn test_struct_field_order_independent_at_construction() {
+    // Fields passed out of declaration order still land correctly.
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet alice = Person(age=42, name=\"Alice\")\nalice.age"
+    ), 42);
+}
+
+#[test]
+fn test_struct_declaration_order_independent() {
+    // `Company` references `Person`, declared *after* it in the source.
+    assert_eq!(compile_and_run(
+        "data Company(ceo: Person)\ndata Person(name: Str, age: Int)\nlet c = Company(ceo=Person(name=\"Alice\", age=42))\nc.ceo.age"
+    ), 42);
+}
+
+/// The crux of the whole unboxed-value-semantics design: aliasing a struct
+/// binding and then "mutating" the alias via the rebind-sugar must NOT
+/// affect the original binding, proving copy-on-assign actually holds under
+/// codegen (not just on paper) — structs are flattened `Variable`s, not a
+/// shared boxed pointer.
+#[test]
+fn test_struct_value_semantics_alias_not_affected_by_rebind() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet a = Person(name=\"Alice\", age=42)\nlet b = a\nb.age = 99\na.age"
+    ), 42);
+}
+
+#[test]
+fn test_struct_rebind_sugar_updates_only_target_field() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet a = Person(name=\"Alice\", age=42)\na.age = 99\na.age"
+    ), 99);
+}
+
+#[test]
+fn test_struct_equality_true() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet a = Person(name=\"Alice\", age=42)\nlet b = Person(name=\"Alice\", age=42)\nif a == b then 1 else 0"
+    ), 1);
+}
+
+#[test]
+fn test_struct_equality_false_on_differing_field() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet a = Person(name=\"Alice\", age=42)\nlet b = Person(name=\"Alice\", age=43)\nif a == b then 1 else 0"
+    ), 0);
+}
+
+#[test]
+fn test_struct_not_equal_operator() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet a = Person(name=\"Alice\", age=42)\nlet b = Person(name=\"Alice\", age=43)\nif a != b then 1 else 0"
+    ), 1);
+}
+
+#[test]
+fn test_nested_struct_field_access() {
+    assert_eq!(compile_and_run(
+        "data Address(city: Str, zip: Int)\ndata Person(name: Str, address: Address)\nlet a = Person(name=\"Alice\", address=Address(city=\"Springfield\", zip=12345))\na.address.zip"
+    ), 12345);
+}
+
+#[test]
+fn test_nested_struct_equality() {
+    assert_eq!(compile_and_run(
+        "data Address(city: Str, zip: Int)\ndata Person(name: Str, address: Address)\nlet a = Person(name=\"Alice\", address=Address(city=\"X\", zip=1))\nlet b = Person(name=\"Alice\", address=Address(city=\"X\", zip=1))\nif a == b then 1 else 0"
+    ), 1);
+}
+
+#[test]
+fn test_struct_typed_function_param_and_return() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nfunc birthday(p: Person): Person = Person(name=p.name, age=p.age + 1)\nlet a = Person(name=\"Alice\", age=42)\nlet b = birthday(a)\nb.age"
+    ), 43);
+}
+
+#[test]
+fn test_struct_typed_function_does_not_mutate_caller_arg() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nfunc birthday(p: Person): Person = { p.age = p.age + 1\np }\nlet a = Person(name=\"Alice\", age=42)\nlet b = birthday(a)\na.age"
+    ), 42);
+}
+
+#[test]
+fn test_list_of_structs_index() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet people = [Person(name=\"Alice\", age=42), Person(name=\"Bob\", age=34)]\npeople[1].age"
+    ), 34);
+}
+
+#[test]
+fn test_list_of_structs_iteration_sum() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet people = [Person(name=\"A\", age=1), Person(name=\"B\", age=2), Person(name=\"C\", age=3)]\nlet total = 0\nfor p in people do { total = total + p.age }\ntotal"
+    ), 6);
+}
+
+#[test]
+fn test_comprehension_of_structs() {
+    assert_eq!(compile_and_run(
+        "data Sq(n: Int, sq: Int)\nlet sqs = [for i in 1..4 do Sq(n=i, sq=i * i)]\nsqs[2].sq"
+    ), 9);
+}
+
+/// GC stress: many struct allocations, each holding a `Str` (heap-pointer)
+/// field, forcing multiple collections — regression test for the list
+/// stride/pointer-mask generalization in `GcHeap::mark` (runtime/gc.rs).
+#[test]
+fn test_list_of_structs_with_str_field_survives_gc() {
+    assert_eq!(compile_and_run(
+        "data Person(name: Str, age: Int)\nlet people = [for i in 1..2000 do Person(name=\"p\", age=i)]\npeople[1998].age"
+    ), 1999);
+}
+
+#[test]
+fn test_struct_self_reference_rejected() {
+    let ast = froglang_core::frontend::parser::Parser::parse(
+        "data Tree(value: Int, left: Tree)\n1"
+    ).expect("parse error");
+    let mut tc = froglang_core::frontend::typeck::TypeChecker::new();
+    let err = tc.check_and_lower(ast).expect_err("self-referential struct should be a type error");
+    assert!(format!("{:?}", err).contains("contains itself"), "unexpected error: {:?}", err);
+}
+
+#[test]
+fn test_struct_missing_field_rejected() {
+    let ast = froglang_core::frontend::parser::Parser::parse(
+        "data Person(name: Str, age: Int)\nPerson(name=\"Alice\")\n1"
+    ).expect("parse error");
+    let mut tc = froglang_core::frontend::typeck::TypeChecker::new();
+    let err = tc.check_and_lower(ast).expect_err("missing field should be a type error");
+    assert!(format!("{:?}", err).contains("Missing field"), "unexpected error: {:?}", err);
+}
+
+#[test]
+fn test_struct_nominal_typing_rejects_cross_type_equality() {
+    let ast = froglang_core::frontend::parser::Parser::parse(
+        "data Point(x: Int, y: Int)\ndata Size(x: Int, y: Int)\nlet p = Point(x=1, y=2)\nlet s = Size(x=1, y=2)\np == s"
+    ).expect("parse error");
+    let mut tc = froglang_core::frontend::typeck::TypeChecker::new();
+    let err = tc.check_and_lower(ast).expect_err("different struct names should never unify");
+    assert!(format!("{:?}", err).contains("incompatible types"), "unexpected error: {:?}", err);
 }

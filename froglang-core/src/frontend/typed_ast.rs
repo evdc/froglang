@@ -81,4 +81,26 @@ pub enum TypedExprKind {
         cond:     Option<TypedExprRef>,
         body:     TypedExprRef,
     },
+
+    /// `Name(field=value, ...)` struct construction, already reordered into
+    /// declared-field order. Result type is `Type::Struct(name)`.
+    StructInit {
+        name:   String,
+        fields: Vec<(String, TypedExprRef)>,
+    },
+
+    /// `target.field` — struct field access. Result type is the field's type.
+    FieldAccess {
+        target: TypedExprRef,
+        field:  String,
+    },
+
+    /// `base.field = value` — the struct "mutation" rebind-sugar: `base`
+    /// (a plain local, never a nested path — see `Grammar::assign`) is
+    /// rebound with `field` replaced by `value`. Result type is `Type::None`.
+    FieldAssign {
+        base:  String,
+        field: String,
+        value: TypedExprRef,
+    },
 }

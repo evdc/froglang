@@ -38,13 +38,20 @@ impl FrogValue {
                 let inner_ty = inner.as_ref();
                 let elems = (0..len)
                     .map(|i| {
-                        let elem = runtime::ffi::frog_list_get(bits, i as i64);
+                        let elem = runtime::ffi::frog_list_get(bits, i as i64, 0);
                         FrogValue::from_bits(elem, inner_ty, _heap)
                     })
                     .collect();
                 FrogValue::List(elems)
             },
-            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } => {
+            // Struct values aren't yet representable in the embedding API's
+            // `FrogValue` (they're multi-slot in the JIT ABI — see
+            // `struct_fields` in codegen/mod.rs — while every other
+            // `FrogValue` variant round-trips through exactly one `i64`).
+            // Not reachable from `compile_and_run`/test code as long as
+            // struct values only ever appear as locals, not as a bare
+            // top-level result or REPL binding — see the struct-support plan.
+            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Struct(_) => {
                 FrogValue::None
             },
         }
@@ -186,6 +193,7 @@ impl FrogState {
                 entry_count,
                 &self.env,
                 &self.env_types,
+                self.tc.struct_defs(),
             )
         }));
 

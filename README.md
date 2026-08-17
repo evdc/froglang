@@ -125,7 +125,7 @@ heap, set via an `ACTIVE_HEAP` thread-local pointer during JIT execution.
 
 | Name | Type | Description |
 |---|---|---|
-| `print(s)` | `Str -> None` | Print string to stdout with newline |
+| `print(value)` | `Any -> None` | Coerce a value to text and print it with a newline |
 | `gc_dump()` | `() -> None` | Dump GC heap contents to stderr |
 
 ## REPL

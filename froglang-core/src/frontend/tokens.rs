@@ -111,6 +111,14 @@ pub enum Token {
     #[lex("do")]
     Do,
 
+    #[prefix(Grammar::data_decl)]
+    #[lex("data")]
+    Data,
+
+    #[infix(Grammar::field_access, Precedence::Call)]
+    #[lex(".")]
+    Dot,
+
     #[infix(Grammar::arrow_func, Precedence::Assign)]
     #[lex("->")]
     Arrow,

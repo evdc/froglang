@@ -1,7 +1,7 @@
 use std::alloc::Layout;
 use std::io::Write;
 
-use super::gc::{ElemTag, FrogList, FrogStr, GcHeap, GC_HEAP, ACTIVE_HEAP};
+use super::gc::{FrogList, FrogStr, GcHeap, GC_HEAP, ACTIVE_HEAP};
 
 /// Call `f` with a mutable reference to the active GcHeap.
 /// Uses the `FrogState`-owned heap if one is executing on this thread,
@@ -116,20 +116,71 @@ pub extern "C" fn frog_str_println(s: i64) {
     let _ = std::io::stdout().flush();
 }
 
+#[no_mangle]
+pub extern "C" fn frog_int_println(n: i64) {
+    println!("{n}");
+}
+
+#[no_mangle]
+pub extern "C" fn frog_float_println(n: f64) {
+    println!("{n:?}");
+}
+
+#[no_mangle]
+pub extern "C" fn frog_bool_println(b: i8) {
+    println!("{}", b != 0);
+}
+
+/// Print a list whose element representation is described by `kind`.
+/// Nested lists deliberately use a compact placeholder: list elements carry
+/// no recursive type metadata at runtime.
+#[no_mangle]
+pub extern "C" fn frog_list_println(list: i64, kind: i64) {
+    let list = unsafe { &*(list as *const FrogList) };
+    let stride = (list.stride as usize).max(1);
+    let elem_len = list.len as usize / stride;
+    let mut out = String::from("[");
+    for i in 0..elem_len {
+        if i != 0 { out.push_str(", "); }
+        if stride != 1 {
+            // Struct elements aren't printable yet — see DESIGN discussion.
+            out.push_str("<struct>");
+            continue;
+        }
+        let value = unsafe { *list.data.add(i) };
+        match kind {
+            0 => out.push_str(&value.to_string()),
+            1 => out.push_str(&f64::from_bits(value as u64).to_string()),
+            2 => out.push_str(&(value != 0).to_string()),
+            3 => unsafe {
+                let s = value as *const FrogStr;
+                let data = (s as *const u8).add(std::mem::size_of::<FrogStr>());
+                let bytes = std::slice::from_raw_parts(data, (*s).len as usize);
+                out.push_str(&String::from_utf8_lossy(bytes));
+            },
+            _ => out.push_str("<list>"),
+        }
+    }
+    println!("{out}]");
+}
+
 // ── List operations ───────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn frog_alloc_list(cap: i64, elem_tag: i64) -> i64 {
-    let tag = if elem_tag == 0 { ElemTag::Scalar } else { ElemTag::Ptr };
+pub extern "C" fn frog_alloc_list(cap: i64, stride: i64, ptr_mask: i64) -> i64 {
     with_heap(|heap| {
         heap.maybe_collect();
-        heap.alloc_list(cap as usize, tag) as i64
+        heap.alloc_list(cap as usize, stride as usize, ptr_mask as u64) as i64
     })
 }
 
 #[no_mangle]
 pub extern "C" fn frog_list_len(list: i64) -> i64 {
-    unsafe { (*(list as *const FrogList)).len as i64 }
+    unsafe {
+        let list_ptr = list as *const FrogList;
+        let stride = ((*list_ptr).stride as i64).max(1);
+        (*list_ptr).len as i64 / stride
+    }
 }
 
 /// Terminate the process with a diagnostic. Called for an out-of-range list
@@ -157,23 +208,31 @@ fn resolve_index(idx: i64, len: i64) -> usize {
     real_idx as usize
 }
 
+/// Read one raw `i64` slot at `field_offset` within element `idx`.
+/// `field_offset` is always `0` for a scalar (non-struct) element type —
+/// see `struct_fields` in `codegen/mod.rs`, which computes it for each
+/// leaf of a struct-typed element.
 #[no_mangle]
-pub extern "C" fn frog_list_get(list: i64, idx: i64) -> i64 {
+pub extern "C" fn frog_list_get(list: i64, idx: i64, field_offset: i64) -> i64 {
     unsafe {
         let list_ptr = list as *const FrogList;
-        let len = (*list_ptr).len as i64;
-        let real_idx = resolve_index(idx, len);
-        *(*list_ptr).data.add(real_idx)
+        let stride = ((*list_ptr).stride as i64).max(1);
+        let elem_len = (*list_ptr).len as i64 / stride;
+        let real_idx = resolve_index(idx, elem_len);
+        let slot = real_idx as i64 * stride + field_offset;
+        *(*list_ptr).data.add(slot as usize)
     }
 }
 
 #[no_mangle]
-pub extern "C" fn frog_list_set(list: i64, idx: i64, val: i64) {
+pub extern "C" fn frog_list_set(list: i64, idx: i64, field_offset: i64, val: i64) {
     unsafe {
         let list_ptr = list as *mut FrogList;
-        let len = (*list_ptr).len as i64;
-        let real_idx = resolve_index(idx, len);
-        *(*list_ptr).data.add(real_idx) = val;
+        let stride = ((*list_ptr).stride as i64).max(1);
+        let elem_len = (*list_ptr).len as i64 / stride;
+        let real_idx = resolve_index(idx, elem_len);
+        let slot = real_idx as i64 * stride + field_offset;
+        *(*list_ptr).data.add(slot as usize) = val;
     }
 }
 
@@ -195,21 +254,24 @@ fn clamp_bound(idx: i64, len: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
     let list_ptr = list as *const FrogList;
-    let (len, tag) = unsafe { ((*list_ptr).len as i64, (*list_ptr).elem_tag) };
+    let (stride, ptr_mask) = unsafe { ((*list_ptr).stride as i64, (*list_ptr).ptr_mask) };
+    let stride = stride.max(1);
+    let elem_len = unsafe { (*list_ptr).len as i64 } / stride;
 
-    let s = if start == i64::MIN { 0 } else { clamp_bound(start, len) };
-    let e = if end == i64::MAX { len } else { clamp_bound(end, len) };
+    let s = if start == i64::MIN { 0 } else { clamp_bound(start, elem_len) };
+    let e = if end == i64::MAX { elem_len } else { clamp_bound(end, elem_len) };
     let e = e.max(s);
-    let slice_len = (e - s) as usize;
+    let slice_elems = (e - s) as usize;
+    let slice_slots = slice_elems * stride as usize;
 
     with_heap(|heap| {
         heap.maybe_collect();
-        let new_list = heap.alloc_list(slice_len.max(1), tag);
+        let new_list = heap.alloc_list(slice_elems.max(1), stride as usize, ptr_mask);
         unsafe {
-            (*new_list).len = slice_len as u32;
-            if slice_len > 0 {
-                let src = (*list_ptr).data.add(s as usize);
-                std::ptr::copy_nonoverlapping(src, (*new_list).data, slice_len);
+            (*new_list).len = slice_slots as u32;
+            if slice_slots > 0 {
+                let src = (*list_ptr).data.add(s as usize * stride as usize);
+                std::ptr::copy_nonoverlapping(src, (*new_list).data, slice_slots);
             }
         }
         new_list as i64
@@ -252,7 +314,7 @@ pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
 
     with_heap(|heap| {
         heap.maybe_collect();
-        let list = heap.alloc_list(len.max(1), ElemTag::Scalar);
+        let list = heap.alloc_list(len.max(1), 1, 0);
         unsafe {
             (*list).len = len as u32;
             for i in 0..len {
@@ -333,13 +395,13 @@ mod tests {
 
     #[test]
     fn test_frog_list_push_and_get() {
-        let list = frog_alloc_list(2, 0);
+        let list = frog_alloc_list(2, 1, 0);
         frog_list_push(list, 10);
         frog_list_push(list, 20);
         frog_list_push(list, 30);  // triggers realloc
         assert_eq!(frog_list_len(list), 3);
-        assert_eq!(frog_list_get(list, 0), 10);
-        assert_eq!(frog_list_get(list, 1), 20);
-        assert_eq!(frog_list_get(list, 2), 30);
+        assert_eq!(frog_list_get(list, 0, 0), 10);
+        assert_eq!(frog_list_get(list, 1, 0), 20);
+        assert_eq!(frog_list_get(list, 2, 0), 30);
     }
 }

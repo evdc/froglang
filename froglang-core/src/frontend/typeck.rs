@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Display, vec};
 
 use crate::frontend::{
-    expression::{AssignExpr, BinaryExpr, ConditionalExpr, Expression, ForLoopExpr, FunctionExpr, LiteralExpr, UnaryExpr},
+    expression::{AssignExpr, BinaryExpr, ConditionalExpr, Expression, FieldAccessExpr, ForLoopExpr, FunctionExpr, LiteralExpr, UnaryExpr},
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
@@ -40,6 +40,15 @@ fn type_implements(ty: &Type, tr: &Trait) -> bool {
     match ty {
         // A union satisfies a trait iff every variant does.
         Type::Union(variants) => variants.iter().all(|v| type_implements(v, tr)),
+        // Structs get structural `==`/`!=` (desugared into a per-field
+        // conjunction at lowering time — see `TypeChecker::desugar_struct_eq`
+        // in `check_and_lower`'s `Binary` arm), so they satisfy `Eq`. A
+        // struct with a field type that itself doesn't implement `Eq` (e.g.
+        // a `List` field — lists don't support `==` at all currently) will
+        // fail type-checking when the desugared per-field comparison is
+        // itself inferred, which is the correct place for that error to
+        // surface, not here.
+        Type::Struct(_) if *tr == Trait::Eq => true,
         _ => match tr {
             Trait::Num => matches!(ty, Type::Int | Type::Float),
             Trait::Eq  => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
@@ -63,6 +72,12 @@ pub enum Type {
     /// Sum / union type: a value whose type is one of the variants.
     /// Produced by if-expressions whose branches have incompatible types.
     Union(Vec<Type>),
+    /// A `data Name(...)` struct type. Nominal: only the name is compared
+    /// (derived `PartialEq`/`unify`'s `t1 == t2` fast path already give
+    /// this for free — two structs unify iff their names match). Field
+    /// names/types live in `TypeChecker.struct_defs`, not here, so cloning
+    /// a `Type::Struct` stays cheap regardless of field count.
+    Struct(String),
 }
 
 impl Type {
@@ -132,6 +147,7 @@ impl Display for Type {
                 let strs: Vec<String> = variants.iter().map(|t| format!("{}", t)).collect();
                 write!(f, "{}", strs.join(" | "))
             }
+            Type::Struct(name) => write!(f, "{}", name),
         }
     }
 }
@@ -158,27 +174,47 @@ pub fn numeric_join(t1: &Type, t2: &Type) -> Option<Type> {
     None
 }
 
+/// Ordered field list for one declared struct: `(field_name, field_type)`
+/// pairs in declaration order — order matters for construction-argument
+/// reordering and for flattened codegen layout (see `struct_fields` in
+/// `codegen/mod.rs`).
+pub type StructDefs = HashMap<String, Vec<(String, Type)>>;
+
 pub struct TypeChecker {
     // Variable (value level) name -> Type
     ctx: HashMap<String, Type>,
     // TypeVar name -> Type
     substitutions: HashMap<String, Type>,
     next_id: u32,
+    /// Registered `data Name(...)` declarations — see `hoist_data_decls`.
+    /// Never scoped/popped: once a struct name is registered it stays
+    /// visible for the rest of the program, including from later
+    /// independent blocks. A known simplification, not a hard limit.
+    struct_defs: StructDefs,
 }
 
 pub struct TypeCheckerCheckpoint {
     ctx: HashMap<String, Type>,
     substitutions: HashMap<String, Type>,
     next_id: u32,
+    struct_defs: StructDefs,
 }
 
 impl TypeChecker {
     pub fn empty() -> Self {
-        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0 }
+        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0 }
+        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new() }
+    }
+
+    /// Field layout for every registered struct, in declaration order.
+    /// Threaded into `Codegen::compile_entry` so codegen can flatten
+    /// struct-typed values into their leaf fields — see `struct_fields`
+    /// in `codegen/mod.rs`.
+    pub fn struct_defs(&self) -> &StructDefs {
+        &self.struct_defs
     }
 
     /// Fresh unconstrained type variable (used for unannotated lambda parameters).
@@ -200,6 +236,7 @@ impl TypeChecker {
             ctx: self.ctx.clone(),
             substitutions: self.substitutions.clone(),
             next_id: self.next_id,
+            struct_defs: self.struct_defs.clone(),
         }
     }
 
@@ -207,6 +244,7 @@ impl TypeChecker {
         self.ctx = cp.ctx;
         self.substitutions = cp.substitutions;
         self.next_id = cp.next_id;
+        self.struct_defs = cp.struct_defs;
     }
 
     pub fn add_ctx(mut self, ctx: impl Iterator<Item=(String, Type)>) -> Self {
@@ -247,9 +285,11 @@ impl TypeChecker {
             // exists on one control-flow path (e.g. one arm of an `if`),
             // which is invalid IR, not just a stale-name bug.
             Expression::Block(stmts) => {
+                self.hoist_data_decls(stmts)?;
                 self.with_context(std::iter::empty(), |t| {
                     let mut last = Type::None;
                     for stmt in stmts {
+                        if matches!(stmt.item, Expression::DataDecl(_)) { continue; }
                         last = t.infer(stmt)?;
                     }
                     Ok(last)
@@ -365,7 +405,138 @@ impl TypeChecker {
                 let body_ty = self.infer_for_loop(fl)?;
                 Ok(Type::List(Box::new(body_ty)))
             }
+
+            // Already registered by `hoist_data_decls` (called from the
+            // enclosing `Block`) by the time this is ever reached directly.
+            Expression::DataDecl(_) => Ok(Type::None),
+
+            Expression::FieldAccess(fa) => self.infer_field_access(fa, expr.span),
         }
+    }
+
+    fn infer_field_access(&mut self, fa: &FieldAccessExpr, span: Span) -> TypeResult {
+        let target_ty = self.infer(&fa.target)?;
+        let resolved = self.lookup(&target_ty);
+        match &resolved {
+            Type::Struct(sname) => {
+                let field_defs = self.struct_defs.get(sname).cloned().unwrap_or_default();
+                field_defs.iter().find(|(n, _)| n == &fa.field).map(|(_, t)| t.clone())
+                    .ok_or_else(|| Spanned::from(TypeError {
+                        msg: format!("Struct {} has no field '{}'", sname, fa.field)
+                    }, span))
+            },
+            _ => Err(Spanned::from(TypeError {
+                msg: format!("Can't access field '{}' on {}, expected a struct", fa.field, resolved)
+            }, fa.target.span)),
+        }
+    }
+
+    /// Register every `data Name(field: Type, ...)` declaration found
+    /// directly in `stmts` into `self.struct_defs`, in three phases so
+    /// declarations can reference each other regardless of source order:
+    /// (1) register every name, so forward references resolve; (2) resolve
+    /// every field list to concrete `Type`s; (3) check the resulting
+    /// field-type graph for direct/transitive self-reference, which would
+    /// make an unboxed struct infinite size.
+    fn hoist_data_decls(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
+        for s in stmts {
+            if let Expression::DataDecl(d) = &s.item {
+                if self.struct_defs.contains_key(&d.name) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Struct '{}' is already declared", d.name)
+                    }, s.span));
+                }
+                self.struct_defs.insert(d.name.clone(), Vec::new());
+            }
+        }
+        for s in stmts {
+            if let Expression::DataDecl(d) = &s.item {
+                let mut fields = Vec::with_capacity(d.fields.len());
+                for p in &d.fields {
+                    let ann = p.ty.as_ref().expect("data-decl fields always carry a type annotation — see Grammar::data_decl");
+                    let ty = self.resolve_annotation(&ann.item, s.span)?;
+                    fields.push((p.name.clone(), ty));
+                }
+                self.struct_defs.insert(d.name.clone(), fields);
+            }
+        }
+        for s in stmts {
+            if let Expression::DataDecl(d) = &s.item {
+                self.check_struct_acyclic(&d.name, &mut Vec::new(), s.span)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// DFS over the struct field-type graph, following only direct
+    /// `Type::Struct` fields (a `List(Struct(_))` field is fine — a list is
+    /// a heap pointer, not inline storage, so it can't create an
+    /// infinite-size cycle the way a direct field can).
+    fn check_struct_acyclic(&self, name: &str, path: &mut Vec<String>, span: Span) -> Result<(), Spanned<TypeError>> {
+        if path.iter().any(|n| n == name) {
+            path.push(name.to_string());
+            return Err(Spanned::from(TypeError {
+                msg: format!("Struct type contains itself: {}", path.join(" -> "))
+            }, span));
+        }
+        path.push(name.to_string());
+        if let Some(fields) = self.struct_defs.get(name).cloned() {
+            for (_, fty) in &fields {
+                if let Type::Struct(inner) = fty {
+                    self.check_struct_acyclic(inner, path, span)?;
+                }
+            }
+        }
+        path.pop();
+        Ok(())
+    }
+
+    /// Type-check a `Name(field=value, ...)` struct construction call —
+    /// intercepted in `infer_call` before the generic function-call path.
+    fn infer_struct_init(&mut self, name: &str, field_defs: &[(String, Type)], args: &[Spanned<Expression>], span: Span) -> TypeResult {
+        let mut seen: HashMap<String, Span> = HashMap::new();
+        for arg in args {
+            let (fname, value_expr) = match &arg.item {
+                Expression::Assign(a) => {
+                    let fname = a.target.item.get_identifier()
+                        .ok_or_else(|| Spanned::from(TypeError {
+                            msg: "Struct field name must be a plain identifier".to_string()
+                        }, arg.span))?
+                        .to_string();
+                    (fname, &*a.value)
+                },
+                _ => return Err(Spanned::from(TypeError {
+                    msg: format!("Struct construction requires named fields, e.g. {}(field=value)", name)
+                }, arg.span)),
+            };
+            if let Some(_prev) = seen.get(&fname) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Duplicate field '{}' in construction of {}", fname, name)
+                }, arg.span));
+            }
+            let field_ty = field_defs.iter().find(|(n, _)| n == &fname)
+                .map(|(_, t)| t.clone())
+                .ok_or_else(|| Spanned::from(TypeError {
+                    msg: format!("Struct {} has no field '{}'", name, fname)
+                }, arg.span))?;
+            let value_ty = self.infer(value_expr)?;
+            let resolved_value_ty = self.lookup(&value_ty);
+            let resolved_field_ty = self.lookup(&field_ty);
+            if !(widens_to(&resolved_value_ty, &resolved_field_ty) || self.unify(&value_ty, &field_ty)) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Field '{}' of {} expects {}, got {}", fname, name, resolved_field_ty, resolved_value_ty)
+                }, value_expr.span));
+            }
+            seen.insert(fname, arg.span);
+        }
+        for (fname, _) in field_defs {
+            if !seen.contains_key(fname) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Missing field '{}' in construction of {}", fname, name)
+                }, span));
+            }
+        }
+        Ok(Type::Struct(name.to_string()))
     }
 
     /// Shared inference for `for var in iterable (if cond)? body`: unifies
@@ -463,6 +634,31 @@ impl TypeChecker {
     }
 
     fn infer_call(&mut self, callable: &Spanned<Expression>, args: &Vec<Spanned<Expression>>) -> TypeResult {
+        // Struct construction: `Person(name="Alice", age=42)` looks like an
+        // ordinary call syntactically (there's no dedicated construction
+        // grammar — see `Grammar::data_decl`'s doc comment), so it's
+        // disambiguated here, before the generic function-call path, by
+        // checking whether the callee name is a registered struct.
+        if let Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) = &callable.item {
+            if let Some(field_defs) = self.struct_defs.get(name).cloned() {
+                return self.infer_struct_init(name, &field_defs, args, callable.span);
+            }
+        }
+
+        // `print` is a builtin conversion: unlike ordinary functions, its
+        // argument is accepted at any type and is formatted as text by the
+        // code generator/runtime.  Still infer the argument so errors inside
+        // it are reported normally.
+        if matches!(&callable.item, Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "print") {
+            if args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", args.len())
+                }, callable.span));
+            }
+            self.infer(&args[0])?;
+            return Ok(Type::None);
+        }
+
         let raw_type = self.infer(callable)?;
         let func_type = self.lookup(&raw_type);
 
@@ -774,9 +970,11 @@ impl TypeChecker {
         let span = expr.span;
         match expr.item {
             Expression::Block(stmts) => {
+                self.hoist_data_decls(&stmts)?;
                 let mut lowered = Vec::with_capacity(stmts.len());
                 let mut ty = Type::None;
                 for s in stmts {
+                    if matches!(s.item, Expression::DataDecl(_)) { continue; }
                     let t = self.check_and_lower(s)?;
                     ty = t.item.ty.clone();
                     lowered.push(t);
@@ -825,7 +1023,15 @@ impl TypeChecker {
             Expression::Binary(b) => {
                 let left  = self.check_and_lower(*b.left)?;
                 let right = self.check_and_lower(*b.right)?;
-                TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
+                if matches!(b.op, Token::EqEq | Token::NotEq) {
+                    if let Type::Struct(name) = left.item.ty.clone() {
+                        self.desugar_struct_eq(b.op, left, right, &name, span)
+                    } else {
+                        TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
+                    }
+                } else {
+                    TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
+                }
             },
 
             Expression::Conditional(c) => {
@@ -856,10 +1062,19 @@ impl TypeChecker {
             },
 
             Expression::Assign(a) => {
-                let name  = a.target.item.get_identifier()
-                    .expect("assignment target must be identifier").to_string();
-                let value = self.check_and_lower(*a.value)?;
-                TypedExprKind::Assign { name, value: Box::new(value) }
+                let target_item = a.target.item;
+                if let Expression::FieldAccess(fa) = target_item {
+                    let base = fa.target.item.get_identifier()
+                        .expect("parser only allows a bare identifier as a field-assign base")
+                        .to_string();
+                    let value = self.check_and_lower(*a.value)?;
+                    TypedExprKind::FieldAssign { base, field: fa.field, value: Box::new(value) }
+                } else {
+                    let name  = target_item.get_identifier()
+                        .expect("assignment target must be identifier").to_string();
+                    let value = self.check_and_lower(*a.value)?;
+                    TypedExprKind::Assign { name, value: Box::new(value) }
+                }
             },
 
             Expression::Function(f) => {
@@ -885,12 +1100,41 @@ impl TypeChecker {
             },
 
             Expression::Call(c) => {
-                let callable = self.check_and_lower(*c.callable)?;
-                let mut args = Vec::with_capacity(c.args.len());
-                for arg in c.args {
-                    args.push(self.check_and_lower(arg)?);
+                let struct_name = c.callable.item.get_identifier()
+                    .filter(|n| self.struct_defs.contains_key(*n))
+                    .map(|n| n.to_string());
+                if let Some(name) = struct_name {
+                    let field_defs = self.struct_defs.get(&name).cloned().unwrap_or_default();
+                    let mut fields: Vec<(String, Box<Spanned<TypedExpr>>)> = Vec::with_capacity(c.args.len());
+                    for arg in c.args {
+                        match arg.item {
+                            Expression::Assign(a) => {
+                                let fname = a.target.item.get_identifier()
+                                    .expect("validated during infer").to_string();
+                                let value = self.check_and_lower(*a.value)?;
+                                fields.push((fname, Box::new(value)));
+                            },
+                            _ => unreachable!("struct construction args validated as Assign during infer"),
+                        }
+                    }
+                    // Reorder into declared-field order so codegen's flattened
+                    // leaf layout (`struct_fields` in codegen/mod.rs) lines up
+                    // regardless of the source's argument order.
+                    let mut ordered = Vec::with_capacity(field_defs.len());
+                    for (fname, _) in &field_defs {
+                        let idx = fields.iter().position(|(n, _)| n == fname)
+                            .expect("field presence validated during infer");
+                        ordered.push(fields.remove(idx));
+                    }
+                    TypedExprKind::StructInit { name, fields: ordered }
+                } else {
+                    let callable = self.check_and_lower(*c.callable)?;
+                    let mut args = Vec::with_capacity(c.args.len());
+                    for arg in c.args {
+                        args.push(self.check_and_lower(arg)?);
+                    }
+                    TypedExprKind::Call { callable: Box::new(callable), args }
                 }
-                TypedExprKind::Call { callable: Box::new(callable), args }
             },
 
             Expression::Tuple(elems) => {
@@ -907,10 +1151,15 @@ impl TypeChecker {
             // since the top-level program/REPL entry goes through
             // `check_and_lower_entry` instead, which does not scope.
             Expression::Block(stmts) => {
+                // Hoisting already ran — see `infer`'s `Expression::Block`
+                // arm, which always runs first (`check_and_lower` infers
+                // the whole expression before this match) — so only the
+                // skip (not another `hoist_data_decls` call) is needed here.
                 let prev_ctx = self.ctx.clone();
                 let mut lowered = Vec::with_capacity(stmts.len());
                 let mut err = None;
                 for s in stmts {
+                    if matches!(s.item, Expression::DataDecl(_)) { continue; }
                     match self.check_and_lower(s) {
                         Ok(t) => lowered.push(t),
                         Err(e) => { err = Some(e); break; },
@@ -966,6 +1215,14 @@ impl TypeChecker {
                 let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
                 TypedExprKind::Comprehension { var, iterable, cond, body }
             },
+
+            // Handled entirely by `hoist_data_decls` — never reaches codegen.
+            Expression::DataDecl(_) => TypedExprKind::IntLit(0),
+
+            Expression::FieldAccess(fa) => {
+                let target = self.check_and_lower(*fa.target)?;
+                TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field }
+            },
         };
 
         Ok(Spanned::from(TypedExpr { ty: resolved_ty, kind }, span))
@@ -1003,6 +1260,54 @@ impl TypeChecker {
         Ok((fl.var, Box::new(iterable), cond, Box::new(body)))
     }
 
+    /// Desugar `left == right` / `left != right` (both already lowered,
+    /// same `Type::Struct(name)`) into a per-field structural comparison.
+    /// `left`/`right` are bound to fresh temporaries first so a
+    /// side-effecting operand (e.g. a function call returning a struct)
+    /// is only evaluated once, not once per field.
+    fn desugar_struct_eq(&mut self, op: Token, left: Spanned<TypedExpr>, right: Spanned<TypedExpr>, name: &str, span: Span) -> TypedExprKind {
+        let l_name = format!("__struct_eq_l{}", self.next_id); self.next_id += 1;
+        let r_name = format!("__struct_eq_r{}", self.next_id); self.next_id += 1;
+        let left_ty = left.item.ty.clone();
+        let right_ty = right.item.ty.clone();
+
+        let l_assign = Spanned::from(TypedExpr { ty: left_ty.clone(), kind: TypedExprKind::Assign { name: l_name.clone(), value: Box::new(left) } }, span);
+        let r_assign = Spanned::from(TypedExpr { ty: right_ty.clone(), kind: TypedExprKind::Assign { name: r_name.clone(), value: Box::new(right) } }, span);
+        let l_var = Spanned::from(TypedExpr { ty: left_ty, kind: TypedExprKind::Var(l_name) }, span);
+        let r_var = Spanned::from(TypedExpr { ty: right_ty, kind: TypedExprKind::Var(r_name) }, span);
+
+        let eq_expr = self.build_struct_eq(name, l_var, r_var, span);
+        let result = if op == Token::NotEq {
+            Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Unary { op: Token::Not, expr: Box::new(eq_expr) } }, span)
+        } else {
+            eq_expr
+        };
+
+        TypedExprKind::Block(vec![l_assign, r_assign, result])
+    }
+
+    /// Build `l.f1 == r.f1 and l.f2 == r.f2 and ...` for every field of
+    /// struct `name`, recursing for nested-struct fields. `l`/`r` are
+    /// assumed cheap to duplicate (a `Var` or `FieldAccess` chain — never
+    /// something that could re-run a side effect).
+    fn build_struct_eq(&self, name: &str, l: Spanned<TypedExpr>, r: Spanned<TypedExpr>, span: Span) -> Spanned<TypedExpr> {
+        let fields = self.struct_defs.get(name).cloned().unwrap_or_default();
+        let mut chain: Option<Spanned<TypedExpr>> = None;
+        for (fname, fty) in &fields {
+            let lf = Spanned::from(TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(l.clone()), field: fname.clone() } }, span);
+            let rf = Spanned::from(TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(r.clone()), field: fname.clone() } }, span);
+            let sub = match fty {
+                Type::Struct(inner) => self.build_struct_eq(inner, lf, rf, span),
+                _ => Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::EqEq, left: Box::new(lf), right: Box::new(rf) } }, span),
+            };
+            chain = Some(match chain {
+                None => sub,
+                Some(prev) => Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::And, left: Box::new(prev), right: Box::new(sub) } }, span),
+            });
+        }
+        chain.unwrap_or_else(|| Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::BoolLit(true) }, span))
+    }
+
     fn resolve_annotation(&self, annotation: &Expression, span: Span) -> TypeResult {
         match annotation {
             Expression::Literal(lit) => match &lit.token {
@@ -1011,6 +1316,7 @@ impl TypeChecker {
                     "Float" => Ok(Type::Float),
                     "Bool"  => Ok(Type::Bool),
                     "Str"   => Ok(Type::Str),
+                    _ if self.struct_defs.contains_key(name) => Ok(Type::Struct(name.clone())),
                     _       => self.get(name, span),
                 },
                 _ => Err(Spanned::from(
@@ -1081,6 +1387,30 @@ impl Infer for BinaryExpr {
 
 impl Infer for AssignExpr {
     fn infer(&self, tc: &mut TypeChecker, span: Span) -> TypeResult {
+        // `alice.age = 43` — rebind-sugar for struct "mutation". `Grammar::assign`
+        // only lets this parse when the FieldAccess's own target is a bare
+        // identifier, so `get_identifier` below is guaranteed to succeed.
+        if let Expression::FieldAccess(fa) = &self.target.item {
+            let base_name = fa.target.item.get_identifier()
+                .expect("parser only allows a bare identifier as a field-assign base")
+                .to_string();
+            let base_ty = tc.get(&base_name, span)?;
+            let resolved_base = tc.lookup(&base_ty);
+            let struct_name = match &resolved_base {
+                Type::Struct(n) => n.clone(),
+                _ => return Err(Spanned::from(TypeError {
+                    msg: format!("Can't assign field '{}' on {}, expected a struct", fa.field, resolved_base)
+                }, span)),
+            };
+            let field_defs = tc.struct_defs.get(&struct_name).cloned().unwrap_or_default();
+            let field_ty = field_defs.iter().find(|(n, _)| n == &fa.field)
+                .map(|(_, t)| t.clone())
+                .ok_or_else(|| Spanned::from(TypeError {
+                    msg: format!("Struct {} has no field '{}'", struct_name, fa.field)
+                }, span))?;
+            return tc.check(&self.value, &field_ty);
+        }
+
         let name = &self.target.item.get_identifier().expect("should have validated in parsing");
         let ty = if let Some(annotation) = &self.typ {
             let annotated_ty = tc.resolve_annotation(&annotation.item, span)?;

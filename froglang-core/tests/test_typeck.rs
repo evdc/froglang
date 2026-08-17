@@ -887,6 +887,46 @@ fn test_union_eq_constraint() {
     assert_eq!(ty, Type::Bool);
 }
 
+// ── Block / conditional-branch lexical scoping ────────────────────────────────
+//
+// A `let` made inside a block or a conditional branch must not remain bound
+// once control leaves it — otherwise codegen can be asked to reference an
+// SSA value that only exists on one control-flow path, which used to crash
+// the Cranelift verifier instead of producing a type error here.
+
+#[test]
+fn test_let_in_braced_branch_does_not_leak() {
+    let err = infer_src("if true then { let y = 5 } else 0\ny").unwrap_err();
+    assert!(err.contains("Unbound variable"), "unexpected error: {}", err);
+}
+
+#[test]
+fn test_let_in_bare_branch_does_not_leak() {
+    // Branches don't require `{ }` — `if c then let y = 5 else 0` is valid
+    // syntax, and must be scoped exactly like the braced form above.
+    let err = infer_src("if true then let y = 5 else 0\ny").unwrap_err();
+    assert!(err.contains("Unbound variable"), "unexpected error: {}", err);
+}
+
+#[test]
+fn test_let_in_branch_visible_within_same_branch() {
+    // A binding IS visible to the rest of its own branch — only leakage
+    // past the conditional is rejected.
+    let ty = infer_src("if true then { let y = 5; y + 1 } else 0").unwrap();
+    assert_eq!(ty, Type::Int);
+}
+
+#[test]
+fn test_let_in_nested_block_does_not_leak() {
+    // A bare `{ }` block (not attached to an `if`) is also its own scope.
+    // Two statements, so the parser doesn't unwrap `{ }` down to a single
+    // bare expression (see test_parser::test_block_single_expr_unwraps) —
+    // that unwrapping is exactly why the single-statement `{ let y = 5 }`
+    // case above is caught by conditional-branch scoping, not Block scoping.
+    let err = infer_src("{ let z = 1; z + 1 }\nz").unwrap_err();
+    assert!(err.contains("Unbound variable"), "unexpected error: {}", err);
+}
+
 // ── Bug #4: colon no longer absorbs arrow ────────────────────────────────────
 
 #[test]

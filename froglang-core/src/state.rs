@@ -72,6 +72,12 @@ impl FrogValue {
 pub enum FrogError {
     Parse(Vec<Spanned<ParseError>>),
     Type(String),
+    /// Codegen hit an internal panic (e.g. an unsupported construct the type
+    /// checker currently lets through — see `codegen::mod`'s `unimplemented!`
+    /// and `panic!` sites). Recovered via `catch_unwind` in `eval`, which
+    /// also rolls back the `Codegen`-internal state that panic would
+    /// otherwise have corrupted, so this `FrogState` stays usable afterward.
+    Codegen(String),
 }
 
 impl std::fmt::Display for FrogError {
@@ -82,8 +88,23 @@ impl std::fmt::Display for FrogError {
                 for e in errs { write!(f, ": {:?}", e)?; }
                 Ok(())
             },
-            FrogError::Type(msg) => write!(f, "Type error: {}", msg),
+            FrogError::Type(msg)    => write!(f, "Type error: {}", msg),
+            FrogError::Codegen(msg) => write!(f, "Codegen error: {}", msg),
         }
+    }
+}
+
+/// Extract a human-readable message from a `catch_unwind` payload. Panics
+/// via `panic!("{}", ...)` / `.expect(...)` carry a `&'static str` or
+/// `String`; anything else (a custom payload type) falls back to a generic
+/// message rather than failing to report the error at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "codegen panicked with a non-string payload".to_string()
     }
 }
 
@@ -126,29 +147,57 @@ impl FrogState {
 
     /// Parse, type-check, compile, and run `src` in this state's context.
     /// Returns the result value and its type.
-    /// On type error, the type-checker state is rolled back.
+    ///
+    /// On a type error, or a codegen panic (an unsupported construct the
+    /// type checker currently lets through), the type-checker and codegen
+    /// state are both rolled back to exactly how they were before this call,
+    /// so a failed `eval` never leaves the `FrogState` unusable for the next
+    /// one.
     pub fn eval(&mut self, src: &str) -> Result<(FrogValue, Type), FrogError> {
         let ast = Parser::parse(src).map_err(FrogError::Parse)?;
 
         let cp = self.tc.checkpoint();
-        let typed = self.tc.check_and_lower(ast).map_err(|e| {
-            self.tc.restore(cp);
-            FrogError::Type(e.to_string())
-        })?;
+        let typed = match self.tc.check_and_lower_entry(ast) {
+            Ok(t) => t,
+            Err(e) => {
+                self.tc.restore(cp);
+                return Err(FrogError::Type(e.to_string()));
+            }
+        };
 
         let result_ty = typed.item.ty.clone();
 
         // `bindings` is every top-level `let`/assignment made in this entry
         // (in source order) — not just the last one, and not conflated with
-        // this entry's own result value (see `eval`'s call to
-        // `build_main_body` in codegen for how `out_ptr` is populated).
-        let (main_id, bindings) = self.codegen.compile_entry(
-            typed,
-            &mut self.string_arena,
-            self.entry_count,
-            &self.env,
-            &self.env_types,
-        );
+        // this entry's own result value (see `build_main_body` in codegen
+        // for how `out_ptr` is populated).
+        //
+        // Wrapped in `catch_unwind`: codegen still panics internally on
+        // unsupported constructs (see codegen/mod.rs) rather than returning
+        // a `Result`, so this is what stands between one bad `eval` call and
+        // a permanently broken `FrogState` (see `Codegen::reset_builder_ctx`
+        // for why the panic itself would otherwise corrupt reusable state).
+        let func_ids_snap = self.codegen.checkpoint_func_ids();
+        let entry_count = self.entry_count;
+        let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.codegen.compile_entry(
+                typed,
+                &mut self.string_arena,
+                entry_count,
+                &self.env,
+                &self.env_types,
+            )
+        }));
+
+        let (main_id, bindings) = match compile_result {
+            Ok(pair) => pair,
+            Err(panic_payload) => {
+                self.codegen.restore_func_ids(func_ids_snap);
+                self.codegen.reset_builder_ctx();
+                self.tc.restore(cp);
+                return Err(FrogError::Codegen(panic_message(&*panic_payload)));
+            }
+        };
         self.entry_count += 1;
 
         let ptr = self.codegen.module.get_finalized_function(main_id);
@@ -158,16 +207,28 @@ impl FrogState {
         let out_ptr = out_buf.as_mut_ptr() as i64;
         let bits = self.call_jit(func_ptr, out_ptr);
 
+        for ((name, ty), &val_bits) in bindings.iter().zip(out_buf.iter()) {
+            self.env.insert(name.clone(), val_bits);
+            self.env_types.insert(name.clone(), ty.clone());
+        }
+
+        // Rebuild the GC's explicit root set from scratch every time, from
+        // exactly what's currently live: this entry's own result (which
+        // needs to survive long enough for `FrogValue::from_bits` below)
+        // plus every heap-typed binding still in `env`. The old code only
+        // ever pushed roots and never popped them, so every string or list
+        // any entry had ever produced — including ones since shadowed or
+        // rebound — stayed alive for the process's lifetime.
+        self.heap.clear_roots();
         if matches!(&result_ty, Type::Str | Type::List(_)) {
             self.heap.push_root(bits, true);
         }
-
-        for ((name, ty), &val_bits) in bindings.iter().zip(out_buf.iter()) {
+        for (name, ty) in &self.env_types {
             if matches!(ty, Type::Str | Type::List(_)) {
-                self.heap.push_root(val_bits, true);
+                if let Some(&val_bits) = self.env.get(name) {
+                    self.heap.push_root(val_bits, true);
+                }
             }
-            self.env.insert(name.clone(), val_bits);
-            self.env_types.insert(name.clone(), ty.clone());
         }
 
         self.heap.maybe_collect();

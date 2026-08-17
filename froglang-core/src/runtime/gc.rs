@@ -98,6 +98,15 @@ impl GcHeap {
         self.roots.push((value, is_ptr));
     }
 
+    /// Discard every explicit root pushed via `push_root`. Callers that
+    /// re-derive their live root set from scratch before each collection
+    /// (e.g. `FrogState::eval`, from its current `env`) should call this
+    /// first — otherwise `roots` only ever grows, keeping every value any
+    /// caller has ever rooted alive for the process's lifetime.
+    pub fn clear_roots(&mut self) {
+        self.roots.clear();
+    }
+
     /// Push a new shadow-stack frame describing `len` `i64` root slots at
     /// `slots` (owned by the JIT function's own stack frame). Zeroes the
     /// slots first: an unwritten slot otherwise holds stack garbage that
@@ -129,6 +138,15 @@ impl GcHeap {
         if self.bytes_allocated > self.gc_threshold {
             self.collect();
         }
+    }
+
+    /// Collect unconditionally, ignoring `gc_threshold`. Mainly for tests
+    /// that want a deterministic sweep rather than waiting on the
+    /// self-growing threshold (`gc_threshold` doubles the live set on every
+    /// collection, so it can take many more allocations than a test wants to
+    /// wait for before the *next* automatic collection fires).
+    pub fn force_collect(&mut self) {
+        self.collect();
     }
 
     fn collect(&mut self) {

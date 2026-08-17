@@ -171,6 +171,33 @@ s"#);
     assert_eq!(frog_str_len(bits), 11);
 }
 
+// ── non-Int list elements (Float/Bool) ───────────────────────────────────────
+//
+// `frog_list_push` takes a plain i64; Float (F64) and Bool (I8) SSA values
+// need the same wire-format conversion applied everywhere else a value
+// crosses an i64 FFI boundary (see `to_i64_repr` in codegen). Before this was
+// applied to list elements too, `[1.0, 2.0]` and `[true, false]` both hit a
+// Cranelift "Verifier errors" panic instead of ever running.
+
+#[test]
+fn test_float_list_roundtrips() {
+    let bits = compile_and_run("[1.0, 2.5, -3.25]");
+    assert_eq!(frog_list_len(bits), 3);
+    let get = |i: i64| f64::from_bits(frog_list_get(bits, i) as u64);
+    assert_eq!(get(0), 1.0);
+    assert_eq!(get(1), 2.5);
+    assert_eq!(get(2), -3.25);
+}
+
+#[test]
+fn test_bool_list_roundtrips() {
+    let bits = compile_and_run("[true, false, true]");
+    assert_eq!(frog_list_len(bits), 3);
+    assert_eq!(frog_list_get(bits, 0) != 0, true);
+    assert_eq!(frog_list_get(bits, 1) != 0, false);
+    assert_eq!(frog_list_get(bits, 2) != 0, true);
+}
+
 /// Regression test for the GC shadow stack: a string bound early must survive
 /// many subsequent string allocations (and the GC collections they trigger)
 /// deep inside recursive calls. Before the shadow stack, `keep` had no root

@@ -238,15 +238,20 @@ impl TypeChecker {
             Expression::Assign(inner)     => inner.infer(self, expr.span),
             Expression::Function(inner)   => inner.infer(self, expr.span),
             Expression::Call(inner)       => self.infer_call(&inner.callable, &inner.args),
+            // A block is its own lexical scope: bindings made by a `let`
+            // inside it (directly, or via a nested block/conditional branch)
+            // must not leak to whatever follows the block. Without this,
+            // codegen can be asked to reference an SSA value that only
+            // exists on one control-flow path (e.g. one arm of an `if`),
+            // which is invalid IR, not just a stale-name bug.
             Expression::Block(stmts) => {
-                if stmts.is_empty() {
-                    return Ok(Type::None);
-                }
-                let mut last = Type::None;
-                for stmt in stmts {
-                    last = self.infer(stmt)?;
-                }
-                Ok(last)
+                self.with_context(std::iter::empty(), |t| {
+                    let mut last = Type::None;
+                    for stmt in stmts {
+                        last = t.infer(stmt)?;
+                    }
+                    Ok(last)
+                })
             },
             Expression::Tuple(elems) => {
                 if elems.is_empty() {
@@ -553,11 +558,15 @@ impl TypeChecker {
         Ok(ty.clone())
     }
 
+    /// Run `closure` with `update_ctx` merged into `self.ctx`, then restore
+    /// `self.ctx` to its pre-call state — regardless of whether `closure`
+    /// succeeded, so a scope's bindings (including ones made *inside*
+    /// `closure`, e.g. a nested `let`) never leak to the caller.
     fn with_context<F, R>(
         &mut self,
         update_ctx: impl Iterator<Item = (String, Type)>,
-        mut closure: F,
-    ) -> R where F: FnMut(&mut Self) -> R,
+        closure: F,
+    ) -> R where F: FnOnce(&mut Self) -> R,
     {
         let prev_ctx = self.ctx.clone();
         self.ctx.extend(update_ctx);
@@ -640,11 +649,45 @@ impl TypeChecker {
         }
     }
 
+    /// Type-check and lower a top-level program or REPL entry.
+    ///
+    /// The parser always wraps its output in a `Block` (see `Parser::block`),
+    /// but unlike a *nested* `{ ... }` block expression, the outermost list
+    /// of statements is not its own lexical scope: a top-level `let` must
+    /// remain visible to later statements in the same entry **and** to later
+    /// `eval` calls on the same `FrogState` (which reuses this `TypeChecker`
+    /// across entries). Plain `check_and_lower` scopes every `Block` it
+    /// sees, so it can only be used here on the unwrapped statement list.
+    pub fn check_and_lower_entry(
+        &mut self,
+        expr: Spanned<Expression>,
+    ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let span = expr.span;
+        match expr.item {
+            Expression::Block(stmts) => {
+                let mut lowered = Vec::with_capacity(stmts.len());
+                let mut ty = Type::None;
+                for s in stmts {
+                    let t = self.check_and_lower(s)?;
+                    ty = t.item.ty.clone();
+                    lowered.push(t);
+                }
+                Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Block(lowered) }, span))
+            },
+            other => self.check_and_lower(Spanned::from(other, span)),
+        }
+    }
+
     /// Type-check and lower an untyped `Spanned<Expression>` into a
     /// `Spanned<TypedExpr>`, consuming the source node by move.
     ///
     /// Every node in the output carries a fully-resolved `Type` (no unbound
     /// `TypeVar`s at leaf positions once concrete call-sites constrain them).
+    ///
+    /// A `Block` encountered here is always a *nested* block (an `if`
+    /// branch, a function body, an explicit `{ ... }` subexpression) and is
+    /// therefore scoped — see `check_and_lower_entry` for the top-level entry
+    /// point, which is not.
     pub fn check_and_lower(
         &mut self,
         expr: Spanned<Expression>,
@@ -677,11 +720,24 @@ impl TypeChecker {
             },
 
             Expression::Conditional(c) => {
-                let cond        = self.check_and_lower(*c.cond)?;
-                let true_branch = self.check_and_lower(*c.true_branch)?;
+                let cond = self.check_and_lower(*c.cond)?;
+
+                // Each branch is its own scope (see the matching note on
+                // `ConditionalExpr::infer`): a `let` inside one arm must not
+                // remain bound once we're back outside the conditional.
+                let prev_ctx = self.ctx.clone();
+                let true_result = self.check_and_lower(*c.true_branch);
+                self.ctx = prev_ctx;
+                let true_branch = true_result?;
+
                 let false_branch = match c.false_branch {
-                    Some(fb) => Some(Box::new(self.check_and_lower(*fb)?)),
-                    None     => None,
+                    Some(fb) => {
+                        let prev_ctx = self.ctx.clone();
+                        let false_result = self.check_and_lower(*fb);
+                        self.ctx = prev_ctx;
+                        Some(Box::new(false_result?))
+                    },
+                    None => None,
                 };
                 TypedExprKind::Conditional {
                     cond:         Box::new(cond),
@@ -736,11 +792,23 @@ impl TypeChecker {
                 TypedExprKind::List(items)
             },
 
+            // A block is its own scope — see the matching note on `infer`'s
+            // `Expression::Block` arm. `check_and_lower` is only ever called
+            // directly (not via `check_and_lower_entry`) on a *nested* block,
+            // since the top-level program/REPL entry goes through
+            // `check_and_lower_entry` instead, which does not scope.
             Expression::Block(stmts) => {
+                let prev_ctx = self.ctx.clone();
                 let mut lowered = Vec::with_capacity(stmts.len());
+                let mut err = None;
                 for s in stmts {
-                    lowered.push(self.check_and_lower(s)?);
+                    match self.check_and_lower(s) {
+                        Ok(t) => lowered.push(t),
+                        Err(e) => { err = Some(e); break; },
+                    }
                 }
+                self.ctx = prev_ctx;
+                if let Some(e) = err { return Err(e); }
                 TypedExprKind::Block(lowered)
             },
 
@@ -866,9 +934,12 @@ impl Infer for ConditionalExpr {
     fn infer(&self, tc: &mut TypeChecker, span: Span) -> TypeResult {
         let cond_type = tc.infer(&self.cond)?;
         if let Type::Bool = cond_type {
-            let true_type  = tc.infer(&self.true_branch)?;
+            // Each branch is its own scope, whether or not it's written with
+            // `{ }` — `if c then let y = 5 else 0` must not leave `y` bound
+            // afterward, any more than `if c then { let y = 5 } else 0` does.
+            let true_type = tc.with_context(std::iter::empty(), |t| t.infer(&self.true_branch))?;
             let false_type = if let Some(fb) = &self.false_branch {
-                tc.infer(fb)?
+                tc.with_context(std::iter::empty(), |t| t.infer(fb))?
             } else {
                 Type::None
             };

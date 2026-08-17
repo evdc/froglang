@@ -100,3 +100,91 @@ fn test_eval_recovers_after_type_error() {
     let (result, _) = s.eval("1 + 2").unwrap();
     assert_eq!(int(&result), 3);
 }
+
+/// A `let` made inside an `if` branch must not be visible after the
+/// conditional. Before this was fixed at the type-checker level, this
+/// program type-checked successfully and then crashed the Cranelift
+/// verifier in codegen (the branch-local SSA value doesn't dominate the use
+/// site) — now it's rejected with an ordinary type error, across both the
+/// braced and bare-branch spellings.
+#[test]
+fn test_let_in_conditional_branch_is_a_type_error_not_a_crash() {
+    let mut s = FrogState::new();
+    assert!(s.eval("let c = true\nif c then { let y = 5 } else 0\ny").is_err());
+
+    let mut s2 = FrogState::new();
+    assert!(s2.eval("let c = true\nif c then let y = 5 else 0\ny").is_err());
+}
+
+/// Rebinding the same name must let the *old* value become garbage. Before
+/// this was fixed, `GcHeap`'s explicit root set only ever grew (every value
+/// any entry had ever produced was pushed once and never popped), so a
+/// shadowed/rebound value stayed live — and rooted — for the rest of the
+/// process, even though nothing could reach it anymore.
+#[test]
+fn test_rebinding_same_name_does_not_leak_old_value() {
+    let mut s = FrogState::new();
+    let big = "x".repeat(4000);
+    for _ in 0..500 {
+        s.eval(&format!(r#"let s = "{}""#, big)).unwrap();
+    }
+    // gc_threshold grows to 2x the live set on every collection, so an
+    // automatic collection can legitimately skip several hundred KB of
+    // *real* garbage before the next one fires — force one final sweep for
+    // a deterministic check, rather than assert on however far the
+    // self-growing threshold happened to get in 500 iterations.
+    s.heap.force_collect();
+    // Only the *latest* `s` (~4000 bytes plus its GC header) should still be
+    // live. Under the old accumulate-forever roots, this would be on the
+    // order of 500 * 4000 = 2,000,000 bytes instead.
+    assert!(
+        s.heap.bytes_allocated < 100_000,
+        "expected old rebindings of `s` to be collected, but {} bytes are still live",
+        s.heap.bytes_allocated
+    );
+}
+
+/// Codegen still panics internally on constructs the type checker allows but
+/// doesn't implement (e.g. calling an immediately-invoked lambda expression,
+/// as opposed to a bare named function — see codegen/mod.rs's "only named
+/// function calls supported" panic). `eval` must convert that panic into a
+/// clean `Err`, not let it escape — and, critically, the `FrogState` must
+/// stay fully usable afterward: defining and calling new functions, and
+/// referencing bindings made before the panic.
+///
+/// This prints a panic message to stderr (Rust's default panic hook runs
+/// before `catch_unwind` recovers) — that's expected, not a test failure.
+#[test]
+fn test_codegen_panic_becomes_clean_error_and_state_survives() {
+    use froglang_core::state::FrogError;
+
+    let mut s = FrogState::new();
+    s.eval("let kept = 41").unwrap();
+
+    match s.eval("(x -> x + 1)(5)") {
+        Err(FrogError::Codegen(_)) => {},
+        other => panic!("expected a Codegen error, got {:?}", other),
+    }
+
+    // Old bindings survived, and the state can still compile and run.
+    let (kept, _) = s.eval("kept").unwrap();
+    assert_eq!(int(&kept), 41);
+
+    s.eval("func double(n: Int): Int = n * 2").unwrap();
+    let (doubled, _) = s.eval("double(21)").unwrap();
+    assert_eq!(int(&doubled), 42);
+}
+
+/// A binding is still visible to the rest of *its own* branch, and the
+/// `FrogState` recovers cleanly and keeps working after the type error above.
+#[test]
+fn test_let_in_conditional_branch_visible_within_branch_and_state_recovers() {
+    let mut s = FrogState::new();
+    let (ok, _) = s.eval("if true then { let y = 5; y + 1 } else 0").unwrap();
+    assert_eq!(int(&ok), 6);
+
+    assert!(s.eval("if true then { let z = 1 } else 0\nz").is_err());
+
+    let (recovered, _) = s.eval("1 + 1").unwrap();
+    assert_eq!(int(&recovered), 2);
+}

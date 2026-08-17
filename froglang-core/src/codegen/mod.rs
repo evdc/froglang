@@ -463,6 +463,14 @@ fn compile_expr(
             let push_id = ctx.func_ids["frog_list_push"];
             for elem in elems {
                 let ev = compile_expr(elem, bcx, vars, ctx);
+                // The list's backing store is a flat i64 buffer (see
+                // FrogList in runtime/gc.rs); Float and Bool elements need
+                // the same bitcast/zero-extend conversion applied to every
+                // other i64-wire-format value (see to_i64_repr). Without
+                // this, pushing an F64 or I8 SSA value into an i64-typed
+                // call argument is a Cranelift type mismatch — a "Verifier
+                // errors" panic, not a bug in the pushed value itself.
+                let ev = to_i64_repr(bcx, &elem.item.ty, ev);
                 let push_ref = ctx.module.declare_func_in_func(push_id, bcx.func);
                 let push_call = bcx.ins().call(push_ref, &[list_ptr, ev]);
                 let _ = bcx.inst_results(push_call)[0];
@@ -474,6 +482,33 @@ fn compile_expr(
 }
 
 impl Codegen {
+    /// Snapshot `func_ids` before a `compile_entry` call that might panic
+    /// partway through (e.g. after Pass 1 has declared this entry's
+    /// functions but before Pass 2 finishes defining them). Pair with
+    /// `restore_func_ids` on failure so a half-declared entry's functions
+    /// don't linger in the name→FuncId map pointing at undefined code.
+    pub fn checkpoint_func_ids(&self) -> HashMap<String, FuncId> {
+        self.func_ids.clone()
+    }
+
+    pub fn restore_func_ids(&mut self, snapshot: HashMap<String, FuncId>) {
+        self.func_ids = snapshot;
+    }
+
+    /// Replace `builder_ctx` with a fresh one. `FunctionBuilder::new` asserts
+    /// its `FunctionBuilderContext` is empty, and it's only ever emptied by
+    /// `FunctionBuilder::finalize` — which a `compile_entry` call that panics
+    /// (or otherwise aborts) partway through never reaches. Without this,
+    /// the *next* compilation attempt on this `Codegen` would immediately
+    /// hit that assertion, permanently breaking it. The half-built machine
+    /// code left behind in `module`/`func_ids` is harmless dead weight (see
+    /// `checkpoint_func_ids`/`restore_func_ids`) — cranelift-jit only
+    /// finalizes functions that were actually *defined*, never ones merely
+    /// declared, so an abandoned declaration is silently inert.
+    pub fn reset_builder_ctx(&mut self) {
+        self.builder_ctx = FunctionBuilderContext::new();
+    }
+
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("is_pic", "false").expect("is_pic setting");

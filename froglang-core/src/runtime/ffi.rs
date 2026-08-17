@@ -162,6 +162,22 @@ pub extern "C" fn frog_gc_dump() {
     super::gc::gc_dump();
 }
 
+// ── Shadow stack (GC roots for JIT-local heap pointers) ────────────────────────
+//
+// Called from the prologue/epilogue codegen emits around every JIT function
+// that has at least one heap-typed subexpression. See gc.rs's "Shadow stack"
+// section for the rooting invariant this maintains.
+
+#[no_mangle]
+pub extern "C" fn frog_frame_push(slots: i64, len: i64) {
+    with_heap(|heap| heap.push_frame(slots as *mut i64, len as usize));
+}
+
+#[no_mangle]
+pub extern "C" fn frog_frame_pop() {
+    with_heap(|heap| heap.pop_frame());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

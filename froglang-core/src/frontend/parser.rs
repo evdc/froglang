@@ -70,14 +70,21 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     pub fn new(input: &'a str) -> Self {
         let mut lexer = Lexer::new(input);
-        // PANICS on the edge case that the first token is a lex error
-        let current_token = lexer.next_token().unwrap();
-        //let zero_pos = Position { line: 0, col: 0 };
-        //let current_token = Spanned::new(Token::EOF, zero_pos, zero_pos);
+        let mut errors = Vec::new();
+        // If the very first token is a lex error, record it and seed EOF so
+        // parsing can proceed (and immediately halt) instead of panicking.
+        let current_token = match lexer.next_token() {
+            Ok(t) => t,
+            Err(err) => {
+                let span = err.span;
+                errors.push(err.map(ParseError::LexError));
+                Spanned::new(Token::EOF, span.start, span.end)
+            }
+        };
         Parser {
             lexer,
             current_token,
-            errors: Vec::new(),
+            errors,
         }
     }
 

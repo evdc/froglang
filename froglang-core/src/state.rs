@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use crate::codegen::Codegen;
 use crate::frontend::parser::{Parser, ParseError};
-use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
 use crate::frontend::typeck::{Type, TypeChecker};
 use crate::frontend::tokens::Spanned;
 use crate::runtime::gc::{GcHeap, ACTIVE_HEAP};
@@ -116,10 +115,11 @@ impl FrogState {
         }
     }
 
-    /// Set `ACTIVE_HEAP` to this state's heap, call `func_ptr`, then clear it.
-    fn call_jit(&mut self, func_ptr: fn() -> i64) -> i64 {
+    /// Set `ACTIVE_HEAP` to this state's heap, call `func_ptr` with the
+    /// out-buffer pointer, then clear it.
+    fn call_jit(&mut self, func_ptr: fn(i64) -> i64, out_ptr: i64) -> i64 {
         ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut GcHeap));
-        let result = func_ptr();
+        let result = func_ptr(out_ptr);
         ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
         result
     }
@@ -137,9 +137,12 @@ impl FrogState {
         })?;
 
         let result_ty = typed.item.ty.clone();
-        let assign_info = extract_toplevel_assign(&typed);
 
-        let main_id = self.codegen.compile_entry(
+        // `bindings` is every top-level `let`/assignment made in this entry
+        // (in source order) — not just the last one, and not conflated with
+        // this entry's own result value (see `eval`'s call to
+        // `build_main_body` in codegen for how `out_ptr` is populated).
+        let (main_id, bindings) = self.codegen.compile_entry(
             typed,
             &mut self.string_arena,
             self.entry_count,
@@ -149,40 +152,27 @@ impl FrogState {
         self.entry_count += 1;
 
         let ptr = self.codegen.module.get_finalized_function(main_id);
-        let func_ptr: fn() -> i64 = unsafe { std::mem::transmute(ptr) };
-        let bits = self.call_jit(func_ptr);
+        let func_ptr: fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
+
+        let mut out_buf: Vec<i64> = vec![0i64; bindings.len()];
+        let out_ptr = out_buf.as_mut_ptr() as i64;
+        let bits = self.call_jit(func_ptr, out_ptr);
 
         if matches!(&result_ty, Type::Str | Type::List(_)) {
             self.heap.push_root(bits, true);
         }
-        self.heap.maybe_collect();
 
-        if let Some((name, ty)) = assign_info {
-            self.env.insert(name.clone(), bits);
-            self.env_types.insert(name, ty);
+        for ((name, ty), &val_bits) in bindings.iter().zip(out_buf.iter()) {
+            if matches!(ty, Type::Str | Type::List(_)) {
+                self.heap.push_root(val_bits, true);
+            }
+            self.env.insert(name.clone(), val_bits);
+            self.env_types.insert(name.clone(), ty.clone());
         }
+
+        self.heap.maybe_collect();
 
         let value = FrogValue::from_bits(bits, &result_ty, &self.heap);
         Ok((value, result_ty))
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn extract_toplevel_assign(
-    typed: &Spanned<TypedExpr>,
-) -> Option<(String, Type)> {
-    match &typed.item.kind {
-        TypedExprKind::Assign { name, value } => {
-            if matches!(value.item.kind, TypedExprKind::Function { .. }) {
-                None
-            } else {
-                Some((name.clone(), typed.item.ty.clone()))
-            }
-        },
-        TypedExprKind::Block(stmts) => {
-            stmts.iter().rev().find_map(|s| extract_toplevel_assign(s))
-        },
-        _ => None,
     }
 }

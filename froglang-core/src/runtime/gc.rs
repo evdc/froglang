@@ -47,6 +47,25 @@ pub struct FrogList {
     pub data:     *mut i64,
 }
 
+// ── Shadow stack ──────────────────────────────────────────────────────────────
+//
+// Codegen roots every heap pointer produced inside a JIT-compiled function by
+// storing it into a dedicated stack slot immediately after it's computed
+// (`root_heap_value` in codegen/mod.rs). Each function pushes one `ShadowFrame`
+// describing that slot's memory at entry and pops it before returning, so the
+// frames form a linked list that mirrors the native call stack. The mark phase
+// walks every frame and treats every non-zero slot as a live root — this is
+// conservative (a value can outlive its last use within one call) but never
+// under-roots, since a value stays reachable until the frame that stored it
+// returns.
+
+#[repr(C)]
+pub struct ShadowFrame {
+    pub prev:  *mut ShadowFrame,
+    pub slots: *mut i64,
+    pub len:   usize,
+}
+
 // ── GcHeap ───────────────────────────────────────────────────────────────────
 
 pub struct GcHeap {
@@ -54,6 +73,7 @@ pub struct GcHeap {
     pub bytes_allocated: usize,
     gc_threshold:    usize,
     roots:           Vec<(i64, bool)>,  // (value, is_ptr)
+    shadow_head:     *mut ShadowFrame,  // head of the JIT shadow stack, see above
 }
 
 thread_local! {
@@ -70,11 +90,39 @@ impl GcHeap {
             bytes_allocated: 0,
             gc_threshold:    1024 * 1024,  // 1 MB initial threshold
             roots:           Vec::new(),
+            shadow_head:     std::ptr::null_mut(),
         }
     }
 
     pub fn push_root(&mut self, value: i64, is_ptr: bool) {
         self.roots.push((value, is_ptr));
+    }
+
+    /// Push a new shadow-stack frame describing `len` `i64` root slots at
+    /// `slots` (owned by the JIT function's own stack frame). Zeroes the
+    /// slots first: an unwritten slot otherwise holds stack garbage that
+    /// `mark` would follow as a pointer.
+    pub fn push_frame(&mut self, slots: *mut i64, len: usize) {
+        if len > 0 {
+            unsafe { std::ptr::write_bytes(slots, 0, len); }
+        }
+        let frame = Box::new(ShadowFrame { prev: self.shadow_head, slots, len });
+        self.shadow_head = Box::into_raw(frame);
+    }
+
+    /// Pop the most recently pushed shadow-stack frame. Must be called
+    /// exactly once per `push_frame`, in LIFO order (i.e. matching the
+    /// native call stack — codegen emits one push/pop pair per function
+    /// invocation).
+    pub fn pop_frame(&mut self) {
+        if self.shadow_head.is_null() { return; }
+        unsafe {
+            let frame = Box::from_raw(self.shadow_head);
+            self.shadow_head = frame.prev;
+            // `frame` (the ShadowFrame box) drops here; `frame.slots` itself
+            // is not owned memory — it points into the JIT function's own
+            // stack frame, which the JIT's own epilogue reclaims.
+        }
     }
 
     pub fn maybe_collect(&mut self) {
@@ -87,7 +135,7 @@ impl GcHeap {
         gc_trace!("collect start — {} bytes allocated, threshold {}",
             self.bytes_allocated, self.gc_threshold);
 
-        // Mark phase
+        // Mark phase — explicit roots pushed by the embedding API...
         let roots = self.roots.clone();
         gc_trace!("marking {} roots", roots.len());
         for (value, is_ptr) in roots {
@@ -95,6 +143,24 @@ impl GcHeap {
                 unsafe { Self::mark(value as *mut GcHeader); }
             }
         }
+
+        // ...plus every live JIT shadow-stack frame.
+        let mut _frame_count = 0usize;
+        let mut frame = self.shadow_head;
+        while !frame.is_null() {
+            _frame_count += 1;
+            unsafe {
+                let f = &*frame;
+                for i in 0..f.len {
+                    let v = *f.slots.add(i);
+                    if v != 0 {
+                        Self::mark(v as *mut GcHeader);
+                    }
+                }
+                frame = f.prev;
+            }
+        }
+        gc_trace!("marked {} shadow frame(s)", _frame_count);
 
         // Sweep phase
         let before = self.bytes_allocated;
@@ -107,18 +173,24 @@ impl GcHeap {
             _freed, self.bytes_allocated, self.gc_threshold);
     }
 
+    /// Mark `obj` and everything transitively reachable from it. Iterative
+    /// (explicit worklist) rather than recursive, since the shadow stack
+    /// makes deep object graphs reachable from ordinary programs.
     unsafe fn mark(obj: *mut GcHeader) {
-        if (*obj).marked { return; }
-        (*obj).marked = true;
-        gc_trace!("mark  {:p} ({})", obj,
-            match (*obj).kind { ObjKind::Str => "Str", ObjKind::List => "List" });
-        if let ObjKind::List = (*obj).kind {
-            let list = obj as *mut FrogList;
-            if let ElemTag::Ptr = (*list).elem_tag {
-                for i in 0..(*list).len as usize {
-                    let elem = *(*list).data.add(i);
-                    if elem != 0 {
-                        Self::mark(elem as *mut GcHeader);
+        let mut worklist = vec![obj];
+        while let Some(obj) = worklist.pop() {
+            if (*obj).marked { continue; }
+            (*obj).marked = true;
+            gc_trace!("mark  {:p} ({})", obj,
+                match (*obj).kind { ObjKind::Str => "Str", ObjKind::List => "List" });
+            if let ObjKind::List = (*obj).kind {
+                let list = obj as *mut FrogList;
+                if let ElemTag::Ptr = (*list).elem_tag {
+                    for i in 0..(*list).len as usize {
+                        let elem = *(*list).data.add(i);
+                        if elem != 0 {
+                            worklist.push(elem as *mut GcHeader);
+                        }
                     }
                 }
             }

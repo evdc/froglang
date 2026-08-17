@@ -125,4 +125,3 @@ fi
 # ── note if almost nothing ran ─────────────────────────────────────────────────
 echo ""
 echo "Note: froglang timing includes JIT compile time (~1ms) and execution."
-echo "      For pure execution throughput, see: cargo bench --bench bench_fib"

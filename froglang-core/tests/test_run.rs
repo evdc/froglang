@@ -170,3 +170,21 @@ fn test_str_in_let() {
 s"#);
     assert_eq!(frog_str_len(bits), 11);
 }
+
+/// Regression test for the GC shadow stack: a string bound early must survive
+/// many subsequent string allocations (and the GC collections they trigger)
+/// deep inside recursive calls. Before the shadow stack, `keep` had no root
+/// visible to the collector while `pad`'s recursive calls were executing, so
+/// the collector could free it out from under a still-live JIT register —
+/// this used to trip a `ptr::copy_nonoverlapping` UB check (or silently
+/// corrupt memory in release builds).
+#[test]
+fn test_gc_shadow_stack_survives_recursive_allocation() {
+    let src = r#"func pad(n: Int): Str = if n <= 0 then "" else pad(n - 1) + "0123456789012345678901234567890123456789"
+let keep = "SENTINEL"
+let big = pad(3000)
+keep"#;
+    let bits = compile_and_run(src);
+    let s = unsafe { frog_str_as_str(bits as *const FrogStr) };
+    assert_eq!(s, "SENTINEL");
+}

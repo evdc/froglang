@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Display, vec};
 
 use crate::frontend::{
-    expression::{AssignExpr, BinaryExpr, ConditionalExpr, Expression, FieldAccessExpr, ForLoopExpr, FunctionExpr, LiteralExpr, UnaryExpr},
+    expression::{AssignExpr, BinaryExpr, ConditionalExpr, Expression, FieldAccessExpr, ForLoopExpr, FunctionExpr, LiteralExpr, MatchArm, Pattern, UnaryExpr},
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
@@ -49,6 +49,8 @@ fn type_implements(ty: &Type, tr: &Trait) -> bool {
         // itself inferred, which is the correct place for that error to
         // surface, not here.
         Type::Struct(_) if *tr == Trait::Eq => true,
+        // Enums get structural `==`/`!=` too — see `TypeChecker::desugar_enum_eq`.
+        Type::Enum(_) if *tr == Trait::Eq => true,
         _ => match tr {
             Trait::Num => matches!(ty, Type::Int | Type::Float),
             Trait::Eq  => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
@@ -78,6 +80,11 @@ pub enum Type {
     /// names/types live in `TypeChecker.struct_defs`, not here, so cloning
     /// a `Type::Struct` stays cheap regardless of field count.
     Struct(String),
+    /// A `data Name(...) is A | B(...)` enum type. Nominal, like `Struct`.
+    /// Variant/common-field layout lives in `TypeChecker.enum_defs`, not
+    /// here. Unlike `Union`, this is a closed, tagged sum with a single
+    /// GC-boxed runtime representation — see `runtime::gc::FrogVariant`.
+    Enum(String),
 }
 
 impl Type {
@@ -148,6 +155,7 @@ impl Display for Type {
                 write!(f, "{}", strs.join(" | "))
             }
             Type::Struct(name) => write!(f, "{}", name),
+            Type::Enum(name) => write!(f, "{}", name),
         }
     }
 }
@@ -180,6 +188,30 @@ pub fn numeric_join(t1: &Type, t2: &Type) -> Option<Type> {
 /// `codegen/mod.rs`).
 pub type StructDefs = HashMap<String, Vec<(String, Type)>>;
 
+/// One registered `data Name(common...) is A(...) | B(...) | ...` enum:
+/// its common fields (readable on any variant without matching) and its
+/// variants in declaration order (declaration order fixes each variant's
+/// runtime tag — see `Codegen`/`runtime::gc::FrogVariant`).
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub common:   Vec<(String, Type)>,
+    pub variants: Vec<(String, Vec<(String, Type)>)>,
+}
+
+impl EnumDef {
+    pub fn variant_index(&self, variant: &str) -> Option<usize> {
+        self.variants.iter().position(|(n, _)| n == variant)
+    }
+
+    /// All-nullary check used by codegen/typeck to decide whether an enum
+    /// can be represented as a bare tag instead of a boxed pointer.
+    pub fn is_unit_enum(&self) -> bool {
+        self.common.is_empty() && self.variants.iter().all(|(_, fs)| fs.is_empty())
+    }
+}
+
+pub type EnumDefs = HashMap<String, EnumDef>;
+
 pub struct TypeChecker {
     // Variable (value level) name -> Type
     ctx: HashMap<String, Type>,
@@ -191,6 +223,13 @@ pub struct TypeChecker {
     /// visible for the rest of the program, including from later
     /// independent blocks. A known simplification, not a hard limit.
     struct_defs: StructDefs,
+    /// Registered `data Name(...) is ...` enum declarations — see
+    /// `hoist_data_decls`. Same never-scoped lifetime as `struct_defs`.
+    enum_defs: EnumDefs,
+    /// variant name -> names of every enum declaring it. Used to resolve a
+    /// bare (unqualified) variant constructor/pattern: unique -> that
+    /// enum, ambiguous -> require `Enum.Variant` qualification.
+    variant_owners: HashMap<String, Vec<String>>,
 }
 
 pub struct TypeCheckerCheckpoint {
@@ -198,15 +237,17 @@ pub struct TypeCheckerCheckpoint {
     substitutions: HashMap<String, Type>,
     next_id: u32,
     struct_defs: StructDefs,
+    enum_defs: EnumDefs,
+    variant_owners: HashMap<String, Vec<String>>,
 }
 
 impl TypeChecker {
     pub fn empty() -> Self {
-        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new() }
+        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), enum_defs: HashMap::new(), variant_owners: HashMap::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new() }
+        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), enum_defs: HashMap::new(), variant_owners: HashMap::new() }
     }
 
     /// Field layout for every registered struct, in declaration order.
@@ -215,6 +256,12 @@ impl TypeChecker {
     /// in `codegen/mod.rs`.
     pub fn struct_defs(&self) -> &StructDefs {
         &self.struct_defs
+    }
+
+    /// Layout for every registered enum, in declaration order. Threaded
+    /// into `Codegen` alongside `struct_defs`.
+    pub fn enum_defs(&self) -> &EnumDefs {
+        &self.enum_defs
     }
 
     /// Fresh unconstrained type variable (used for unannotated lambda parameters).
@@ -237,6 +284,8 @@ impl TypeChecker {
             substitutions: self.substitutions.clone(),
             next_id: self.next_id,
             struct_defs: self.struct_defs.clone(),
+            enum_defs: self.enum_defs.clone(),
+            variant_owners: self.variant_owners.clone(),
         }
     }
 
@@ -245,6 +294,8 @@ impl TypeChecker {
         self.substitutions = cp.substitutions;
         self.next_id = cp.next_id;
         self.struct_defs = cp.struct_defs;
+        self.enum_defs = cp.enum_defs;
+        self.variant_owners = cp.variant_owners;
     }
 
     pub fn add_ctx(mut self, ctx: impl Iterator<Item=(String, Type)>) -> Self {
@@ -412,6 +463,10 @@ impl TypeChecker {
 
             Expression::FieldAccess(fa) => self.infer_field_access(fa, expr.span),
 
+            Expression::Match(m) => self.infer_match(&m.subject, &m.arms, &m.default, expr.span),
+
+            Expression::IsPattern(ip) => self.infer_is_pattern(ip, expr.span),
+
             Expression::Import(_) => unreachable!(
                 "Expression::Import must be resolved and stripped by frontend::modules before typeck ever sees it"
             ),
@@ -429,8 +484,26 @@ impl TypeChecker {
                         msg: format!("Struct {} has no field '{}'", sname, fa.field)
                     }, span))
             },
+            // Only common fields (declared on the enum head) are readable
+            // without matching — a variant-only field requires a `match`/
+            // `is` to narrow the value first (see DESIGN.md's `shape.r`
+            // example).
+            Type::Enum(ename) => {
+                let def = self.enum_defs.get(ename).cloned().unwrap_or(EnumDef { common: Vec::new(), variants: Vec::new() });
+                if let Some((_, t)) = def.common.iter().find(|(n, _)| n == &fa.field) {
+                    return Ok(t.clone());
+                }
+                if def.variants.iter().any(|(_, fs)| fs.iter().any(|(n, _)| n == &fa.field)) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("'{}' is a variant-specific field of {} — match on it to access it", fa.field, ename)
+                    }, span));
+                }
+                Err(Spanned::from(TypeError {
+                    msg: format!("{} has no field '{}'", ename, fa.field)
+                }, span))
+            },
             _ => Err(Spanned::from(TypeError {
-                msg: format!("Can't access field '{}' on {}, expected a struct", fa.field, resolved)
+                msg: format!("Can't access field '{}' on {}, expected a struct or enum", fa.field, resolved)
             }, fa.target.span)),
         }
     }
@@ -445,12 +518,19 @@ impl TypeChecker {
     fn hoist_data_decls(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
         for s in stmts {
             if let Expression::DataDecl(d) = &s.item {
-                if self.struct_defs.contains_key(&d.name) {
+                if self.struct_defs.contains_key(&d.name) || self.enum_defs.contains_key(&d.name) {
                     return Err(Spanned::from(TypeError {
-                        msg: format!("Struct '{}' is already declared", d.name)
+                        msg: format!("'{}' is already declared", d.name)
                     }, s.span));
                 }
-                self.struct_defs.insert(d.name.clone(), Vec::new());
+                if d.variants.is_empty() {
+                    self.struct_defs.insert(d.name.clone(), Vec::new());
+                } else {
+                    for v in &d.variants {
+                        self.variant_owners.entry(v.name.clone()).or_default().push(d.name.clone());
+                    }
+                    self.enum_defs.insert(d.name.clone(), EnumDef { common: Vec::new(), variants: Vec::new() });
+                }
             }
         }
         for s in stmts {
@@ -461,7 +541,28 @@ impl TypeChecker {
                     let ty = self.resolve_annotation(&ann.item, s.span)?;
                     fields.push((p.name.clone(), ty));
                 }
-                self.struct_defs.insert(d.name.clone(), fields);
+                if d.variants.is_empty() {
+                    self.struct_defs.insert(d.name.clone(), fields);
+                } else {
+                    let mut seen_variants: HashMap<String, Span> = HashMap::new();
+                    let mut variants = Vec::with_capacity(d.variants.len());
+                    for v in &d.variants {
+                        if seen_variants.contains_key(&v.name) {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!("Variant '{}' is declared twice in {}", v.name, d.name)
+                            }, s.span));
+                        }
+                        seen_variants.insert(v.name.clone(), s.span);
+                        let mut vfields = Vec::with_capacity(v.fields.len());
+                        for p in &v.fields {
+                            let ann = p.ty.as_ref().expect("variant fields always carry a type annotation — see Grammar::data_decl");
+                            let ty = self.resolve_annotation(&ann.item, s.span)?;
+                            vfields.push((p.name.clone(), ty));
+                        }
+                        variants.push((v.name.clone(), vfields));
+                    }
+                    self.enum_defs.insert(d.name.clone(), EnumDef { common: fields, variants });
+                }
             }
         }
         for s in stmts {
@@ -475,7 +576,11 @@ impl TypeChecker {
     /// DFS over the struct field-type graph, following only direct
     /// `Type::Struct` fields (a `List(Struct(_))` field is fine — a list is
     /// a heap pointer, not inline storage, so it can't create an
-    /// infinite-size cycle the way a direct field can).
+    /// infinite-size cycle the way a direct field can). `Type::Enum` fields
+    /// are always fine too — an enum value is a single boxed pointer (see
+    /// `runtime::gc::FrogVariant`), so it can't create an infinite-size
+    /// cycle either; this is what makes recursive enums (e.g. a binary
+    /// tree) legal even though recursive structs are not.
     fn check_struct_acyclic(&self, name: &str, path: &mut Vec<String>, span: Span) -> Result<(), Spanned<TypeError>> {
         if path.iter().any(|n| n == name) {
             path.push(name.to_string());
@@ -495,40 +600,42 @@ impl TypeChecker {
         Ok(())
     }
 
-    /// Type-check a `Name(field=value, ...)` struct construction call —
-    /// intercepted in `infer_call` before the generic function-call path.
-    fn infer_struct_init(&mut self, name: &str, field_defs: &[(String, Type)], args: &[Spanned<Expression>], span: Span) -> TypeResult {
+    /// Type-check a `Kind(field=value, ...)` construction call's arguments
+    /// against `field_defs` — shared by struct construction and enum
+    /// variant construction (`kind_name` is only used for error text, e.g.
+    /// `"Person"` or `"Shape.Circle"`).
+    fn check_record_args(&mut self, kind_name: &str, field_defs: &[(String, Type)], args: &[Spanned<Expression>], span: Span) -> Result<(), Spanned<TypeError>> {
         let mut seen: HashMap<String, Span> = HashMap::new();
         for arg in args {
             let (fname, value_expr) = match &arg.item {
                 Expression::Assign(a) => {
                     let fname = a.target.item.get_identifier()
                         .ok_or_else(|| Spanned::from(TypeError {
-                            msg: "Struct field name must be a plain identifier".to_string()
+                            msg: "Field name must be a plain identifier".to_string()
                         }, arg.span))?
                         .to_string();
                     (fname, &*a.value)
                 },
                 _ => return Err(Spanned::from(TypeError {
-                    msg: format!("Struct construction requires named fields, e.g. {}(field=value)", name)
+                    msg: format!("Construction requires named fields, e.g. {}(field=value)", kind_name)
                 }, arg.span)),
             };
             if let Some(_prev) = seen.get(&fname) {
                 return Err(Spanned::from(TypeError {
-                    msg: format!("Duplicate field '{}' in construction of {}", fname, name)
+                    msg: format!("Duplicate field '{}' in construction of {}", fname, kind_name)
                 }, arg.span));
             }
             let field_ty = field_defs.iter().find(|(n, _)| n == &fname)
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| Spanned::from(TypeError {
-                    msg: format!("Struct {} has no field '{}'", name, fname)
+                    msg: format!("{} has no field '{}'", kind_name, fname)
                 }, arg.span))?;
             let value_ty = self.infer(value_expr)?;
             let resolved_value_ty = self.lookup(&value_ty);
             let resolved_field_ty = self.lookup(&field_ty);
             if !(widens_to(&resolved_value_ty, &resolved_field_ty) || self.unify(&value_ty, &field_ty)) {
                 return Err(Spanned::from(TypeError {
-                    msg: format!("Field '{}' of {} expects {}, got {}", fname, name, resolved_field_ty, resolved_value_ty)
+                    msg: format!("Field '{}' of {} expects {}, got {}", fname, kind_name, resolved_field_ty, resolved_value_ty)
                 }, value_expr.span));
             }
             seen.insert(fname, arg.span);
@@ -536,11 +643,228 @@ impl TypeChecker {
         for (fname, _) in field_defs {
             if !seen.contains_key(fname) {
                 return Err(Spanned::from(TypeError {
-                    msg: format!("Missing field '{}' in construction of {}", fname, name)
+                    msg: format!("Missing field '{}' in construction of {}", fname, kind_name)
                 }, span));
             }
         }
+        Ok(())
+    }
+
+    /// Type-check a `Name(field=value, ...)` struct construction call —
+    /// intercepted in `infer_call` before the generic function-call path.
+    fn infer_struct_init(&mut self, name: &str, field_defs: &[(String, Type)], args: &[Spanned<Expression>], span: Span) -> TypeResult {
+        self.check_record_args(name, field_defs, args, span)?;
         Ok(Type::Struct(name.to_string()))
+    }
+
+    /// Type-check a `Variant(field=value, ...)` enum variant construction
+    /// call (bare or `Enum.Variant`-qualified) — intercepted in
+    /// `infer_call` alongside struct construction. `field_defs` for the
+    /// call is the enum's common fields followed by the variant's own.
+    fn infer_variant_init(&mut self, enum_name: &str, variant: &str, args: &[Spanned<Expression>], span: Span) -> TypeResult {
+        let def = self.enum_defs.get(enum_name).cloned()
+            .expect("enum_name resolved via variant_owners/enum_defs, must be registered");
+        let variant_fields = def.variants.iter().find(|(n, _)| n == variant)
+            .map(|(_, fs)| fs.clone())
+            .expect("variant resolved via variant_owners/enum_defs, must be registered");
+        let mut field_defs = def.common.clone();
+        field_defs.extend(variant_fields);
+        let kind_name = format!("{}.{}", enum_name, variant);
+        self.check_record_args(&kind_name, &field_defs, args, span)?;
+        Ok(Type::Enum(enum_name.to_string()))
+    }
+
+    /// Resolve a call's callee to `(enum_name, variant_name)` if it names
+    /// an enum variant constructor — either bare (`Circle(...)`, valid
+    /// only if `Circle` is declared by exactly one enum) or qualified
+    /// (`Shape.Circle(...)`). `Ok(None)` means "not a variant constructor
+    /// at all" (an ordinary call, or struct construction — handled by the
+    /// caller before/after this).
+    fn resolve_variant_callee(&self, callable: &Expression) -> Result<Option<(String, String)>, String> {
+        match callable {
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) => {
+                match self.variant_owners.get(name) {
+                    None => Ok(None),
+                    Some(owners) if owners.len() == 1 => Ok(Some((owners[0].clone(), name.clone()))),
+                    Some(owners) => Err(format!(
+                        "Variant '{}' is ambiguous between {} — qualify it, e.g. {}.{}(...)",
+                        name, owners.join(", "), owners[0], name
+                    )),
+                }
+            }
+            Expression::FieldAccess(fa) => {
+                if let Some(enum_name) = fa.target.item.get_identifier() {
+                    if let Some(def) = self.enum_defs.get(enum_name) {
+                        return if def.variant_index(&fa.field).is_some() {
+                            Ok(Some((enum_name.to_string(), fa.field.clone())))
+                        } else {
+                            Err(format!("{} has no variant '{}'", enum_name, fa.field))
+                        };
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Infer a bare identifier that isn't a bound variable as a nullary
+    /// (parenthesis-free) enum variant construction, e.g. `Red` for
+    /// `data Color is Red | Green | Blue`. Only legal when the variant (and
+    /// its enum's common fields) declare no fields at all — anything with
+    /// fields must be constructed with call syntax, even if the variant
+    /// itself is empty (to supply the common fields).
+    fn infer_bare_variant(&self, name: &str, span: Span) -> TypeResult {
+        match self.variant_owners.get(name) {
+            None => Err(Spanned::from(TypeError { msg: format!("Unbound variable {}", name) }, span)),
+            Some(owners) if owners.len() > 1 => Err(Spanned::from(TypeError {
+                msg: format!("Variant '{}' is ambiguous between {} — qualify it, e.g. {}.{}(...)", name, owners.join(", "), owners[0], name)
+            }, span)),
+            Some(owners) => {
+                let enum_name = &owners[0];
+                let def = self.enum_defs.get(enum_name).expect("registered");
+                let variant_fields = def.variants.iter().find(|(n, _)| n == name)
+                    .map(|(_, fs)| fs).expect("registered");
+                if !def.common.is_empty() || !variant_fields.is_empty() {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Variant '{}' has fields and must be constructed with {}(...)", name, name)
+                    }, span));
+                }
+                Ok(Type::Enum(enum_name.clone()))
+            }
+        }
+    }
+
+    /// Validate a match/`is` pattern against `enum_name`'s definition:
+    /// the optional qualifier (if present) must name the same enum, the
+    /// variant must exist, and — if any binds are given at all — their
+    /// count must exactly match the variant's field arity. Returns the
+    /// variant's declaration index (its runtime tag).
+    fn check_pattern(&self, pattern: &Pattern, enum_name: &str, def: &EnumDef, span: Span) -> Result<usize, Spanned<TypeError>> {
+        if let Some(path) = &pattern.path {
+            if path != enum_name {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Pattern '{}.{}' does not match subject type {}", path, pattern.variant, enum_name)
+                }, span));
+            }
+        }
+        let idx = def.variant_index(&pattern.variant).ok_or_else(|| Spanned::from(TypeError {
+            msg: format!("{} has no variant '{}'", enum_name, pattern.variant)
+        }, span))?;
+        let arity = def.variants[idx].1.len();
+        if !pattern.binds.is_empty() && pattern.binds.len() != arity {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Pattern for variant '{}' expects {} binding(s), got {}", pattern.variant, arity, pattern.binds.len())
+            }, span));
+        }
+        Ok(idx)
+    }
+
+    /// `subject is Pattern` used as an ordinary `Bool`-valued expression
+    /// (not the entire condition of an `if` — that case is intercepted
+    /// earlier, in `ConditionalExpr::infer`, and desugars through
+    /// `infer_match`/`lower_match` instead so the pattern's binds are
+    /// actually reachable). Binds are rejected here since there is no
+    /// `then`-scope for them to enter.
+    fn infer_is_pattern(&mut self, ip: &crate::frontend::expression::IsPatternExpr, span: Span) -> TypeResult {
+        let subject_ty = self.infer(&ip.subject)?;
+        let resolved = self.lookup(&subject_ty);
+        let enum_name = match &resolved {
+            Type::Enum(name) => name.clone(),
+            _ => return Err(Spanned::from(TypeError {
+                msg: format!("Can only use 'is' on an enum value, got {}", resolved)
+            }, ip.subject.span)),
+        };
+        let def = self.enum_defs.get(&enum_name).cloned().expect("registered");
+        self.check_pattern(&ip.pattern, &enum_name, &def, span)?;
+        if !ip.pattern.binds.is_empty() {
+            return Err(Spanned::from(TypeError {
+                msg: "pattern bindings with 'is' are only allowed as the entire condition of an 'if'".to_string()
+            }, span));
+        }
+        Ok(Type::Bool)
+    }
+
+    /// Type-check a `match subject { arms... (else default)? }`. Also used
+    /// (with a single synthesized arm) to type-check `if subject is P then
+    /// ... (else ...)?` — see `ConditionalExpr::infer`. Each arm's bound
+    /// fields are in scope for its own guard and body only. An unguarded
+    /// arm counts toward exhaustiveness; a guarded one never does (the
+    /// guard might not hold at runtime). Arm/default bodies are joined the
+    /// same way `if` branches are: unify if possible, else fall back to a
+    /// `Union` — this is what lets `lower_match` desugar into ordinary
+    /// nested `Conditional`s with no dedicated codegen of its own.
+    fn infer_match(&mut self, subject: &Spanned<Expression>, arms: &[MatchArm], default: &Option<Box<Spanned<Expression>>>, span: Span) -> TypeResult {
+        let subject_ty = self.infer(subject)?;
+        let resolved_subject = self.lookup(&subject_ty);
+        let enum_name = match &resolved_subject {
+            Type::Enum(name) => name.clone(),
+            _ => return Err(Spanned::from(TypeError {
+                msg: format!("Can only match on an enum value, got {}", resolved_subject)
+            }, subject.span)),
+        };
+        let def = self.enum_defs.get(&enum_name).cloned().expect("registered");
+
+        let mut covered: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut result_ty: Option<Type> = None;
+
+        for arm in arms {
+            let idx = self.check_pattern(&arm.pattern, &enum_name, &def, arm.body.span)?;
+            let variant_fields = &def.variants[idx].1;
+            let bindings: Vec<(String, Type)> = if arm.pattern.binds.is_empty() {
+                Vec::new()
+            } else {
+                arm.pattern.binds.iter().zip(variant_fields.iter())
+                    .filter(|(b, _)| b.as_str() != "_")
+                    .map(|(b, (_, ty))| (b.clone(), ty.clone()))
+                    .collect()
+            };
+
+            let arm_ty = self.with_context(bindings.into_iter(), |t| -> TypeResult {
+                if let Some(g) = &arm.guard {
+                    let gt = t.infer(g)?;
+                    if !t.unify(&gt, &Type::Bool) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("match guard must be Bool, got {}", t.lookup(&gt))
+                        }, g.span));
+                    }
+                }
+                t.infer(&arm.body)
+            })?;
+
+            if arm.guard.is_none() {
+                covered.insert(idx);
+            }
+
+            result_ty = Some(match result_ty {
+                None => arm_ty,
+                Some(prev) => {
+                    if self.unify(&prev, &arm_ty) {
+                        self.lookup(&prev)
+                    } else {
+                        Type::Union(vec![prev, arm_ty]).normalize()
+                    }
+                }
+            });
+        }
+
+        if let Some(d) = default {
+            let dt = self.with_context(std::iter::empty(), |t| t.infer(d))?;
+            result_ty = Some(match result_ty {
+                None => dt,
+                Some(prev) => if self.unify(&prev, &dt) { self.lookup(&prev) } else { Type::Union(vec![prev, dt]).normalize() },
+            });
+        } else if covered.len() < def.variants.len() {
+            let missing: Vec<&str> = def.variants.iter().enumerate()
+                .filter(|(i, _)| !covered.contains(i))
+                .map(|(_, (n, _))| n.as_str())
+                .collect();
+            return Err(Spanned::from(TypeError {
+                msg: format!("Non-exhaustive match on {}: missing {} (add an 'else' arm to handle the rest)", enum_name, missing.join(", "))
+            }, span));
+        }
+
+        Ok(result_ty.unwrap_or(Type::None))
     }
 
     /// Shared inference for `for var in iterable (if cond)? body`: unifies
@@ -647,6 +971,15 @@ impl TypeChecker {
             if let Some(field_defs) = self.struct_defs.get(name).cloned() {
                 return self.infer_struct_init(name, &field_defs, args, callable.span);
             }
+        }
+
+        // Enum variant construction: `Circle(r=4)` (bare, unique owner) or
+        // `Shape.Circle(r=4)` (qualified) — same syntactic shape as an
+        // ordinary call, disambiguated the same way struct construction is.
+        match self.resolve_variant_callee(&callable.item) {
+            Ok(Some((enum_name, variant))) => return self.infer_variant_init(&enum_name, &variant, args, callable.span),
+            Ok(None) => {},
+            Err(msg) => return Err(Spanned::from(TypeError { msg }, callable.span)),
         }
 
         // `print` is a builtin conversion: unlike ordinary functions, its
@@ -1015,7 +1348,18 @@ impl TypeChecker {
                 Token::String(s)      => TypedExprKind::StrLit(s),
                 Token::True           => TypedExprKind::BoolLit(true),
                 Token::False          => TypedExprKind::BoolLit(false),
-                Token::Identifier(nm) => TypedExprKind::Var(nm),
+                // A bound value takes priority; otherwise this is a
+                // bindless nullary variant construction — see
+                // `TypeChecker::infer_bare_variant`.
+                Token::Identifier(nm) => if self.ctx.contains_key(&nm) {
+                    TypedExprKind::Var(nm)
+                } else {
+                    let enum_name = self.variant_owners.get(&nm).and_then(|owners| owners.first()).cloned()
+                        .expect("bare identifier validated as a nullary variant during infer");
+                    let def = self.enum_defs.get(&enum_name).expect("registered");
+                    let tag = def.variant_index(&nm).expect("registered") as u32;
+                    TypedExprKind::VariantInit { enum_name, variant: nm, tag, fields: Vec::new() }
+                },
                 _ => unreachable!("unexpected literal token"),
             },
 
@@ -1039,6 +1383,24 @@ impl TypeChecker {
             },
 
             Expression::Conditional(c) => {
+                // `if subject is Pattern then A (else B)?` — see the matching
+                // note on `ConditionalExpr::infer`. Desugars entirely through
+                // `lower_match`, which returns a fully-formed typed node, so
+                // its `.kind` is used directly (its `.ty` should already
+                // equal `resolved_ty`, computed above via `infer_match`).
+                if matches!(&c.cond.item, Expression::IsPattern(_)) {
+                    let ip = match c.cond.item {
+                        Expression::IsPattern(ip) => ip,
+                        _ => unreachable!(),
+                    };
+                    let arms = vec![crate::frontend::expression::MatchArm {
+                        pattern: ip.pattern,
+                        guard: None,
+                        body: c.true_branch,
+                    }];
+                    return Ok(self.lower_match(ip.subject, arms, c.false_branch, span)?);
+                }
+
                 let cond = self.check_and_lower(*c.cond)?;
 
                 // Each branch is its own scope (see the matching note on
@@ -1131,6 +1493,33 @@ impl TypeChecker {
                         ordered.push(fields.remove(idx));
                     }
                     TypedExprKind::StructInit { name, fields: ordered }
+                } else if let Ok(Some((enum_name, variant))) = self.resolve_variant_callee(&c.callable.item) {
+                    let def = self.enum_defs.get(&enum_name).cloned().expect("validated during infer");
+                    let variant_fields = def.variants.iter().find(|(n, _)| n == &variant)
+                        .map(|(_, fs)| fs.clone()).expect("validated during infer");
+                    let mut field_defs = def.common.clone();
+                    field_defs.extend(variant_fields);
+
+                    let mut fields: Vec<(String, Box<Spanned<TypedExpr>>)> = Vec::with_capacity(c.args.len());
+                    for arg in c.args {
+                        match arg.item {
+                            Expression::Assign(a) => {
+                                let fname = a.target.item.get_identifier()
+                                    .expect("validated during infer").to_string();
+                                let value = self.check_and_lower(*a.value)?;
+                                fields.push((fname, Box::new(value)));
+                            },
+                            _ => unreachable!("variant construction args validated as Assign during infer"),
+                        }
+                    }
+                    let mut ordered = Vec::with_capacity(field_defs.len());
+                    for (fname, _) in &field_defs {
+                        let idx = fields.iter().position(|(n, _)| n == fname)
+                            .expect("field presence validated during infer");
+                        ordered.push(fields.remove(idx));
+                    }
+                    let tag = def.variant_index(&variant).expect("validated during infer") as u32;
+                    TypedExprKind::VariantInit { enum_name, variant, tag, fields: ordered }
                 } else {
                     let callable = self.check_and_lower(*c.callable)?;
                     let mut args = Vec::with_capacity(c.args.len());
@@ -1228,6 +1617,21 @@ impl TypeChecker {
                 TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field }
             },
 
+            Expression::Match(m) => return self.lower_match(m.subject, m.arms, m.default, span),
+
+            // Standalone (non-if-condition) `subject is Variant` — a plain
+            // tag test; see `infer_is_pattern`.
+            Expression::IsPattern(ip) => {
+                let target = self.check_and_lower(*ip.subject)?;
+                let enum_name = match &target.item.ty {
+                    Type::Enum(name) => name.clone(),
+                    _ => unreachable!("is-pattern subject must be Enum after inference"),
+                };
+                let def = self.enum_defs.get(&enum_name).expect("registered");
+                let tag = def.variant_index(&ip.pattern.variant).expect("validated during infer") as u32;
+                TypedExprKind::IsVariant { target: Box::new(target), variant: ip.pattern.variant, tag }
+            },
+
             Expression::Import(_) => unreachable!(
                 "Expression::Import must be resolved and stripped by frontend::modules before typeck ever sees it"
             ),
@@ -1266,6 +1670,145 @@ impl TypeChecker {
 
         let (cond, body) = result?;
         Ok((fl.var, Box::new(iterable), cond, Box::new(body)))
+    }
+
+    /// Lower `match subject { arms... (else default)? }` — and, via
+    /// `ConditionalExpr`'s special-case, `if subject is Pattern then A
+    /// (else B)?` too (a single synthesized arm). `match` has no runtime
+    /// representation of its own: it desugars entirely into ordinary
+    /// `Conditional`/`Assign`/`IsVariant`/`VariantField` nodes, built
+    /// right-to-left so each arm's "else" is the chain already built for
+    /// the arms after it. `subject` is bound to a temporary first (mirrors
+    /// `desugar_struct_eq`) so a side-effecting subject expression is only
+    /// evaluated once, not once per arm's tag test.
+    fn lower_match(&mut self, subject: Box<Spanned<Expression>>, arms: Vec<MatchArm>, default: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let subject = self.check_and_lower(*subject)?;
+        let enum_name = match &subject.item.ty {
+            Type::Enum(name) => name.clone(),
+            _ => unreachable!("match/is-pattern subject must be Enum after inference"),
+        };
+        let def = self.enum_defs.get(&enum_name).cloned().expect("registered");
+
+        let subject_name = format!("__match_subject_{}", self.next_id); self.next_id += 1;
+        let subject_ty = subject.item.ty.clone();
+        let subject_assign = Spanned::from(
+            TypedExpr { ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject) } },
+            span,
+        );
+
+        let mut tail: Option<Spanned<TypedExpr>> = match default {
+            Some(d) => {
+                let prev_ctx = self.ctx.clone();
+                let result = self.check_and_lower(*d);
+                self.ctx = prev_ctx;
+                Some(result?)
+            }
+            None => None,
+        };
+
+        for arm in arms.into_iter().rev() {
+            let idx = def.variant_index(&arm.pattern.variant).expect("validated during infer");
+            let variant_fields = def.variants[idx].1.clone();
+
+            let subject_var = Spanned::from(
+                TypedExpr { ty: subject_ty.clone(), kind: TypedExprKind::Var(subject_name.clone()) },
+                span,
+            );
+            let base_cond = Spanned::from(
+                TypedExpr { ty: Type::Bool, kind: TypedExprKind::IsVariant {
+                    target: Box::new(subject_var.clone()), variant: arm.pattern.variant.clone(), tag: idx as u32,
+                } },
+                span,
+            );
+
+            let mut prelude = Vec::new();
+            let mut bindings = Vec::new();
+            if !arm.pattern.binds.is_empty() {
+                for (bind, (fname, fty)) in arm.pattern.binds.iter().zip(variant_fields.iter()) {
+                    if bind == "_" { continue; }
+                    let value = Spanned::from(
+                        TypedExpr { ty: fty.clone(), kind: TypedExprKind::VariantField {
+                            target: Box::new(subject_var.clone()), variant: arm.pattern.variant.clone(), field: fname.clone(),
+                        } },
+                        span,
+                    );
+                    prelude.push(Spanned::from(
+                        TypedExpr { ty: fty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
+                        span,
+                    ));
+                    bindings.push((bind.clone(), fty.clone()));
+                }
+            }
+
+            // A guard's binds must be extracted (the `prelude`) *before*
+            // the guard itself runs — they can't be folded into a single
+            // `base_cond and guard` boolean the way a bindless guard could,
+            // since extraction is a statement, not an expression. So a
+            // guarded arm nests one level deeper: the tag test's true
+            // branch runs the prelude, then re-tests the guard, only
+            // falling through to `tail` (cloned — it's the else of both
+            // the tag test and, on guard failure, the inner check too) if
+            // that also fails.
+            let prev_ctx = self.ctx.clone();
+            for (n, t) in &bindings { self.ctx.insert(n.clone(), t.clone()); }
+            let lowered = (|| -> Result<_, Spanned<TypeError>> {
+                let body = self.check_and_lower(*arm.body)?;
+                let guard = match arm.guard {
+                    Some(g) => Some(self.check_and_lower(*g)?),
+                    None => None,
+                };
+                Ok((guard, body))
+            })();
+            self.ctx = prev_ctx;
+            let (guard, body) = lowered?;
+
+            let true_inner = match guard {
+                None => body,
+                Some(g) => {
+                    let true_ty = body.item.ty.clone();
+                    let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::None);
+                    let result_ty = if self.unify(&true_ty, &false_ty) {
+                        self.lookup(&true_ty)
+                    } else {
+                        Type::Union(vec![true_ty, false_ty]).normalize()
+                    };
+                    Spanned::from(
+                        TypedExpr { ty: result_ty, kind: TypedExprKind::Conditional {
+                            cond: Box::new(g), true_branch: Box::new(body), false_branch: tail.clone().map(Box::new),
+                        } },
+                        span,
+                    )
+                }
+            };
+
+            let true_branch = if prelude.is_empty() {
+                true_inner
+            } else {
+                let inner_ty = true_inner.item.ty.clone();
+                let mut stmts = prelude;
+                stmts.push(true_inner);
+                Spanned::from(TypedExpr { ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
+            };
+
+            let true_ty = true_branch.item.ty.clone();
+            let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::None);
+            let result_ty = if self.unify(&true_ty, &false_ty) {
+                self.lookup(&true_ty)
+            } else {
+                Type::Union(vec![true_ty, false_ty]).normalize()
+            };
+
+            tail = Some(Spanned::from(
+                TypedExpr { ty: result_ty, kind: TypedExprKind::Conditional {
+                    cond: Box::new(base_cond), true_branch: Box::new(true_branch), false_branch: tail.map(Box::new),
+                } },
+                span,
+            ));
+        }
+
+        let chain = tail.expect("infer_match already rejected an empty match with no arms and no default");
+        let chain_ty = chain.item.ty.clone();
+        Ok(Spanned::from(TypedExpr { ty: chain_ty, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span))
     }
 
     /// Desugar `left == right` / `left != right` (both already lowered,
@@ -1325,6 +1868,7 @@ impl TypeChecker {
                     "Bool"  => Ok(Type::Bool),
                     "Str"   => Ok(Type::Str),
                     _ if self.struct_defs.contains_key(name) => Ok(Type::Struct(name.clone())),
+                    _ if self.enum_defs.contains_key(name) => Ok(Type::Enum(name.clone())),
                     _       => self.get(name, span),
                 },
                 _ => Err(Spanned::from(
@@ -1368,7 +1912,13 @@ impl Infer for LiteralExpr {
             Token::String(_)      => Type::Str,
             Token::False          => Type::Bool,
             Token::True           => Type::Bool,
-            Token::Identifier(nm) => tc.get(&nm, span)?,
+            // A bound value takes priority; otherwise this might be a
+            // nullary enum variant used without call syntax (`Red` for
+            // `data Color is Red | ...`) — see `infer_bare_variant`.
+            Token::Identifier(nm) => match tc.ctx.get(nm) {
+                Some(t) => t.clone(),
+                None => tc.infer_bare_variant(nm, span)?,
+            },
             _ => unreachable!("weird literal"),
         };
         Ok(ty)
@@ -1450,6 +2000,19 @@ impl Infer for AssignExpr {
 
 impl Infer for ConditionalExpr {
     fn infer(&self, tc: &mut TypeChecker, span: Span) -> TypeResult {
+        // `if subject is Pattern then A (else B)?` — a binding pattern is
+        // only meaningful with a `then`-scope to bind into, so this is
+        // intercepted here (before the pattern ever reaches the generic
+        // `IsPattern` path, which rejects binds) and handled as sugar for
+        // a single-arm `match` — see `infer_match`/`lower_match`.
+        if let Expression::IsPattern(ip) = &self.cond.item {
+            let arms = vec![crate::frontend::expression::MatchArm {
+                pattern: ip.pattern.clone(),
+                guard: None,
+                body: self.true_branch.clone(),
+            }];
+            return tc.infer_match(&ip.subject, &arms, &self.false_branch, span);
+        }
         let cond_type = tc.infer(&self.cond)?;
         if let Type::Bool = cond_type {
             // Each branch is its own scope, whether or not it's written with

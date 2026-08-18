@@ -1,0 +1,68 @@
+// Order-pipeline benchmark — exercises structs, enums + match, and lists.
+//
+// The shape is deliberately mundane: build a catalogue of line items, then
+// repeatedly filter it into a batch and price every item in that batch,
+// where pricing means classifying the item into a discount variant and then
+// matching on that variant.  Per round this allocates a fresh list (GC
+// pressure) and one boxed enum value per item (more GC pressure), on top of
+// struct field access and integer arithmetic in the inner loop.
+//
+// The sibling orders.{rs,go,py,lua} files implement exactly this, and
+// run_comparisons.sh reads the two loop bounds below out of *this* file and
+// passes them to the others, so all five stay in lockstep.
+//
+// Run: cargo run --release -- run benches/orders.frog
+
+data Category is Food | Book | Electronics | Toy
+
+data Item(sku: Int, category: Category, qty: Int, unit_price: Int)
+
+data Discount is
+    NoDiscount | Percent(pct: Int) | Flat(amount: Int) | BulkOver(min_qty: Int, pct: Int)
+
+// froglang has no `%` operator yet, so modulo is spelled out.  Every operand
+// here is non-negative, so truncating and flooring division agree and the
+// other five implementations can use their native `%`.
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+
+// Knuth multiplicative hash — gives each sku a deterministic but unpatterned
+// category / quantity / price, so no branch in the inner loop is predictable.
+func hash(i: Int): Int = modn(i * 2654435761 + 1013904223, 2147483647)
+
+func category_of(h: Int): Category = {
+    let k = modn(h, 4)
+    if k == 0 then Food
+    else if k == 1 then Book
+    else if k == 2 then Electronics
+    else Toy
+}
+
+// Pricing policy: which discount an item qualifies for.  Returns an enum
+// rather than a number so the caller has to match on it.
+func discount_for(it: Item): Discount = match it.category {
+    is Food then if it.qty >= 6 then BulkOver(min_qty=6, pct=5) else NoDiscount
+    is Book then Percent(pct=10)
+    is Electronics then if it.unit_price > 3000 then Flat(amount=250) else Percent(pct=3)
+    is Toy then BulkOver(min_qty=3, pct=15)
+}
+
+func apply(d: Discount, gross: Int, qty: Int): Int = match d {
+    is NoDiscount then gross
+    is Percent(pct) then gross - gross * pct / 100
+    is Flat(amount) then if gross > amount then gross - amount else 0
+    is BulkOver(min_qty, pct) then if qty >= min_qty then gross - gross * pct / 100 else gross
+}
+
+let items = [for i in 0..2000 do Item(sku=i, category=category_of(hash(i)), qty=1 + modn(hash(i + 7), 9), unit_price=100 + modn(hash(i + 13), 5000))]
+
+let total = 0
+for round in 0..2000 do {
+    // Rotating the filter by `round` keeps a different two-thirds of the
+    // catalogue in each batch, so the list can't be hoisted out of the loop.
+    let batch = [for it in items if modn(it.sku + round, 3) != 0 do it]
+    for it in batch do {
+        total = total + apply(discount_for(it), it.qty * it.unit_price, it.qty)
+    }
+}
+
+total

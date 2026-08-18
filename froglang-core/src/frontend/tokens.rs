@@ -115,6 +115,17 @@ pub enum Token {
     #[lex("data")]
     Data,
 
+    #[infix(Grammar::is_pattern, Precedence::Comparison)]
+    #[lex("is")]
+    Is,
+
+    #[prefix(Grammar::match_expr)]
+    #[lex("match")]
+    Match,
+
+    #[lex("|")]
+    Pipe,
+
     #[prefix(Grammar::import_decl)]
     #[lex("import")]
     Import,

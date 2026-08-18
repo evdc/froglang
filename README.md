@@ -172,6 +172,54 @@ need no coordination — each owns its heap and JIT module (Lua model, no GIL).
 
 ---
 
+## Benchmarks
+
+`benches/run_comparisons.sh [fib|orders|all]` runs each benchmark in froglang and
+in Rust, Go, Python, LuaJIT and Lua, and prints wall-clock time per language.
+Every implementation is a line-by-line translation of the froglang one, and all
+of them must print the same result — a differing row means one of them is wrong.
+
+- **`fib`** — naive recursive `fib(35)`. Pure call overhead and integer
+  arithmetic, no allocation.
+- **`orders`** — an order-pricing pipeline over 2000 `Item` structs, repeated
+  2000 rounds. Each round filters the catalogue into a fresh list, classifies
+  every item into a `Discount` enum variant, and matches on that variant to
+  price it. Exercises structs, enums + `match`, list construction, and the GC.
+
+Apple M-series, release build; times are the whole process, so froglang's
+include JIT compilation:
+
+| | fib(35) | orders |
+|---|---|---|
+| Rust -O3        | 50ms   | 31ms  |
+| Go (gc)         | 52ms   | 38ms  |
+| LuaJIT          | 71ms   | 56ms  |
+| **froglang**    | 64ms   | 182ms |
+| Lua             | 670ms  | 579ms |
+| Python 3        | 2359ms | 1381ms |
+
+On straight-line arithmetic froglang sits between Go and LuaJIT, as expected
+from a Cranelift backend. `orders` is where the runtime shows: it started at
+427ms, and two rounds of profiling took it to 182ms.
+
+- **Inline heap access.** Reading a list element, reading or writing a variant
+  payload slot, and appending to a list with spare capacity were each an
+  out-of-line call to an FFI symbol that did a single load or store. Emitting
+  the memory operation directly in Cranelift IR instead (see "Inline
+  heap-object access" in codegen/mod.rs) took 427ms → 242ms.
+- **Unboxed shadow frames.** Every JIT call that touches the heap registers a
+  GC shadow frame; each one was a `Box`, so a `malloc`/`free` pair per call.
+  Keeping them in a `Vec` took 242ms → 182ms.
+
+What's left is allocation: one `FrogVariant` per enum value, so this program
+mallocs ~4M times, and `malloc`/`free`/`memset` plus the mark phase are now
+about half its profile. Payload-less variants are already unboxed into
+immediates; unboxing variants *with* payloads — flattening them into
+tag-plus-fields slots the way structs already are, and boxing only what is
+recursive — is the next real win.
+
+---
+
 ## Running
 
 ```sh

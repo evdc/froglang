@@ -100,13 +100,66 @@ pub struct ForLoopExpr {
     pub body: ExprRef
 }
 
-/// `data Name(field: Type, ...)`. Field type annotations stay as unresolved
-/// expressions (see `Parameter`) until type checking, mirroring function
-/// params exactly — reuses `Parameter` rather than a new struct.
+/// One variant of an enum declaration: `Circle(r: Int)` or a nullary
+/// `Red`. Fields (if any) are on top of whatever common fields the
+/// enclosing `DataDeclExpr` declares.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DataDeclExpr {
+pub struct VariantDecl {
     pub name:   String,
     pub fields: Vec<Parameter>,
+}
+
+/// `data Name(field: Type, ...)` for a struct, or
+/// `data Name(common: Type, ...) is A(...) | B(...)` for an enum.
+/// Field type annotations stay as unresolved expressions (see
+/// `Parameter`) until type checking, mirroring function params exactly —
+/// reuses `Parameter` rather than a new struct.
+/// An empty `variants` list means this is a plain struct declaration;
+/// `fields` holds the struct's own fields, or the enum's common fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataDeclExpr {
+    pub name:     String,
+    pub fields:   Vec<Parameter>,
+    pub variants: Vec<VariantDecl>,
+}
+
+/// A pattern matched against an enum value: `Circle(r)`, `Shape.Circle(r)`,
+/// `Circle(_)`, or a bindless `Circle`. `binds` names the variant's
+/// declared fields positionally in declaration order; `"_"` means "don't
+/// bind this field". `path`, if present, qualifies `variant` with its
+/// owning enum's name (`Shape.Circle`); `None` means the bare, inferred
+/// form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pattern {
+    pub path:    Option<String>,
+    pub variant: String,
+    pub binds:   Vec<String>,
+}
+
+/// One arm of a `match` expression: `is Pattern (and guard)? then body`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub guard:   Option<ExprRef>,
+    pub body:    ExprRef,
+}
+
+/// `match subject { is P1 then e1  is P2 and guard then e2  else e3 }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchExpr {
+    pub subject: ExprRef,
+    pub arms:    Vec<MatchArm>,
+    pub default: Option<ExprRef>,
+}
+
+/// `subject is Pattern` — used standalone as a `Bool` test, or (when it is
+/// the entire condition of an `if`) as sugar for a two-armed `Match` that
+/// also binds the pattern's fields in the `then` branch. See
+/// `TypeChecker::check_and_lower`'s `Conditional` arm.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsPatternExpr {
+    pub subject: ExprRef,
+    pub pattern: Pattern,
 }
 
 /// `target.field` — struct field access. Also used, with `target.field`
@@ -160,6 +213,8 @@ pub enum Expression {
     DataDecl(DataDeclExpr),
     FieldAccess(FieldAccessExpr),
     Import(ImportExpr),
+    Match(MatchExpr),
+    IsPattern(IsPatternExpr),
 }
 
 
@@ -226,6 +281,10 @@ impl Expression {
 
     pub fn field_access(target: Spanned<Expression>, field: String) -> Expression {
         Expression::FieldAccess(FieldAccessExpr { target: Box::new(target), field })
+    }
+
+    pub fn is_pattern(subject: Spanned<Expression>, pattern: Pattern) -> Expression {
+        Expression::IsPattern(IsPatternExpr { subject: Box::new(subject), pattern })
     }
 
     pub fn get_identifier(&self) -> Option<&str> {
@@ -372,7 +431,26 @@ impl fmt::Display for Expression {
                         None => write!(f, "{}", p.name)?,
                     }
                 }
-                write!(f, ")")
+                write!(f, ")")?;
+                if !d.variants.is_empty() {
+                    write!(f, " is ")?;
+                    for (i, v) in d.variants.iter().enumerate() {
+                        if i > 0 { write!(f, " | ")?; }
+                        write!(f, "{}", v.name)?;
+                        if !v.fields.is_empty() {
+                            write!(f, "(")?;
+                            for (j, p) in v.fields.iter().enumerate() {
+                                if j > 0 { write!(f, ", ")?; }
+                                match &p.ty {
+                                    Some(ty) => write!(f, "{}: {}", p.name, ty)?,
+                                    None => write!(f, "{}", p.name)?,
+                                }
+                            }
+                            write!(f, ")")?;
+                        }
+                    }
+                }
+                Ok(())
             }
 
             Expression::FieldAccess(fa) => {
@@ -385,7 +463,34 @@ impl fmt::Display for Expression {
                     ImportKind::Qualified(alias) => write!(f, "import {:?} as {}", i.path, alias),
                 }
             }
+
+            Expression::Match(m) => {
+                write!(f, "match {} {{ ", m.subject)?;
+                for arm in &m.arms {
+                    write!(f, "is {}", fmt_pattern(&arm.pattern))?;
+                    if let Some(g) = &arm.guard { write!(f, " and {}", g)?; }
+                    write!(f, " then {}  ", arm.body)?;
+                }
+                if let Some(d) = &m.default { write!(f, "else {}", d)?; }
+                write!(f, "}}")
+            }
+
+            Expression::IsPattern(ip) => {
+                write!(f, "{} is {}", ip.subject, fmt_pattern(&ip.pattern))
+            }
         }
+    }
+}
+
+fn fmt_pattern(p: &Pattern) -> String {
+    let head = match &p.path {
+        Some(path) => format!("{}.{}", path, p.variant),
+        None => p.variant.clone(),
+    };
+    if p.binds.is_empty() {
+        head
+    } else {
+        format!("{}({})", head, p.binds.join(", "))
     }
 }
 

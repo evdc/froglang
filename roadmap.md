@@ -1,7 +1,10 @@
 - Modules
 - Better error messages / pretty-printing rustc-style using span info
-- Enums / variants, common fields, matching expressions (e.g. via `if x is Circle(r) then ...`)
-- Error handling, errors as values + early-return sugar, etc
+- Enums / variants, common fields, matching expressions (e.g. via `if x is Circle(r) then ...`) — done: `data X is A | B(...)`, `match`, `is`, boxed+tagged GC representation, exhaustiveness checking
+  - follow-ups: structural `==` on enums, named/nested pattern binds, multi-line leading-`|` variant lists
+  - done: payload-less variants are unboxed to an immediate tag (`(tag << 1) | 1`, low bit distinguishes them from 8-aligned pointers — see gc.rs "Immediate (unboxed) values")
+- Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value (~4M mallocs); after inlining heap access and un-boxing shadow frames it is at 182ms vs 31ms for the same program in Rust, and `malloc`/`free`/`memset` plus the mark phase are ~half of what's left. Secondary: pool/free-list the fixed-size GC blocks, and make shadow frames cheaper than an FFI push/pop + zeroing per call.
+- Error handling, errors as values + early-return sugar, etc — builds on enums (Result/Option as compiler-known enums)
 - Traits/interfaces, explicit-style
 - Annotations, and auto-deriving trait implementations (macros/comptime?)
 - Structured concurrency

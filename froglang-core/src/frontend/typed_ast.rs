@@ -103,4 +103,35 @@ pub enum TypedExprKind {
         field: String,
         value: TypedExprRef,
     },
+
+    /// `Enum.Variant(field=value, ...)` construction — bare or qualified,
+    /// nullary or not, all normalize to this. `fields` are pre-ordered
+    /// common-then-variant, matching `struct_fields`'s flattened layout
+    /// order (see `StructInit`). `tag` is the variant's declaration index.
+    /// Result type is `Type::Enum(enum_name)`.
+    VariantInit {
+        enum_name: String,
+        variant:   String,
+        tag:       u32,
+        fields:    Vec<(String, TypedExprRef)>,
+    },
+
+    /// `target is Variant` — a runtime tag test, no bindings (bindings are
+    /// only ever reachable via `match`/`if ... is`'s desugaring into
+    /// `Conditional` + `VariantField`, never directly on this node — see
+    /// `TypeChecker::lower_match`). Result type is `Type::Bool`.
+    IsVariant {
+        target:  TypedExprRef,
+        variant: String,
+        tag:     u32,
+    },
+
+    /// One of `variant`'s own declared fields (not a common field — those
+    /// use ordinary `FieldAccess`). Only ever emitted already guarded by a
+    /// preceding `IsVariant` check, so no runtime tag check happens here.
+    VariantField {
+        target:  TypedExprRef,
+        variant: String,
+        field:   String,
+    },
 }

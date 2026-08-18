@@ -111,6 +111,16 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
             }
             Expression::Comprehension(inner) => walk(&inner.item, path),
             Expression::FieldAccess(fa) => walk(&fa.target.item, path),
+            Expression::Match(m) => {
+                walk(&m.subject.item, path)?;
+                for arm in &m.arms {
+                    if let Some(g) = &arm.guard { walk(&g.item, path)?; }
+                    walk(&arm.body.item, path)?;
+                }
+                if let Some(d) = &m.default { walk(&d.item, path)?; }
+                Ok(())
+            }
+            Expression::IsPattern(ip) => walk(&ip.subject.item, path),
             Expression::DataDecl(_) | Expression::Literal(_) => Ok(()),
         }
     }
@@ -379,6 +389,9 @@ fn collect_names_in(expr: &Expression, names: &mut HashSet<String>) {
         }
         Expression::DataDecl(d) => {
             names.insert(d.name.clone());
+            for v in &d.variants {
+                names.insert(v.name.clone());
+            }
         }
         Expression::Block(stmts) | Expression::Tuple(stmts) => {
             for s in stmts { collect_names_in(&s.item, names); }
@@ -574,14 +587,67 @@ fn rewrite(
                 if let Some(mangled) = subst.get(&d.name) {
                     d.name = mangled.clone();
                 }
+                for v in &mut d.variants {
+                    if let Some(mangled) = subst.get(&v.name) {
+                        v.name = mangled.clone();
+                    }
+                }
             }
             for p in &mut d.fields {
                 if let Some(ty) = &mut p.ty {
                     rewrite(&mut ty.item, subst, qualified, shadow, track_let_shadow);
                 }
             }
+            for v in &mut d.variants {
+                for p in &mut v.fields {
+                    if let Some(ty) = &mut p.ty {
+                        rewrite(&mut ty.item, subst, qualified, shadow, track_let_shadow);
+                    }
+                }
+            }
+        }
+
+        Expression::Match(m) => {
+            rewrite(&mut m.subject.item, subst, qualified, shadow, track_let_shadow);
+            for arm in &mut m.arms {
+                rewrite_pattern(&mut arm.pattern, subst);
+                let already_shadowed: Vec<bool> = arm.pattern.binds.iter()
+                    .map(|b| shadow.contains(b)).collect();
+                for b in &arm.pattern.binds {
+                    if b != "_" { shadow.insert(b.clone()); }
+                }
+                if let Some(g) = &mut arm.guard {
+                    rewrite(&mut g.item, subst, qualified, shadow, track_let_shadow);
+                }
+                rewrite(&mut arm.body.item, subst, qualified, shadow, track_let_shadow);
+                for (b, was_shadowed) in arm.pattern.binds.iter().zip(already_shadowed) {
+                    if b != "_" && !was_shadowed { shadow.remove(b); }
+                }
+            }
+            if let Some(d) = &mut m.default {
+                rewrite(&mut d.item, subst, qualified, shadow, track_let_shadow);
+            }
+        }
+
+        Expression::IsPattern(ip) => {
+            rewrite(&mut ip.subject.item, subst, qualified, shadow, track_let_shadow);
+            rewrite_pattern(&mut ip.pattern, subst);
         }
 
         Expression::Import(_) => unreachable!("Import nodes are stripped before rewrite runs"),
+    }
+}
+
+/// Rewrite a pattern's (optional) enum-name path and its bare variant name
+/// (when unqualified) through `subst`, mirroring how a bare identifier
+/// reference is rewritten in `rewrite` above. The pattern's binds are
+/// locals, never substitution candidates.
+fn rewrite_pattern(pattern: &mut crate::frontend::expression::Pattern, subst: &HashMap<String, String>) {
+    if let Some(path) = &mut pattern.path {
+        if let Some(mangled) = subst.get(path) {
+            *path = mangled.clone();
+        }
+    } else if let Some(mangled) = subst.get(&pattern.variant) {
+        pattern.variant = mangled.clone();
     }
 }

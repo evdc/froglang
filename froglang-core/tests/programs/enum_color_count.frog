@@ -1,0 +1,8 @@
+data Color is Red | Green | Blue
+
+let colors = [Red, Green, Blue, Red, Red, Blue]
+
+let red_count = 0
+for c in colors do { if c is Red then { red_count = red_count + 1 } else 0 }
+
+red_count

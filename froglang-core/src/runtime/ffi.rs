@@ -1,7 +1,7 @@
 use std::alloc::Layout;
 use std::io::Write;
 
-use super::gc::{FrogList, FrogStr, GcHeap, GC_HEAP, ACTIVE_HEAP};
+use super::gc::{FrogList, FrogStr, FrogVariant, GcHeap, GC_HEAP, ACTIVE_HEAP};
 
 /// Call `f` with a mutable reference to the active GcHeap.
 /// Uses the `FrogState`-owned heap if one is executing on this thread,
@@ -363,6 +363,55 @@ pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
         }
         list as i64
     })
+}
+
+// ── Variant (enum value) operations ─────────────────────────────────────────
+
+/// Allocate a GC-managed `FrogVariant`: `tag` is the variant's declaration
+/// index, `nslots` its flattened payload width, `ptr_mask` marks which
+/// slots are heap pointers — all computed at codegen time from
+/// `TypeChecker::EnumDef`/`codegen::enum_field_leaf_types`. Payload slots
+/// start zeroed; the caller (codegen's `VariantInit`) fills them in with
+/// `frog_variant_set` right after this returns.
+#[no_mangle]
+pub extern "C" fn frog_alloc_variant(tag: i64, nslots: i64, ptr_mask: i64) -> i64 {
+    with_heap(|heap| {
+        heap.maybe_collect();
+        heap.alloc_variant(tag as u32, nslots as usize, ptr_mask as u64) as i64
+    })
+}
+
+/// A payload-less variant is unboxed — the value carries its own tag and
+/// there is nothing to dereference. See gc.rs's "Immediate (unboxed)
+/// values" section for the encoding.
+#[no_mangle]
+pub extern "C" fn frog_variant_tag(variant: i64) -> i64 {
+    if !super::gc::is_heap_ptr(variant) {
+        return super::gc::immediate_variant_tag(variant);
+    }
+    unsafe { (*(variant as *const FrogVariant)).tag as i64 }
+}
+
+/// Read raw payload slot `slot` — always in-bounds by construction (the
+/// slot index is a compile-time constant computed from the variant's own
+/// declared layout, never runtime-derived the way a list index is), so
+/// unlike `frog_list_get` there is no bounds check here.
+#[no_mangle]
+pub extern "C" fn frog_variant_get(variant: i64, slot: i64) -> i64 {
+    unsafe {
+        let ptr = variant as *const FrogVariant;
+        let data = (ptr as *const u8).add(std::mem::size_of::<FrogVariant>()) as *const i64;
+        *data.add(slot as usize)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn frog_variant_set(variant: i64, slot: i64, val: i64) {
+    unsafe {
+        let ptr = variant as *mut FrogVariant;
+        let data = (ptr as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
+        *data.add(slot as usize) = val;
+    }
 }
 
 // ── GC diagnostics ───────────────────────────────────────────────────────────

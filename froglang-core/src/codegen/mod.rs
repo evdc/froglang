@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem::{offset_of, size_of};
 
 use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, Value};
 use cranelift_codegen::{settings, settings::Configurable, Context};
@@ -8,8 +9,9 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::tokens::{Spanned, Token};
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
-use crate::frontend::typeck::{StructDefs, Type, numeric_join};
-use crate::runtime::ffi;
+use crate::frontend::typeck::{EnumDef, EnumDefs, StructDefs, Type, numeric_join};
+use crate::runtime::{ffi, gc};
+use crate::runtime::gc::{FrogList, FrogVariant};
 
 pub struct Codegen {
     pub module: JITModule,
@@ -43,11 +45,17 @@ struct Ctx<'a> {
     /// scalar/heap fields (recursively, for nested struct fields) — see
     /// `struct_fields` and `compile_expr_multi`.
     structs:       &'a StructDefs,
+    /// Layout for every registered enum, from `TypeChecker::enum_defs`. An
+    /// enum value, unlike a struct, IS a single GC-boxed heap pointer (see
+    /// `runtime::gc::FrogVariant`) — this is only consulted to resolve a
+    /// field name to a slot offset (`enum_field_leaf_types`), never to
+    /// flatten an enum value into more than one `Value`.
+    enums:         &'a EnumDefs,
 }
 
 /// True iff a value of this type is a GC-managed heap pointer.
 fn is_heap_ty(ty: &Type) -> bool {
-    matches!(ty, Type::Str | Type::List(_))
+    matches!(ty, Type::Str | Type::List(_) | Type::Enum(_))
 }
 
 /// Recursively flatten `ty` into its ordered leaf `(dotted_path, Type)`
@@ -201,10 +209,40 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         },
 
         // Reading a field off an already-bound struct isn't itself a new
-        // heap-value producer — only `target` might be (e.g. `f().name`).
-        TypedExprKind::FieldAccess { target, .. } => for_each_heap_producer(target, structs, f),
+        // heap-value producer (its leaf is a `Variable`, already rooted
+        // wherever it was produced) — only `target` might be (e.g.
+        // `f().name`). An enum-typed target is different: its fields live
+        // in heap memory, so *reading* one is a fresh `Value` each time,
+        // same as a list-element read (`Index`, above) — needs its own root.
+        TypedExprKind::FieldAccess { target, .. } => {
+            for_each_heap_producer(target, structs, f);
+            if matches!(&target.item.ty, Type::Enum(_)) {
+                for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
+            }
+        },
 
         TypedExprKind::FieldAssign { value, .. } => for_each_heap_producer(value, structs, f),
+
+        // A new heap object, just like `List`/`Slice`/`Range` — visits its
+        // fields' own producers first, then itself.
+        TypedExprKind::VariantInit { fields, .. } => {
+            for (_, v) in fields { for_each_heap_producer(v, structs, f); }
+            // A payload-less variant compiles to an immediate, not an
+            // allocation, so it produces nothing to root — see the matching
+            // arm in `compile_expr_multi`.
+            if !fields.is_empty() { f(); }
+        },
+
+        // A runtime tag test — no allocation; only `target`'s own
+        // producers (if any) matter.
+        TypedExprKind::IsVariant { target, .. } => for_each_heap_producer(target, structs, f),
+
+        // Reading a variant's own field is a fresh heap read, exactly like
+        // the enum arm of `FieldAccess` above.
+        TypedExprKind::VariantField { target, .. } => {
+            for_each_heap_producer(target, structs, f);
+            for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
+        },
     }
 }
 
@@ -235,6 +273,128 @@ fn root_heap_value(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) {
         bcx.ins().stack_store(val, slot, offset);
         ctx.heap_cursor += 1;
     }
+}
+
+// ── Inline heap-object access ────────────────────────────────────────────────
+//
+// Reading a list element, reading or writing a variant payload slot, and
+// appending to a list with spare capacity are each a single load or store at
+// an offset fixed by the object's own layout.  Routing them through the
+// `frog_*` FFI symbols made them opaque out-of-line calls instead, and those
+// calls — not the memory traffic they perform — dominated the `orders`
+// benchmark's profile.  The hot paths below emit the memory operation
+// directly.  The FFI entry points stay: they are still what the paths with
+// real runtime logic use (negative-index resolution, list growth) and what
+// the embedding API calls from Rust.
+
+/// Flags for accesses to a live GC object: the pointer came from `alloc`, so
+/// it is non-null and 8-byte aligned, and every offset here is derived from
+/// the object's declared layout, so nothing can trap.
+fn heap_mem() -> MemFlags { MemFlags::trusted() }
+
+/// Address of raw slot `slot` in `list`'s flat data buffer. Reloads `data`
+/// on each use rather than hoisting it, since a push can reallocate the
+/// buffer out from under a cached copy.
+fn list_slot_addr(bcx: &mut FunctionBuilder, list: Value, slot: Value) -> Value {
+    let data = bcx.ins().load(types::I64, heap_mem(), list, offset_of!(FrogList, data) as i32);
+    let byte_off = bcx.ins().imul_imm(slot, 8);
+    bcx.ins().iadd(data, byte_off)
+}
+
+/// A list's per-element slot count, normalized to at least 1 exactly as
+/// `frog_list_len` and `frog_list_get` do.
+fn list_stride(bcx: &mut FunctionBuilder, list: Value) -> Value {
+    let raw = bcx.ins().load(types::I32, heap_mem(), list, offset_of!(FrogList, stride) as i32);
+    let s = bcx.ins().uextend(types::I64, raw);
+    let is_zero = bcx.ins().icmp_imm(IntCC::Equal, s, 0);
+    let one = bcx.ins().iconst(types::I64, 1);
+    bcx.ins().select(is_zero, one, s)
+}
+
+/// Byte offset of payload slot `slot` within a `FrogVariant`.
+fn variant_slot_offset(slot: usize) -> i32 {
+    (size_of::<FrogVariant>() + slot * 8) as i32
+}
+
+/// Append one raw slot to `list`. The common case — spare capacity, so the
+/// push is a store plus a length bump — is inline; growing the buffer still
+/// goes through `frog_list_push`, which has to reallocate and report the new
+/// bytes to the GC.
+fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, val: Value) {
+    let len = bcx.ins().load(types::I32, heap_mem(), list, offset_of!(FrogList, len) as i32);
+    let cap = bcx.ins().load(types::I32, heap_mem(), list, offset_of!(FrogList, cap) as i32);
+    let has_room = bcx.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+
+    let fast_bb = bcx.create_block();
+    let slow_bb = bcx.create_block();
+    let done_bb = bcx.create_block();
+    bcx.ins().brif(has_room, fast_bb, &[], slow_bb, &[]);
+
+    bcx.switch_to_block(fast_bb);
+    bcx.seal_block(fast_bb);
+    let len64 = bcx.ins().uextend(types::I64, len);
+    let addr = list_slot_addr(bcx, list, len64);
+    bcx.ins().store(heap_mem(), val, addr, 0);
+    let next_len = bcx.ins().iadd_imm(len, 1);
+    bcx.ins().store(heap_mem(), next_len, list, offset_of!(FrogList, len) as i32);
+    bcx.ins().jump(done_bb, &[]);
+
+    bcx.switch_to_block(slow_bb);
+    bcx.seal_block(slow_bb);
+    let push_id = ctx.func_ids["frog_list_push"];
+    let push_ref = ctx.module.declare_func_in_func(push_id, bcx.func);
+    bcx.ins().call(push_ref, &[list, val]);
+    bcx.ins().jump(done_bb, &[]);
+
+    bcx.switch_to_block(done_bb);
+    bcx.seal_block(done_bb);
+}
+
+/// Emit the runtime test `val is <the variant at index `tag`>` for an enum
+/// value of `def`'s enum, as an `I8` boolean.
+///
+/// Which code this needs comes down to which representations `val` can
+/// actually have (see gc.rs's "Immediate (unboxed) values"):
+///
+///   * the tested variant is payload-less — then it is unboxed, and every
+///     other value of this enum (boxed or not) has a different bit pattern,
+///     so the whole test is one comparison against a constant;
+///   * the enum has no payload-less variant at all — then `val` is always a
+///     pointer, so the tag can be loaded unconditionally;
+///   * otherwise `val` may be an immediate, which can never match a
+///     payload-carrying variant but must not be dereferenced to find that
+///     out — so the load is guarded by the low-bit test.
+fn emit_is_variant(bcx: &mut FunctionBuilder, val: Value, def: &EnumDef, tag: u32) -> Value {
+    let variant_is_unit = def.common.is_empty()
+        && def.variants.get(tag as usize).is_some_and(|(_, fs)| fs.is_empty());
+    if variant_is_unit {
+        return bcx.ins().icmp_imm(IntCC::Equal, val, gc::immediate_variant(tag));
+    }
+
+    let enum_has_immediates = def.common.is_empty()
+        && def.variants.iter().any(|(_, fs)| fs.is_empty());
+    if !enum_has_immediates {
+        let actual = bcx.ins().load(types::I32, heap_mem(), val, offset_of!(FrogVariant, tag) as i32);
+        return bcx.ins().icmp_imm(IntCC::Equal, actual, tag as i64);
+    }
+
+    let boxed_bb = bcx.create_block();
+    let done_bb  = bcx.create_block();
+    bcx.append_block_param(done_bb, types::I8);
+
+    let is_immediate = bcx.ins().band_imm(val, 1);
+    let no = bcx.ins().iconst(types::I8, 0);
+    bcx.ins().brif(is_immediate, done_bb, &[no], boxed_bb, &[]);
+
+    bcx.switch_to_block(boxed_bb);
+    bcx.seal_block(boxed_bb);
+    let actual = bcx.ins().load(types::I32, heap_mem(), val, offset_of!(FrogVariant, tag) as i32);
+    let matched = bcx.ins().icmp_imm(IntCC::Equal, actual, tag as i64);
+    bcx.ins().jump(done_bb, &[matched]);
+
+    bcx.switch_to_block(done_bb);
+    bcx.seal_block(done_bb);
+    bcx.block_params(done_bb)[0]
 }
 
 /// If `n > 0`, allocate an `n`-slot stack region and register it as a GC
@@ -941,7 +1101,6 @@ fn compile_expr_multi(
             // collection, and the list must already be reachable by then.
             root_heap_value(bcx, ctx, list_ptr);
 
-            let push_id = ctx.func_ids["frog_list_push"];
             for elem in elems {
                 // A struct element compiles to `leafs.len()` values, pushed
                 // back-to-back — matching `stride` exactly is what makes the
@@ -957,9 +1116,7 @@ fn compile_expr_multi(
                     // call argument is a Cranelift type mismatch — a "Verifier
                     // errors" panic, not a bug in the pushed value itself.
                     let ev = to_i64_repr(bcx, lty, *ev);
-                    let push_ref = ctx.module.declare_func_in_func(push_id, bcx.func);
-                    let push_call = bcx.ins().call(push_ref, &[list_ptr, ev]);
-                    let _ = bcx.inst_results(push_call)[0];
+                    emit_list_push(bcx, ctx, list_ptr, ev);
                 }
             }
 
@@ -1007,9 +1164,22 @@ fn compile_expr_multi(
         },
 
         TypedExprKind::FieldAccess { target, field } => {
-            let target_vals = compile_expr_multi(target, bcx, vars, ctx);
-            let (start, len) = field_slice_range(&target.item.ty, field, ctx.structs);
-            target_vals[start..start + len].to_vec()
+            match &target.item.ty {
+                Type::Enum(ename) => {
+                    // A common field, read out of heap memory — unlike a
+                    // struct's `Variable`-backed leaf, this is a fresh
+                    // `Value` on every read, so each heap-typed slot roots
+                    // itself (see `for_each_heap_producer`'s matching arm).
+                    let ptr = compile_expr(target, bcx, vars, ctx);
+                    let (offset, leaf_types) = enum_field_leaf_types(ename, None, field, ctx.structs, ctx.enums);
+                    read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
+                },
+                _ => {
+                    let target_vals = compile_expr_multi(target, bcx, vars, ctx);
+                    let (start, len) = field_slice_range(&target.item.ty, field, ctx.structs);
+                    target_vals[start..start + len].to_vec()
+                },
+            }
         },
 
         TypedExprKind::FieldAssign { base, field, value } => {
@@ -1028,7 +1198,126 @@ fn compile_expr_multi(
             }
             vec![bcx.ins().iconst(types::I64, 0)]
         },
+
+        TypedExprKind::VariantInit { fields, tag, .. } => {
+            // A variant with no fields at all — neither its own nor common
+            // ones its enum declares — carries no information beyond its
+            // tag, so it needs no heap object: emit the tag as an unboxed
+            // immediate. `fields` is the enum's common fields followed by
+            // this variant's own (see `check_and_lower`'s variant-call arm),
+            // so it being empty is exactly the "nothing to store" test.
+            // See gc.rs's "Immediate (unboxed) values" for the encoding and
+            // why the GC can tell the two apart.
+            if fields.is_empty() {
+                return vec![bcx.ins().iconst(types::I64, gc::immediate_variant(*tag))];
+            }
+
+            // Compute every field's flattened leaf values first (mirrors
+            // `StructInit` exactly) — each heap-typed leaf among them
+            // roots itself already, via its own producer's codegen.
+            let mut flat_vals: Vec<Value> = Vec::new();
+            let mut flat_types: Vec<Type> = Vec::new();
+            for (_, v) in fields {
+                flat_vals.extend(compile_expr_multi(v, bcx, vars, ctx));
+                flat_types.extend(struct_fields(&v.item.ty, ctx.structs).into_iter().map(|(_, t)| t));
+            }
+
+            let mut ptr_mask: i64 = 0;
+            for (i, t) in flat_types.iter().enumerate() {
+                if is_heap_ty(t) { ptr_mask |= 1i64 << i; }
+            }
+            let tag_val    = bcx.ins().iconst(types::I64, *tag as i64);
+            let nslots_val = bcx.ins().iconst(types::I64, flat_vals.len() as i64);
+            let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
+
+            let alloc_id  = ctx.func_ids["frog_alloc_variant"];
+            let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+            let call      = bcx.ins().call(alloc_ref, &[tag_val, nslots_val, mask_val]);
+            let ptr       = bcx.inst_results(call)[0];
+            // Root the new object itself before populating it — matches
+            // the traversal order `for_each_heap_producer`'s `VariantInit`
+            // arm uses (fields' own producers first, then `f()` for this).
+            root_heap_value(bcx, ctx, ptr);
+
+            for (i, (v, t)) in flat_vals.iter().zip(flat_types.iter()).enumerate() {
+                let wire = to_i64_repr(bcx, t, *v);
+                bcx.ins().store(heap_mem(), wire, ptr, variant_slot_offset(i));
+            }
+            vec![ptr]
+        },
+
+        TypedExprKind::IsVariant { target, tag, .. } => {
+            let val = compile_expr(target, bcx, vars, ctx);
+            let ename = match &target.item.ty {
+                Type::Enum(n) => n.clone(),
+                other => unreachable!("IsVariant target must be Enum-typed, got {}", other),
+            };
+            let def = ctx.enums.get(&ename).expect("known enum in codegen").clone();
+            vec![emit_is_variant(bcx, val, &def, *tag)]
+        },
+
+        TypedExprKind::VariantField { target, variant, field } => {
+            let ptr = compile_expr(target, bcx, vars, ctx);
+            let ename = match &target.item.ty {
+                Type::Enum(n) => n.clone(),
+                _ => unreachable!("VariantField target must be Enum-typed"),
+            };
+            let (offset, leaf_types) = enum_field_leaf_types(&ename, Some(variant), field, ctx.structs, ctx.enums);
+            read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
+        },
     }
+}
+
+/// Read `leaf_types.len()` consecutive payload slots starting at `offset`
+/// out of the `FrogVariant` at `ptr`, converting each back from its
+/// `i64`-wire representation and — for a heap-typed leaf — rooting the
+/// freshly-read pointer (it's only reachable via `ptr`, which may itself
+/// go unrooted before this value is done being used, exactly like a
+/// list-element read — see `for_each_heap_producer`).
+fn read_variant_slots(ptr: Value, offset: usize, leaf_types: &[Type], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Vec<Value> {
+    let mut out = Vec::with_capacity(leaf_types.len());
+    for (i, lty) in leaf_types.iter().enumerate() {
+        // Only a variant that has payload slots to read is ever boxed, so
+        // `ptr` here is always a real pointer, never an unboxed immediate.
+        let raw = bcx.ins().load(types::I64, heap_mem(), ptr, variant_slot_offset(offset + i));
+        let v = from_i64_repr(bcx, lty, raw);
+        if is_heap_ty(lty) { root_heap_value(bcx, ctx, v); }
+        out.push(v);
+    }
+    out
+}
+
+/// Locate field `field` within one enum's runtime payload layout: common
+/// fields (declared order) first, then — if `variant` is given — that
+/// variant's own fields (declared order) appended right after. Returns the
+/// starting slot offset and the field's own flattened leaf types (len 1
+/// for a scalar/heap-pointer field, >1 for a nested-struct field) — mirrors
+/// `field_slice_range` for structs, generalized to the enum's two-part
+/// (common, variant) layout. `variant: None` is used for an ordinary
+/// common-field `FieldAccess` (the field must be common — enforced during
+/// typeck); `variant: Some(v)` is used for a match-bound `VariantField`.
+fn enum_field_leaf_types(enum_name: &str, variant: Option<&str>, field: &str, structs: &StructDefs, enums: &EnumDefs) -> (usize, Vec<Type>) {
+    let def = enums.get(enum_name).expect("known enum in codegen");
+    let mut offset = 0;
+    for (fname, fty) in &def.common {
+        let leaves = struct_fields(fty, structs);
+        if fname == field {
+            return (offset, leaves.into_iter().map(|(_, t)| t).collect());
+        }
+        offset += leaves.len();
+    }
+    if let Some(vname) = variant {
+        if let Some((_, vfields)) = def.variants.iter().find(|(n, _)| n == vname) {
+            for (fname, fty) in vfields {
+                let leaves = struct_fields(fty, structs);
+                if fname == field {
+                    return (offset, leaves.into_iter().map(|(_, t)| t).collect());
+                }
+                offset += leaves.len();
+            }
+        }
+    }
+    panic!("field '{}' not found on enum {} in codegen", field, enum_name);
 }
 
 /// Locate field `field` within struct-typed `struct_ty`'s flattened leaf
@@ -1084,6 +1373,7 @@ fn compile_for_loop(
     let len_callee = ctx.module.declare_func_in_func(len_id, bcx.func);
     let len_call = bcx.ins().call(len_callee, &[list_val]);
     let len_val = bcx.inst_results(len_call)[0];
+    let stride_val = list_stride(bcx, list_val);
 
     let header_bb = bcx.create_block();
     let body_bb   = bcx.create_block();
@@ -1108,12 +1398,16 @@ fn compile_for_loop(
     // Read each leaf field of the current element (1 call for a scalar
     // element, one per leaf for a struct element) and bind `var`'s
     // corresponding `Variable`(s) — mirrors `Assign`'s multi-leaf binding.
-    let get_id = ctx.func_ids["frog_list_get"];
+    // `i` is an element index the loop header has already bounded by
+    // `frog_list_len`, so — unlike a user-written `xs[i]`, which still goes
+    // through `frog_list_get` for negative-index and range handling — the
+    // read needs no bounds check, just the slot arithmetic `frog_list_get`
+    // would have done: `i * stride + leaf_idx`.
+    let base_slot = bcx.ins().imul(i, stride_val);
     for (leaf_idx, (leaf_path, lty)) in elem_leafs.iter().enumerate() {
-        let get_callee = ctx.module.declare_func_in_func(get_id, bcx.func);
-        let off_val = bcx.ins().iconst(types::I64, leaf_idx as i64);
-        let get_call = bcx.ins().call(get_callee, &[list_val, i, off_val]);
-        let raw = bcx.inst_results(get_call)[0];
+        let slot = bcx.ins().iadd_imm(base_slot, leaf_idx as i64);
+        let addr = list_slot_addr(bcx, list_val, slot);
+        let raw = bcx.ins().load(types::I64, heap_mem(), addr, 0);
         let elem_val = from_i64_repr(bcx, lty, raw);
         if is_heap_ty(lty) {
             root_heap_value(bcx, ctx, elem_val);
@@ -1143,11 +1437,9 @@ fn compile_for_loop(
     let body_vals = compile_expr_multi(body, bcx, vars, ctx);
     if let Some(list_ptr) = result_list {
         let body_leafs = struct_fields(&body.item.ty, ctx.structs);
-        let push_id = ctx.func_ids["frog_list_push"];
         for (v, (_, lty)) in body_vals.iter().zip(body_leafs.iter()) {
             let pushed = to_i64_repr(bcx, lty, *v);
-            let push_callee = ctx.module.declare_func_in_func(push_id, bcx.func);
-            bcx.ins().call(push_callee, &[list_ptr, pushed]);
+            emit_list_push(bcx, ctx, list_ptr, pushed);
         }
     }
 
@@ -1226,6 +1518,10 @@ impl Codegen {
         builder.symbol("frog_gc_dump",     ffi::frog_gc_dump     as *const u8);
         builder.symbol("frog_frame_push",  ffi::frog_frame_push  as *const u8);
         builder.symbol("frog_frame_pop",   ffi::frog_frame_pop   as *const u8);
+        builder.symbol("frog_alloc_variant", ffi::frog_alloc_variant as *const u8);
+        builder.symbol("frog_variant_tag", ffi::frog_variant_tag as *const u8);
+        builder.symbol("frog_variant_get", ffi::frog_variant_get as *const u8);
+        builder.symbol("frog_variant_set", ffi::frog_variant_set as *const u8);
 
         let mut module   = JITModule::new(builder);
         let mut func_ids = HashMap::<String, FuncId>::new();
@@ -1260,6 +1556,10 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_gc_dump",    "gc_dump",         &[],               None);
         declare_rt(&mut module, &mut func_ids, "frog_frame_push", "frog_frame_push", &[I64, I64],      None);
         declare_rt(&mut module, &mut func_ids, "frog_frame_pop",  "frog_frame_pop",  &[],              None);
+        declare_rt(&mut module, &mut func_ids, "frog_alloc_variant", "frog_alloc_variant", &[I64, I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_variant_tag", "frog_variant_tag", &[I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_variant_get", "frog_variant_get", &[I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_variant_set", "frog_variant_set", &[I64, I64, I64], None);
 
         Codegen {
             module,
@@ -1298,6 +1598,7 @@ impl Codegen {
         body: &Spanned<TypedExpr>,
         string_arena: &mut Vec<Vec<u8>>,
         structs: &StructDefs,
+        enums: &EnumDefs,
     ) {
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
         let entry = bcx.create_block();
@@ -1321,7 +1622,7 @@ impl Codegen {
         }
 
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, count_heap_slots(body, structs));
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs, enums };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
         teardown_shadow_frame(&mut bcx, module, func_ids, heap_slot);
 
@@ -1367,6 +1668,7 @@ impl Codegen {
         pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
+        enums: &EnumDefs,
     ) -> Vec<(String, Type)> {
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
         let entry = bcx.create_block();
@@ -1398,7 +1700,7 @@ impl Codegen {
 
         let n: usize = stmts.iter().map(|s| count_heap_slots(s, structs)).sum();
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs, enums };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;
@@ -1466,6 +1768,7 @@ impl Codegen {
         pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
+        enums: &EnumDefs,
     ) -> (FuncId, Vec<(String, Type)>) {
         let stmts: Vec<Spanned<TypedExpr>> = match typed.item.kind {
             TypedExprKind::Block(s) => s,
@@ -1528,6 +1831,7 @@ impl Codegen {
                 body,
                 string_arena,
                 structs,
+                enums,
             );
 
             self.module
@@ -1558,6 +1862,7 @@ impl Codegen {
             pre_env,
             env_types,
             structs,
+            enums,
         );
 
         self.module
@@ -1584,7 +1889,7 @@ pub fn compile_and_run(src: &str) -> i64 {
     let mut codegen = Codegen::new();
     let mut string_arena: Vec<Vec<u8>> = Vec::new();
     let (main_id, bindings) = codegen.compile_entry(
-        typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(),
+        typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.enum_defs(),
     );
 
     let ptr = codegen.module.get_finalized_function(main_id);

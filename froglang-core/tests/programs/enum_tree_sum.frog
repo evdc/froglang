@@ -1,0 +1,10 @@
+data Tree is Leaf | Node(v: Int, l: Tree, r: Tree)
+
+func sum(t: Tree): Int = match t {
+    is Leaf then 0
+    is Node(v, l, r) then v + sum(l) + sum(r)
+}
+
+let t = Node(v=1, l=Node(v=2, l=Leaf, r=Leaf), r=Node(v=3, l=Leaf, r=Node(v=4, l=Leaf, r=Leaf)))
+
+sum(t)

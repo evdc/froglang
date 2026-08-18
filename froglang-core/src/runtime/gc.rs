@@ -13,7 +13,7 @@ macro_rules! gc_trace {
 // ── Object kinds ─────────────────────────────────────────────────────────────
 
 #[repr(u8)]
-pub enum ObjKind { Str = 0, List = 1 }
+pub enum ObjKind { Str = 0, List = 1, Variant = 2 }
 
 // ── GC header (prefix for every heap object) ─────────────────────────────────
 
@@ -59,6 +59,61 @@ pub struct FrogList {
     pub data:     *mut i64,
 }
 
+// ── FrogVariant — immutable, inline payload immediately after the struct ──────
+//
+// Runtime representation of an enum value: `tag` is the variant's
+// declaration index within its enum (fixed by `TypeChecker::EnumDef`,
+// consulted only at codegen time — the GC itself never needs to know which
+// enum this came from). The payload is `nslots` `i64`s, laid out as the
+// enum's common fields (flattened, in declared order) followed by this
+// variant's own fields (flattened, in declared order) — see
+// `codegen::enum_field_leaf_types`. `ptr_mask` marks which payload slots
+// are heap pointers, exactly like `FrogList::ptr_mask` but one bit per
+// slot directly (no `stride` — a variant is always exactly one "element").
+#[repr(C)]
+pub struct FrogVariant {
+    pub header:   GcHeader,
+    pub tag:      u32,
+    pub nslots:   u32,
+    pub ptr_mask: u64,
+    _data: [i64; 0],  // zero-sized marker; slots live at (ptr + size_of::<FrogVariant>())
+}
+
+// ── Immediate (unboxed) values ────────────────────────────────────────────────
+//
+// A payload-less enum variant — no fields of its own and no common fields on
+// its enum, e.g. `Red` in `data Color is Red | Green | Blue`, or `NoDiscount`
+// in an enum whose other variants do carry fields — needs no heap object at
+// all: the tag *is* the whole value.  Codegen emits such a value as the
+// immediate `(tag << 1) | 1` instead of calling `frog_alloc_variant`
+// (see `TypedExprKind::VariantInit` in codegen/mod.rs).
+//
+// The low bit is what tells the two apart: every heap object comes from
+// `alloc`, so its address is at least 8-byte aligned and has the low bit
+// clear.  An enum-typed slot therefore holds either a real pointer or an
+// odd immediate, and everything that follows enum-typed words — the mark
+// phase's roots, shadow-stack slots, list element slots, and variant payload
+// slots — must ask `is_heap_ptr` first rather than dereferencing blind.
+
+/// Is `v` a pointer the GC may follow, rather than 0 (an empty slot) or an
+/// unboxed immediate (low bit set — see above)?
+#[inline]
+pub fn is_heap_ptr(v: i64) -> bool {
+    v != 0 && v & 1 == 0
+}
+
+/// Encode variant index `tag` as an unboxed enum value.
+#[inline]
+pub fn immediate_variant(tag: u32) -> i64 {
+    ((tag as i64) << 1) | 1
+}
+
+/// Decode an unboxed enum value produced by `immediate_variant`.
+#[inline]
+pub fn immediate_variant_tag(v: i64) -> i64 {
+    v >> 1
+}
+
 // ── Shadow stack ──────────────────────────────────────────────────────────────
 //
 // Codegen roots every heap pointer produced inside a JIT-compiled function by
@@ -71,9 +126,7 @@ pub struct FrogList {
 // under-roots, since a value stays reachable until the frame that stored it
 // returns.
 
-#[repr(C)]
 pub struct ShadowFrame {
-    pub prev:  *mut ShadowFrame,
     pub slots: *mut i64,
     pub len:   usize,
 }
@@ -85,7 +138,13 @@ pub struct GcHeap {
     pub bytes_allocated: usize,
     gc_threshold:    usize,
     roots:           Vec<(i64, bool)>,  // (value, is_ptr)
-    shadow_head:     *mut ShadowFrame,  // head of the JIT shadow stack, see above
+    // The JIT shadow stack (see above), innermost frame last. A `Vec` rather
+    // than a linked list of boxed frames: frames are pushed and popped in
+    // strict LIFO order by every JIT call that touches the heap, so boxing
+    // each one cost a `malloc`/`free` pair per call — enough of the `orders`
+    // benchmark's time to show up in its profile. The `Vec` reaches its
+    // high-water mark once and reuses that storage afterwards.
+    shadow_frames:   Vec<ShadowFrame>,
 }
 
 thread_local! {
@@ -102,7 +161,7 @@ impl GcHeap {
             bytes_allocated: 0,
             gc_threshold:    1024 * 1024,  // 1 MB initial threshold
             roots:           Vec::new(),
-            shadow_head:     std::ptr::null_mut(),
+            shadow_frames:   Vec::new(),
         }
     }
 
@@ -127,8 +186,7 @@ impl GcHeap {
         if len > 0 {
             unsafe { std::ptr::write_bytes(slots, 0, len); }
         }
-        let frame = Box::new(ShadowFrame { prev: self.shadow_head, slots, len });
-        self.shadow_head = Box::into_raw(frame);
+        self.shadow_frames.push(ShadowFrame { slots, len });
     }
 
     /// Pop the most recently pushed shadow-stack frame. Must be called
@@ -136,14 +194,9 @@ impl GcHeap {
     /// native call stack — codegen emits one push/pop pair per function
     /// invocation).
     pub fn pop_frame(&mut self) {
-        if self.shadow_head.is_null() { return; }
-        unsafe {
-            let frame = Box::from_raw(self.shadow_head);
-            self.shadow_head = frame.prev;
-            // `frame` (the ShadowFrame box) drops here; `frame.slots` itself
-            // is not owned memory — it points into the JIT function's own
-            // stack frame, which the JIT's own epilogue reclaims.
-        }
+        // A popped frame's `slots` is not owned memory — it points into the
+        // JIT function's own stack frame, which its epilogue reclaims.
+        self.shadow_frames.pop();
     }
 
     pub fn maybe_collect(&mut self) {
@@ -169,28 +222,23 @@ impl GcHeap {
         let roots = self.roots.clone();
         gc_trace!("marking {} roots", roots.len());
         for (value, is_ptr) in roots {
-            if is_ptr && value != 0 {
+            if is_ptr && is_heap_ptr(value) {
                 unsafe { Self::mark(value as *mut GcHeader); }
             }
         }
 
         // ...plus every live JIT shadow-stack frame.
-        let mut _frame_count = 0usize;
-        let mut frame = self.shadow_head;
-        while !frame.is_null() {
-            _frame_count += 1;
-            unsafe {
-                let f = &*frame;
-                for i in 0..f.len {
+        for f in &self.shadow_frames {
+            for i in 0..f.len {
+                unsafe {
                     let v = *f.slots.add(i);
-                    if v != 0 {
+                    if is_heap_ptr(v) {
                         Self::mark(v as *mut GcHeader);
                     }
                 }
-                frame = f.prev;
             }
         }
-        gc_trace!("marked {} shadow frame(s)", _frame_count);
+        gc_trace!("marked {} shadow frame(s)", self.shadow_frames.len());
 
         // Sweep phase
         let before = self.bytes_allocated;
@@ -212,25 +260,44 @@ impl GcHeap {
             if (*obj).marked { continue; }
             (*obj).marked = true;
             gc_trace!("mark  {:p} ({})", obj,
-                match (*obj).kind { ObjKind::Str => "Str", ObjKind::List => "List" });
-            if let ObjKind::List = (*obj).kind {
-                let list = obj as *mut FrogList;
-                let mask = (*list).ptr_mask;
-                if mask != 0 {
-                    let stride = ((*list).stride as usize).max(1);
-                    let elem_len = (*list).len as usize / stride;
-                    for i in 0..elem_len {
-                        let base = i * stride;
-                        for bit in 0..stride {
-                            if mask & (1u64 << bit) != 0 {
-                                let elem = *(*list).data.add(base + bit);
-                                if elem != 0 {
+                match (*obj).kind { ObjKind::Str => "Str", ObjKind::List => "List", ObjKind::Variant => "Variant" });
+            match (*obj).kind {
+                ObjKind::List => {
+                    let list = obj as *mut FrogList;
+                    let mask = (*list).ptr_mask;
+                    if mask != 0 {
+                        let stride = ((*list).stride as usize).max(1);
+                        let elem_len = (*list).len as usize / stride;
+                        for i in 0..elem_len {
+                            let base = i * stride;
+                            for bit in 0..stride {
+                                if mask & (1u64 << bit) != 0 {
+                                    let elem = *(*list).data.add(base + bit);
+                                    if is_heap_ptr(elem) {
+                                        worklist.push(elem as *mut GcHeader);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ObjKind::Variant => {
+                    let variant = obj as *mut FrogVariant;
+                    let mask = (*variant).ptr_mask;
+                    if mask != 0 {
+                        let nslots = (*variant).nslots as usize;
+                        let data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
+                        for i in 0..nslots {
+                            if mask & (1u64 << i) != 0 {
+                                let elem = *data.add(i);
+                                if is_heap_ptr(elem) {
                                     worklist.push(elem as *mut GcHeader);
                                 }
                             }
                         }
                     }
                 }
+                ObjKind::Str => {}
             }
         }
     }
@@ -280,6 +347,16 @@ impl GcHeap {
                 }
                 dealloc(obj as *mut u8, Layout::new::<FrogList>());
                 list_size + data_size
+            }
+            ObjKind::Variant => {
+                let variant_ptr = obj as *mut FrogVariant;
+                let nslots = (*variant_ptr).nslots as usize;
+                let total = std::mem::size_of::<FrogVariant>() + nslots * std::mem::size_of::<i64>();
+                let layout = Layout::from_size_align(total, std::mem::align_of::<FrogVariant>())
+                    .expect("FrogVariant layout");
+                gc_trace!("sweep free {:p} Variant {} bytes", obj, total);
+                dealloc(obj as *mut u8, layout);
+                total
             }
         }
     }
@@ -351,6 +428,42 @@ impl GcHeap {
         ptr
     }
 
+    /// Allocate a GC-managed `FrogVariant` with `nslots` `i64` payload
+    /// slots, zero-initialized (so a collection triggered while a
+    /// still-being-populated field is being computed never follows
+    /// garbage through an as-yet-unwritten slot — mirrors why
+    /// `push_frame` zeroes shadow-stack slots). `ptr_mask` marks which
+    /// slots are heap pointers, exactly like `alloc_list`'s.
+    pub fn alloc_variant(&mut self, tag: u32, nslots: usize, ptr_mask: u64) -> *mut FrogVariant {
+        let struct_size = std::mem::size_of::<FrogVariant>();
+        let data_size = nslots * std::mem::size_of::<i64>();
+        let total = struct_size + data_size;
+        let layout = Layout::from_size_align(total, std::mem::align_of::<FrogVariant>())
+            .expect("FrogVariant layout");
+
+        let ptr = unsafe { alloc(layout) as *mut FrogVariant };
+        unsafe {
+            (*ptr).header = GcHeader {
+                next:   self.head,
+                marked: false,
+                kind:   ObjKind::Variant,
+            };
+            (*ptr).tag      = tag;
+            (*ptr).nslots   = nslots as u32;
+            (*ptr).ptr_mask = ptr_mask;
+            if nslots > 0 {
+                let dst = (ptr as *mut u8).add(struct_size) as *mut i64;
+                std::ptr::write_bytes(dst, 0, nslots);
+            }
+        }
+
+        self.head = ptr as *mut GcHeader;
+        self.bytes_allocated += total;
+        gc_trace!("alloc Variant tag={} {} bytes -> {:p}  (total: {} bytes)",
+            tag, total, ptr, self.bytes_allocated);
+        ptr
+    }
+
     /// Print every live object in this heap to stderr.
     pub fn dump(&self) {
         let struct_size = std::mem::size_of::<FrogStr>();
@@ -384,6 +497,18 @@ impl GcHeap {
                             eprint!("{}", *(*l).data.add(i * stride));
                         }
                         if elem_len > 8 { eprint!(", …"); }
+                        eprintln!("]");
+                    }
+                    ObjKind::Variant => {
+                        let v = current as *const FrogVariant;
+                        let nslots = (*v).nslots as usize;
+                        let data = (current as *const u8).add(std::mem::size_of::<FrogVariant>()) as *const i64;
+                        eprint!("  [{:p}] Variant tag={:<2} nslots={:<2} ptr_mask={:#x}  [",
+                            current, (*v).tag, nslots, (*v).ptr_mask);
+                        for i in 0..nslots {
+                            if i > 0 { eprint!(", "); }
+                            eprint!("{}", *data.add(i));
+                        }
                         eprintln!("]");
                     }
                 }

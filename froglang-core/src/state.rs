@@ -54,7 +54,12 @@ impl FrogValue {
             // Not reachable from `compile_and_run`/test code as long as
             // struct values only ever appear as locals, not as a bare
             // top-level result or REPL binding — see the struct-support plan.
-            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Struct(_) => {
+            // Struct/enum values aren't yet representable in the embedding
+            // API's `FrogValue` — see the comment above for structs; an
+            // enum value is a single `i64` (a `FrogVariant` pointer) but
+            // decoding it generically would need the enum's field layout,
+            // which isn't threaded through here.
+            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Struct(_) | Type::Enum(_) => {
                 FrogValue::None
             },
         }
@@ -229,6 +234,7 @@ impl FrogState {
                 &self.env,
                 &self.env_types,
                 self.tc.struct_defs(),
+                self.tc.enum_defs(),
             )
         }));
 

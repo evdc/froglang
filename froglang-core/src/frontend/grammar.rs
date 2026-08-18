@@ -1,4 +1,4 @@
-use crate::frontend::{expression::{DataDeclExpr, Expression, ImportExpr, ImportKind, Parameter}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Spanned, Token}};
+use crate::frontend::{expression::{DataDeclExpr, Expression, ImportExpr, ImportKind, MatchArm, MatchExpr, Parameter, Pattern, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}};
 
 pub type PrefixFnType = fn(&mut Parser, Spanned<Token>) -> ParseResult;
 pub type InfixFnType = fn(&mut Parser, Spanned<Token>, Spanned<Expression>, Precedence) -> ParseResult;
@@ -373,18 +373,14 @@ impl Grammar {
         })
     }
 
-    /// `data Name(field: Type, ...)` — every field requires a type
-    /// annotation (unlike function params, where it's optional).
-    pub fn data_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
-        let name_tok = parser.identifier()?;
-        let name = match &name_tok.item {
-            Token::Identifier(s) => s.clone(),
-            _ => unreachable!(),
-        };
+    /// `(field: Type, ...)` — every field requires a type annotation
+    /// (unlike function params, where it's optional). Shared by struct
+    /// fields, enum common fields, and enum variant fields. Assumes the
+    /// opening `(` has not yet been consumed; returns the field list and
+    /// the closing paren's span.
+    fn field_list(parser: &mut Parser) -> Result<(Vec<Parameter>, Span), Spanned<ParseError>> {
         parser.consume(Token::LeftParen)?;
-
         let mut fields = Vec::new();
-        let mut end = name_tok.span;
         while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
             let field_tok = parser.identifier()?;
             let field_name = match &field_tok.item {
@@ -393,18 +389,169 @@ impl Grammar {
             };
             parser.consume(Token::Colon)?;
             let ty_tok = parser.identifier()?;
-            end = ty_tok.span;
             fields.push(Parameter { name: field_name, ty: Some(Box::new(ty_tok.map(Expression::literal))) });
             if parser.check(&Token::Comma) {
                 parser.advance()?;
             }
         }
         let closing = parser.consume(Token::RightParen)?;
-        let _ = end;
+        Ok((fields, closing.span))
+    }
+
+    /// `data Name(field: Type, ...)` for a struct, or
+    /// `data Name(common: Type, ...) is A(...) | B(...) | ...` for an enum
+    /// (the common-field parens are optional in either form; empty ⇒ none).
+    /// A multi-line variant list is written with a trailing `|` at the end
+    /// of each line (the parser has no lookahead past a newline to safely
+    /// know whether a *leading* `|` on the next line is coming).
+    pub fn data_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let name_tok = parser.identifier()?;
+        let name = match &name_tok.item {
+            Token::Identifier(s) => s.clone(),
+            _ => unreachable!(),
+        };
+
+        let mut end = name_tok.span;
+        let fields = if parser.check(&Token::LeftParen) {
+            let (fields, closing) = Self::field_list(parser)?;
+            end = closing;
+            fields
+        } else {
+            Vec::new()
+        };
+
+        let mut variants = Vec::new();
+        if parser.check(&Token::Is) {
+            parser.advance()?;
+            parser.skip_newlines();
+            loop {
+                let variant_name_tok = parser.identifier()?;
+                let variant_name = match &variant_name_tok.item {
+                    Token::Identifier(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                end = variant_name_tok.span;
+                let variant_fields = if parser.check(&Token::LeftParen) {
+                    let (fields, closing) = Self::field_list(parser)?;
+                    end = closing;
+                    fields
+                } else {
+                    Vec::new()
+                };
+                variants.push(VariantDecl { name: variant_name, fields: variant_fields });
+
+                if parser.check(&Token::Pipe) {
+                    parser.advance()?;
+                    parser.skip_newlines();
+                    continue;
+                }
+                break;
+            }
+        }
+
+        Ok(Spanned {
+            span: token.span.merge(end),
+            item: Expression::DataDecl(DataDeclExpr { name, fields, variants })
+        })
+    }
+
+    /// `Ident` or `Ident.Ident`, optionally followed by `(bind, bind, ...)`
+    /// (`_` for a skipped field). Shared by `match` arms and the infix
+    /// `is` operator. Returns the pattern and its own span.
+    fn pattern(parser: &mut Parser) -> Result<(Pattern, Span), Spanned<ParseError>> {
+        let first_tok = parser.identifier()?;
+        let first_name = match &first_tok.item {
+            Token::Identifier(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        let mut end = first_tok.span;
+
+        let (path, variant) = if parser.check(&Token::Dot) {
+            parser.advance()?;
+            let variant_tok = parser.identifier()?;
+            end = variant_tok.span;
+            let variant_name = match &variant_tok.item {
+                Token::Identifier(s) => s.clone(),
+                _ => unreachable!(),
+            };
+            (Some(first_name), variant_name)
+        } else {
+            (None, first_name)
+        };
+
+        let mut binds = Vec::new();
+        if parser.check(&Token::LeftParen) {
+            parser.advance()?;
+            while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
+                let bind_tok = parser.identifier()?;
+                let bind_name = match &bind_tok.item {
+                    Token::Identifier(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                binds.push(bind_name);
+                if parser.check(&Token::Comma) {
+                    parser.advance()?;
+                }
+            }
+            let closing = parser.consume(Token::RightParen)?;
+            end = closing.span;
+        }
+
+        Ok((Pattern { path, variant, binds }, Span { start: first_tok.span.start, end: end.end }))
+    }
+
+    /// `subject is Pattern` — infix on `is`. Legal anywhere as a `Bool`
+    /// test; also recognized specially as the entire condition of an `if`
+    /// (see `TypeChecker::check_and_lower`'s `Conditional` arm) to bind
+    /// the pattern's fields into the `then` branch.
+    pub fn is_pattern(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
+        let (pattern, pat_span) = Self::pattern(parser)?;
+        Ok(Spanned {
+            span: left.span.merge(pat_span),
+            item: Expression::is_pattern(left, pattern)
+        })
+    }
+
+    /// `match subject { is P1 (and guard)? then e1  ...  (else e_default)? }`.
+    /// Arms must be newline-separated (a stray `is`/`else` on the same
+    /// line as a previous arm's body would otherwise be swallowed by that
+    /// body's own expression parsing).
+    pub fn match_expr(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let subject = parser.expression(Precedence::Assign)?;
+        parser.skip_newlines();
+        parser.consume(Token::LeftBrace)?;
+        parser.skip_newlines();
+
+        let mut arms = Vec::new();
+        let mut default = None;
+        while !parser.check(&Token::RightBrace) && !parser.check(&Token::EOF) {
+            if parser.check(&Token::Else) {
+                parser.advance()?;
+                parser.skip_newlines();
+                let body = parser.expression(Precedence::Assign)?;
+                default = Some(Box::new(body));
+            } else {
+                parser.consume(Token::Is)?;
+                let (pattern, _) = Self::pattern(parser)?;
+                let guard = if parser.check(&Token::And) {
+                    parser.advance()?;
+                    Some(Box::new(parser.expression(Precedence::Assign)?))
+                } else {
+                    None
+                };
+                parser.skip_newlines();
+                parser.consume(Token::Then)?;
+                parser.skip_newlines();
+                let body = parser.expression(Precedence::Assign)?;
+                arms.push(MatchArm { pattern, guard, body: Box::new(body) });
+            }
+            parser.skip_newlines();
+        }
+        let closing = parser.consume(Token::RightBrace)?;
 
         Ok(Spanned {
             span: token.span.merge(closing.span),
-            item: Expression::DataDecl(DataDeclExpr { name, fields })
+            item: Expression::Match(MatchExpr { subject: Box::new(subject), arms, default })
         })
     }
 

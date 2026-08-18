@@ -434,17 +434,21 @@ impl Grammar {
             });
         }
 
-        parser.consume(Token::LeftBrace)?;
+        let open = parser.consume(Token::LeftBrace)?;
         let mut names = Vec::new();
-        while !parser.check(&Token::RightBrace) && !parser.check(&Token::EOF) {
+        loop {
+            if parser.check(&Token::RightBrace) { break; }
             let name_tok = parser.identifier()?;
             match &name_tok.item {
                 Token::Identifier(s) => names.push(s.clone()),
                 _ => unreachable!(),
             };
-            if parser.check(&Token::Comma) {
-                parser.advance()?;
-            }
+            if parser.check(&Token::RightBrace) { break; }
+            parser.consume(Token::Comma)?;
+        }
+        if names.is_empty() {
+            let err = open.map(|_| ParseError::Other("import list must name at least one binding".to_string()));
+            return Err(err);
         }
         let closing = parser.consume(Token::RightBrace)?;
 

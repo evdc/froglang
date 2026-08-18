@@ -404,6 +404,21 @@ fn print_fragment(text: &str, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
     bcx.ins().call(callee, &[data, len]);
 }
 
+/// The `kind` discriminant `frog_list_print`/`frog_list_println` (in
+/// runtime/ffi.rs) switch on to render a list's element type. Both codegen
+/// call sites that build this discriminant must agree on the encoding.
+fn list_elem_kind(elem_ty: &Type) -> i64 {
+    match elem_ty {
+        Type::Int => 0,
+        Type::Float => 1,
+        Type::Bool => 2,
+        Type::Str => 3,
+        Type::List(_) => 4,
+        Type::Struct(_) => 5,
+        _ => 6,
+    }
+}
+
 /// Print one value without a trailing newline. Structs are represented as a
 /// sequence of flattened leaf values, so this recursively consumes that
 /// sequence according to the declared field layout.
@@ -430,10 +445,7 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
                 Type::Int => ("frog_int_print", None),
                 Type::Float => ("frog_float_print", None),
                 Type::Bool => ("frog_bool_print", None),
-                Type::List(inner) => ("frog_list_print", Some(match inner.as_ref() {
-                    Type::Int => 0, Type::Float => 1, Type::Bool => 2, Type::Str => 3,
-                    Type::List(_) => 4, Type::Struct(_) => 5, _ => 6,
-                })),
+                Type::List(inner) => ("frog_list_print", Some(list_elem_kind(inner))),
                 _ => unreachable!(),
             };
             let callee = ctx.module.declare_func_in_func(ctx.func_ids[id], bcx.func);
@@ -752,14 +764,7 @@ fn compile_expr_multi(
                     Type::Int => ("frog_int_println", None),
                     Type::Float => ("frog_float_println", None),
                     Type::Bool => ("frog_bool_println", None),
-                    Type::List(inner) => ("frog_list_println", Some(match inner.as_ref() {
-                        Type::Int => 0,
-                        Type::Float => 1,
-                        Type::Bool => 2,
-                        Type::Str => 3,
-                        Type::List(_) => 4,
-                        _ => 5,
-                    })),
+                    Type::List(inner) => ("frog_list_println", Some(list_elem_kind(inner))),
                     ty => panic!("print codegen does not support {:?}", ty),
                 };
                 let func_id = ctx.func_ids[rt_name];

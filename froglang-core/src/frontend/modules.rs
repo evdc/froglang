@@ -266,7 +266,7 @@ impl ModuleResolver {
                         let mangled = record.exports.get(name).cloned().ok_or_else(|| {
                             ModuleError::UnknownExport { path: target.clone(), name: name.clone() }
                         })?;
-                        if named.insert(name.clone(), mangled).is_some() {
+                        if named.insert(name.clone(), mangled).is_some() || qualified.contains_key(name) {
                             return Err(ModuleError::DuplicateImportBinding {
                                 path: importer_path.to_path_buf(),
                                 name: name.clone(),
@@ -275,7 +275,7 @@ impl ModuleResolver {
                     }
                 }
                 ImportKind::Qualified(alias) => {
-                    if qualified.insert(alias.clone(), record.exports.clone()).is_some() {
+                    if qualified.insert(alias.clone(), record.exports.clone()).is_some() || named.contains_key(alias) {
                         return Err(ModuleError::DuplicateImportBinding {
                             path: importer_path.to_path_buf(),
                             name: alias.clone(),

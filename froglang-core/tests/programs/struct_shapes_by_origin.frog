@@ -1,0 +1,16 @@
+data Point(x: Int, y: Int)
+data Shape(name: Str, center: Point, radius: Int)
+
+func area(s: Shape): Int = s.radius * s.radius * 3
+
+let origin = Point(x=0, y=0)
+
+let shapes = [Shape(name="A", center=Point(x=0, y=0), radius=2), Shape(name="B", center=Point(x=5, y=5), radius=3), Shape(name="C", center=Point(x=0, y=0), radius=1)]
+
+// Struct equality used directly as a comprehension filter predicate.
+let centered = [for s in shapes if s.center == origin do s]
+
+let total_area = 0
+for s in centered do { total_area = total_area + area(s) }
+
+total_area

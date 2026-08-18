@@ -1,0 +1,4 @@
+import "./utils.frog" { add, origin }
+
+let p = origin()
+add(p.x, add(3, 4))

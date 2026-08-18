@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::codegen::Codegen;
-use crate::frontend::parser::{Parser, ParseError};
+use crate::frontend::parser::ParseError;
+use crate::frontend::modules;
 use crate::frontend::typeck::{Type, TypeChecker};
 use crate::frontend::tokens::Spanned;
+use crate::frontend::expression::Expression;
 use crate::runtime::gc::{GcHeap, ACTIVE_HEAP};
 use crate::runtime;
 
@@ -78,6 +81,9 @@ impl FrogValue {
 #[derive(Debug)]
 pub enum FrogError {
     Parse(Vec<Spanned<ParseError>>),
+    /// A module-resolution failure (bad import path, cycle, unknown
+    /// export, etc) — see `frontend::modules::ModuleError`.
+    Module(String),
     Type(String),
     /// Codegen hit an internal panic (e.g. an unsupported construct the type
     /// checker currently lets through — see `codegen::mod`'s `unimplemented!`
@@ -95,6 +101,7 @@ impl std::fmt::Display for FrogError {
                 for e in errs { write!(f, ": {:?}", e)?; }
                 Ok(())
             },
+            FrogError::Module(msg)  => write!(f, "Module error: {}", msg),
             FrogError::Type(msg)    => write!(f, "Type error: {}", msg),
             FrogError::Codegen(msg) => write!(f, "Codegen error: {}", msg),
         }
@@ -124,7 +131,11 @@ pub struct FrogState {
     pub heap:         GcHeap,
     pub tc:           TypeChecker,
     pub codegen:      Codegen,
-    pub env:          HashMap<String, i64>,
+    /// One `i64` per flattened leaf field of the binding's type (see
+    /// `struct_fields` in `codegen/mod.rs`) — a single element for every
+    /// non-struct type, matching how it always worked before structs
+    /// existed; more than one for a struct-typed binding.
+    pub env:          HashMap<String, Vec<i64>>,
     pub env_types:    HashMap<String, Type>,
     pub string_arena: Vec<Vec<u8>>,
     pub entry_count:  usize,
@@ -160,8 +171,32 @@ impl FrogState {
     /// state are both rolled back to exactly how they were before this call,
     /// so a failed `eval` never leaves the `FrogState` unusable for the next
     /// one.
+    ///
+    /// `src`'s own `import` statements (if any) are resolved relative to
+    /// the current working directory — this is the REPL/no-file entry
+    /// point. See `eval_file` for a file-backed entry, where imports
+    /// resolve relative to that file's own directory instead.
     pub fn eval(&mut self, src: &str) -> Result<(FrogValue, Type), FrogError> {
-        let ast = Parser::parse(src).map_err(FrogError::Parse)?;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.eval_with_base(src, &cwd.join("<repl>"))
+    }
+
+    /// Read, parse, type-check, compile, and run the file at `path`.
+    /// `import` statements in it (and transitively, in every file it
+    /// imports) resolve relative to each importing file's own directory.
+    pub fn eval_file(&mut self, path: &Path) -> Result<(FrogValue, Type), FrogError> {
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| FrogError::Module(format!("could not read '{}': {}", path.display(), e)))?;
+        self.eval_with_base(&src, path)
+    }
+
+    fn eval_with_base(&mut self, src: &str, base_path: &Path) -> Result<(FrogValue, Type), FrogError> {
+        let stmts = modules::resolve_source(src, base_path).map_err(|e| FrogError::Module(e.to_string()))?;
+        let span = match (stmts.first(), stmts.last()) {
+            (Some(first), Some(last)) => first.span.merge(last.span),
+            _ => crate::frontend::tokens::Span::new((0, 0), (0, 0)),
+        };
+        let ast = Spanned::from(Expression::Block(stmts), span);
 
         let cp = self.tc.checkpoint();
         let typed = match self.tc.check_and_lower_entry(ast) {
@@ -211,13 +246,22 @@ impl FrogState {
         let ptr = self.codegen.module.get_finalized_function(main_id);
         let func_ptr: fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
 
-        let mut out_buf: Vec<i64> = vec![0i64; bindings.len()];
+        // Each binding occupies `struct_fields(ty, structs).len()` slots
+        // (1 for every non-struct type) — see `build_main_body`'s doc
+        // comment in codegen/mod.rs for the write side of this protocol.
+        let total_slots: usize = bindings.iter()
+            .map(|(_, ty)| crate::codegen::struct_fields(ty, self.tc.struct_defs()).len())
+            .sum();
+        let mut out_buf: Vec<i64> = vec![0i64; total_slots];
         let out_ptr = out_buf.as_mut_ptr() as i64;
         let bits = self.call_jit(func_ptr, out_ptr);
 
-        for ((name, ty), &val_bits) in bindings.iter().zip(out_buf.iter()) {
-            self.env.insert(name.clone(), val_bits);
+        let mut cursor = 0usize;
+        for (name, ty) in &bindings {
+            let width = crate::codegen::struct_fields(ty, self.tc.struct_defs()).len();
+            self.env.insert(name.clone(), out_buf[cursor..cursor + width].to_vec());
             self.env_types.insert(name.clone(), ty.clone());
+            cursor += width;
         }
 
         // Rebuild the GC's explicit root set from scratch every time, from
@@ -232,9 +276,12 @@ impl FrogState {
             self.heap.push_root(bits, true);
         }
         for (name, ty) in &self.env_types {
-            if matches!(ty, Type::Str | Type::List(_)) {
-                if let Some(&val_bits) = self.env.get(name) {
-                    self.heap.push_root(val_bits, true);
+            if let Some(vals) = self.env.get(name) {
+                let leafs = crate::codegen::struct_fields(ty, self.tc.struct_defs());
+                for (v, (_, lty)) in vals.iter().zip(leafs.iter()) {
+                    if matches!(lty, Type::Str | Type::List(_)) {
+                        self.heap.push_root(*v, true);
+                    }
                 }
             }
         }

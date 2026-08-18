@@ -613,3 +613,34 @@ fn test_struct_nominal_typing_rejects_cross_type_equality() {
     let err = tc.check_and_lower(ast).expect_err("different struct names should never unify");
     assert!(format!("{:?}", err).contains("incompatible types"), "unexpected error: {:?}", err);
 }
+
+// ── struct programs from tests/programs/ (structs + for-loops/comprehensions
+// combined, more realistic than the single-feature tests above) ─────────────
+
+/// Shopping cart: nested structs (`LineItem` holds a `Product`), list
+/// indexing into a separately-built catalog, a function taking a struct
+/// param, a plain for-loop accumulator, and a filtering comprehension.
+/// subtotal = 450*2 + 500*1 = 1400; bulk discount = 900/10 = 90 -> 1310.
+#[test]
+fn test_struct_cart_total() {
+    assert_eq!(compile_and_run(&prog("struct_cart_total.frog")), 1310);
+}
+
+/// Grade stats: a struct-returning function that mutates its (copied)
+/// struct param via the field-rebind sugar, a comprehension filtering
+/// structs (not just scalars) by a field predicate, and a for-loop folding
+/// the filtered results through the function. Passing scores 92/77/88,
+/// average = 257/3 = 85 (integer division).
+#[test]
+fn test_struct_grade_stats() {
+    assert_eq!(compile_and_run(&prog("struct_grade_stats.frog")), 85);
+}
+
+/// Shapes-by-origin: nested structs (`Shape` holds a `Point`), struct
+/// equality used directly as a comprehension filter predicate, and a
+/// function taking a struct param. Shapes A and C are centered at the
+/// origin (radius 2 and 1); total_area = 2*2*3 + 1*1*3 = 15.
+#[test]
+fn test_struct_shapes_by_origin() {
+    assert_eq!(compile_and_run(&prog("struct_shapes_by_origin.frog")), 15);
+}

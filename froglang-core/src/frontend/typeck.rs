@@ -411,6 +411,10 @@ impl TypeChecker {
             Expression::DataDecl(_) => Ok(Type::None),
 
             Expression::FieldAccess(fa) => self.infer_field_access(fa, expr.span),
+
+            Expression::Import(_) => unreachable!(
+                "Expression::Import must be resolved and stripped by frontend::modules before typeck ever sees it"
+            ),
         }
     }
 
@@ -1223,6 +1227,10 @@ impl TypeChecker {
                 let target = self.check_and_lower(*fa.target)?;
                 TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field }
             },
+
+            Expression::Import(_) => unreachable!(
+                "Expression::Import must be resolved and stripped by frontend::modules before typeck ever sees it"
+            ),
         };
 
         Ok(Spanned::from(TypedExpr { ty: resolved_ty, kind }, span))

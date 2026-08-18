@@ -1,0 +1,3 @@
+import "./shared.frog" { base, double }
+
+let result_a = double(base) + 1

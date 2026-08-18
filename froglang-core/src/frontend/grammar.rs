@@ -1,4 +1,4 @@
-use crate::frontend::{expression::{DataDeclExpr, Expression, Parameter}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Spanned, Token}};
+use crate::frontend::{expression::{DataDeclExpr, Expression, ImportExpr, ImportKind, Parameter}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Spanned, Token}};
 
 pub type PrefixFnType = fn(&mut Parser, Spanned<Token>) -> ParseResult;
 pub type InfixFnType = fn(&mut Parser, Spanned<Token>, Spanned<Expression>, Precedence) -> ParseResult;
@@ -405,6 +405,52 @@ impl Grammar {
         Ok(Spanned {
             span: token.span.merge(closing.span),
             item: Expression::DataDecl(DataDeclExpr { name, fields })
+        })
+    }
+
+    /// `import "./path.frog" { a, b }` or `import "./path.frog" as alias`.
+    /// See `frontend::modules` for how these are resolved and stripped
+    /// before typeck ever runs.
+    pub fn import_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let path_tok = parser.advance()?;
+        let path = match &path_tok.item {
+            Token::String(s) => s.clone(),
+            _ => {
+                let err = path_tok.map(|_| ParseError::Other("expected a string literal module path after 'import'".to_string()));
+                return Err(err);
+            }
+        };
+
+        if parser.check(&Token::As) {
+            parser.advance()?;
+            let alias_tok = parser.identifier()?;
+            let alias = match &alias_tok.item {
+                Token::Identifier(s) => s.clone(),
+                _ => unreachable!(),
+            };
+            return Ok(Spanned {
+                span: token.span.merge(alias_tok.span),
+                item: Expression::Import(ImportExpr { path, kind: ImportKind::Qualified(alias) }),
+            });
+        }
+
+        parser.consume(Token::LeftBrace)?;
+        let mut names = Vec::new();
+        while !parser.check(&Token::RightBrace) && !parser.check(&Token::EOF) {
+            let name_tok = parser.identifier()?;
+            match &name_tok.item {
+                Token::Identifier(s) => names.push(s.clone()),
+                _ => unreachable!(),
+            };
+            if parser.check(&Token::Comma) {
+                parser.advance()?;
+            }
+        }
+        let closing = parser.consume(Token::RightBrace)?;
+
+        Ok(Spanned {
+            span: token.span.merge(closing.span),
+            item: Expression::Import(ImportExpr { path, kind: ImportKind::Named(names) }),
         })
     }
 

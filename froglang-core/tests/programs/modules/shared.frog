@@ -1,0 +1,3 @@
+let base = 100
+
+func double(n: Int): Int = n * 2

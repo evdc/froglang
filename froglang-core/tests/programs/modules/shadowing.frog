@@ -1,0 +1,7 @@
+import "./utils.frog" { add }
+
+func shadow_add(add: Int): Int = add + 1
+
+let outside = add(1, 2)
+let inside = shadow_add(10)
+outside * 100 + inside

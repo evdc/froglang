@@ -119,6 +119,22 @@ pub struct FieldAccessExpr {
     pub field:  String,
 }
 
+/// `import "./path.frog" { a, b }` or `import "./path.frog" as alias`.
+/// Resolved and removed entirely by `crate::frontend::modules` before the
+/// AST ever reaches the type checker — see that module for the merge
+/// algorithm. Never appears in a `TypedExpr`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportExpr {
+    pub path: String,
+    pub kind: ImportKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportKind {
+    Named(Vec<String>),
+    Qualified(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Literal(LiteralExpr),
@@ -143,6 +159,7 @@ pub enum Expression {
     Comprehension(ExprRef),
     DataDecl(DataDeclExpr),
     FieldAccess(FieldAccessExpr),
+    Import(ImportExpr),
 }
 
 
@@ -360,6 +377,13 @@ impl fmt::Display for Expression {
 
             Expression::FieldAccess(fa) => {
                 write!(f, "{}.{}", fa.target, fa.field)
+            }
+
+            Expression::Import(i) => {
+                match &i.kind {
+                    ImportKind::Named(names) => write!(f, "import {:?} {{ {} }}", i.path, names.join(", ")),
+                    ImportKind::Qualified(alias) => write!(f, "import {:?} as {}", i.path, alias),
+                }
             }
         }
     }

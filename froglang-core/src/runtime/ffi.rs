@@ -109,6 +109,31 @@ pub extern "C" fn frog_str_print(s: i64) {
     }
 }
 
+/// Print a string as a quoted, escaped literal. Composite value formatting
+/// uses this so string fields remain unambiguous while plain `print(str)`
+/// keeps its existing raw-text behavior.
+#[no_mangle]
+pub extern "C" fn frog_str_repr_print(s: i64) {
+    let ptr = s as *const FrogStr;
+    unsafe {
+        let len = (*ptr).len as usize;
+        let data = (ptr as *const u8).add(std::mem::size_of::<FrogStr>());
+        let bytes = std::slice::from_raw_parts(data, len);
+        let _ = write!(std::io::stdout(), "{:?}", String::from_utf8_lossy(bytes));
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Print a host-owned byte slice. Used by generated formatting code for
+/// punctuation and struct field names; unlike `FrogStr`, these bytes do not
+/// live on the GC heap.
+#[no_mangle]
+pub extern "C" fn frog_bytes_print(data: i64, len: i64) {
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
+    let _ = std::io::stdout().write_all(bytes);
+    let _ = std::io::stdout().flush();
+}
+
 #[no_mangle]
 pub extern "C" fn frog_str_println(s: i64) {
     frog_str_print(s);
@@ -118,24 +143,39 @@ pub extern "C" fn frog_str_println(s: i64) {
 
 #[no_mangle]
 pub extern "C" fn frog_int_println(n: i64) {
-    println!("{n}");
+    print!("{n}\n");
 }
 
 #[no_mangle]
 pub extern "C" fn frog_float_println(n: f64) {
-    println!("{n:?}");
+    print!("{n:?}\n");
 }
 
 #[no_mangle]
 pub extern "C" fn frog_bool_println(b: i8) {
-    println!("{}", b != 0);
+    print!("{}\n", b != 0);
 }
+
+#[no_mangle]
+pub extern "C" fn frog_int_print(n: i64) { print!("{n}"); }
+
+#[no_mangle]
+pub extern "C" fn frog_float_print(n: f64) { print!("{n:?}"); }
+
+#[no_mangle]
+pub extern "C" fn frog_bool_print(b: i8) { print!("{}", b != 0); }
 
 /// Print a list whose element representation is described by `kind`.
 /// Nested lists deliberately use a compact placeholder: list elements carry
 /// no recursive type metadata at runtime.
 #[no_mangle]
 pub extern "C" fn frog_list_println(list: i64, kind: i64) {
+    frog_list_print(list, kind);
+    println!();
+}
+
+#[no_mangle]
+pub extern "C" fn frog_list_print(list: i64, kind: i64) {
     let list = unsafe { &*(list as *const FrogList) };
     let stride = (list.stride as usize).max(1);
     let elem_len = list.len as usize / stride;
@@ -161,7 +201,7 @@ pub extern "C" fn frog_list_println(list: i64, kind: i64) {
             _ => out.push_str("<list>"),
         }
     }
-    println!("{out}]");
+    print!("{out}]");
 }
 
 // ── List operations ───────────────────────────────────────────────────────────

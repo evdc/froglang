@@ -1,0 +1,5 @@
+data Point(x: Int, y: Int)
+
+func add(a: Int, b: Int): Int = a + b
+
+func origin(): Point = Point(x=0, y=0)

@@ -1,6 +1,5 @@
 use std::process;
 use std::time::Instant;
-use froglang_core::frontend::{parser::ParseError, tokens::Spanned};
 use froglang_core::state::{FrogState, FrogValue};
 
 use rustyline::error::ReadlineError;
@@ -64,37 +63,43 @@ pub fn repl() {
     }
 }
 
-fn print_parse_errors(errors: &[Spanned<ParseError>]) {
-    println!("Parse errors:");
-    for (i, error) in errors.iter().enumerate() {
-        println!("  {}. {:?}", i + 1, error);
-    }
-    if errors.len() > 1 {
-        println!("Note: {} errors found, showing all.", errors.len());
-    }
-}
-
-fn check(src: &str) {
-    use froglang_core::frontend::parser::Parser;
+fn check(src: &str, path: Option<&std::path::Path>) {
+    use froglang_core::frontend::modules;
     use froglang_core::frontend::typeck::TypeChecker;
-    match Parser::parse(src) {
-        Err(errs) => {
-            print_parse_errors(&errs);
-            process::exit(1);
-        }
-        Ok(ast) => {
-            let mut tc = TypeChecker::new();
-            match tc.check_and_lower(ast) {
-                Ok(typed) => println!(":: {}", typed.item.ty),
-                Err(e)    => { println!("Type error: {}", e); process::exit(1); }
-            }
-        }
+    use froglang_core::frontend::expression::Expression;
+    use froglang_core::frontend::tokens::{Span, Spanned};
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let base = path.map(|p| p.to_path_buf()).unwrap_or_else(|| cwd.join("<check>"));
+
+    let stmts = match path {
+        Some(p) => modules::resolve_file(p),
+        None => modules::resolve_source(src, &base),
+    };
+    let stmts = match stmts {
+        Ok(s) => s,
+        Err(e) => { println!("Module error: {}", e); process::exit(1); }
+    };
+    let span = match (stmts.first(), stmts.last()) {
+        (Some(first), Some(last)) => first.span.merge(last.span),
+        _ => Span::new((0, 0), (0, 0)),
+    };
+    let ast = Spanned::from(Expression::Block(stmts), span);
+
+    let mut tc = TypeChecker::new();
+    match tc.check_and_lower(ast) {
+        Ok(typed) => println!(":: {}", typed.item.ty),
+        Err(e)    => { println!("Type error: {}", e); process::exit(1); }
     }
 }
 
-fn run(src: &str) {
+fn run(src: &str, path: Option<&std::path::Path>) {
     let mut state = FrogState::new();
-    match state.eval(src) {
+    let result = match path {
+        Some(p) => state.eval_file(p),
+        None => state.eval(src),
+    };
+    match result {
         Err(e) => { println!("{}", e); process::exit(1); }
         Ok((value, result_ty)) => {
             match &value {
@@ -116,27 +121,21 @@ fn main() {
     match args.as_slice() {
         // frog run <expr-or-file>
         [_, cmd, input] if cmd == "run" => {
-            let src = if std::path::Path::new(input).is_file() {
-                match std::fs::read_to_string(input) {
-                    Ok(s)  => s,
-                    Err(e) => { eprintln!("Error reading {}: {}", input, e); process::exit(1); }
-                }
+            let path = std::path::Path::new(input);
+            if path.is_file() {
+                run("", Some(path));
             } else {
-                input.clone()
-            };
-            run(&src);
+                run(input, None);
+            }
         }
         // frog check <expr-or-file>
         [_, cmd, input] if cmd == "check" => {
-            let src = if std::path::Path::new(input).is_file() {
-                match std::fs::read_to_string(input) {
-                    Ok(s)  => s,
-                    Err(e) => { eprintln!("Error reading {}: {}", input, e); process::exit(1); }
-                }
+            let path = std::path::Path::new(input);
+            if path.is_file() {
+                check("", Some(path));
             } else {
-                input.clone()
-            };
-            check(&src);
+                check(input, None);
+            }
         }
         // unknown subcommand
         [_, cmd, ..] if !cmd.starts_with('-') && cmd != "check" && cmd != "run" => {

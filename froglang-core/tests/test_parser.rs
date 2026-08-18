@@ -1061,3 +1061,31 @@ fn test_block_empty_is_error() {
     let result = Parser::new("{}").expression(Precedence::Assign);
     assert_eq!(result.unwrap_err().item, ParseError::ExpectedExpression);
 }
+
+// ── import ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_import_named() {
+    use froglang_core::frontend::expression::ImportKind;
+    let result = Parser::new(r#"import "./x.frog" { a, b }"#).expression(Precedence::Assign);
+    match result.expect("parse error").item {
+        Expression::Import(i) => {
+            assert_eq!(i.path, "./x.frog");
+            assert_eq!(i.kind, ImportKind::Named(vec!["a".to_string(), "b".to_string()]));
+        }
+        other => panic!("expected Import, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_import_qualified() {
+    use froglang_core::frontend::expression::ImportKind;
+    let result = Parser::new(r#"import "./x.frog" as x"#).expression(Precedence::Assign);
+    match result.expect("parse error").item {
+        Expression::Import(i) => {
+            assert_eq!(i.path, "./x.frog");
+            assert_eq!(i.kind, ImportKind::Qualified("x".to_string()));
+        }
+        other => panic!("expected Import, got {:?}", other),
+    }
+}

@@ -1,0 +1,21 @@
+data Student(name: Str, score: Int)
+data Stats(count: Int, total: Int, highest: Int)
+
+// `stats` is a copy of the caller's argument (value semantics), so mutating
+// its fields here via the rebind sugar never affects the caller's binding —
+// this is exactly the pattern the language is meant to make safe.
+func record(stats: Stats, score: Int): Stats = {
+    stats.highest = if score > stats.highest then score else stats.highest
+    stats.count = stats.count + 1
+    stats.total = stats.total + score
+    stats
+}
+
+let students = [Student(name="Alice", score=92), Student(name="Bob", score=58), Student(name="Cara", score=77), Student(name="Dev", score=41), Student(name="Eve", score=88)]
+
+let passing = [for s in students if s.score >= 60 do s]
+
+let stats = Stats(count=0, total=0, highest=0)
+for s in passing do { stats = record(stats, s.score) }
+
+stats.total / stats.count

@@ -1,0 +1,4 @@
+import "./diamond_a.frog" { result_a }
+import "./diamond_b.frog" { result_b }
+
+result_a + result_b

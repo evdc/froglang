@@ -115,6 +115,13 @@ pub enum Token {
     #[lex("data")]
     Data,
 
+    #[prefix(Grammar::import_decl)]
+    #[lex("import")]
+    Import,
+
+    #[lex("as")]
+    As,
+
     #[infix(Grammar::field_access, Precedence::Call)]
     #[lex(".")]
     Dot,

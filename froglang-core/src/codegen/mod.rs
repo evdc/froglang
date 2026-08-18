@@ -58,7 +58,7 @@ fn is_heap_ty(ty: &Type) -> bool {
 /// field (in declaration order) so a struct-typed field is expanded inline
 /// rather than nested, e.g. `Company{ceo: Person{name, age}}` flattens to
 /// `[("ceo.name", Str), ("ceo.age", Int)]`.
-fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
+pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
     match ty {
         Type::Struct(name) => {
             let fields = structs.get(name).cloned().unwrap_or_default();
@@ -391,6 +391,64 @@ fn declare_rt(
     func_ids.insert(key.to_string(), id);
 }
 
+/// Emit a non-GC string fragment used while formatting composite values.
+fn print_fragment(text: &str, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    let bytes = text.as_bytes().to_vec();
+    let ptr = bytes.as_ptr() as i64;
+    let len = bytes.len() as i64;
+    ctx.string_arena.push(bytes);
+    let data = bcx.ins().iconst(types::I64, ptr);
+    let len = bcx.ins().iconst(types::I64, len);
+    let id = ctx.func_ids["frog_bytes_print"];
+    let callee = ctx.module.declare_func_in_func(id, bcx.func);
+    bcx.ins().call(callee, &[data, len]);
+}
+
+/// Print one value without a trailing newline. Structs are represented as a
+/// sequence of flattened leaf values, so this recursively consumes that
+/// sequence according to the declared field layout.
+fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    match ty {
+        Type::Struct(name) => {
+            print_fragment(&format!("{}(", name), bcx, ctx);
+            let fields = ctx.structs.get(name).expect("known struct in codegen");
+            for (i, (field, field_ty)) in fields.iter().enumerate() {
+                if i != 0 { print_fragment(", ", bcx, ctx); }
+                print_fragment(&format!("{}=", field), bcx, ctx);
+                print_value(field_ty, values, cursor, bcx, ctx);
+            }
+            print_fragment(")", bcx, ctx);
+        }
+        Type::Str => {
+            let id = ctx.func_ids["frog_str_repr_print"];
+            let callee = ctx.module.declare_func_in_func(id, bcx.func);
+            bcx.ins().call(callee, &[values[*cursor]]);
+            *cursor += 1;
+        }
+        Type::Int | Type::Float | Type::Bool | Type::List(_) => {
+            let (id, extra) = match ty {
+                Type::Int => ("frog_int_print", None),
+                Type::Float => ("frog_float_print", None),
+                Type::Bool => ("frog_bool_print", None),
+                Type::List(inner) => ("frog_list_print", Some(match inner.as_ref() {
+                    Type::Int => 0, Type::Float => 1, Type::Bool => 2, Type::Str => 3,
+                    Type::List(_) => 4, Type::Struct(_) => 5, _ => 6,
+                })),
+                _ => unreachable!(),
+            };
+            let callee = ctx.module.declare_func_in_func(ctx.func_ids[id], bcx.func);
+            if let Some(kind) = extra {
+                let kind = bcx.ins().iconst(types::I64, kind);
+                bcx.ins().call(callee, &[values[*cursor], kind]);
+            } else {
+                bcx.ins().call(callee, &[values[*cursor]]);
+            }
+            *cursor += 1;
+        }
+        other => panic!("print codegen does not support {:?}", other),
+    }
+}
+
 /// Compile a scalar (non-struct-typed) expression into Cranelift IR,
 /// returning its single SSA value. A thin convenience wrapper around
 /// `compile_expr_multi` for the many call sites whose operand is always
@@ -681,6 +739,13 @@ fn compile_expr_multi(
             // concrete argument type, so no invalid Str coercion is emitted.
             if func_name == "print" {
                 let arg = &args[0];
+                if matches!(&arg.item.ty, Type::Struct(_)) {
+                    let values = compile_expr_multi(arg, bcx, vars, ctx);
+                    let mut cursor = 0;
+                    print_value(&arg.item.ty, &values, &mut cursor, bcx, ctx);
+                    print_fragment("\n", bcx, ctx);
+                    return vec![bcx.ins().iconst(types::I64, 0)];
+                }
                 let arg_val = compile_expr(arg, bcx, vars, ctx);
                 let (rt_name, extra_arg) = match &arg.item.ty {
                     Type::Str => ("print", None),
@@ -1135,10 +1200,16 @@ impl Codegen {
         builder.symbol("frog_str_eq",      ffi::frog_str_eq      as *const u8);
         builder.symbol("frog_str_cmp",     ffi::frog_str_cmp     as *const u8);
         builder.symbol("frog_str_print",   ffi::frog_str_print   as *const u8);
+        builder.symbol("frog_str_repr_print", ffi::frog_str_repr_print as *const u8);
+        builder.symbol("frog_bytes_print", ffi::frog_bytes_print as *const u8);
         builder.symbol("frog_str_println", ffi::frog_str_println as *const u8);
         builder.symbol("frog_int_println", ffi::frog_int_println as *const u8);
         builder.symbol("frog_float_println", ffi::frog_float_println as *const u8);
         builder.symbol("frog_bool_println", ffi::frog_bool_println as *const u8);
+        builder.symbol("frog_int_print", ffi::frog_int_print as *const u8);
+        builder.symbol("frog_float_print", ffi::frog_float_print as *const u8);
+        builder.symbol("frog_bool_print", ffi::frog_bool_print as *const u8);
+        builder.symbol("frog_list_print", ffi::frog_list_print as *const u8);
         builder.symbol("frog_list_println", ffi::frog_list_println as *const u8);
         builder.symbol("frog_alloc_list",  ffi::frog_alloc_list  as *const u8);
         builder.symbol("frog_list_len",    ffi::frog_list_len    as *const u8);
@@ -1162,11 +1233,17 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_str_eq",     "frog_str_eq",     &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_str_cmp",    "frog_str_cmp",    &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_str_print",  "frog_str_print",  &[I64],           None);
+        declare_rt(&mut module, &mut func_ids, "frog_str_repr_print", "frog_str_repr_print", &[I64], None);
+        declare_rt(&mut module, &mut func_ids, "frog_bytes_print", "frog_bytes_print", &[I64, I64], None);
         // "print" in froglang calls frog_str_println (with newline).
         declare_rt(&mut module, &mut func_ids, "frog_str_println","print",           &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_int_println", "frog_int_println", &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_float_println", "frog_float_println", &[types::F64], None);
         declare_rt(&mut module, &mut func_ids, "frog_bool_println", "frog_bool_println", &[types::I8],  None);
+        declare_rt(&mut module, &mut func_ids, "frog_int_print", "frog_int_print", &[I64], None);
+        declare_rt(&mut module, &mut func_ids, "frog_float_print", "frog_float_print", &[types::F64], None);
+        declare_rt(&mut module, &mut func_ids, "frog_bool_print", "frog_bool_print", &[types::I8], None);
+        declare_rt(&mut module, &mut func_ids, "frog_list_print", "frog_list_print", &[I64, I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_list_println", "frog_list_println", &[I64, I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_alloc_list", "frog_alloc_list", &[I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_list_len",   "frog_list_len",   &[I64],           Some(I64));
@@ -1256,23 +1333,25 @@ impl Codegen {
     /// Build the `__frog_main[_N]` body. The function takes one `i64` pointer
     /// parameter (`out_ptr`, unused if there are no top-level bindings) and
     /// writes each top-level `let`/`func`-free `Assign`'s value into
-    /// consecutive 8-byte slots there, in source order — this is how the
-    /// caller (`FrogState::eval`) learns the values of *every* binding made
-    /// in this entry, not just the last one. Returns that ordered
-    /// `(name, type)` list so the caller can decode `out_ptr`'s contents.
-    /// **Struct scope note**: a struct value only ever round-trips correctly
-    /// through this function's `out_ptr`/return-value encoding as a
-    /// *local* (bound inside a nested block/function) — a struct-typed
-    /// value used as a bare *top-level* binding or as the entry's own final
-    /// result only has its first flattened leaf value written here, the
-    /// rest silently dropped (this function's `bindings`/`out_ptr` protocol
-    /// is one-slot-per-binding, matching `FrogState`'s `env: HashMap<String,
-    /// i64>`, which doesn't support multi-slot bindings — a bigger, separate
-    /// piece of REPL-persistence plumbing this pass doesn't extend). This
-    /// doesn't limit the *language* — structs work fully as locals, function
-    /// params/returns, and list elements — only what this specific
-    /// top-level-result/REPL-binding path can observe. Wrap struct-producing
-    /// top-level code in a block or function that returns a scalar instead.
+    /// `out_ptr`, back-to-back in source order — this is how the caller
+    /// (`FrogState::eval`) learns the values of *every* binding made in this
+    /// entry, not just the last one. A binding's width in `i64` slots is
+    /// `struct_fields(ty, structs).len()` — 1 for every non-struct type, so
+    /// nothing changes there; a struct-typed binding writes all of its
+    /// flattened leaf values, not just a single slot. Returns the ordered
+    /// `(name, type)` list so the caller can recompute each binding's slot
+    /// range the same way and decode `out_ptr`'s contents.
+    ///
+    /// **Struct scope note**: only *named top-level bindings* (this
+    /// function's `pre_env`/`out_ptr` protocol) and struct-typed
+    /// params/returns/locals/list-elements round-trip correctly. The
+    /// entry's own bare *final result* (`__frog_main`'s single-`i64` return
+    /// value, decoded by `FrogValue::from_bits`) still only reports a
+    /// struct's first flattened leaf — that's a separate, narrower gap
+    /// (the JIT ABI's single scalar return, not the persistence layer) left
+    /// as future work. Ending an entry with `some_struct` bare will show a
+    /// truncated result in the REPL; `let x = some_struct` (then referring
+    /// to `x`) is unaffected and round-trips fully.
     fn build_main_body(
         builder_ctx: &mut FunctionBuilderContext,
         cl_ctx: &mut Context,
@@ -1280,7 +1359,7 @@ impl Codegen {
         func_ids: &HashMap<String, FuncId>,
         stmts: &[Spanned<TypedExpr>],
         string_arena: &mut Vec<Vec<u8>>,
-        pre_env: &HashMap<String, i64>,
+        pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
     ) -> Vec<(String, Type)> {
@@ -1294,15 +1373,20 @@ impl Codegen {
         let mut vars: HashMap<String, Variable> = HashMap::new();
         let mut var_counter: u32 = 0;
 
-        // Pre-seed vars from prior REPL entries as iconst values.
-        for (name, &bits) in pre_env {
+        // Pre-seed vars from prior REPL entries as iconst values — one per
+        // flattened leaf field, matching how `FrogState::eval` decoded them.
+        for (name, bits) in pre_env {
             let ty = env_types.get(name).unwrap_or(&Type::Int);
-            let val = match ty {
-                Type::Float => bcx.ins().f64const(f64::from_bits(bits as u64)),
-                Type::Bool  => bcx.ins().iconst(types::I8, bits),
-                _           => bcx.ins().iconst(types::I64, bits),
-            };
-            declare_and_def_var(&mut bcx, &mut vars, &mut var_counter, name, ty, val);
+            let leafs = struct_fields(ty, structs);
+            for ((path, lty), &leaf_bits) in leafs.iter().zip(bits.iter()) {
+                let val = match lty {
+                    Type::Float => bcx.ins().f64const(f64::from_bits(leaf_bits as u64)),
+                    Type::Bool  => bcx.ins().iconst(types::I8, leaf_bits),
+                    _           => bcx.ins().iconst(types::I64, leaf_bits),
+                };
+                let key = var_key(name, path);
+                declare_and_def_var(&mut bcx, &mut vars, &mut var_counter, &key, lty, val);
+            }
         }
         let mut last_val = bcx.ins().iconst(types::I64, 0);
         let mut last_ty = &Type::Int;
@@ -1312,21 +1396,32 @@ impl Codegen {
         let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
+        let mut slot_cursor: usize = 0;
 
         for stmt in stmts {
             if let TypedExprKind::Assign { name, value } = &stmt.item.kind {
                 if matches!(value.item.kind, TypedExprKind::Function { .. }) {
                     continue;
                 }
-                // See this function's doc comment: only the first flattened
-                // leaf of a struct-typed top-level binding is captured here.
                 let vals = compile_expr_multi(stmt, &mut bcx, &mut vars, &mut ctx);
                 last_val = vals[0];
-                last_ty = &stmt.item.ty;
-                let leaf0_ty = struct_fields(last_ty, structs).into_iter().next().map(|(_, t)| t).unwrap_or(Type::Int);
-                let repr = to_i64_repr(&mut bcx, &leaf0_ty, last_val);
-                let offset = (bindings.len() * 8) as i32;
-                bcx.ins().store(MemFlags::new(), repr, out_ptr, offset);
+                // Use `value.item.ty`, not `stmt.item.ty` (the Assign
+                // expression's own — possibly annotation-widened — type):
+                // `vals` was produced by flattening `value`, so its length
+                // is exactly `struct_fields(value.item.ty).len()`. Zipping
+                // against leafs derived from a different type could silently
+                // truncate the store loop below and desync every later
+                // binding's `out_ptr` slot from what `FrogState::eval` (the
+                // read side, `state.rs`) expects.
+                last_ty = &value.item.ty;
+                let leafs = struct_fields(last_ty, structs);
+                assert_eq!(vals.len(), leafs.len(), "compile_expr_multi produced {} values for {} leaf fields", vals.len(), leafs.len());
+                for (v, (_, lty)) in vals.iter().zip(leafs.iter()) {
+                    let repr = to_i64_repr(&mut bcx, lty, *v);
+                    let offset = (slot_cursor * 8) as i32;
+                    bcx.ins().store(MemFlags::new(), repr, out_ptr, offset);
+                    slot_cursor += 1;
+                }
                 bindings.push((name.clone(), last_ty.clone()));
                 continue;
             }
@@ -1363,7 +1458,7 @@ impl Codegen {
         typed: Spanned<TypedExpr>,
         string_arena: &mut Vec<Vec<u8>>,
         entry_id: usize,
-        pre_env: &HashMap<String, i64>,
+        pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
     ) -> (FuncId, Vec<(String, Type)>) {
@@ -1489,7 +1584,13 @@ pub fn compile_and_run(src: &str) -> i64 {
 
     let ptr = codegen.module.get_finalized_function(main_id);
     let f: fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
-    let mut out_buf: Vec<i64> = vec![0i64; bindings.len()];
+    // Each binding occupies `struct_fields(ty, structs).len()` i64 slots in
+    // `out_ptr` (1 for every non-struct type) — see `build_main_body`'s doc
+    // comment for the write side of this protocol.
+    let total_slots: usize = bindings.iter()
+        .map(|(_, ty)| struct_fields(ty, tc.struct_defs()).len())
+        .sum();
+    let mut out_buf: Vec<i64> = vec![0i64; total_slots];
     f(out_buf.as_mut_ptr() as i64)
     // string_arena and out_buf dropped here, after f() returns
 }

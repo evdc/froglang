@@ -22,3 +22,10 @@ fn run(src: &str) -> String {
 fn print_coerces_scalar_values_to_text() {
     assert_eq!(run("print(3)\nprint(1.5)\nprint(true)\nprint(\"ok\")\nprint([1, 2])"), "3\n1.5\ntrue\nok\n[1, 2]\n");
 }
+
+#[test]
+fn print_formats_structs_and_nested_structs() {
+    assert_eq!(run(
+        "data Address(city: Str, zip: Int)\ndata Person(name: Str, address: Address)\nprint(Person(name=\"Ada\", address=Address(city=\"London\", zip=123)))"
+    ), "Person(name=\"Ada\", address=Address(city=\"London\", zip=123))\n");
+}

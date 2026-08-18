@@ -1,0 +1,3 @@
+import "./cycle_b.frog" { b_value }
+
+let a_value = b_value + 1

@@ -1,0 +1,8 @@
+- Modules
+- Better error messages / pretty-printing rustc-style using span info
+- Enums / variants, common fields, matching expressions (e.g. via `if x is Circle(r) then ...`)
+- Error handling, errors as values + early-return sugar, etc
+- Traits/interfaces, explicit-style
+- Annotations, and auto-deriving trait implementations (macros/comptime?)
+- Structured concurrency
+- 

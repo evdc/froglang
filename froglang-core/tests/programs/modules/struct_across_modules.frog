@@ -1,0 +1,4 @@
+import "./utils.frog" { Point, add }
+
+let p = Point(x=3, y=4)
+add(p.x, p.y)

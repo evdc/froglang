@@ -210,6 +210,26 @@ impl UnionDef {
 
 pub type UnionDefs = HashMap<String, UnionDef>;
 
+/// One union member `?`/`!`/`catch` are building a match arm for (see
+/// `TypeChecker::union_entries`). `whole_value`, together with
+/// `bind_names`, reconstructs "the entire matched member's value" as an
+/// expression — needed because a nominal union's own pattern binds are
+/// positional *per field* (`is Circle(r)`), not "the whole value", unlike
+/// an anonymous union's `Narrow`-backed single bind. For a nominal member
+/// with fields, `whole_value` is a fresh `Union.Variant(field=bind, ...)`
+/// construction call referencing `bind_names`; for a nullary one, a fresh
+/// no-arg construction (semantically identical to any other instance —
+/// nullary values carry no data); for an anonymous member, `bind_names` is
+/// the single name `check_type_pattern`/`Narrow` already bind the whole
+/// value to, and `whole_value` just reads it back.
+struct ErrorArmEntry {
+    pattern_variant: String,
+    ty: Type,
+    is_error: bool,
+    bind_names: Vec<String>,
+    whole_value: Expression,
+}
+
 pub struct TypeChecker {
     // Variable (value level) name -> Type
     ctx: HashMap<String, Type>,
@@ -561,6 +581,13 @@ impl TypeChecker {
             ),
 
             Expression::Return(value) => self.infer_return(value, expr.span),
+
+            Expression::Try(inner) => self.infer_try(inner, expr.span),
+            Expression::Unwrap(inner) => self.infer_unwrap(inner, expr.span),
+            Expression::Catch { value, handler } => self.infer_catch(value, handler, expr.span),
+            // Only ever synthesized by `lower_unwrap`, after typeck itself
+            // — see `Expression::Panic`'s doc comment.
+            Expression::Panic(_) => Ok(Type::Never),
         }
     }
 
@@ -671,6 +698,202 @@ impl TypeChecker {
             TypedExpr { ty: target.clone(), kind: TypedExprKind::Widen { value: Box::new(lowered), tag: tag as u32 } },
             span,
         ))
+    }
+
+    /// Infers `inner`'s type and partitions it into one `ErrorArmEntry` per
+    /// union member (nominal or anonymous — see `resolve_union`). Errors if
+    /// `inner` isn't a union at all.
+    fn union_entries(&mut self, inner: &Spanned<Expression>, span: Span) -> Result<Vec<ErrorArmEntry>, Spanned<TypeError>> {
+        let subject_ty = self.infer(inner)?;
+        let resolved = self.lookup(&subject_ty);
+        let mut out = Vec::new();
+        if let Some((enum_name, def)) = self.resolve_union(&resolved) {
+            let enum_name = enum_name.to_string();
+            for (vn, fields) in &def.variants {
+                let ty = Type::Struct(format!("{}.{}", enum_name, vn));
+                let is_error = self.type_implements(&ty, &Trait::Error);
+                let callee = Spanned::from(
+                    Expression::field_access(
+                        Spanned::from(Expression::literal(Token::Identifier(enum_name.clone())), span),
+                        vn.clone(),
+                    ),
+                    span,
+                );
+                let mut bind_names = Vec::with_capacity(fields.len());
+                let mut args = Vec::with_capacity(fields.len());
+                for (i, (fname, _)) in fields.iter().enumerate() {
+                    let bind = format!("__f{}", i);
+                    args.push(Spanned::from(
+                        Expression::assign(
+                            Spanned::from(Expression::literal(Token::Identifier(fname.clone())), span),
+                            None,
+                            Spanned::from(Expression::literal(Token::Identifier(bind.clone())), span),
+                        ),
+                        span,
+                    ));
+                    bind_names.push(bind);
+                }
+                let whole_value = Expression::call(callee, args);
+                out.push(ErrorArmEntry { pattern_variant: vn.clone(), ty, is_error, bind_names, whole_value });
+            }
+        } else if let Type::Union(members) = &resolved {
+            for m in members {
+                let is_error = self.type_implements(m, &Trait::Error);
+                let bind = "__whole".to_string();
+                let whole_value = Expression::literal(Token::Identifier(bind.clone()));
+                out.push(ErrorArmEntry { pattern_variant: m.to_string(), ty: m.clone(), is_error, bind_names: vec![bind], whole_value });
+            }
+        } else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("expected a union value here, got {}", resolved)
+            }, inner.span));
+        }
+        Ok(out)
+    }
+
+    /// `e?`'s match arms: an `Error`-providing member returns its (whole,
+    /// reconstructed) value early; every other member passes its value
+    /// through unchanged. The join across arms (`infer_match`'s own
+    /// machinery) is exactly the doc's "set subtraction" type rule for
+    /// free — a `return` arm is `Never`-typed and vanishes from the join,
+    /// leaving only the non-`Error` members' union (or a single type, or
+    /// `Never` if every member is an `Error`).
+    fn build_try_arms(&mut self, inner: &Spanned<Expression>, span: Span) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
+        let entries = self.union_entries(inner, span)?;
+        if !entries.iter().any(|e| e.is_error) {
+            return Err(Spanned::from(TypeError {
+                msg: "'?' requires a union with at least one Error-providing member".to_string()
+            }, inner.span));
+        }
+        let return_ty = self.return_types.last().cloned().ok_or_else(|| Spanned::from(
+            TypeError { msg: "'?' used outside of a function".to_string() }, span
+        ))?;
+        let resolved_return = self.lookup(&return_ty);
+        if matches!(resolved_return, Type::TypeVar { .. }) {
+            return Err(Spanned::from(TypeError {
+                msg: "'?' requires the enclosing function to have an explicit return type that includes the propagated error type(s) — inferred error sets are not supported".to_string()
+            }, span));
+        }
+        for e in &entries {
+            if e.is_error && !self.is_subtype(&e.ty, &resolved_return) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("'?' may propagate {}, but the enclosing function's return type ({}) does not include it", e.ty, resolved_return)
+                }, span));
+            }
+        }
+        let mut arms = Vec::with_capacity(entries.len());
+        for e in entries {
+            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names };
+            let body_expr = if e.is_error {
+                Expression::return_value(Some(Spanned::from(e.whole_value, span)))
+            } else {
+                e.whole_value
+            };
+            arms.push(MatchArm { pattern, guard: None, body: Box::new(Spanned::from(body_expr, span)) });
+        }
+        Ok(arms)
+    }
+
+    fn infer_try(&mut self, inner: &Spanned<Expression>, span: Span) -> TypeResult {
+        let arms = self.build_try_arms(inner, span)?;
+        self.infer_match(inner, &arms, &None, span)
+    }
+
+    fn lower_try(&mut self, inner: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let arms = self.build_try_arms(&inner, span)?;
+        self.lower_match(Box::new(inner), arms, None, span)
+    }
+
+    /// `e!`'s match arms: an `Error`-providing member panics (see
+    /// `Expression::Panic`, `TypedExprKind::Panic`, ignoring the
+    /// reconstructed value); every other member passes its value through
+    /// unchanged — same join as `?`, except the panicking arm is also
+    /// `Never`-typed (see `infer`'s `Expression::Panic` arm), so it
+    /// vanishes from the join exactly like a `return` arm does.
+    fn build_unwrap_arms(&mut self, inner: &Spanned<Expression>, span: Span) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
+        let entries = self.union_entries(inner, span)?;
+        if !entries.iter().any(|e| e.is_error) {
+            return Err(Spanned::from(TypeError {
+                msg: "'!' requires a union with at least one Error-providing member".to_string()
+            }, inner.span));
+        }
+        let mut arms = Vec::with_capacity(entries.len());
+        for e in entries {
+            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names };
+            let body_expr = if e.is_error {
+                let msg = Spanned::from(Expression::literal(Token::String("unwrapped an error value with '!'".to_string())), span);
+                Expression::Panic(Box::new(msg))
+            } else {
+                e.whole_value
+            };
+            arms.push(MatchArm { pattern, guard: None, body: Box::new(Spanned::from(body_expr, span)) });
+        }
+        Ok(arms)
+    }
+
+    fn infer_unwrap(&mut self, inner: &Spanned<Expression>, span: Span) -> TypeResult {
+        let arms = self.build_unwrap_arms(inner, span)?;
+        self.infer_match(inner, &arms, &None, span)
+    }
+
+    fn lower_unwrap(&mut self, inner: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let arms = self.build_unwrap_arms(&inner, span)?;
+        self.lower_match(Box::new(inner), arms, None, span)
+    }
+
+    /// `value catch handler`'s match arms. `handler` is inlined per
+    /// `Error`-providing member rather than called: a single-parameter
+    /// lambda (`[e] -> body`, i.e. `Expression::Function` with exactly one
+    /// param) contributes its own param name, assigned the member's whole
+    /// (reconstructed) value in a one-statement prelude, then its body —
+    /// no actual closure/call codegen is needed. Any other handler
+    /// expression is used as a plain fallback value, cloned into every
+    /// `Error` arm, ignoring the matched value entirely.
+    fn build_catch_arms(&mut self, inner: &Spanned<Expression>, handler: &Spanned<Expression>, span: Span) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
+        let entries = self.union_entries(inner, span)?;
+        if !entries.iter().any(|e| e.is_error) {
+            return Err(Spanned::from(TypeError {
+                msg: "'catch' requires a union with at least one Error-providing member".to_string()
+            }, inner.span));
+        }
+        let (handler_bind, handler_body): (Option<String>, Spanned<Expression>) = match &handler.item {
+            Expression::Function(f) if f.params.len() == 1 => (Some(f.params[0].name.clone()), (*f.body).clone()),
+            _ => (None, handler.clone()),
+        };
+        let mut arms = Vec::with_capacity(entries.len());
+        for e in entries {
+            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names };
+            let body = if e.is_error {
+                match &handler_bind {
+                    None => handler_body.clone(),
+                    Some(bind) => {
+                        let assign = Spanned::from(
+                            Expression::assign(
+                                Spanned::from(Expression::literal(Token::Identifier(bind.clone())), span),
+                                None,
+                                Spanned::from(e.whole_value, span),
+                            ),
+                            span,
+                        );
+                        Spanned::from(Expression::Block(vec![assign, handler_body.clone()]), span)
+                    }
+                }
+            } else {
+                Spanned::from(e.whole_value, span)
+            };
+            arms.push(MatchArm { pattern, guard: None, body: Box::new(body) });
+        }
+        Ok(arms)
+    }
+
+    fn infer_catch(&mut self, value: &Spanned<Expression>, handler: &Spanned<Expression>, span: Span) -> TypeResult {
+        let arms = self.build_catch_arms(value, handler, span)?;
+        self.infer_match(value, &arms, &None, span)
+    }
+
+    fn lower_catch(&mut self, value: Spanned<Expression>, handler: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let arms = self.build_catch_arms(&value, &handler, span)?;
+        self.lower_match(Box::new(value), arms, None, span)
     }
 
     /// Register every `data Name(field: Type, ...)` declaration found
@@ -2127,6 +2350,15 @@ impl TypeChecker {
                     None => None,
                 };
                 TypedExprKind::Return(value)
+            },
+
+            Expression::Try(inner) => return self.lower_try(*inner, span),
+            Expression::Unwrap(inner) => return self.lower_unwrap(*inner, span),
+            Expression::Catch { value, handler } => return self.lower_catch(*value, *handler, span),
+
+            Expression::Panic(msg) => {
+                let message = self.check_and_lower(*msg)?;
+                TypedExprKind::Panic { message: Box::new(message) }
             },
         };
 

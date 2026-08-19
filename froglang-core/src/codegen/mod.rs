@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::mem::{offset_of, size_of};
 
-use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, Value};
+use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, TrapCode, Value};
 use cranelift_codegen::{settings, settings::Configurable, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -264,6 +264,10 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         TypedExprKind::Return(value) => {
             if let Some(v) = value { for_each_heap_producer(v, structs, f); }
         },
+
+        // Like `Return`: allocates nothing itself, but `message` (always a
+        // `Str` literal) is its own heap producer.
+        TypedExprKind::Panic { message } => for_each_heap_producer(message, structs, f),
 
         TypedExprKind::NoneLit => {},
 
@@ -942,6 +946,58 @@ fn compile_expr_multi(
             let false_bb = bcx.create_block();
             let merge_bb = bcx.create_block();
 
+            // `expr.item.ty == Never` means *both* branches terminate
+            // (each is itself `Never`-typed, or — a match's "missing tail"
+            // default, see `lower_match` — is absent and stands for
+            // provably-unreachable code; the type system only ever unifies
+            // to `Never` when every contributing side is `Never`, so this
+            // is inductive, not an assumption). `?`/`!`'s match desugaring
+            // (`ERRORS.md` Phase 5) is the first thing that actually builds
+            // this shape at codegen — every arm before it always paired a
+            // `Never` branch with a real value on the other side. Since
+            // nothing downstream of this conditional is ever reachable,
+            // `merge_bb` gets no value and no param; each branch supplies
+            // its own terminator (`return_`/a nested `Never` conditional's
+            // own trap), or — the "missing tail" case — a `trap` here,
+            // mirroring `TypedExprKind::Panic`'s own shape. `merge_bb`
+            // itself is simply never reached and stays unlaid-out.
+            if expr.item.ty == Type::Never {
+                bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
+
+                bcx.switch_to_block(true_bb);
+                bcx.seal_block(true_bb);
+                compile_expr_multi(true_branch, bcx, vars, ctx);
+                if true_branch.item.ty != Type::Never {
+                    bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
+                }
+
+                bcx.switch_to_block(false_bb);
+                bcx.seal_block(false_bb);
+                match false_branch {
+                    Some(fb) => {
+                        compile_expr_multi(fb, bcx, vars, ctx);
+                        if fb.item.ty != Type::Never {
+                            bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
+                        }
+                    }
+                    None => { bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code")); }
+                }
+
+                // Every path above already ended in a terminator (a nested
+                // `Never` conditional's own trap, `return_`, or the `trap`
+                // just emitted) — this conditional itself is `Never`-typed,
+                // so it might be the tail of its enclosing function body
+                // (`build_func_body`'s own tail `return_`/`teardown_shadow_frame`
+                // would otherwise try to append to an already-filled
+                // block), or nested inside a `Block`/another `Conditional`
+                // that keeps building after it. Either way it needs a
+                // fresh block to land in — see `Return`'s codegen.
+                let dead = bcx.create_block();
+                bcx.switch_to_block(dead);
+                bcx.seal_block(dead);
+                return Vec::new();
+            }
+
             let has_value = expr.item.ty != Type::None;
             let is_struct = matches!(&expr.item.ty, Type::Struct(_));
 
@@ -1398,6 +1454,25 @@ fn compile_expr_multi(
             // for exactly that to skip emitting the jump — so this block
             // is genuinely unreachable, which Cranelift's verifier permits
             // as long as it's syntactically well-formed.
+            let dead = bcx.create_block();
+            bcx.switch_to_block(dead);
+            bcx.seal_block(dead);
+            Vec::new()
+        },
+
+        TypedExprKind::Panic { message } => {
+            // `message` is always `Str`-typed — print it through the same
+            // runtime entry point `print(a_str_value)` uses, then trap: a
+            // real placeholder for "abort the program" (see `ERRORS.md`
+            // Phase 5 — proper unwinding is `CONCURRENCY.md` stage 1). The
+            // trap is a genuine Cranelift terminator, so the block ends
+            // validly; whatever follows in the source needs a fresh block
+            // to land in, exactly like `Return`'s codegen just above.
+            let msg_val = compile_expr(message, bcx, vars, ctx);
+            let func_id = ctx.func_ids["print"];
+            let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
+            bcx.ins().call(callee, &[msg_val]);
+            bcx.ins().trap(TrapCode::user(1).expect("1 is a valid user trap code"));
             let dead = bcx.create_block();
             bcx.switch_to_block(dead);
             bcx.seal_block(dead);

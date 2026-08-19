@@ -181,6 +181,15 @@ pub enum TypedExprKind {
         tag:   u32,
     },
 
+    /// `!`'s panicking arm (see `TypeChecker::lower_unwrap`). Always typed
+    /// `Type::Never`, exactly like `Return`: it never yields a value, so
+    /// codegen prints `message` then terminates the current block with a
+    /// trap and opens a fresh (dead) one for whatever follows, the same
+    /// shape `Return`'s own codegen uses. `message` is always `Str`-typed.
+    Panic {
+        message: TypedExprRef,
+    },
+
     /// `target is <TypeName>` where `target`'s static type is an
     /// *anonymous* `Type::Union` — a structural type test, the anonymous
     /// counterpart of `IsVariant`'s nominal one. `tag` is the tested

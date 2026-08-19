@@ -34,6 +34,10 @@ pub enum Precedence {
     None = 0,
     Assign,
     TypeAnnotation,
+    /// `x catch y` — a new rung between `TypeAnnotation` and `Range`: it
+    /// binds looser than `Range`/`Or`/`And`/etc. but tighter than `Assign`,
+    /// so `let x = f() catch 0` parses `f() catch 0` as the let's value.
+    Catch,
     Range,
     Or,
     And,
@@ -51,7 +55,8 @@ impl Precedence {
         match self {
             Precedence::None => Precedence::Assign,
             Precedence::Assign => Precedence::TypeAnnotation,
-            Precedence::TypeAnnotation => Precedence::Range,
+            Precedence::TypeAnnotation => Precedence::Catch,
+            Precedence::Catch => Precedence::Range,
             Precedence::Range => Precedence::Or,
             Precedence::Or => Precedence::And,
             Precedence::And => Precedence::Equality,

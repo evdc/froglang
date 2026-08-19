@@ -228,6 +228,24 @@ pub enum Expression {
     Import(ImportExpr),
     Match(MatchExpr),
     IsPattern(IsPatternExpr),
+    /// `e?` — error propagation (`ERRORS.md` Phase 5). Desugars entirely in
+    /// `TypeChecker::lower_try` into a `match` over `e`'s union members, one
+    /// `Error`-providing arm returning early per member, so codegen gains
+    /// no new control flow of its own.
+    Try(ExprRef),
+    /// `e!` — panic-on-error. Same shape as `Try`, but an `Error`-providing
+    /// arm panics (`TypeChecker::lower_unwrap`, `TypedExprKind::Panic`)
+    /// instead of returning.
+    Unwrap(ExprRef),
+    /// `value catch handler` — `handler` is either a plain fallback
+    /// expression, or a single-parameter lambda (`[e] -> body`) whose body
+    /// is inlined per `Error`-providing member with that parameter bound to
+    /// it (`TypeChecker::lower_catch`).
+    Catch { value: ExprRef, handler: ExprRef },
+    /// Synthetic, never produced by the parser: the panicking arm of `e!`'s
+    /// match desugaring (`TypeChecker::lower_unwrap`). `message` is always
+    /// a `Str` literal.
+    Panic(ExprRef),
 }
 
 
@@ -500,6 +518,11 @@ impl fmt::Display for Expression {
                 Some(v) => write!(f, "return {}", v),
                 None => write!(f, "return"),
             },
+
+            Expression::Try(inner) => write!(f, "{}?", inner),
+            Expression::Unwrap(inner) => write!(f, "{}!", inner),
+            Expression::Catch { value, handler } => write!(f, "{} catch {}", value, handler),
+            Expression::Panic(msg) => write!(f, "<panic {}>", msg),
         }
     }
 }

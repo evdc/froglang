@@ -187,16 +187,25 @@ pub enum Token {
     RightBrace,
     #[lex(",")]
     Comma,
+    /// Postfix `e!` — panic-on-error (`ERRORS.md` Phase 5). An infix rule
+    /// that ignores its right operand, exactly like `?`/`(`/`[` below.
+    #[infix(Grammar::postfix_unwrap, Precedence::Call)]
     #[lex("!")]
     Exclamation,
-    /// Postfix `?`. Used today only by the *type* grammar (`T?` = `T | None`,
-    /// see `Grammar::type_expr`), which is hand-written and does not consult
-    /// the parse-rule table — so this variant deliberately carries no prefix
-    /// or infix rule yet. It gains one when `e?` error propagation lands.
+    /// Postfix `e?` — error propagation (`ERRORS.md` Phase 5). The *type*
+    /// grammar's own `T?` (`Grammar::type_expr`) is hand-written and does
+    /// not consult this parse-rule table, so the two spellings don't
+    /// conflict despite sharing a token.
+    #[infix(Grammar::postfix_try, Precedence::Call)]
     #[lex("?")]
     Question,
     #[lex(";")]
     Semicolon,
+
+    /// `x catch y` / `x catch [e] -> body` — see `Grammar::catch_expr`.
+    #[infix(Grammar::catch_expr, Precedence::Catch)]
+    #[lex("catch")]
+    Catch,
 
     // Special handling by the lexer - don't use lex() attr
     Newline,

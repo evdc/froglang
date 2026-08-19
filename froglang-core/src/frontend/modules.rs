@@ -127,6 +127,8 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
                 Some(v) => walk(&v.item, path),
                 None => Ok(()),
             },
+            Expression::Try(inner) | Expression::Unwrap(inner) | Expression::Panic(inner) => walk(&inner.item, path),
+            Expression::Catch { value, handler } => { walk(&value.item, path)?; walk(&handler.item, path) }
             Expression::DataDecl(_) | Expression::Literal(_) => Ok(()),
         }
     }
@@ -670,6 +672,15 @@ fn rewrite(
             if let Some(v) = value {
                 rewrite(&mut v.item, subst, qualified, shadow, track_let_shadow);
             }
+        }
+
+        Expression::Try(inner) | Expression::Unwrap(inner) | Expression::Panic(inner) => {
+            rewrite(&mut inner.item, subst, qualified, shadow, track_let_shadow);
+        }
+
+        Expression::Catch { value, handler } => {
+            rewrite(&mut value.item, subst, qualified, shadow, track_let_shadow);
+            rewrite(&mut handler.item, subst, qualified, shadow, track_let_shadow);
         }
     }
 }

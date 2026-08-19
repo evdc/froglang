@@ -273,6 +273,30 @@ impl Grammar {
         })
     }
 
+    /// `e?` — postfix, no right operand to parse (mirrors `call`/`index`'s
+    /// shape but consumes nothing further). See `TypeChecker::lower_try`.
+    pub fn postfix_try(_parser: &mut Parser, t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
+        Ok(Spanned { span: left.span.merge(t.span), item: Expression::Try(Box::new(left)) })
+    }
+
+    /// `e!` — postfix, see `postfix_try` above and `TypeChecker::lower_unwrap`.
+    pub fn postfix_unwrap(_parser: &mut Parser, t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
+        Ok(Spanned { span: left.span.merge(t.span), item: Expression::Unwrap(Box::new(left)) })
+    }
+
+    /// `value catch handler`. The handler is parsed at `Precedence::Assign`
+    /// (not the incoming `catch`-relative precedence) specifically so a
+    /// `[e] -> body` lambda handler — whose own `->` sits at `Precedence::Assign`
+    /// — parses its body fully, the same way `let`'s value and `->`'s own
+    /// body do (`let_binding`, `arrow_func`).
+    pub fn catch_expr(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
+        let handler = parser.expression(Precedence::Assign)?;
+        Ok(Spanned {
+            span: left.span.merge(handler.span),
+            item: Expression::Catch { value: Box::new(left), handler: Box::new(handler) }
+        })
+    }
+
     pub fn type_annotation(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _p: Precedence) -> ParseResult {
         // Parse the type expression at TypeAnnotation precedence (one level above Assign).
         // This prevents `->` (Assign precedence) from firing here, so `f : Int -> Int`

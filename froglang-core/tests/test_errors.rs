@@ -90,6 +90,22 @@ fn test_discarding_a_fallible_for_loop_body_is_a_must_handle_error() {
 }
 
 #[test]
+fn test_comprehension_body_with_fallible_value_is_not_must_handle_rejected() {
+    // Unlike a plain for-loop, a comprehension collects each body value
+    // into the result list rather than discarding it, so must-handle
+    // must not fire here — `lower_for_loop` is shared by both, but the
+    // check belongs only to the `ForLoop` call site.
+    let ast = froglang_core::frontend::parser::Parser::parse(
+        "error DbError(msg: Str)\n\
+         func risky(fail: Bool): Int | DbError = if fail then DbError(msg=\"bad\") else 5\n\
+         let xs = [for i in 0..3 do risky(false)]\n\
+         5"
+    ).expect("parse error");
+    let mut tc = froglang_core::frontend::typeck::TypeChecker::new();
+    tc.check_and_lower(ast).expect("comprehension body should not trigger must-handle");
+}
+
+#[test]
 fn test_tail_position_fallible_value_is_exempt_from_must_handle() {
     // The tail value propagates to the caller (here, the whole program's
     // own result), so it isn't "discarded" — must-handle only fires on a

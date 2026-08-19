@@ -2058,6 +2058,9 @@ impl TypeChecker {
 
             Expression::ForLoop(fl) => {
                 let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
+                // Each iteration discards the body's value exactly like a
+                // non-tail Block statement does — same must-handle rule.
+                self.check_must_handle(&body)?;
                 TypedExprKind::ForLoop { var, iterable, cond, body }
             },
 
@@ -2066,6 +2069,9 @@ impl TypeChecker {
                     Expression::ForLoop(fl) => fl,
                     _ => unreachable!("Comprehension always wraps a ForLoop — see Grammar::tuple"),
                 };
+                // A comprehension collects the body's value into the
+                // result list rather than discarding it, so must-handle
+                // does not apply here — unlike a plain ForLoop.
                 let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
                 TypedExprKind::Comprehension { var, iterable, cond, body }
             },
@@ -2156,9 +2162,6 @@ impl TypeChecker {
         self.ctx = prev_ctx;
 
         let (cond, body) = result?;
-        // Each iteration discards the body's value exactly like a non-tail
-        // Block statement does — same must-handle rule.
-        self.check_must_handle(&body)?;
         Ok((fl.var, Box::new(iterable), cond, Box::new(body)))
     }
 

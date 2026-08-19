@@ -555,6 +555,17 @@ impl Grammar {
     /// of each line (the parser has no lookahead past a newline to safely
     /// know whether a *leading* `|` on the next line is coming).
     pub fn data_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        Self::data_decl_body(parser, token, false)
+    }
+
+    /// `error Name(...)` / `error Name(...) is A | B` — sugar for `data`
+    /// with an implicit `provides Error`. An explicit trailing `provides`
+    /// clause may still list additional traits alongside it.
+    pub fn error_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        Self::data_decl_body(parser, token, true)
+    }
+
+    fn data_decl_body(parser: &mut Parser, token: Spanned<Token>, implicit_error: bool) -> ParseResult {
         let name_tok = parser.identifier()?;
         let name = match &name_tok.item {
             Token::Identifier(s) => s.clone(),
@@ -599,9 +610,31 @@ impl Grammar {
             }
         }
 
+        let mut provides = Vec::new();
+        if parser.check(&Token::Provides) {
+            parser.advance()?;
+            loop {
+                let trait_tok = parser.identifier()?;
+                let trait_name = match &trait_tok.item {
+                    Token::Identifier(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                end = trait_tok.span;
+                provides.push(trait_name);
+                if parser.check(&Token::Comma) {
+                    parser.advance()?;
+                    continue;
+                }
+                break;
+            }
+        }
+        if implicit_error && !provides.iter().any(|p| p == "Error") {
+            provides.push("Error".to_string());
+        }
+
         Ok(Spanned {
             span: token.span.merge(end),
-            item: Expression::DataDecl(DataDeclExpr { name, fields, variants })
+            item: Expression::DataDecl(DataDeclExpr { name, fields, variants, provides })
         })
     }
 

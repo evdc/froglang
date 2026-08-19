@@ -22,38 +22,21 @@ pub enum Trait {
     Num,   // Int, Float — arithmetic operators
     Eq,    // Int, Float, Bool, Str — == and !=
     Ord,   // Int, Float, Str — <, >, <=, >=
+    /// Marker trait for fallible-function error types (`ERRORS.md`). Unlike
+    /// the other three traits, no type implements this structurally — it's
+    /// granted per-struct-name by a `provides Error` clause on a `data`
+    /// declaration (or implied by the `error X(...)` shorthand), recorded in
+    /// `TypeChecker.provides` and consulted only through `type_implements`.
+    Error,
 }
 
 impl Display for Trait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Trait::Num => write!(f, "Num"),
-            Trait::Eq  => write!(f, "Eq"),
-            Trait::Ord => write!(f, "Ord"),
-        }
-    }
-}
-
-/// Check whether a concrete type implements the given trait.
-/// Only makes sense for non-TypeVar types; TypeVar-TypeVar unification is
-/// handled separately so we never call this on a TypeVar.
-fn type_implements(ty: &Type, tr: &Trait) -> bool {
-    match ty {
-        // A union satisfies a trait iff every variant does.
-        Type::Union(variants) => variants.iter().all(|v| type_implements(v, tr)),
-        // Structs get structural `==`/`!=` (desugared into a per-field
-        // conjunction at lowering time — see `TypeChecker::desugar_struct_eq`
-        // in `check_and_lower`'s `Binary` arm), so they satisfy `Eq`. A
-        // struct with a field type that itself doesn't implement `Eq` (e.g.
-        // a `List` field — lists don't support `==` at all currently) will
-        // fail type-checking when the desugared per-field comparison is
-        // itself inferred, which is the correct place for that error to
-        // surface, not here.
-        Type::Struct(_) if *tr == Trait::Eq => true,
-        _ => match tr {
-            Trait::Num => matches!(ty, Type::Int | Type::Float),
-            Trait::Eq  => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
-            Trait::Ord => matches!(ty, Type::Int | Type::Float | Type::Str),
+            Trait::Num   => write!(f, "Num"),
+            Trait::Eq    => write!(f, "Eq"),
+            Trait::Ord   => write!(f, "Ord"),
+            Trait::Error => write!(f, "Error"),
         }
     }
 }
@@ -260,6 +243,12 @@ pub struct TypeChecker {
     /// `infer` and `check_and_lower` are two independent passes over the
     /// same body, so each needs its own push.
     return_types: Vec<Type>,
+    /// Trait names granted to a struct or union-member by name — populated
+    /// from a `data`/`error` declaration's trailing `provides Clause`
+    /// (`hoist_data_decls`). Keyed by the same qualified name `struct_defs`
+    /// uses for a union member (`"Shape.Circle"`) or the bare name for a
+    /// plain struct. Consulted only by `type_implements`.
+    provides: HashMap<String, Vec<Trait>>,
 }
 
 pub struct TypeCheckerCheckpoint {
@@ -271,15 +260,77 @@ pub struct TypeCheckerCheckpoint {
     union_names: HashMap<Vec<Type>, String>,
     variant_owners: HashMap<String, Vec<String>>,
     return_types: Vec<Type>,
+    provides: HashMap<String, Vec<Trait>>,
 }
 
 impl TypeChecker {
     pub fn empty() -> Self {
-        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new() }
+        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new() }
+        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new() }
+    }
+
+    /// Check whether a concrete type implements the given trait. Only makes
+    /// sense for non-TypeVar types; TypeVar-TypeVar unification is handled
+    /// separately so this is never called on a TypeVar.
+    fn type_implements(&self, ty: &Type, tr: &Trait) -> bool {
+        match ty {
+            // A union satisfies a trait iff every variant does.
+            Type::Union(variants) => variants.iter().all(|v| self.type_implements(v, tr)),
+            // Structs get structural `==`/`!=` (desugared into a per-field
+            // conjunction at lowering time — see `TypeChecker::desugar_struct_eq`
+            // in `check_and_lower`'s `Binary` arm), so they satisfy `Eq`. A
+            // struct with a field type that itself doesn't implement `Eq` (e.g.
+            // a `List` field — lists don't support `==` at all currently) will
+            // fail type-checking when the desugared per-field comparison is
+            // itself inferred, which is the correct place for that error to
+            // surface, not here.
+            Type::Struct(_) if *tr == Trait::Eq => true,
+            // `Error` is granted, not structural — see `provides`.
+            Type::Struct(name) if *tr == Trait::Error => {
+                self.provides.get(name).map(|ts| ts.contains(tr)).unwrap_or(false)
+            },
+            _ => match tr {
+                Trait::Num   => matches!(ty, Type::Int | Type::Float),
+                Trait::Eq    => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
+                Trait::Ord   => matches!(ty, Type::Int | Type::Float | Type::Str),
+                Trait::Error => false,
+            }
+        }
+    }
+
+    /// A statement-position value may not silently discard a possible
+    /// `Error` — the must-handle rule (`ERRORS.md`). Applies to every
+    /// non-tail `Block` statement and every `for`-loop body; a tail
+    /// position is exempt because its value propagates to the caller,
+    /// where the same value is (recursively) subject to this same rule.
+    /// `let x = ...`/`obj.f = ...` are exempt too: binding a name isn't
+    /// discarding — `x` still carries the union type onward to wherever it
+    /// (recursively) needs to be handled, exactly like a tail value does.
+    fn check_must_handle(&self, stmt: &Spanned<TypedExpr>) -> Result<(), Spanned<TypeError>> {
+        if matches!(stmt.item.kind, TypedExprKind::Assign { .. } | TypedExprKind::FieldAssign { .. }) {
+            return Ok(());
+        }
+        let ty = &stmt.item.ty;
+        let span = stmt.span;
+        let offender = match ty {
+            Type::Union(members) => members.iter().find(|m| self.type_implements(m, &Trait::Error)),
+            other if self.type_implements(other, &Trait::Error) => Some(other),
+            _ => None,
+        };
+        if let Some(m) = offender {
+            return Err(Spanned::from(TypeError {
+                msg: format!(
+                    "unhandled error: this statement's value has type '{}', which may be '{}' \
+                     (declared to provide Error) — bind it, match it, or otherwise handle it \
+                     instead of discarding it",
+                    ty, m
+                )
+            }, span));
+        }
+        Ok(())
     }
 
     /// Field layout for every registered struct, in declaration order.
@@ -320,6 +371,7 @@ impl TypeChecker {
             union_names: self.union_names.clone(),
             variant_owners: self.variant_owners.clone(),
             return_types: self.return_types.clone(),
+            provides: self.provides.clone(),
         }
     }
 
@@ -332,6 +384,7 @@ impl TypeChecker {
         self.union_names = cp.union_names;
         self.variant_owners = cp.variant_owners;
         self.return_types = cp.return_types;
+        self.provides = cp.provides;
     }
 
     pub fn add_ctx(mut self, ctx: impl Iterator<Item=(String, Type)>) -> Self {
@@ -689,6 +742,31 @@ impl TypeChecker {
                     let def = self.union_defs.get_mut(&d.name).expect("registered in the first pass, above");
                     def.common = fields;
                     def.variants = variants;
+                }
+
+                if !d.provides.is_empty() {
+                    let mut traits = Vec::with_capacity(d.provides.len());
+                    for name in &d.provides {
+                        match name.as_str() {
+                            "Error" => traits.push(Trait::Error),
+                            other => return Err(Spanned::from(TypeError {
+                                msg: format!("Unknown trait '{}' in provides clause", other)
+                            }, s.span)),
+                        }
+                    }
+                    // A union's `provides` grants every variant the trait
+                    // (the doc's "a union satisfies a trait iff every
+                    // member does" rule then makes the alias itself
+                    // satisfy it too, for free, via `type_implements`) —
+                    // there's no `Type::Struct` for the alias name itself
+                    // to key `provides` off of.
+                    if d.variants.is_empty() {
+                        self.provides.entry(d.name.clone()).or_default().extend(traits);
+                    } else {
+                        for v in &d.variants {
+                            self.provides.entry(format!("{}.{}", d.name, v.name)).or_default().extend(traits.clone());
+                        }
+                    }
                 }
             }
         }
@@ -1362,7 +1440,7 @@ impl TypeChecker {
         for arg in args {
             let argt = self.infer(arg)?;
             let resolved = self.lookup(&argt);
-            if !matches!(&resolved, Type::TypeVar { .. }) && !type_implements(&resolved, &tr) {
+            if !matches!(&resolved, Type::TypeVar { .. }) && !self.type_implements(&resolved, &tr) {
                 return Err(Spanned::from(TypeError {
                     msg: format!("Operator '{}' requires {}, got {}", op, tr, resolved)
                 }, arg.span));
@@ -1552,7 +1630,7 @@ impl TypeChecker {
             // Union ↔ bounded TypeVar: accept if every union member satisfies every bound,
             // e.g. `Int | Float` satisfies `Num`. Must come before the generic TypeVar arms.
             (Type::Union(variants), Type::TypeVar { name, bounds }) => {
-                if bounds.iter().all(|b| variants.iter().all(|v| type_implements(v, b))) {
+                if bounds.iter().all(|b| variants.iter().all(|v| self.type_implements(v, b))) {
                     self.substitutions.insert(name.clone(), t1.clone());
                     true
                 } else {
@@ -1560,7 +1638,7 @@ impl TypeChecker {
                 }
             },
             (Type::TypeVar { name, bounds }, Type::Union(variants)) => {
-                if bounds.iter().all(|b| variants.iter().all(|v| type_implements(v, b))) {
+                if bounds.iter().all(|b| variants.iter().all(|v| self.type_implements(v, b))) {
                     self.substitutions.insert(name.clone(), t2.clone());
                     true
                 } else {
@@ -1569,7 +1647,7 @@ impl TypeChecker {
             },
             // Bounded TypeVar on left, concrete type on right.
             (Type::TypeVar { name, bounds }, _) => {
-                if !bounds.iter().all(|b| type_implements(&t2, b)) {
+                if !bounds.iter().all(|b| self.type_implements(&t2, b)) {
                     return false;
                 }
                 self.substitutions.insert(name.clone(), t2.clone());
@@ -1577,7 +1655,7 @@ impl TypeChecker {
             },
             // Concrete type on left, bounded TypeVar on right.
             (_, Type::TypeVar { name, bounds }) => {
-                if !bounds.iter().all(|b| type_implements(&t1, b)) {
+                if !bounds.iter().all(|b| self.type_implements(&t1, b)) {
                     return false;
                 }
                 self.substitutions.insert(name.clone(), t1.clone());
@@ -1624,6 +1702,11 @@ impl TypeChecker {
                     let t = self.check_and_lower(s)?;
                     ty = t.item.ty.clone();
                     lowered.push(t);
+                }
+                if let Some((_, rest)) = lowered.split_last() {
+                    for t in rest {
+                        self.check_must_handle(t)?;
+                    }
                 }
                 Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Block(lowered) }, span))
             },
@@ -1928,6 +2011,16 @@ impl TypeChecker {
                 }
                 self.ctx = prev_ctx;
                 if let Some(e) = err { return Err(e); }
+                // Must-handle: every non-tail statement's value is
+                // discarded, so none may be a possible Error — see
+                // `check_must_handle`. The tail is exempt; its value
+                // propagates to whatever position this Block itself sits
+                // in, which is checked there instead.
+                if let Some((_, rest)) = lowered.split_last() {
+                    for t in rest {
+                        self.check_must_handle(t)?;
+                    }
+                }
                 TypedExprKind::Block(lowered)
             },
 
@@ -2063,6 +2156,9 @@ impl TypeChecker {
         self.ctx = prev_ctx;
 
         let (cond, body) = result?;
+        // Each iteration discards the body's value exactly like a non-tail
+        // Block statement does — same must-handle rule.
+        self.check_must_handle(&body)?;
         Ok((fl.var, Box::new(iterable), cond, Box::new(body)))
     }
 

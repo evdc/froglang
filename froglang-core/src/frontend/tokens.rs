@@ -127,6 +127,13 @@ pub enum Token {
     #[lex("data")]
     Data,
 
+    #[prefix(Grammar::error_decl)]
+    #[lex("error")]
+    Error,
+
+    #[lex("provides")]
+    Provides,
+
     #[infix(Grammar::is_pattern, Precedence::Comparison)]
     #[lex("is")]
     Is,

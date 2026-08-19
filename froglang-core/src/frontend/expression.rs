@@ -119,11 +119,17 @@ pub struct VariantDecl {
 /// reuses `Parameter` rather than a new struct.
 /// An empty `variants` list means this is a plain struct declaration;
 /// `fields` holds the struct's own fields, or the enum's common fields.
+/// `provides` is the trait-name list from a trailing `provides X, Y`
+/// clause (`ERRORS.md`'s must-handle mechanism) — `error X(...)` is sugar
+/// that implies `provides Error` here without needing its own AST node.
+/// For a union declaration, `provides` grants every variant the trait, not
+/// the union alias itself (see `TypeChecker::hoist_data_decls`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataDeclExpr {
     pub name:     String,
     pub fields:   Vec<Parameter>,
     pub variants: Vec<VariantDecl>,
+    pub provides: Vec<String>,
 }
 
 /// A pattern matched against an enum value: `Circle(r)`, `Shape.Circle(r)`,

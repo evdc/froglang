@@ -9,7 +9,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::tokens::{Spanned, Token};
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
-use crate::frontend::typeck::{EnumDef, EnumDefs, StructDefs, Type, numeric_join};
+use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join};
 use crate::runtime::{ffi, gc};
 use crate::runtime::gc::{FrogList, FrogVariant};
 
@@ -45,17 +45,23 @@ struct Ctx<'a> {
     /// scalar/heap fields (recursively, for nested struct fields) — see
     /// `struct_fields` and `compile_expr_multi`.
     structs:       &'a StructDefs,
-    /// Layout for every registered enum, from `TypeChecker::enum_defs`. An
-    /// enum value, unlike a struct, IS a single GC-boxed heap pointer (see
-    /// `runtime::gc::FrogVariant`) — this is only consulted to resolve a
-    /// field name to a slot offset (`enum_field_leaf_types`), never to
-    /// flatten an enum value into more than one `Value`.
-    enums:         &'a EnumDefs,
+    /// Layout for every registered nominal union, from
+    /// `TypeChecker::union_defs`. A union value, unlike a struct, IS a
+    /// single GC-boxed heap pointer (see `runtime::gc::FrogVariant`) — this
+    /// is only consulted to resolve a field name to a slot offset
+    /// (`enum_field_leaf_types`), never to flatten a union value into more
+    /// than one `Value`.
+    unions:        &'a UnionDefs,
 }
 
 /// True iff a value of this type is a GC-managed heap pointer.
 fn is_heap_ty(ty: &Type) -> bool {
-    matches!(ty, Type::Str | Type::List(_) | Type::Enum(_))
+    // A `Type::Union` is only ever codegen'd for a registered nominal union
+    // (`data X is A | B`) — see `Ctx.unions`. Those are GC-boxed exactly
+    // like the old `Type::Enum` was (`runtime::gc::FrogVariant`); an
+    // anonymous structural union (`Int | Str`) has no codegen support and
+    // is never produced by anything `compile_and_run` actually runs.
+    matches!(ty, Type::Str | Type::List(_) | Type::Union(_))
 }
 
 /// Recursively flatten `ty` into its ordered leaf `(dotted_path, Type)`
@@ -211,12 +217,12 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         // Reading a field off an already-bound struct isn't itself a new
         // heap-value producer (its leaf is a `Variable`, already rooted
         // wherever it was produced) — only `target` might be (e.g.
-        // `f().name`). An enum-typed target is different: its fields live
+        // `f().name`). A union-typed target is different: its fields live
         // in heap memory, so *reading* one is a fresh `Value` each time,
         // same as a list-element read (`Index`, above) — needs its own root.
-        TypedExprKind::FieldAccess { target, .. } => {
+        TypedExprKind::FieldAccess { target, enum_name, .. } => {
             for_each_heap_producer(target, structs, f);
-            if matches!(&target.item.ty, Type::Enum(_)) {
+            if enum_name.is_some() {
                 for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
             }
         },
@@ -370,7 +376,7 @@ fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, val: Va
 ///   * otherwise `val` may be an immediate, which can never match a
 ///     payload-carrying variant but must not be dereferenced to find that
 ///     out — so the load is guarded by the low-bit test.
-fn emit_is_variant(bcx: &mut FunctionBuilder, val: Value, def: &EnumDef, tag: u32) -> Value {
+fn emit_is_variant(bcx: &mut FunctionBuilder, val: Value, def: &UnionDef, tag: u32) -> Value {
     let variant_is_unit = def.common.is_empty()
         && def.variants.get(tag as usize).is_some_and(|(_, fs)| fs.is_empty());
     if variant_is_unit {
@@ -1208,18 +1214,18 @@ fn compile_expr_multi(
             out
         },
 
-        TypedExprKind::FieldAccess { target, field } => {
-            match &target.item.ty {
-                Type::Enum(ename) => {
+        TypedExprKind::FieldAccess { target, field, enum_name } => {
+            match enum_name {
+                Some(ename) => {
                     // A common field, read out of heap memory — unlike a
                     // struct's `Variable`-backed leaf, this is a fresh
                     // `Value` on every read, so each heap-typed slot roots
                     // itself (see `for_each_heap_producer`'s matching arm).
                     let ptr = compile_expr(target, bcx, vars, ctx);
-                    let (offset, leaf_types) = enum_field_leaf_types(ename, None, field, ctx.structs, ctx.enums);
+                    let (offset, leaf_types) = enum_field_leaf_types(ename, None, field, ctx.structs, ctx.unions);
                     read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
                 },
-                _ => {
+                None => {
                     let target_vals = compile_expr_multi(target, bcx, vars, ctx);
                     let (start, len) = field_slice_range(&target.item.ty, field, ctx.structs);
                     target_vals[start..start + len].to_vec()
@@ -1291,23 +1297,15 @@ fn compile_expr_multi(
             vec![ptr]
         },
 
-        TypedExprKind::IsVariant { target, tag, .. } => {
+        TypedExprKind::IsVariant { target, enum_name, tag, .. } => {
             let val = compile_expr(target, bcx, vars, ctx);
-            let ename = match &target.item.ty {
-                Type::Enum(n) => n.clone(),
-                other => unreachable!("IsVariant target must be Enum-typed, got {}", other),
-            };
-            let def = ctx.enums.get(&ename).expect("known enum in codegen").clone();
+            let def = ctx.unions.get(enum_name).expect("known union in codegen").clone();
             vec![emit_is_variant(bcx, val, &def, *tag)]
         },
 
-        TypedExprKind::VariantField { target, variant, field } => {
+        TypedExprKind::VariantField { target, enum_name, variant, field } => {
             let ptr = compile_expr(target, bcx, vars, ctx);
-            let ename = match &target.item.ty {
-                Type::Enum(n) => n.clone(),
-                _ => unreachable!("VariantField target must be Enum-typed"),
-            };
-            let (offset, leaf_types) = enum_field_leaf_types(&ename, Some(variant), field, ctx.structs, ctx.enums);
+            let (offset, leaf_types) = enum_field_leaf_types(enum_name, Some(variant), field, ctx.structs, ctx.unions);
             read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
         },
 
@@ -1367,8 +1365,8 @@ fn read_variant_slots(ptr: Value, offset: usize, leaf_types: &[Type], bcx: &mut 
 /// (common, variant) layout. `variant: None` is used for an ordinary
 /// common-field `FieldAccess` (the field must be common — enforced during
 /// typeck); `variant: Some(v)` is used for a match-bound `VariantField`.
-fn enum_field_leaf_types(enum_name: &str, variant: Option<&str>, field: &str, structs: &StructDefs, enums: &EnumDefs) -> (usize, Vec<Type>) {
-    let def = enums.get(enum_name).expect("known enum in codegen");
+fn enum_field_leaf_types(enum_name: &str, variant: Option<&str>, field: &str, structs: &StructDefs, unions: &UnionDefs) -> (usize, Vec<Type>) {
+    let def = unions.get(enum_name).expect("known enum in codegen");
     let mut offset = 0;
     for (fname, fty) in &def.common {
         let leaves = struct_fields(fty, structs);
@@ -1669,7 +1667,7 @@ impl Codegen {
         body: &Spanned<TypedExpr>,
         string_arena: &mut Vec<Vec<u8>>,
         structs: &StructDefs,
-        enums: &EnumDefs,
+        unions: &UnionDefs,
     ) {
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
         let entry = bcx.create_block();
@@ -1693,7 +1691,7 @@ impl Codegen {
         }
 
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, count_heap_slots(body, structs));
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs, enums };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs, unions };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
         teardown_shadow_frame(&mut bcx, module, func_ids, heap_slot);
 
@@ -1754,7 +1752,7 @@ impl Codegen {
         pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
-        enums: &EnumDefs,
+        unions: &UnionDefs,
     ) -> Vec<(String, Type)> {
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
         let entry = bcx.create_block();
@@ -1786,7 +1784,7 @@ impl Codegen {
 
         let n: usize = stmts.iter().map(|s| count_heap_slots(s, structs)).sum();
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs, enums };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs, unions };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;
@@ -1854,7 +1852,7 @@ impl Codegen {
         pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
-        enums: &EnumDefs,
+        unions: &UnionDefs,
     ) -> (FuncId, Vec<(String, Type)>) {
         let stmts: Vec<Spanned<TypedExpr>> = match typed.item.kind {
             TypedExprKind::Block(s) => s,
@@ -1917,7 +1915,7 @@ impl Codegen {
                 body,
                 string_arena,
                 structs,
-                enums,
+                unions,
             );
 
             self.module
@@ -1948,7 +1946,7 @@ impl Codegen {
             pre_env,
             env_types,
             structs,
-            enums,
+            unions,
         );
 
         self.module
@@ -1975,7 +1973,7 @@ pub fn compile_and_run(src: &str) -> i64 {
     let mut codegen = Codegen::new();
     let mut string_arena: Vec<Vec<u8>> = Vec::new();
     let (main_id, bindings) = codegen.compile_entry(
-        typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.enum_defs(),
+        typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),
     );
 
     let ptr = codegen.module.get_finalized_function(main_id);

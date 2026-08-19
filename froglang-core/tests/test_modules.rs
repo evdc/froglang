@@ -30,7 +30,7 @@ fn run_module_entry_at(path: &Path) -> i64 {
     let mut codegen = Codegen::new();
     let mut string_arena: Vec<Vec<u8>> = Vec::new();
     let (main_id, bindings) = codegen.compile_entry(
-        typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.enum_defs(),
+        typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),
     );
 
     let ptr = codegen.module.get_finalized_function(main_id);

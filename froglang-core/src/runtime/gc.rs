@@ -61,12 +61,13 @@ pub struct FrogList {
 
 // ── FrogVariant — immutable, inline payload immediately after the struct ──────
 //
-// Runtime representation of an enum value: `tag` is the variant's
-// declaration index within its enum (fixed by `TypeChecker::EnumDef`,
-// consulted only at codegen time — the GC itself never needs to know which
-// enum this came from). The payload is `nslots` `i64`s, laid out as the
-// enum's common fields (flattened, in declared order) followed by this
-// variant's own fields (flattened, in declared order) — see
+// Runtime representation of a nominal union's member (`data X is A | B` —
+// the language's only sum type): `tag` is the member's declaration index
+// within its union (fixed by `TypeChecker::UnionDef`, consulted only at
+// codegen time — the GC itself never needs to know which union this came
+// from). The payload is `nslots` `i64`s, laid out as the union's common
+// fields (flattened, in declared order) followed by this member's own
+// fields (flattened, in declared order) — see
 // `codegen::enum_field_leaf_types`. `ptr_mask` marks which payload slots
 // are heap pointers, exactly like `FrogList::ptr_mask` but one bit per
 // slot directly (no `stride` — a variant is always exactly one "element").

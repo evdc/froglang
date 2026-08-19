@@ -89,10 +89,15 @@ pub enum TypedExprKind {
         fields: Vec<(String, TypedExprRef)>,
     },
 
-    /// `target.field` — struct field access. Result type is the field's type.
+    /// `target.field` — struct field access, or a nominal union's *common*
+    /// field access (`enum_name: Some(name)` — the union member is boxed,
+    /// so unlike a struct's `Variable`-backed leaf this reads out of heap
+    /// memory; `None` for an ordinary struct). Result type is the field's
+    /// type.
     FieldAccess {
-        target: TypedExprRef,
-        field:  String,
+        target:    TypedExprRef,
+        field:     String,
+        enum_name: Option<String>,
     },
 
     /// `base.field = value` — the struct "mutation" rebind-sugar: `base`
@@ -104,11 +109,11 @@ pub enum TypedExprKind {
         value: TypedExprRef,
     },
 
-    /// `Enum.Variant(field=value, ...)` construction — bare or qualified,
+    /// `Union.Variant(field=value, ...)` construction — bare or qualified,
     /// nullary or not, all normalize to this. `fields` are pre-ordered
     /// common-then-variant, matching `struct_fields`'s flattened layout
     /// order (see `StructInit`). `tag` is the variant's declaration index.
-    /// Result type is `Type::Enum(enum_name)`.
+    /// Result type is the nominal union's resolved `Type::Union`.
     VariantInit {
         enum_name: String,
         variant:   String,
@@ -121,18 +126,20 @@ pub enum TypedExprKind {
     /// `Conditional` + `VariantField`, never directly on this node — see
     /// `TypeChecker::lower_match`). Result type is `Type::Bool`.
     IsVariant {
-        target:  TypedExprRef,
-        variant: String,
-        tag:     u32,
+        target:    TypedExprRef,
+        enum_name: String,
+        variant:   String,
+        tag:       u32,
     },
 
     /// One of `variant`'s own declared fields (not a common field — those
     /// use ordinary `FieldAccess`). Only ever emitted already guarded by a
     /// preceding `IsVariant` check, so no runtime tag check happens here.
     VariantField {
-        target:  TypedExprRef,
-        variant: String,
-        field:   String,
+        target:    TypedExprRef,
+        enum_name: String,
+        variant:   String,
+        field:     String,
     },
 
     /// `return`, or `return value`. This node's own `.ty` (on the enclosing

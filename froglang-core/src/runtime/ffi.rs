@@ -365,12 +365,12 @@ pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
     })
 }
 
-// ── Variant (enum value) operations ─────────────────────────────────────────
+// ── Variant (nominal union member) operations ───────────────────────────────
 
-/// Allocate a GC-managed `FrogVariant`: `tag` is the variant's declaration
+/// Allocate a GC-managed `FrogVariant`: `tag` is the member's declaration
 /// index, `nslots` its flattened payload width, `ptr_mask` marks which
 /// slots are heap pointers — all computed at codegen time from
-/// `TypeChecker::EnumDef`/`codegen::enum_field_leaf_types`. Payload slots
+/// `TypeChecker::UnionDef`/`codegen::enum_field_leaf_types`. Payload slots
 /// start zeroed; the caller (codegen's `VariantInit`) fills them in with
 /// `frog_variant_set` right after this returns.
 #[no_mangle]

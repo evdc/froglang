@@ -17,7 +17,7 @@ type TypeResult = Result<Type, Spanned<TypeError>>;
 
 /// Traits constrain type variables. A type must implement a trait to be bound
 /// to a TypeVar that carries that bound.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Trait {
     Num,   // Int, Float — arithmetic operators
     Eq,    // Int, Float, Bool, Str — == and !=
@@ -50,8 +50,6 @@ fn type_implements(ty: &Type, tr: &Trait) -> bool {
         // itself inferred, which is the correct place for that error to
         // surface, not here.
         Type::Struct(_) if *tr == Trait::Eq => true,
-        // Enums get structural `==`/`!=` too — see `TypeChecker::desugar_enum_eq`.
-        Type::Enum(_) if *tr == Trait::Eq => true,
         _ => match tr {
             Trait::Num => matches!(ty, Type::Int | Type::Float),
             Trait::Eq  => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
@@ -60,7 +58,7 @@ fn type_implements(ty: &Type, tr: &Trait) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     None,
     Int,
@@ -81,11 +79,6 @@ pub enum Type {
     /// names/types live in `TypeChecker.struct_defs`, not here, so cloning
     /// a `Type::Struct` stays cheap regardless of field count.
     Struct(String),
-    /// A `data Name(...) is A | B(...)` enum type. Nominal, like `Struct`.
-    /// Variant/common-field layout lives in `TypeChecker.enum_defs`, not
-    /// here. Unlike `Union`, this is a closed, tagged sum with a single
-    /// GC-boxed runtime representation — see `runtime::gc::FrogVariant`.
-    Enum(String),
     /// The bottom type: no value of this type is ever produced. `return`'s
     /// own type (see `TypeChecker::return_types`) — it unifies with
     /// anything and vanishes from any union it appears in (`normalize`,
@@ -171,7 +164,6 @@ impl Display for Type {
                 write!(f, "{}", strs.join(" | "))
             }
             Type::Struct(name) => write!(f, "{}", name),
-            Type::Enum(name) => write!(f, "{}", name),
             Type::Never => write!(f, "Never"),
         }
     }
@@ -205,29 +197,35 @@ pub fn numeric_join(t1: &Type, t2: &Type) -> Option<Type> {
 /// `codegen/mod.rs`).
 pub type StructDefs = HashMap<String, Vec<(String, Type)>>;
 
-/// One registered `data Name(common...) is A(...) | B(...) | ...` enum:
-/// its common fields (readable on any variant without matching) and its
-/// variants in declaration order (declaration order fixes each variant's
-/// runtime tag — see `Codegen`/`runtime::gc::FrogVariant`).
+/// One registered `data Name(common...) is A(...) | B(...) | ...` nominal
+/// union (the language's only sum type — see `ERRORS.md`): its common
+/// fields (readable on any member without matching) and its members in
+/// declaration order (declaration order fixes each member's runtime tag —
+/// see `Codegen`/`runtime::gc::FrogVariant`). `ty` is the resolved
+/// `Type::Union` this declaration's name stands for — every member is a
+/// nominal marker `Type::Struct("Name.Member")`, sorted the same way
+/// `Type::normalize()` would sort them, so it can be looked up in
+/// `TypeChecker.union_names` in the other direction.
 #[derive(Debug, Clone)]
-pub struct EnumDef {
+pub struct UnionDef {
     pub common:   Vec<(String, Type)>,
     pub variants: Vec<(String, Vec<(String, Type)>)>,
+    pub ty:       Type,
 }
 
-impl EnumDef {
+impl UnionDef {
     pub fn variant_index(&self, variant: &str) -> Option<usize> {
         self.variants.iter().position(|(n, _)| n == variant)
     }
 
-    /// All-nullary check used by codegen/typeck to decide whether an enum
+    /// All-nullary check used by codegen/typeck to decide whether a union
     /// can be represented as a bare tag instead of a boxed pointer.
     pub fn is_unit_enum(&self) -> bool {
         self.common.is_empty() && self.variants.iter().all(|(_, fs)| fs.is_empty())
     }
 }
 
-pub type EnumDefs = HashMap<String, EnumDef>;
+pub type UnionDefs = HashMap<String, UnionDef>;
 
 pub struct TypeChecker {
     // Variable (value level) name -> Type
@@ -240,12 +238,18 @@ pub struct TypeChecker {
     /// visible for the rest of the program, including from later
     /// independent blocks. A known simplification, not a hard limit.
     struct_defs: StructDefs,
-    /// Registered `data Name(...) is ...` enum declarations — see
+    /// Registered `data Name(...) is ...` nominal-union declarations — see
     /// `hoist_data_decls`. Same never-scoped lifetime as `struct_defs`.
-    enum_defs: EnumDefs,
-    /// variant name -> names of every enum declaring it. Used to resolve a
+    union_defs: UnionDefs,
+    /// Reverse of `union_defs`: a union's normalized, sorted member-type
+    /// vector (the same shape `Type::normalize()` produces) -> its declared
+    /// name. Lets any `Type::Union` value that happens to be a registered
+    /// nominal union be resolved back to its `UnionDef` — see
+    /// `TypeChecker::resolve_union`.
+    union_names: HashMap<Vec<Type>, String>,
+    /// variant name -> names of every union declaring it. Used to resolve a
     /// bare (unqualified) variant constructor/pattern: unique -> that
-    /// enum, ambiguous -> require `Enum.Variant` qualification.
+    /// union, ambiguous -> require `Union.Variant` qualification.
     variant_owners: HashMap<String, Vec<String>>,
     /// Stack of enclosing functions' return types, innermost last. `return`
     /// (in `infer`'s `Expression::Return` arm) checks its value against
@@ -263,18 +267,19 @@ pub struct TypeCheckerCheckpoint {
     substitutions: HashMap<String, Type>,
     next_id: u32,
     struct_defs: StructDefs,
-    enum_defs: EnumDefs,
+    union_defs: UnionDefs,
+    union_names: HashMap<Vec<Type>, String>,
     variant_owners: HashMap<String, Vec<String>>,
     return_types: Vec<Type>,
 }
 
 impl TypeChecker {
     pub fn empty() -> Self {
-        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), enum_defs: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new() }
+        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), enum_defs: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new() }
+        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new() }
     }
 
     /// Field layout for every registered struct, in declaration order.
@@ -285,10 +290,10 @@ impl TypeChecker {
         &self.struct_defs
     }
 
-    /// Layout for every registered enum, in declaration order. Threaded
-    /// into `Codegen` alongside `struct_defs`.
-    pub fn enum_defs(&self) -> &EnumDefs {
-        &self.enum_defs
+    /// Layout for every registered nominal union, in declaration order.
+    /// Threaded into `Codegen` alongside `struct_defs`.
+    pub fn union_defs(&self) -> &UnionDefs {
+        &self.union_defs
     }
 
     /// Fresh unconstrained type variable (used for unannotated lambda parameters).
@@ -311,7 +316,8 @@ impl TypeChecker {
             substitutions: self.substitutions.clone(),
             next_id: self.next_id,
             struct_defs: self.struct_defs.clone(),
-            enum_defs: self.enum_defs.clone(),
+            union_defs: self.union_defs.clone(),
+            union_names: self.union_names.clone(),
             variant_owners: self.variant_owners.clone(),
             return_types: self.return_types.clone(),
         }
@@ -322,7 +328,8 @@ impl TypeChecker {
         self.substitutions = cp.substitutions;
         self.next_id = cp.next_id;
         self.struct_defs = cp.struct_defs;
-        self.enum_defs = cp.enum_defs;
+        self.union_defs = cp.union_defs;
+        self.union_names = cp.union_names;
         self.variant_owners = cp.variant_owners;
         self.return_types = cp.return_types;
     }
@@ -507,36 +514,49 @@ impl TypeChecker {
     fn infer_field_access(&mut self, fa: &FieldAccessExpr, span: Span) -> TypeResult {
         let target_ty = self.infer(&fa.target)?;
         let resolved = self.lookup(&target_ty);
-        match &resolved {
-            Type::Struct(sname) => {
-                let field_defs = self.struct_defs.get(sname).cloned().unwrap_or_default();
-                field_defs.iter().find(|(n, _)| n == &fa.field).map(|(_, t)| t.clone())
-                    .ok_or_else(|| Spanned::from(TypeError {
-                        msg: format!("Struct {} has no field '{}'", sname, fa.field)
-                    }, span))
-            },
-            // Only common fields (declared on the enum head) are readable
-            // without matching — a variant-only field requires a `match`/
-            // `is` to narrow the value first (see DESIGN.md's `shape.r`
-            // example).
-            Type::Enum(ename) => {
-                let def = self.enum_defs.get(ename).cloned().unwrap_or(EnumDef { common: Vec::new(), variants: Vec::new() });
-                if let Some((_, t)) = def.common.iter().find(|(n, _)| n == &fa.field) {
-                    return Ok(t.clone());
-                }
-                if def.variants.iter().any(|(_, fs)| fs.iter().any(|(n, _)| n == &fa.field)) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("'{}' is a variant-specific field of {} — match on it to access it", fa.field, ename)
-                    }, span));
-                }
+        if let Type::Struct(sname) = &resolved {
+            let field_defs = self.struct_defs.get(sname).cloned().unwrap_or_default();
+            return field_defs.iter().find(|(n, _)| n == &fa.field).map(|(_, t)| t.clone())
+                .ok_or_else(|| Spanned::from(TypeError {
+                    msg: format!("Struct {} has no field '{}'", sname, fa.field)
+                }, span));
+        }
+        // Only common fields (declared on the union head) are readable
+        // without matching — a variant-only field requires a `match`/
+        // `is` to narrow the value first (see DESIGN.md's `shape.r`
+        // example).
+        if let Some((ename, def)) = self.resolve_union(&resolved) {
+            let ename = ename.to_string();
+            let def = def.clone();
+            if let Some((_, t)) = def.common.iter().find(|(n, _)| n == &fa.field) {
+                return Ok(t.clone());
+            }
+            return if def.variants.iter().any(|(_, fs)| fs.iter().any(|(n, _)| n == &fa.field)) {
+                Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is a variant-specific field of {} — match on it to access it", fa.field, ename)
+                }, span))
+            } else {
                 Err(Spanned::from(TypeError {
                     msg: format!("{} has no field '{}'", ename, fa.field)
                 }, span))
-            },
-            _ => Err(Spanned::from(TypeError {
-                msg: format!("Can't access field '{}' on {}, expected a struct or enum", fa.field, resolved)
-            }, fa.target.span)),
+            };
         }
+        Err(Spanned::from(TypeError {
+            msg: format!("Can't access field '{}' on {}, expected a struct or union", fa.field, resolved)
+        }, fa.target.span))
+    }
+
+    /// If `ty` is a `Type::Union` matching a registered nominal union
+    /// (`data X is A | B`), return its declared name and definition. `None`
+    /// for any other type, including an anonymous structural union with no
+    /// matching declaration.
+    fn resolve_union(&self, ty: &Type) -> Option<(&str, &UnionDef)> {
+        if let Type::Union(members) = ty {
+            if let Some(name) = self.union_names.get(members) {
+                return self.union_defs.get(name).map(|d| (name.as_str(), d));
+            }
+        }
+        None
     }
 
     /// Register every `data Name(field: Type, ...)` declaration found
@@ -549,7 +569,7 @@ impl TypeChecker {
     fn hoist_data_decls(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
         for s in stmts {
             if let Expression::DataDecl(d) = &s.item {
-                if self.struct_defs.contains_key(&d.name) || self.enum_defs.contains_key(&d.name) {
+                if self.struct_defs.contains_key(&d.name) || self.union_defs.contains_key(&d.name) {
                     return Err(Spanned::from(TypeError {
                         msg: format!("'{}' is already declared", d.name)
                     }, s.span));
@@ -560,7 +580,20 @@ impl TypeChecker {
                     for v in &d.variants {
                         self.variant_owners.entry(v.name.clone()).or_default().push(d.name.clone());
                     }
-                    self.enum_defs.insert(d.name.clone(), EnumDef { common: Vec::new(), variants: Vec::new() });
+                    // Only the member *names* are needed to build the
+                    // nominal marker types below — field types aren't
+                    // resolved until the second pass, which is what lets a
+                    // union reference itself recursively (`data Tree is
+                    // Leaf | Node(l: Tree, r: Tree)`): by the time a
+                    // member's fields are resolved, `Tree`'s own `Type`
+                    // (and its `union_names` reverse entry) already exist.
+                    let mut member_types: Vec<Type> = d.variants.iter()
+                        .map(|v| Type::Struct(format!("{}.{}", d.name, v.name)))
+                        .collect();
+                    member_types.sort_by_cached_key(|t| t.to_string());
+                    let ty = Type::Union(member_types.clone());
+                    self.union_names.insert(member_types, d.name.clone());
+                    self.union_defs.insert(d.name.clone(), UnionDef { common: Vec::new(), variants: Vec::new(), ty });
                 }
             }
         }
@@ -592,7 +625,9 @@ impl TypeChecker {
                         }
                         variants.push((v.name.clone(), vfields));
                     }
-                    self.enum_defs.insert(d.name.clone(), EnumDef { common: fields, variants });
+                    let def = self.union_defs.get_mut(&d.name).expect("registered in the first pass, above");
+                    def.common = fields;
+                    def.variants = variants;
                 }
             }
         }
@@ -607,11 +642,12 @@ impl TypeChecker {
     /// DFS over the struct field-type graph, following only direct
     /// `Type::Struct` fields (a `List(Struct(_))` field is fine — a list is
     /// a heap pointer, not inline storage, so it can't create an
-    /// infinite-size cycle the way a direct field can). `Type::Enum` fields
-    /// are always fine too — an enum value is a single boxed pointer (see
-    /// `runtime::gc::FrogVariant`), so it can't create an infinite-size
-    /// cycle either; this is what makes recursive enums (e.g. a binary
-    /// tree) legal even though recursive structs are not.
+    /// infinite-size cycle the way a direct field can). A `Type::Union`
+    /// field is always fine too — a nominal union's member is a single
+    /// boxed pointer (see `runtime::gc::FrogVariant`), so it can't create
+    /// an infinite-size cycle either; this is what makes a recursive union
+    /// (e.g. a binary tree, `data Tree is Leaf | Node(l: Tree, r: Tree)`)
+    /// legal even though a recursive struct is not.
     fn check_struct_acyclic(&self, name: &str, path: &mut Vec<String>, span: Span) -> Result<(), Spanned<TypeError>> {
         if path.iter().any(|n| n == name) {
             path.push(name.to_string());
@@ -693,16 +729,16 @@ impl TypeChecker {
     /// `infer_call` alongside struct construction. `field_defs` for the
     /// call is the enum's common fields followed by the variant's own.
     fn infer_variant_init(&mut self, enum_name: &str, variant: &str, args: &[Spanned<Expression>], span: Span) -> TypeResult {
-        let def = self.enum_defs.get(enum_name).cloned()
-            .expect("enum_name resolved via variant_owners/enum_defs, must be registered");
+        let def = self.union_defs.get(enum_name).cloned()
+            .expect("enum_name resolved via variant_owners/union_defs, must be registered");
         let variant_fields = def.variants.iter().find(|(n, _)| n == variant)
             .map(|(_, fs)| fs.clone())
-            .expect("variant resolved via variant_owners/enum_defs, must be registered");
+            .expect("variant resolved via variant_owners/union_defs, must be registered");
         let mut field_defs = def.common.clone();
         field_defs.extend(variant_fields);
         let kind_name = format!("{}.{}", enum_name, variant);
         self.check_record_args(&kind_name, &field_defs, args, span)?;
-        Ok(Type::Enum(enum_name.to_string()))
+        Ok(def.ty.clone())
     }
 
     /// Resolve a call's callee to `(enum_name, variant_name)` if it names
@@ -725,7 +761,7 @@ impl TypeChecker {
             }
             Expression::FieldAccess(fa) => {
                 if let Some(enum_name) = fa.target.item.get_identifier() {
-                    if let Some(def) = self.enum_defs.get(enum_name) {
+                    if let Some(def) = self.union_defs.get(enum_name) {
                         return if def.variant_index(&fa.field).is_some() {
                             Ok(Some((enum_name.to_string(), fa.field.clone())))
                         } else {
@@ -753,7 +789,7 @@ impl TypeChecker {
             }, span)),
             Some(owners) => {
                 let enum_name = &owners[0];
-                let def = self.enum_defs.get(enum_name).expect("registered");
+                let def = self.union_defs.get(enum_name).expect("registered");
                 let variant_fields = def.variants.iter().find(|(n, _)| n == name)
                     .map(|(_, fs)| fs).expect("registered");
                 if !def.common.is_empty() || !variant_fields.is_empty() {
@@ -761,7 +797,7 @@ impl TypeChecker {
                         msg: format!("Variant '{}' has fields and must be constructed with {}(...)", name, name)
                     }, span));
                 }
-                Ok(Type::Enum(enum_name.clone()))
+                Ok(def.ty.clone())
             }
         }
     }
@@ -771,7 +807,7 @@ impl TypeChecker {
     /// variant must exist, and — if any binds are given at all — their
     /// count must exactly match the variant's field arity. Returns the
     /// variant's declaration index (its runtime tag).
-    fn check_pattern(&self, pattern: &Pattern, enum_name: &str, def: &EnumDef, span: Span) -> Result<usize, Spanned<TypeError>> {
+    fn check_pattern(&self, pattern: &Pattern, enum_name: &str, def: &UnionDef, span: Span) -> Result<usize, Spanned<TypeError>> {
         if let Some(path) = &pattern.path {
             if path != enum_name {
                 return Err(Spanned::from(TypeError {
@@ -800,13 +836,13 @@ impl TypeChecker {
     fn infer_is_pattern(&mut self, ip: &crate::frontend::expression::IsPatternExpr, span: Span) -> TypeResult {
         let subject_ty = self.infer(&ip.subject)?;
         let resolved = self.lookup(&subject_ty);
-        let enum_name = match &resolved {
-            Type::Enum(name) => name.clone(),
-            _ => return Err(Spanned::from(TypeError {
-                msg: format!("Can only use 'is' on an enum value, got {}", resolved)
+        let enum_name = match self.resolve_union(&resolved) {
+            Some((name, _)) => name.to_string(),
+            None => return Err(Spanned::from(TypeError {
+                msg: format!("Can only use 'is' on a union value, got {}", resolved)
             }, ip.subject.span)),
         };
-        let def = self.enum_defs.get(&enum_name).cloned().expect("registered");
+        let def = self.union_defs.get(&enum_name).cloned().expect("registered");
         self.check_pattern(&ip.pattern, &enum_name, &def, span)?;
         if !ip.pattern.binds.is_empty() {
             return Err(Spanned::from(TypeError {
@@ -828,13 +864,13 @@ impl TypeChecker {
     fn infer_match(&mut self, subject: &Spanned<Expression>, arms: &[MatchArm], default: &Option<Box<Spanned<Expression>>>, span: Span) -> TypeResult {
         let subject_ty = self.infer(subject)?;
         let resolved_subject = self.lookup(&subject_ty);
-        let enum_name = match &resolved_subject {
-            Type::Enum(name) => name.clone(),
-            _ => return Err(Spanned::from(TypeError {
-                msg: format!("Can only match on an enum value, got {}", resolved_subject)
+        let enum_name = match self.resolve_union(&resolved_subject) {
+            Some((name, _)) => name.to_string(),
+            None => return Err(Spanned::from(TypeError {
+                msg: format!("Can only match on a union value, got {}", resolved_subject)
             }, subject.span)),
         };
-        let def = self.enum_defs.get(&enum_name).cloned().expect("registered");
+        let def = self.union_defs.get(&enum_name).cloned().expect("registered");
 
         let mut covered: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut result_ty: Option<Type> = None;
@@ -1453,7 +1489,7 @@ impl TypeChecker {
                 } else {
                     let enum_name = self.variant_owners.get(&nm).and_then(|owners| owners.first()).cloned()
                         .expect("bare identifier validated as a nullary variant during infer");
-                    let def = self.enum_defs.get(&enum_name).expect("registered");
+                    let def = self.union_defs.get(&enum_name).expect("registered");
                     let tag = def.variant_index(&nm).expect("registered") as u32;
                     TypedExprKind::VariantInit { enum_name, variant: nm, tag, fields: Vec::new() }
                 },
@@ -1597,7 +1633,7 @@ impl TypeChecker {
                     }
                     TypedExprKind::StructInit { name, fields: ordered }
                 } else if let Ok(Some((enum_name, variant))) = self.resolve_variant_callee(&c.callable.item) {
-                    let def = self.enum_defs.get(&enum_name).cloned().expect("validated during infer");
+                    let def = self.union_defs.get(&enum_name).cloned().expect("validated during infer");
                     let variant_fields = def.variants.iter().find(|(n, _)| n == &variant)
                         .map(|(_, fs)| fs.clone()).expect("validated during infer");
                     let mut field_defs = def.common.clone();
@@ -1717,7 +1753,8 @@ impl TypeChecker {
 
             Expression::FieldAccess(fa) => {
                 let target = self.check_and_lower(*fa.target)?;
-                TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field }
+                let enum_name = self.resolve_union(&target.item.ty).map(|(name, _)| name.to_string());
+                TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field, enum_name }
             },
 
             Expression::Match(m) => return self.lower_match(m.subject, m.arms, m.default, span),
@@ -1726,13 +1763,12 @@ impl TypeChecker {
             // tag test; see `infer_is_pattern`.
             Expression::IsPattern(ip) => {
                 let target = self.check_and_lower(*ip.subject)?;
-                let enum_name = match &target.item.ty {
-                    Type::Enum(name) => name.clone(),
-                    _ => unreachable!("is-pattern subject must be Enum after inference"),
-                };
-                let def = self.enum_defs.get(&enum_name).expect("registered");
+                let enum_name = self.resolve_union(&target.item.ty)
+                    .map(|(name, _)| name.to_string())
+                    .unwrap_or_else(|| unreachable!("is-pattern subject must be a nominal union after inference"));
+                let def = self.union_defs.get(&enum_name).expect("registered");
                 let tag = def.variant_index(&ip.pattern.variant).expect("validated during infer") as u32;
-                TypedExprKind::IsVariant { target: Box::new(target), variant: ip.pattern.variant, tag }
+                TypedExprKind::IsVariant { target: Box::new(target), enum_name, variant: ip.pattern.variant, tag }
             },
 
             Expression::Import(_) => unreachable!(
@@ -1794,11 +1830,10 @@ impl TypeChecker {
     /// evaluated once, not once per arm's tag test.
     fn lower_match(&mut self, subject: Box<Spanned<Expression>>, arms: Vec<MatchArm>, default: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let subject = self.check_and_lower(*subject)?;
-        let enum_name = match &subject.item.ty {
-            Type::Enum(name) => name.clone(),
-            _ => unreachable!("match/is-pattern subject must be Enum after inference"),
-        };
-        let def = self.enum_defs.get(&enum_name).cloned().expect("registered");
+        let enum_name = self.resolve_union(&subject.item.ty)
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| unreachable!("match/is-pattern subject must be a nominal union after inference"));
+        let def = self.union_defs.get(&enum_name).cloned().expect("registered");
 
         let subject_name = format!("__match_subject_{}", self.next_id); self.next_id += 1;
         let subject_ty = subject.item.ty.clone();
@@ -1827,7 +1862,7 @@ impl TypeChecker {
             );
             let base_cond = Spanned::from(
                 TypedExpr { ty: Type::Bool, kind: TypedExprKind::IsVariant {
-                    target: Box::new(subject_var.clone()), variant: arm.pattern.variant.clone(), tag: idx as u32,
+                    target: Box::new(subject_var.clone()), enum_name: enum_name.clone(), variant: arm.pattern.variant.clone(), tag: idx as u32,
                 } },
                 span,
             );
@@ -1839,7 +1874,7 @@ impl TypeChecker {
                     if bind == "_" { continue; }
                     let value = Spanned::from(
                         TypedExpr { ty: fty.clone(), kind: TypedExprKind::VariantField {
-                            target: Box::new(subject_var.clone()), variant: arm.pattern.variant.clone(), field: fname.clone(),
+                            target: Box::new(subject_var.clone()), enum_name: enum_name.clone(), variant: arm.pattern.variant.clone(), field: fname.clone(),
                         } },
                         span,
                     );
@@ -1877,7 +1912,17 @@ impl TypeChecker {
                 None => body,
                 Some(g) => {
                     let true_ty = body.item.ty.clone();
-                    let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::None);
+                    // `tail` is only ever `None` here once every remaining
+                    // arm/default has been folded in already (the loop runs
+                    // right-to-left) — and `infer_match` already rejected a
+                    // non-exhaustive match with no default before lowering
+                    // ever starts, so a missing `tail` at this point means
+                    // this guard's failure path is genuinely unreachable,
+                    // not "produces None". `Never` (not `None`) is the
+                    // correct placeholder: it vanishes from the union join
+                    // below instead of forcing every guarded arm's type to
+                    // widen to `T | None`.
+                    let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::Never);
                     let result_ty = if self.unify(&true_ty, &false_ty) {
                         self.lookup(&true_ty)
                     } else {
@@ -1902,7 +1947,10 @@ impl TypeChecker {
             };
 
             let true_ty = true_branch.item.ty.clone();
-            let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::None);
+            // See the matching comment above: a missing `tail` here means
+            // this arm's tag-test-false path is unreachable (the match is
+            // already known exhaustive), not that it produces `None`.
+            let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::Never);
             let result_ty = if self.unify(&true_ty, &false_ty) {
                 self.lookup(&true_ty)
             } else {
@@ -1956,8 +2004,8 @@ impl TypeChecker {
         let fields = self.struct_defs.get(name).cloned().unwrap_or_default();
         let mut chain: Option<Spanned<TypedExpr>> = None;
         for (fname, fty) in &fields {
-            let lf = Spanned::from(TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(l.clone()), field: fname.clone() } }, span);
-            let rf = Spanned::from(TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(r.clone()), field: fname.clone() } }, span);
+            let lf = Spanned::from(TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(l.clone()), field: fname.clone(), enum_name: None } }, span);
+            let rf = Spanned::from(TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(r.clone()), field: fname.clone(), enum_name: None } }, span);
             let sub = match fty {
                 Type::Struct(inner) => self.build_struct_eq(inner, lf, rf, span),
                 _ => Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::EqEq, left: Box::new(lf), right: Box::new(rf) } }, span),
@@ -1989,7 +2037,7 @@ impl TypeChecker {
                 "Str"   => Ok(Type::Str),
                 "None"  => Ok(Type::None),
                 _ if self.struct_defs.contains_key(name) => Ok(Type::Struct(name.clone())),
-                _ if self.enum_defs.contains_key(name)   => Ok(Type::Enum(name.clone())),
+                _ if self.union_defs.contains_key(name)  => Ok(self.union_defs[name].ty.clone()),
                 _ => Err(Spanned::from(TypeError { msg: format!("Unknown type '{}'", name) }, span)),
             },
 

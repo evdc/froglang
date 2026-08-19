@@ -61,7 +61,7 @@ impl FrogValue {
             // which isn't threaded through here.
             // `Never` is never a value's actual runtime type — nothing of
             // that type is ever produced — but the match must stay exhaustive.
-            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Struct(_) | Type::Enum(_) | Type::Never => {
+            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Struct(_) | Type::Never => {
                 FrogValue::None
             },
         }
@@ -236,7 +236,7 @@ impl FrogState {
                 &self.env,
                 &self.env_types,
                 self.tc.struct_defs(),
-                self.tc.enum_defs(),
+                self.tc.union_defs(),
             )
         }));
 

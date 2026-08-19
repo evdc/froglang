@@ -20,6 +20,7 @@ use crate::frontend::expression::{
     Expression, FieldAccessExpr, ImportKind, LiteralExpr,
 };
 use crate::frontend::parser::{ParseError, Parser};
+use crate::frontend::type_expr::TypeExpr;
 use crate::frontend::tokens::{Spanned, Token};
 
 #[derive(Debug)]
@@ -95,7 +96,8 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
                 for e in es { walk(&e.item, path)?; }
                 Ok(())
             }
-            Expression::Annotated(a) => { walk(&a.expr.item, path)?; walk(&a.ty.item, path) }
+            // `a.ty` is a `TypeExpr` — the type grammar has no `import` form.
+            Expression::Annotated(a) => walk(&a.expr.item, path),
             Expression::Index(i) => { walk(&i.target.item, path)?; walk(&i.index.item, path) }
             Expression::Slice(s) => {
                 walk(&s.target.item, path)?;
@@ -121,6 +123,10 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
                 Ok(())
             }
             Expression::IsPattern(ip) => walk(&ip.subject.item, path),
+            Expression::Return(value) => match value {
+                Some(v) => walk(&v.item, path),
+                None => Ok(()),
+            },
             Expression::DataDecl(_) | Expression::Literal(_) => Ok(()),
         }
     }
@@ -430,6 +436,30 @@ fn rewrite_top(
     rewrite(expr, subst, qualified, &mut empty_shadow, false);
 }
 
+/// Mangle every type name inside one type annotation.
+///
+/// The value-side `rewrite` needs a `shadow` set because a local can shadow an
+/// imported name; types live in their own namespace and cannot be shadowed by
+/// a `let`, so this needs only the substitution maps. Dotted names
+/// (`utils.Point`, reaching a type through a qualified import) are resolved
+/// against `qualified` first, mirroring how `rewrite` collapses a
+/// `FieldAccess` on an alias.
+fn rewrite_type_expr(
+    ty: &mut Spanned<TypeExpr>,
+    subst: &HashMap<String, String>,
+    qualified: &HashMap<String, HashMap<String, String>>,
+) {
+    for name in ty.item.names_mut() {
+        let replacement = match name.split_once('.') {
+            Some((alias, member)) => qualified.get(alias).and_then(|m| m.get(member)),
+            None => subst.get(name.as_str()),
+        };
+        if let Some(mangled) = replacement {
+            *name = mangled.clone();
+        }
+    }
+}
+
 /// The shared rewrite walker. `shadow` tracks names currently locally bound
 /// (function params, nested `let`s inside a function body, `for` loop
 /// variables) that should NOT be substituted. `track_let_shadow` is true
@@ -490,7 +520,7 @@ fn rewrite(
         Expression::Assign(a) => {
             rewrite(&mut a.value.item, subst, qualified, shadow, track_let_shadow);
             if let Some(ty) = &mut a.typ {
-                rewrite(&mut ty.item, subst, qualified, shadow, track_let_shadow);
+                rewrite_type_expr(ty, subst, qualified);
             }
             match &mut a.target.item {
                 Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) => {
@@ -514,11 +544,11 @@ fn rewrite(
         Expression::Function(func) => {
             for p in &mut func.params {
                 if let Some(ty) = &mut p.ty {
-                    rewrite(&mut ty.item, subst, qualified, shadow, track_let_shadow);
+                    rewrite_type_expr(ty, subst, qualified);
                 }
             }
             if let Some(rt) = &mut func.return_type {
-                rewrite(&mut rt.item, subst, qualified, shadow, track_let_shadow);
+                rewrite_type_expr(rt, subst, qualified);
             }
             let mut inner_shadow: HashSet<String> = func.params.iter().map(|p| p.name.clone()).collect();
             rewrite(&mut func.body.item, subst, qualified, &mut inner_shadow, true);
@@ -546,7 +576,7 @@ fn rewrite(
 
         Expression::Annotated(a) => {
             rewrite(&mut a.expr.item, subst, qualified, shadow, track_let_shadow);
-            rewrite(&mut a.ty.item, subst, qualified, shadow, track_let_shadow);
+            rewrite_type_expr(&mut a.ty, subst, qualified);
         }
 
         Expression::Index(i) => {
@@ -595,13 +625,13 @@ fn rewrite(
             }
             for p in &mut d.fields {
                 if let Some(ty) = &mut p.ty {
-                    rewrite(&mut ty.item, subst, qualified, shadow, track_let_shadow);
+                    rewrite_type_expr(ty, subst, qualified);
                 }
             }
             for v in &mut d.variants {
                 for p in &mut v.fields {
                     if let Some(ty) = &mut p.ty {
-                        rewrite(&mut ty.item, subst, qualified, shadow, track_let_shadow);
+                        rewrite_type_expr(ty, subst, qualified);
                     }
                 }
             }
@@ -635,6 +665,12 @@ fn rewrite(
         }
 
         Expression::Import(_) => unreachable!("Import nodes are stripped before rewrite runs"),
+
+        Expression::Return(value) => {
+            if let Some(v) = value {
+                rewrite(&mut v.item, subst, qualified, shadow, track_let_shadow);
+            }
+        }
     }
 }
 

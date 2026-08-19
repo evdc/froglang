@@ -103,6 +103,10 @@ pub enum Token {
     #[lex("func")]
     Func,
 
+    #[prefix(Grammar::return_expr)]
+    #[lex("return")]
+    Return,
+
     #[prefix(Grammar::for_expr)]
     #[lex("for")]
     For,
@@ -170,6 +174,12 @@ pub enum Token {
     Comma,
     #[lex("!")]
     Exclamation,
+    /// Postfix `?`. Used today only by the *type* grammar (`T?` = `T | None`,
+    /// see `Grammar::type_expr`), which is hand-written and does not consult
+    /// the parse-rule table — so this variant deliberately carries no prefix
+    /// or infix rule yet. It gains one when `e?` error propagation lands.
+    #[lex("?")]
+    Question,
     #[lex(";")]
     Semicolon,
 

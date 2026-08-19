@@ -1,5 +1,5 @@
 use std::{fmt::Debug, vec};
-use froglang_core::frontend::{expression::{Expression, Parameter}, tokens::{Span, Spanned, Token}, typeck::{Trait, Type, TypeChecker}};
+use froglang_core::frontend::{expression::{Expression, Parameter}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr, typeck::{Trait, Type, TypeChecker}};
 use froglang_core::frontend::parser::Parser;
 
 // Helper function to create a spanned item
@@ -628,12 +628,12 @@ fn test_comprehension_with_filter_type_inference() {
 fn test_assignment_with_type_annotation() {
     let mut t = TypeChecker::new();
     // let x: Int = 5
-    let ann_type = spanned(Expression::literal(Token::Identifier("Int".to_string())));
+    let ann_type = spanned(TypeExpr::Name("Int".to_string()));
     let assign = spanned(Expression::assign(ident("x"), Some(ann_type), int(5)));
     assert_eq!(t.infer(&assign).unwrap(), Type::Int);
     // Type mismatch: let x: Bool = 5 should fail
     let mut t2 = TypeChecker::new();
-    let ann_type2 = spanned(Expression::literal(Token::Identifier("Bool".to_string())));
+    let ann_type2 = spanned(TypeExpr::Name("Bool".to_string()));
     let assign2 = spanned(Expression::assign(ident("x"), Some(ann_type2), int(5)));
     assert!(t2.infer(&assign2).is_err());
 }
@@ -995,16 +995,16 @@ fn test_annotation_wrong_type_still_errors() {
 fn test_union_num_satisfies_arithmetic() {
     // Int | Float satisfies Num, so (Int|Float) + 2 is valid → Int | Float
     let ty = infer_src("(if true then 1 else 1.0) + 2").unwrap();
-    // The union comes directly from the conditional branches (not normalized),
-    // so order matches branch order: true=Int, else=Float.
-    assert_eq!(ty, Type::Union(vec![Type::Int, Type::Float]));
+    // `Conditional`'s branch join normalizes (like every other join site),
+    // so member order is canonical (sorted by Display), not branch order.
+    assert_eq!(ty, Type::Union(vec![Type::Float, Type::Int]));
 }
 
 #[test]
 fn test_union_num_both_operands() {
     // Both operands are Int|Float — result is the same union
     let ty = infer_src("(if true then 1 else 1.0) * (if false then 2 else 2.0)").unwrap();
-    assert_eq!(ty, Type::Union(vec![Type::Int, Type::Float]));
+    assert_eq!(ty, Type::Union(vec![Type::Float, Type::Int]));
 }
 
 #[test]

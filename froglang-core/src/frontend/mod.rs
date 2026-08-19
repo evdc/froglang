@@ -4,5 +4,6 @@ pub mod parser;
 pub mod grammar;
 pub mod expression;
 pub mod typeck;
+pub mod type_expr;
 pub mod typed_ast;
 pub mod modules;

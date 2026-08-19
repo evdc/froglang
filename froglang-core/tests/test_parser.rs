@@ -422,10 +422,12 @@ fn test_invalid_assignment_target() {
 
 #[test]
 fn test_unexpected_character() {
-    let result = Parser::new("1 ? 2").expression(Precedence::Assign);
+    // `?` is a real token now (the type grammar's `T?`), so it is no longer
+    // available as a stand-in for "character the lexer rejects".
+    let result = Parser::new("1 @ 2").expression(Precedence::Assign);
     assert_eq!(result.unwrap_err().item, ParseError::LexError(LexerError::UnexpectedCharacter));
 
-    let result = Parser::new("1 + ?").expression(Precedence::Assign);
+    let result = Parser::new("1 + @").expression(Precedence::Assign);
     assert_eq!(result.unwrap_err().item, ParseError::LexError(LexerError::UnexpectedCharacter));
 }
 

@@ -134,4 +134,10 @@ pub enum TypedExprKind {
         variant: String,
         field:   String,
     },
+
+    /// `return`, or `return value`. This node's own `.ty` (on the enclosing
+    /// `TypedExpr`) is always `Type::Never` — see
+    /// `TypeChecker::return_types`. Compiles to an unconditional exit: pop
+    /// the shadow frame, then `return_`.
+    Return(Option<TypedExprRef>),
 }

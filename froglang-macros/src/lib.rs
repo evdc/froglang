@@ -30,12 +30,16 @@ fn _derive_parse_rules2(input: DeriveInput) -> syn::Result<TokenStream> {
     if let syn::Data::Enum(data) = &input.data {
         for variant in &data.variants {   
             let variant_name = &variant.ident;
-            let mut prefix_fn = quote! { Grammar::prefix_error };
+            // `None` = this token has no prefix rule, i.e. it cannot start an
+            // expression. `Grammar::return_expr` reads this to decide whether a
+            // value follows a `return`.
+            let mut prefix_fn = quote! { None };
             let mut infix_fn = quote! { Grammar::infix_error };
             let mut precedence = quote! { Precedence::None };     
             for attr in &variant.attrs {
                 if attr.path().is_ident("prefix") {
-                    prefix_fn = extract_prefix_attr(attr)?;
+                    let f = extract_prefix_attr(attr)?;
+                    prefix_fn = quote! { Some(#f) };
                     // Only value-atom tokens (literals) and dual-role
                     // unary/binary operators (e.g. `-`, which is also
                     // infix `Minus` — that `#[infix(...)]` attr overrides
@@ -86,7 +90,7 @@ fn _derive_parse_rules2(input: DeriveInput) -> syn::Result<TokenStream> {
             pub fn get_parse_rule(token: &Spanned<Token>) -> ParseRule {
                 match &token.item {
                     #(#rules)*
-                    _ => ParseRule { prefix: Grammar::prefix_error, infix: Grammar::infix_error, precedence: Precedence::None }
+                    _ => ParseRule { prefix: None, infix: Grammar::infix_error, precedence: Precedence::None }
                 }
             }
         }

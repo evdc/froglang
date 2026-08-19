@@ -1,11 +1,18 @@
-use crate::frontend::{expression::{DataDeclExpr, Expression, ImportExpr, ImportKind, MatchArm, MatchExpr, Parameter, Pattern, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}};
+use crate::frontend::{expression::{DataDeclExpr, Expression, ImportExpr, ImportKind, MatchArm, MatchExpr, Parameter, Pattern, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
+
+/// Result of parsing a type annotation. Parallel to `ParseResult`, but over
+/// the type grammar (`crate::frontend::type_expr`) rather than `Expression`.
+pub type TypeParseResult = Result<Spanned<TypeExpr>, Spanned<ParseError>>;
 
 pub type PrefixFnType = fn(&mut Parser, Spanned<Token>) -> ParseResult;
 pub type InfixFnType = fn(&mut Parser, Spanned<Token>, Spanned<Expression>, Precedence) -> ParseResult;
 
 #[derive(Debug)]
 pub struct ParseRule {
-    pub prefix: PrefixFnType,
+    /// `None` if this token cannot start an expression (a statement
+    /// separator, a closing delimiter, EOF, or a keyword like `else`/`then`
+    /// that only means something inside an enclosing construct).
+    pub prefix: Option<PrefixFnType>,
     pub infix: InfixFnType,
     pub precedence: Precedence
 }
@@ -46,17 +53,9 @@ impl Grammar {
         // parse a pattern - a name, optional colon&type, then an =, then an expr
         // later(?) add destructuring assignment here
         let name = parser.identifier()?;
-        // Parse type annotation at TypeAnnotation precedence so `->` doesn't fire bare;
-        // parenthesised function types like `(Int -> Int)` still work via grouping.
         let ty = if parser.check(&Token::Colon) {
             parser.advance()?;
-            let ty_expr = parser.expression(Precedence::TypeAnnotation)?;
-            // If `->` follows the type annotation, the user wrote `let f: Int -> Int = ...`
-            // without parentheses around the function type.
-            if parser.check(&Token::Arrow) {
-                return Err(ty_expr.to(ParseError::FunctionTypeNeedsParens));
-            }
-            Some(ty_expr)
+            Some(Self::type_expr(parser)?)
         } else { None };
         parser.consume(Token::Assign)?;
         parser.skip_newlines();
@@ -172,8 +171,7 @@ impl Grammar {
             };
             let ty = if parser.check(&Token::Colon) {
                 parser.advance()?;
-                let ty_tok = parser.identifier()?;
-                Some(Box::new(ty_tok.map(Expression::literal)))
+                Some(Self::type_expr(parser)?)
             } else {
                 None
             };
@@ -186,8 +184,7 @@ impl Grammar {
 
         let return_type = if parser.check(&Token::Colon) {
             parser.advance()?;
-            let ty_tok = parser.identifier()?;
-            Some(ty_tok.map(Expression::literal))
+            Some(Self::type_expr(parser)?)
         } else {
             None
         };
@@ -207,6 +204,26 @@ impl Grammar {
             span: token.span.merge(body_span),
             item: Expression::assign(name_expr, None, func_expr),
         })
+    }
+
+    /// `return`, or `return expr`. Whether a value follows is decided by
+    /// asking the grammar table itself: if the next token has no prefix
+    /// rule (can't start an expression — a statement separator, a closing
+    /// delimiter, EOF, or a keyword like `else`/`then` that only means
+    /// something as part of an enclosing construct), this is a bare
+    /// `return`. This is more robust than a hand-maintained token list —
+    /// every keyword that can legally follow a value-less `return` for the
+    /// same reason (`if c then return else 0`, `return }`) is covered
+    /// automatically, with no risk of the list drifting as tokens are added.
+    pub fn return_expr(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let has_value = Self::get_parse_rule(&parser.current_token).prefix.is_some();
+        if has_value {
+            let value = parser.expression(Precedence::Assign)?;
+            let span = token.span.merge(value.span);
+            Ok(Spanned { span, item: Expression::return_value(Some(value)) })
+        } else {
+            Ok(Spanned { span: token.span, item: Expression::return_value(None) })
+        }
     }
 
     pub fn arrow_func(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
@@ -262,8 +279,141 @@ impl Grammar {
         // is a parse error — the user must parenthesise: `f : (Int -> Int)`.
         // Parenthesised types work because `(` triggers grouping, which parses its
         // interior at Assign level where `->` fires normally.
-        let type_expr = parser.expression(Precedence::TypeAnnotation)?;
-        Ok(Spanned { span: left.span.merge(type_expr.span), item: Expression::annotated(left, type_expr) })
+        let ty = Self::type_expr(parser)?;
+        Ok(Spanned { span: left.span.merge(ty.span), item: Expression::annotated(left, ty) })
+    }
+
+    // ── The type grammar ────────────────────────────────────────────────
+    //
+    // Types get their own hand-written recursive-descent parser rather than
+    // riding the expression parse-rule table. Two reasons: a type is not an
+    // expression (`|` means union here and nothing at all there), and the
+    // annotation sites that need it most — `func` params, `func` return
+    // types, `data` fields — never called `Parser::expression` in the first
+    // place, they called `Parser::identifier` and accepted exactly one token.
+    //
+    // Loosest to tightest: union (`|`), postfix (`?`), atom (name, `Name(..)`
+    // application, or a parenthesised group / function type).
+
+    /// The entry point every annotation site uses. Rejects a trailing bare
+    /// `->` so `f: Int -> Int` still reports `FunctionTypeNeedsParens`
+    /// rather than silently annotating `f` as `Int`.
+    pub fn type_expr(parser: &mut Parser) -> TypeParseResult {
+        let ty = Self::type_union(parser)?;
+        if parser.check(&Token::Arrow) {
+            return Err(ty.to(ParseError::FunctionTypeNeedsParens));
+        }
+        Ok(ty)
+    }
+
+    /// `A | B | C`. A newline is allowed after each `|` so a long union can
+    /// be written with trailing pipes, matching how `data ... is ...` already
+    /// permits multi-line variant lists.
+    fn type_union(parser: &mut Parser) -> TypeParseResult {
+        let first = Self::type_postfix(parser)?;
+        if !parser.check(&Token::Pipe) {
+            return Ok(first);
+        }
+        let mut members = vec![first];
+        while parser.check(&Token::Pipe) {
+            parser.advance()?;
+            parser.skip_newlines();
+            members.push(Self::type_postfix(parser)?);
+        }
+        let span = members[0].span.merge(members[members.len() - 1].span);
+        Ok(Spanned::from(TypeExpr::Union(members), span))
+    }
+
+    /// `T?`, `T??` (idempotent, but parsed rather than rejected here — the
+    /// flattening is `normalize`'s job).
+    fn type_postfix(parser: &mut Parser) -> TypeParseResult {
+        let mut ty = Self::type_atom(parser)?;
+        while parser.check(&Token::Question) {
+            let q = parser.advance()?;
+            let span = ty.span.merge(q.span);
+            ty = Spanned::from(TypeExpr::Optional(Box::new(ty)), span);
+        }
+        Ok(ty)
+    }
+
+    /// Everything to the right of an `->` inside a function type. `->` is
+    /// right-associative, so `(Int -> Int -> Int)` is
+    /// `Int -> (Int -> Int)` — a curried function, matching how the
+    /// expression-level `->` already associated.
+    fn type_arrow_tail(parser: &mut Parser) -> TypeParseResult {
+        let first = Self::type_union(parser)?;
+        if !parser.check(&Token::Arrow) {
+            return Ok(first);
+        }
+        parser.advance()?;
+        let rest = Self::type_arrow_tail(parser)?;
+        let span = first.span.merge(rest.span);
+        Ok(Spanned::from(TypeExpr::Func(vec![first], Box::new(rest)), span))
+    }
+
+    /// `Name`, `Name(A, B)`, `(T)`, or `(A, B -> C)`.
+    fn type_atom(parser: &mut Parser) -> TypeParseResult {
+        if parser.check(&Token::LeftParen) {
+            let open = parser.advance()?;
+            let mut items = vec![Self::type_union(parser)?];
+            while parser.check(&Token::Comma) {
+                parser.advance()?;
+                items.push(Self::type_union(parser)?);
+            }
+            if parser.check(&Token::Arrow) {
+                parser.advance()?;
+                let result = Self::type_arrow_tail(parser)?;
+                let close = parser.consume(Token::RightParen)?;
+                let span = open.span.merge(close.span);
+                return Ok(Spanned::from(TypeExpr::Func(items, Box::new(result)), span));
+            }
+            let close = parser.consume(Token::RightParen)?;
+            let span = open.span.merge(close.span);
+            if items.len() != 1 {
+                // `(Int, Str)` with no `->` — a tuple type, which doesn't
+                // exist yet. Say so rather than silently dropping members.
+                return Err(Spanned::from(
+                    ParseError::Other("Expected `->` after a parenthesised parameter list — tuple types are not supported".to_string()),
+                    span,
+                ));
+            }
+            let inner = items.pop().expect("length checked above");
+            // Re-span to include the parens, so a later error points at the
+            // whole group rather than at its interior.
+            return Ok(Spanned::from(inner.item, span));
+        }
+
+        let name_tok = parser.identifier()?;
+        let mut name = match &name_tok.item {
+            Token::Identifier(s) => s.clone(),
+            _ => unreachable!("Parser::identifier only returns Token::Identifier"),
+        };
+        // Dotted names are kept as one string: `utils.Point` (a type reached
+        // through a qualified import, collapsed by `frontend::modules` before
+        // type checking) and, later, `Shape.Circle`. Resolution treats the
+        // whole dotted string as the name.
+        let mut name_span = name_tok.span;
+        while parser.check(&Token::Dot) {
+            parser.advance()?;
+            let part = parser.identifier()?;
+            match &part.item {
+                Token::Identifier(s) => { name.push('.'); name.push_str(s); }
+                _ => unreachable!("Parser::identifier only returns Token::Identifier"),
+            }
+            name_span = name_span.merge(part.span);
+        }
+        if parser.check(&Token::LeftParen) {
+            parser.advance()?;
+            let mut args = vec![Self::type_union(parser)?];
+            while parser.check(&Token::Comma) {
+                parser.advance()?;
+                args.push(Self::type_union(parser)?);
+            }
+            let close = parser.consume(Token::RightParen)?;
+            let span = name_span.merge(close.span);
+            return Ok(Spanned::from(TypeExpr::Apply(name, args), span));
+        }
+        Ok(Spanned::from(TypeExpr::Name(name), name_span))
     }
 
     pub fn call(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
@@ -388,8 +538,8 @@ impl Grammar {
                 _ => unreachable!(),
             };
             parser.consume(Token::Colon)?;
-            let ty_tok = parser.identifier()?;
-            fields.push(Parameter { name: field_name, ty: Some(Box::new(ty_tok.map(Expression::literal))) });
+            let ty = Self::type_expr(parser)?;
+            fields.push(Parameter { name: field_name, ty: Some(ty) });
             if parser.check(&Token::Comma) {
                 parser.advance()?;
             }

@@ -243,6 +243,12 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
             for_each_heap_producer(target, structs, f);
             for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
         },
+
+        // `return` itself allocates nothing — whatever `value` produces is
+        // already accounted for by recursing into it.
+        TypedExprKind::Return(value) => {
+            if let Some(v) = value { for_each_heap_producer(v, structs, f); }
+        },
     }
 }
 
@@ -486,6 +492,21 @@ fn cl_type(ty: &Type) -> types::Type {
         Type::Bool  => types::I8,
         Type::Float => types::F64,
         _           => types::I64,
+    }
+}
+
+/// A zero of Cranelift type `t`, for a value slot that is never actually
+/// observed (the results of an unreachable block's terminator, or a missing
+/// `else` branch's contribution to a merge block). `iconst` is integer-only,
+/// so float slots must use the float constant instructions instead —
+/// `iconst` on an `F64` trips the Cranelift verifier.
+fn placeholder_value(bcx: &mut FunctionBuilder, t: types::Type) -> Value {
+    if t == types::F64 {
+        bcx.ins().f64const(0.0)
+    } else if t == types::F32 {
+        bcx.ins().f32const(0.0)
+    } else {
+        bcx.ins().iconst(t, 0)
     }
 }
 
@@ -838,28 +859,41 @@ fn compile_expr_multi(
 
                 bcx.switch_to_block(true_bb);
                 bcx.seal_block(true_bb);
-                let tv = compile_expr(true_branch, bcx, vars, ctx);
-                if has_value {
-                    let tv = ensure_width(tv, &true_branch.item.ty, result_ty, bcx);
-                    bcx.ins().jump(merge_bb, &[tv]);
-                } else {
-                    bcx.ins().jump(merge_bb, &[]);
+                // `compile_expr_multi`, not `compile_expr` — a `Never`-typed
+                // branch (a `return`) yields zero values, which the
+                // single-value wrapper's assertion would reject; every other
+                // scalar branch still yields exactly one, unpacked below.
+                let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
+                // A `Never`-typed branch has already emitted its own
+                // terminator — jumping to `merge_bb` on top of that would
+                // be a second terminator in the same block, which
+                // Cranelift rejects. Every other branch shape reaches here
+                // normally and joins as before.
+                if true_branch.item.ty != Type::Never {
+                    if has_value {
+                        let tv = ensure_width(tv[0], &true_branch.item.ty, result_ty, bcx);
+                        bcx.ins().jump(merge_bb, &[tv]);
+                    } else {
+                        bcx.ins().jump(merge_bb, &[]);
+                    }
                 }
 
                 bcx.switch_to_block(false_bb);
                 bcx.seal_block(false_bb);
-                if has_value {
-                    let fv = if let Some(fb) = false_branch {
-                        let v = compile_expr(fb, bcx, vars, ctx);
-                        ensure_width(v, &fb.item.ty, result_ty, bcx)
-                    } else {
-                        bcx.ins().iconst(result_ty, 0)
-                    };
+                if let Some(fb) = false_branch {
+                    let fv = compile_expr_multi(fb, bcx, vars, ctx);
+                    if fb.item.ty != Type::Never {
+                        if has_value {
+                            let fv = ensure_width(fv[0], &fb.item.ty, result_ty, bcx);
+                            bcx.ins().jump(merge_bb, &[fv]);
+                        } else {
+                            bcx.ins().jump(merge_bb, &[]);
+                        }
+                    }
+                } else if has_value {
+                    let fv = bcx.ins().iconst(result_ty, 0);
                     bcx.ins().jump(merge_bb, &[fv]);
                 } else {
-                    if let Some(fb) = false_branch {
-                        compile_expr(fb, bcx, vars, ctx);
-                    }
                     bcx.ins().jump(merge_bb, &[]);
                 }
 
@@ -884,15 +918,26 @@ fn compile_expr_multi(
                 bcx.switch_to_block(true_bb);
                 bcx.seal_block(true_bb);
                 let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
-                bcx.ins().jump(merge_bb, &tv);
+                // See the scalar path above for why a `Never`-typed branch
+                // must not also jump — it already terminated itself.
+                if true_branch.item.ty != Type::Never {
+                    bcx.ins().jump(merge_bb, &tv);
+                }
 
                 bcx.switch_to_block(false_bb);
                 bcx.seal_block(false_bb);
-                let fv = match false_branch {
-                    Some(fb) => compile_expr_multi(fb, bcx, vars, ctx),
-                    None => param_tys.iter().map(|&t| bcx.ins().iconst(t, 0)).collect(),
+                match false_branch {
+                    Some(fb) => {
+                        let fv = compile_expr_multi(fb, bcx, vars, ctx);
+                        if fb.item.ty != Type::Never {
+                            bcx.ins().jump(merge_bb, &fv);
+                        }
+                    }
+                    None => {
+                        let fv: Vec<Value> = param_tys.iter().map(|&t| placeholder_value(bcx, t)).collect();
+                        bcx.ins().jump(merge_bb, &fv);
+                    }
                 };
-                bcx.ins().jump(merge_bb, &fv);
 
                 bcx.switch_to_block(merge_bb);
                 bcx.seal_block(merge_bb);
@@ -1265,6 +1310,32 @@ fn compile_expr_multi(
             let (offset, leaf_types) = enum_field_leaf_types(&ename, Some(variant), field, ctx.structs, ctx.enums);
             read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
         },
+
+        TypedExprKind::Return(value) => {
+            let results = match value {
+                Some(v) => compile_expr_multi(v, bcx, vars, ctx),
+                None => Vec::new(),
+            };
+            // Every path out of the function pops the shadow frame first —
+            // this is an *early* exit, so it must do the same thing
+            // `build_func_body`'s own tail `return_` does, not skip it.
+            teardown_shadow_frame(bcx, ctx.module, ctx.func_ids, ctx.heap_slot);
+            bcx.ins().return_(&results);
+            // Cranelift requires every block to end in exactly one
+            // terminator, and `return_` is one — so whatever IR follows
+            // this `Return` in the source (there is always some: it sits
+            // inside a `Block`/`Conditional` whose caller keeps building)
+            // needs a fresh block to land in. Nothing ever jumps to it —
+            // the branch/block that contains an unconditional `return`
+            // has `Type::Never`, and the `Conditional` join (below) checks
+            // for exactly that to skip emitting the jump — so this block
+            // is genuinely unreachable, which Cranelift's verifier permits
+            // as long as it's syntactically well-formed.
+            let dead = bcx.create_block();
+            bcx.switch_to_block(dead);
+            bcx.seal_block(dead);
+            Vec::new()
+        },
     }
 }
 
@@ -1627,6 +1698,21 @@ impl Codegen {
         teardown_shadow_frame(&mut bcx, module, func_ids, heap_slot);
 
         if *return_type != Type::None {
+            // If the body's own type is `Never`, it already returned
+            // unconditionally (see `TypedExprKind::Return`'s codegen), and
+            // `results` is the empty `Vec` that arm produces — we're now
+            // positioned in the dead block it switched to. Cranelift still
+            // verifies that block's own terminator against the function
+            // signature even though nothing ever reaches it at runtime, so
+            // it needs a value list of the right shape; the values
+            // themselves are never observed.
+            let results = if body.item.ty == Type::Never {
+                struct_fields(return_type, structs).iter()
+                    .map(|(_, t)| placeholder_value(&mut bcx, cl_type(t)))
+                    .collect()
+            } else {
+                results
+            };
             bcx.ins().return_(&results);
         } else {
             bcx.ins().return_(&[]);

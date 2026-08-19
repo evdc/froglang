@@ -4,6 +4,7 @@ use crate::frontend::{
     expression::{AssignExpr, BinaryExpr, ConditionalExpr, Expression, FieldAccessExpr, ForLoopExpr, FunctionExpr, LiteralExpr, MatchArm, Pattern, UnaryExpr},
     tokens::{Span, Spanned, Token},
 };
+use crate::frontend::type_expr::TypeExpr;
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
 use crate::utils::format_vec;
 
@@ -85,6 +86,12 @@ pub enum Type {
     /// here. Unlike `Union`, this is a closed, tagged sum with a single
     /// GC-boxed runtime representation — see `runtime::gc::FrogVariant`.
     Enum(String),
+    /// The bottom type: no value of this type is ever produced. `return`'s
+    /// own type (see `TypeChecker::return_types`) — it unifies with
+    /// anything and vanishes from any union it appears in (`normalize`,
+    /// `is_subtype`), so `if c then return 1 else 2` types as plain `Int`,
+    /// not `Never | Int`.
+    Never,
 }
 
 impl Type {
@@ -112,6 +119,15 @@ impl Type {
                     if !seen.contains(&ty) {
                         seen.push(ty);
                     }
+                }
+                // 2b. `Never` never widens a union — it exists to vanish as
+                // soon as it stands next to a real value (that's the whole
+                // point of a `return` unifying with its surroundings).
+                // Kept only when it is the union's sole remaining member, so
+                // `Never | Never` still normalizes to `Never` rather than to
+                // `None`.
+                if seen.len() > 1 {
+                    seen.retain(|t| *t != Type::Never);
                 }
                 // 3. Sort canonically by display string (stable, readable).
                 // `sort_by_cached_key` renders each element's key once, not
@@ -156,6 +172,7 @@ impl Display for Type {
             }
             Type::Struct(name) => write!(f, "{}", name),
             Type::Enum(name) => write!(f, "{}", name),
+            Type::Never => write!(f, "Never"),
         }
     }
 }
@@ -230,6 +247,15 @@ pub struct TypeChecker {
     /// bare (unqualified) variant constructor/pattern: unique -> that
     /// enum, ambiguous -> require `Enum.Variant` qualification.
     variant_owners: HashMap<String, Vec<String>>,
+    /// Stack of enclosing functions' return types, innermost last. `return`
+    /// (in `infer`'s `Expression::Return` arm) checks its value against
+    /// `.last()` and errors if the stack is empty — "return outside a
+    /// function". Pushed/popped around a function body's inference and,
+    /// separately, its lowering (`FunctionExpr::infer`, `check_and_lower`'s
+    /// `Function` arm, and `check`'s lambda-against-`Type::Function` case) —
+    /// `infer` and `check_and_lower` are two independent passes over the
+    /// same body, so each needs its own push.
+    return_types: Vec<Type>,
 }
 
 pub struct TypeCheckerCheckpoint {
@@ -239,15 +265,16 @@ pub struct TypeCheckerCheckpoint {
     struct_defs: StructDefs,
     enum_defs: EnumDefs,
     variant_owners: HashMap<String, Vec<String>>,
+    return_types: Vec<Type>,
 }
 
 impl TypeChecker {
     pub fn empty() -> Self {
-        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), enum_defs: HashMap::new(), variant_owners: HashMap::new() }
+        TypeChecker { ctx: HashMap::new(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), enum_defs: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), enum_defs: HashMap::new(), variant_owners: HashMap::new() }
+        TypeChecker { ctx: TypeChecker::default_context(), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), enum_defs: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new() }
     }
 
     /// Field layout for every registered struct, in declaration order.
@@ -286,6 +313,7 @@ impl TypeChecker {
             struct_defs: self.struct_defs.clone(),
             enum_defs: self.enum_defs.clone(),
             variant_owners: self.variant_owners.clone(),
+            return_types: self.return_types.clone(),
         }
     }
 
@@ -296,6 +324,7 @@ impl TypeChecker {
         self.struct_defs = cp.struct_defs;
         self.enum_defs = cp.enum_defs;
         self.variant_owners = cp.variant_owners;
+        self.return_types = cp.return_types;
     }
 
     pub fn add_ctx(mut self, ctx: impl Iterator<Item=(String, Type)>) -> Self {
@@ -362,7 +391,7 @@ impl TypeChecker {
                 Ok(Type::List(Box::new(self.lookup(&first_ty))))
             },
             Expression::Annotated(inner) => {
-                let annotated_ty = self.resolve_annotation(&inner.ty.item, expr.span)?;
+                let annotated_ty = self.resolve_type_expr(&inner.ty)?;
                 self.check(&inner.expr, &annotated_ty)
             }
 
@@ -470,6 +499,8 @@ impl TypeChecker {
             Expression::Import(_) => unreachable!(
                 "Expression::Import must be resolved and stripped by frontend::modules before typeck ever sees it"
             ),
+
+            Expression::Return(value) => self.infer_return(value, expr.span),
         }
     }
 
@@ -538,7 +569,7 @@ impl TypeChecker {
                 let mut fields = Vec::with_capacity(d.fields.len());
                 for p in &d.fields {
                     let ann = p.ty.as_ref().expect("data-decl fields always carry a type annotation — see Grammar::data_decl");
-                    let ty = self.resolve_annotation(&ann.item, s.span)?;
+                    let ty = self.resolve_type_expr(ann)?;
                     fields.push((p.name.clone(), ty));
                 }
                 if d.variants.is_empty() {
@@ -556,7 +587,7 @@ impl TypeChecker {
                         let mut vfields = Vec::with_capacity(v.fields.len());
                         for p in &v.fields {
                             let ann = p.ty.as_ref().expect("variant fields always carry a type annotation — see Grammar::data_decl");
-                            let ty = self.resolve_annotation(&ann.item, s.span)?;
+                            let ty = self.resolve_type_expr(ann)?;
                             vfields.push((p.name.clone(), ty));
                         }
                         variants.push((v.name.clone(), vfields));
@@ -904,6 +935,65 @@ impl TypeChecker {
         })
     }
 
+    /// The post-inference half of `check`: given an already-known `actual`
+    /// type (rather than an expression to infer one from), accept it if
+    /// it's a subtype of `expected`, or unify if `actual` is still an open
+    /// type variable. Used by a bare `return` (no expression to hand
+    /// `check`) checking its implicit `None` against the enclosing
+    /// function's return type.
+    fn check_ty(&mut self, actual: Type, expected: &Type, span: Span) -> TypeResult {
+        let resolved = self.lookup(&actual);
+        if self.is_subtype(&resolved, expected) {
+            Ok(resolved)
+        } else if matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, expected) {
+            Ok(self.lookup(&resolved))
+        } else {
+            Err(Spanned::from(TypeError {
+                msg: format!("Expected {} got {}", expected, resolved)
+            }, span))
+        }
+    }
+
+    /// `return`, or `return value`. Always typed `Never` — see
+    /// `Type::Never` and `TypeChecker::return_types`.
+    ///
+    /// When the enclosing function has a declared return type, `check` is
+    /// used — it gives subtype acceptance (returning an `Int` into a
+    /// declared `Int | Str` works) and pushes expected types down into an
+    /// unannotated lambda literal. But an *unannotated* function's return
+    /// type is a fresh, still-unbound type var (see `FunctionExpr::infer`),
+    /// and `check` assumes its `expected_ty` argument is already concrete —
+    /// so for that case this unifies directly instead, exactly like any
+    /// other site that pins down a fresh var from an inferred type.
+    fn infer_return(&mut self, value: &Option<Box<Spanned<Expression>>>, span: Span) -> TypeResult {
+        let return_ty = self.return_types.last().cloned().ok_or_else(|| Spanned::from(
+            TypeError { msg: "'return' used outside of a function".to_string() }, span
+        ))?;
+        let resolved_return_ty = self.lookup(&return_ty);
+        let still_unbound = matches!(resolved_return_ty, Type::TypeVar { .. });
+
+        match value {
+            Some(v) if still_unbound => {
+                let value_ty = self.infer(v)?;
+                if !self.unify(&value_ty, &return_ty) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Function's return statements disagree: {} vs {}", self.lookup(&return_ty), value_ty)
+                    }, span));
+                }
+            }
+            Some(v) => { self.check(v, &resolved_return_ty)?; }
+            None if still_unbound => {
+                if !self.unify(&Type::None, &return_ty) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Function's return statements disagree: {} vs None", self.lookup(&return_ty))
+                    }, span));
+                }
+            }
+            None => { self.check_ty(Type::None, &resolved_return_ty, span)?; }
+        }
+        Ok(Type::Never)
+    }
+
     pub fn check(&mut self, expr: &Spanned<Expression>, expected_ty: &Type) -> TypeResult {
         // Special-case for functions: push down expected parameter types.
         if let Expression::Function(func) = &expr.item {
@@ -919,9 +1009,14 @@ impl TypeChecker {
                     body_ctx.insert(p.name.clone(), pty.clone());
                 }
                 self.ctx = body_ctx;
-                let res = self.check(&func.body, &*result)?;
+                self.return_types.push((**result).clone());
+                // Pop before propagating: an error inside the body must not
+                // leave a stale frame on `return_types`, or a later `infer`
+                // on this same checker would accept a top-level `return`.
+                let res = self.check(&func.body, &*result);
+                self.return_types.pop();
                 self.ctx = prev_ctx;
-                return Ok(res);
+                return Ok(res?);
             } else {
                 return Err(Spanned::from(TypeError { msg: "Expected function type".to_string() }, expr.span));
             }
@@ -944,12 +1039,14 @@ impl TypeChecker {
 
     /// Subtype relation:
     ///   T ≤ T
+    ///   Never ≤ T  (the bottom type is a subtype of everything)
     ///   T ≤ T | U  (T is a member of any union it belongs to)
     ///   T | U ≤ V  iff T ≤ V and U ≤ V
     pub fn is_subtype(&self, sub: &Type, sup: &Type) -> bool {
         let sub = self.lookup(sub);
         let sup = self.lookup(sup);
         if sub == sup { return true; }
+        if sub == Type::Never { return true; }
         match (&sub, &sup) {
             // Union on left: every variant must be a subtype of sup.
             // This arm must come first so it takes priority over the next arm
@@ -1458,7 +1555,13 @@ impl TypeChecker {
                 for (name, ty) in &params {
                     self.ctx.insert(name.clone(), ty.clone());
                 }
+                // Independent pass from `FunctionExpr::infer`'s own push —
+                // `check_and_lower` re-walks the body from scratch to lower
+                // it, so `return`'s lowering arm (below) needs the stack
+                // populated here too, not just during inference.
+                self.return_types.push(return_type.clone());
                 let body_result = self.check_and_lower(*f.body);
+                self.return_types.pop();
                 self.ctx = prev_ctx;
                 let body = body_result?;
 
@@ -1635,6 +1738,14 @@ impl TypeChecker {
             Expression::Import(_) => unreachable!(
                 "Expression::Import must be resolved and stripped by frontend::modules before typeck ever sees it"
             ),
+
+            Expression::Return(value) => {
+                let value = match value {
+                    Some(v) => Some(Box::new(self.check_and_lower(*v)?)),
+                    None => None,
+                };
+                TypedExprKind::Return(value)
+            },
         };
 
         Ok(Spanned::from(TypedExpr { ty: resolved_ty, kind }, span))
@@ -1859,43 +1970,63 @@ impl TypeChecker {
         chain.unwrap_or_else(|| Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::BoolLit(true) }, span))
     }
 
-    fn resolve_annotation(&self, annotation: &Expression, span: Span) -> TypeResult {
-        match annotation {
-            Expression::Literal(lit) => match &lit.token {
-                Token::Identifier(name) => match name.as_str() {
-                    "Int"   => Ok(Type::Int),
-                    "Float" => Ok(Type::Float),
-                    "Bool"  => Ok(Type::Bool),
-                    "Str"   => Ok(Type::Str),
-                    _ if self.struct_defs.contains_key(name) => Ok(Type::Struct(name.clone())),
-                    _ if self.enum_defs.contains_key(name) => Ok(Type::Enum(name.clone())),
-                    _       => self.get(name, span),
-                },
-                _ => Err(Spanned::from(
-                    TypeError { msg: format!("Expected identifier for type, got {}", annotation) },
-                    span
-                )),
+    /// Resolve a parsed type annotation (`crate::frontend::type_expr`) into a
+    /// `Type`. Total over the type grammar — every `TypeExpr` variant is
+    /// handled here, so an unresolvable annotation is a *name* problem, never
+    /// a shape problem.
+    ///
+    /// Note that a type name is looked up only among the built-ins and the
+    /// declared data types. It deliberately does *not* fall back to the value
+    /// environment, which the old `Expression`-sniffing version did — that let
+    /// a local variable shadow a type name.
+    fn resolve_type_expr(&self, ann: &Spanned<TypeExpr>) -> TypeResult {
+        let span = ann.span;
+        match &ann.item {
+            TypeExpr::Name(name) => match name.as_str() {
+                "Int"   => Ok(Type::Int),
+                "Float" => Ok(Type::Float),
+                "Bool"  => Ok(Type::Bool),
+                "Str"   => Ok(Type::Str),
+                "None"  => Ok(Type::None),
+                _ if self.struct_defs.contains_key(name) => Ok(Type::Struct(name.clone())),
+                _ if self.enum_defs.contains_key(name)   => Ok(Type::Enum(name.clone())),
+                _ => Err(Spanned::from(TypeError { msg: format!("Unknown type '{}'", name) }, span)),
             },
-            // `(T -> U)` in a type annotation parses as a FunctionExpr.
-            // Parameter *names* are the input type names; body is the return type.
-            // e.g. `(Int -> Int)` → params=[Parameter{name:"Int"}], body=Literal("Int")
-            // e.g. `(Int -> Int -> Bool)` → right-associative nesting is handled recursively.
-            Expression::Function(func) => {
-                let param_types: Result<Vec<Type>, _> = func.params.iter()
-                    .map(|p| self.resolve_annotation(
-                        &Expression::Literal(crate::frontend::expression::LiteralExpr {
-                            token: Token::Identifier(p.name.clone())
-                        }),
-                        span
-                    ))
-                    .collect();
-                let result_type = self.resolve_annotation(&func.body.item, span)?;
-                Ok(Type::Function { params: param_types?, result: Box::new(result_type) })
-            },
-            _ => Err(Spanned::from(
-                TypeError { msg: format!("Invalid type expression: {}", annotation) },
-                span
-            )),
+
+            TypeExpr::Apply(name, args) => {
+                let arg_types: Vec<Type> = args.iter()
+                    .map(|a| self.resolve_type_expr(a))
+                    .collect::<Result<_, _>>()?;
+                match (name.as_str(), arg_types.len()) {
+                    ("List", 1) => Ok(Type::List(Box::new(arg_types.into_iter().next().expect("len checked")))),
+                    ("List", n) => Err(Spanned::from(
+                        TypeError { msg: format!("List takes exactly 1 type argument, got {}", n) }, span)),
+                    _ => Err(Spanned::from(
+                        TypeError { msg: format!("Type '{}' does not take type arguments", name) }, span)),
+                }
+            }
+
+            TypeExpr::Union(members) => {
+                let member_types: Vec<Type> = members.iter()
+                    .map(|m| self.resolve_type_expr(m))
+                    .collect::<Result<_, _>>()?;
+                Ok(Type::Union(member_types).normalize())
+            }
+
+            // `T?` is `T | None` and nothing more — the abbreviation exists
+            // for readability, not as a distinct type.
+            TypeExpr::Optional(inner) => {
+                let inner_ty = self.resolve_type_expr(inner)?;
+                Ok(Type::Union(vec![inner_ty, Type::None]).normalize())
+            }
+
+            TypeExpr::Func(params, result) => {
+                let param_types: Vec<Type> = params.iter()
+                    .map(|p| self.resolve_type_expr(p))
+                    .collect::<Result<_, _>>()?;
+                let result_type = self.resolve_type_expr(result)?;
+                Ok(Type::Function { params: param_types, result: Box::new(result_type) })
+            }
         }
     }
 }
@@ -1971,7 +2102,7 @@ impl Infer for AssignExpr {
 
         let name = &self.target.item.get_identifier().expect("should have validated in parsing");
         let ty = if let Some(annotation) = &self.typ {
-            let annotated_ty = tc.resolve_annotation(&annotation.item, span)?;
+            let annotated_ty = tc.resolve_type_expr(annotation)?;
             // Validate the value against the annotation, then store the annotation
             // type (not the check return value). For function types this matters:
             // check() returns the body type, but the variable's type is the full
@@ -1984,9 +2115,9 @@ impl Infer for AssignExpr {
             if let Expression::Function(func) = &self.value.item {
                 if func.return_type.is_some() && func.params.iter().all(|p| p.ty.is_some()) {
                     let param_tys: Result<Vec<Type>, _> = func.params.iter()
-                        .map(|p| tc.resolve_annotation(&p.ty.as_ref().unwrap().item, span))
+                        .map(|p| tc.resolve_type_expr(p.ty.as_ref().expect("all params annotated — checked above")))
                         .collect();
-                    let ret_ty = tc.resolve_annotation(&func.return_type.as_ref().unwrap().item, span)?;
+                    let ret_ty = tc.resolve_type_expr(func.return_type.as_ref().expect("return type present — checked above"))?;
                     let func_ty = Type::Function { params: param_tys?, result: Box::new(ret_ty) };
                     tc.ctx.insert(name.to_string(), func_ty);
                 }
@@ -2028,7 +2159,11 @@ impl Infer for ConditionalExpr {
                 Ok(tc.lookup(&true_type))
             } else {
                 // Branches have incompatible types: produce a union.
-                Ok(Type::Union(vec![true_type, false_type]))
+                // Normalizing matters beyond tidiness here — it's what
+                // drops `Never` (a `return`'d branch) out of the result
+                // entirely, so `if c then return 1 else 2` types as plain
+                // `Int` rather than `Never | Int`.
+                Ok(Type::Union(vec![true_type, false_type]).normalize())
             }
         } else {
             Err(Spanned::from(TypeError {
@@ -2045,7 +2180,7 @@ impl Infer for FunctionExpr {
 
         for p in &self.params {
             let param_ty = if let Some(annotation) = &p.ty {
-                tc.resolve_annotation(&annotation.item, span)?
+                tc.resolve_type_expr(annotation)?
             } else {
                 tc.fresh_var()
             };
@@ -2053,16 +2188,49 @@ impl Infer for FunctionExpr {
             param_types.push(param_ty);
         }
 
+        // `return`'s type rule needs to know what it's returning into, even
+        // when the body has no `: RetType` annotation at all — a fresh,
+        // unbound type var serves as that slot in the unannotated case, and
+        // gets pinned down the same way any other inferred type does: every
+        // `return e` unifies against it via `check`, and so does the body's
+        // own tail value below.
+        let declared_ret = match &self.return_type {
+            Some(ann) => Some(tc.resolve_type_expr(ann)?),
+            None => None,
+        };
+        let return_slot = declared_ret.clone().unwrap_or_else(|| tc.fresh_var());
+
         let body_type = tc.with_context(param_bindings.into_iter(), |t| {
-            if let Some(ret_ann) = &self.return_type {
-                let ret_ty = t.resolve_annotation(&ret_ann.item, span)?;
-                t.check(&self.body, &ret_ty)
-            } else {
-                t.infer(&self.body)
-            }
+            t.return_types.push(return_slot.clone());
+            let result = match &declared_ret {
+                Some(ret_ty) => t.check(&self.body, ret_ty),
+                None => t.infer(&self.body),
+            };
+            t.return_types.pop();
+            result
         })?;
 
-        let func_ty = Type::Function { params: param_types, result: Box::new(body_type) };
+        let result_ty = if declared_ret.is_some() {
+            return_slot
+        } else if body_type == Type::Never {
+            // The body ends in an unconditional `return`, so it never falls
+            // through to a final value — the `return` statements alone
+            // determine the result type, and there is nothing to unify with.
+            // (`Never` unifies with nothing, so without this every
+            // unannotated function ending in `return` would fail here.)
+            tc.lookup(&return_slot)
+        } else if tc.unify(&return_slot, &body_type) {
+            tc.lookup(&return_slot)
+        } else {
+            return Err(Spanned::from(TypeError {
+                msg: format!(
+                    "Function's return statements disagree with its final value: {} vs {}",
+                    tc.lookup(&return_slot), body_type
+                )
+            }, span));
+        };
+
+        let func_ty = Type::Function { params: param_types, result: Box::new(result_ty) };
         Ok(tc.lookup(&func_ty))
     }
 }

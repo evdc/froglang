@@ -59,7 +59,9 @@ impl FrogValue {
             // enum value is a single `i64` (a `FrogVariant` pointer) but
             // decoding it generically would need the enum's field layout,
             // which isn't threaded through here.
-            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Struct(_) | Type::Enum(_) => {
+            // `Never` is never a value's actual runtime type — nothing of
+            // that type is ever produced — but the match must stay exhaustive.
+            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Struct(_) | Type::Enum(_) | Type::Never => {
                 FrogValue::None
             },
         }

@@ -184,7 +184,8 @@ impl<'a> Parser<'a> {
         let mut token = self.advance()?;
 
         let rule = Grammar::get_parse_rule(&token);
-        let mut left = (rule.prefix)(self, token)?;
+        let prefix = rule.prefix.unwrap_or(Grammar::prefix_error);
+        let mut left = prefix(self, token)?;
 
         loop {
             let rule = Grammar::get_parse_rule(&self.current_token);

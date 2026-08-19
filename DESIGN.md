@@ -240,6 +240,10 @@ type Rectangle : Shape = (w: Int, h: Int)
 Based on syntax for common fields in enums (in Data Structures, above), in both cases, Circle and Rectangle have a .color,
 and the .color field is accessible on any Shape.
 
+Consider a `try` prefix operator, like Swift
+
+Look to Zig for insights, it's a pretty well designed language overall though with some different goals than froglang
+
 # Effects, Capabilities, Concurrency
 
 This section is the most work-in-progress. Examples here should be treated as drafts.
@@ -287,3 +291,75 @@ scope-level policies for gathering results/errors (join all, exit on first settl
 
 ---
 
+Python nested comprehensions cause a lot of confusion even for experienced python devs anyway
+what about
+`[x for inner_list in outer_list, x in inner_list]`
+
+or perhaps, unlike Python we put the "select" part of the comprehension last:
+`[for x in xs if cond(x) -> x * 2]` but then it needs some syntax separating, like `->` or `do` or `yield` ...
+`[for x in xs if cond(x) { x * 2}]` most closely mirrors the normal loop form
+
+also I wonder if the `for NAME in EXPR if COND` syntax could be lifted out of comprehensions into the statement form
+this sort of allows the compiler to see the relational-ish (select/where) form too, eg
+```
+// common pattern:
+for x in xs {
+    if cond(x) {
+        do_thing(x)
+    }
+}
+
+// rewrite:
+for x in xs if cond(x) {
+    do_thing(x)
+}
+
+// nested form:
+for inner_list in outer_list {
+    for x in inner_list {
+        do_thing(x)
+    }
+}
+
+// rewrite?
+for inner_list in outer_list, 
+    x in inner_list {
+        do_thing(x)
+    }
+// the single `for` is rewritten to a nested loop
+
+// but now we could do 
+for l in left, r in right if l == r {
+    do_thing(l)
+}
+// and basically this is a "join", which can be recognized and rewritten more easily?
+```
+
+not sure how valuable any of this is, but at least, I'm interested in exploring alt syntaxes for nested-comprehensions that are less confusing
+
+
+---
+
+on falsey-ness and coalescing:
+- should `else` be spelled differently to avoid confusion with if/else? `or`, `orelse`, `catch`, `except`, ...?
+- A `is_error()` / `.is_ok()` changes an error-union to a Bool for truth-testing, explicitly
+- I do still think having "empty types are falsey", e.g. `[]`, `""`, `0` (as in Python) is useful and convenient
+- A postfix `?` operator as shorthand for `is_not_empty()` essentially - can be applied to lists, str, int, etc to coerce to bool - and can also 
+    - then you need a different spelling for the early-return operator
+
+```
+// explicitly:
+func get_user(id: UserId): User | None | DbError = {
+    // lookup user in the db, return None if no row present, or DbError if the conn failed or something
+}
+// assignment is an expression
+match let u = get_user(id) {
+    is User then do_thing(u)
+    is None then log("user not found")
+    is Error then log("DB error: ${e}")
+}
+
+// Implicitly?
+func get_user(id): User? | DbError = ...
+let u = get_user(id)?   // does ? propagate the None, or the DbError, or both?
+```

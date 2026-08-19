@@ -2,6 +2,11 @@
 
 use std::{fmt, ops::Range};
 use crate::frontend::tokens::{Position, Spanned, Token};
+use crate::frontend::type_expr::TypeExpr;
+
+// Type annotations are carried as `TypeExpr` (see `type_expr.rs`) rather than
+// as `Expression`s: types have their own grammar, and only the TypeChecker
+// has enough context to resolve one to a `Type`.
 
 // alias for conciseness
 type ExprRef = Box<Spanned<Expression>>;
@@ -34,23 +39,21 @@ pub struct ConditionalExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssignExpr {
     pub target: ExprRef,
-    pub typ: Option<ExprRef>,
+    pub typ: Option<Spanned<TypeExpr>>,
     pub value: ExprRef
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parameter { 
     pub name: String,
-    // Type annotations are carried as expressions
-    // until type checking, since only the TypeChecker has enough context to resolve them to a Type.
-    pub ty: Option<ExprRef>
+    pub ty: Option<Spanned<TypeExpr>>
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionExpr {
     pub params: Vec<Parameter>,
     pub body: ExprRef,
-    pub return_type: Option<ExprRef>
+    pub return_type: Option<Spanned<TypeExpr>>
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,7 +65,7 @@ pub struct CallExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnotatedExpr {
     pub expr: ExprRef,
-    pub ty: ExprRef     // Will be resolved into an actual Type in the checker
+    pub ty: Spanned<TypeExpr>   // Resolved into an actual Type in the checker
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,6 +194,10 @@ pub enum ImportKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Literal(LiteralExpr),
+    /// `return`, or `return value`. Typed `Never` — see `frontend::typeck`'s
+    /// `return_types` stack — so it unifies with whatever real value sits
+    /// next to it on the other side of an `if`/`match` join.
+    Return(Option<ExprRef>),
     Unary(UnaryExpr),
     Binary(BinaryExpr),
     Conditional(ConditionalExpr),
@@ -239,24 +246,24 @@ impl Expression {
         Expression::Conditional(ConditionalExpr { cond: Box::new(cond), true_branch: Box::new(true_branch), false_branch: false_branch.map(Box::new) })
     }
 
-    pub fn assign(target: Spanned<Expression>, typ: Option<Spanned<Expression>>, value: Spanned<Expression>) -> Expression {
-        Expression::Assign(AssignExpr { target: Box::new(target), typ: typ.map(Box::new), value: Box::new(value) })
+    pub fn assign(target: Spanned<Expression>, typ: Option<Spanned<TypeExpr>>, value: Spanned<Expression>) -> Expression {
+        Expression::Assign(AssignExpr { target: Box::new(target), typ, value: Box::new(value) })
     }
 
     pub fn function(params: Vec<Parameter>, body: Spanned<Expression>) -> Expression {
         Expression::Function(FunctionExpr { params, body: Box::new(body), return_type: None })
     }
 
-    pub fn function_with_return(params: Vec<Parameter>, body: Spanned<Expression>, return_type: Option<Spanned<Expression>>) -> Expression {
-        Expression::Function(FunctionExpr { params, body: Box::new(body), return_type: return_type.map(Box::new) })
+    pub fn function_with_return(params: Vec<Parameter>, body: Spanned<Expression>, return_type: Option<Spanned<TypeExpr>>) -> Expression {
+        Expression::Function(FunctionExpr { params, body: Box::new(body), return_type })
     }
 
     pub fn call(func: Spanned<Expression>, args: Vec<Spanned<Expression>>) -> Expression {
         Expression::Call(CallExpr { callable: Box::new(func), args })
     }
 
-    pub fn annotated(expr: Spanned<Expression>, ty: Spanned<Expression>) -> Expression {
-        Expression::Annotated(AnnotatedExpr { expr: Box::new(expr), ty: Box::new(ty) })
+    pub fn annotated(expr: Spanned<Expression>, ty: Spanned<TypeExpr>) -> Expression {
+        Expression::Annotated(AnnotatedExpr { expr: Box::new(expr), ty })
     }
 
     pub fn index(target: Spanned<Expression>, index: Spanned<Expression>) -> Expression {
@@ -285,6 +292,10 @@ impl Expression {
 
     pub fn is_pattern(subject: Spanned<Expression>, pattern: Pattern) -> Expression {
         Expression::IsPattern(IsPatternExpr { subject: Box::new(subject), pattern })
+    }
+
+    pub fn return_value(value: Option<Spanned<Expression>>) -> Expression {
+        Expression::Return(value.map(Box::new))
     }
 
     pub fn get_identifier(&self) -> Option<&str> {
@@ -391,7 +402,7 @@ impl fmt::Display for Expression {
             }
 
             Expression::Annotated(inner) => {
-                write!(f, "{} : {}", inner.expr, inner.ty)
+                write!(f, "{} : {}", inner.expr, inner.ty.item)
             }
 
             Expression::Index(idx) => {
@@ -427,7 +438,7 @@ impl fmt::Display for Expression {
                 for (i, p) in d.fields.iter().enumerate() {
                     if i > 0 { write!(f, ", ")?; }
                     match &p.ty {
-                        Some(ty) => write!(f, "{}: {}", p.name, ty)?,
+                        Some(ty) => write!(f, "{}: {}", p.name, ty.item)?,
                         None => write!(f, "{}", p.name)?,
                     }
                 }
@@ -442,7 +453,7 @@ impl fmt::Display for Expression {
                             for (j, p) in v.fields.iter().enumerate() {
                                 if j > 0 { write!(f, ", ")?; }
                                 match &p.ty {
-                                    Some(ty) => write!(f, "{}: {}", p.name, ty)?,
+                                    Some(ty) => write!(f, "{}: {}", p.name, ty.item)?,
                                     None => write!(f, "{}", p.name)?,
                                 }
                             }
@@ -478,6 +489,11 @@ impl fmt::Display for Expression {
             Expression::IsPattern(ip) => {
                 write!(f, "{} is {}", ip.subject, fmt_pattern(&ip.pattern))
             }
+
+            Expression::Return(value) => match value {
+                Some(v) => write!(f, "return {}", v),
+                None => write!(f, "return"),
+            },
         }
     }
 }

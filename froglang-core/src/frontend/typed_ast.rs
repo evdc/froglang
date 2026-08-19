@@ -19,6 +19,11 @@ pub enum TypedExprKind {
     FloatLit(f64),
     BoolLit(bool),
     StrLit(String),
+    /// The `none` literal — the singleton `Type::None` value. Compiles to
+    /// the immediate `1` (same encoding as a nullary union member's tag
+    /// `0` — see `gc::immediate_variant` — chosen for consistency, not
+    /// because `None` is "variant 0" of anything).
+    NoneLit,
     /// Variable reference — name resolved from environment.
     Var(String),
 
@@ -147,4 +152,43 @@ pub enum TypedExprKind {
     /// `TypeChecker::return_types`. Compiles to an unconditional exit: pop
     /// the shadow frame, then `return_`.
     Return(Option<TypedExprRef>),
+
+    /// Coerce `value` (a strict, narrower member type) up into this node's
+    /// own `.ty`, always an *anonymous* `Type::Union` (one with no
+    /// matching `UnionDef` — see `TypeChecker::resolve_union`; a nominal
+    /// union's own construction already produces its widened type
+    /// directly, via `VariantInit`, so never needs this node). `tag` is
+    /// `value`'s type's index in the union's own sorted member list
+    /// (`Type::normalize`'s canonical order). Boxes `value` the same way
+    /// `VariantInit` boxes a non-nullary member's fields — see
+    /// `codegen::box_into_variant` — except when `value.item.ty` is
+    /// `Type::None`, which is the immediate `1` already and needs no
+    /// allocation at all.
+    Widen {
+        value: TypedExprRef,
+        tag:   u32,
+    },
+
+    /// The inverse of `Widen`: `value` (an anonymous-`Type::Union`-typed
+    /// expression, already known — from a preceding `TypeTag` test — to
+    /// currently hold this node's own `.ty`) extracted back out as a plain
+    /// value of that type. Unboxes the payload `Widen` wrote; a target
+    /// type of `Type::None` reads nothing (there is no payload to read —
+    /// `None` carries no information beyond its own tag, already proven
+    /// true by the preceding `TypeTag`).
+    Narrow {
+        value: TypedExprRef,
+        tag:   u32,
+    },
+
+    /// `target is <TypeName>` where `target`'s static type is an
+    /// *anonymous* `Type::Union` — a structural type test, the anonymous
+    /// counterpart of `IsVariant`'s nominal one. `tag` is the tested
+    /// type's index in the union's own sorted member list, consistent
+    /// with `Widen`/`Narrow`'s numbering for the same union. Result type
+    /// is `Type::Bool`.
+    TypeTag {
+        target: TypedExprRef,
+        tag:    u32,
+    },
 }

@@ -255,6 +255,25 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         TypedExprKind::Return(value) => {
             if let Some(v) = value { for_each_heap_producer(v, structs, f); }
         },
+
+        TypedExprKind::NoneLit => {},
+
+        // Boxes `value` into a new heap cell — unless `value`'s type is
+        // `None`, which is already the immediate `1` and needs no
+        // allocation at all (see `TypedExprKind::Widen`'s doc comment).
+        TypedExprKind::Widen { value, .. } => {
+            for_each_heap_producer(value, structs, f);
+            if value.item.ty != Type::None { f(); }
+        },
+
+        // Unboxes a payload slot already rooted by whatever produced
+        // `value` (or reads nothing, for a `None` target) — never itself a
+        // fresh allocation.
+        TypedExprKind::Narrow { value, .. } => for_each_heap_producer(value, structs, f),
+
+        // A runtime tag test on an anonymous union — no allocation, exactly
+        // like `IsVariant`.
+        TypedExprKind::TypeTag { target, .. } => for_each_heap_producer(target, structs, f),
     }
 }
 
@@ -377,15 +396,38 @@ fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, val: Va
 ///     payload-carrying variant but must not be dereferenced to find that
 ///     out — so the load is guarded by the low-bit test.
 fn emit_is_variant(bcx: &mut FunctionBuilder, val: Value, def: &UnionDef, tag: u32) -> Value {
-    let variant_is_unit = def.common.is_empty()
+    let target_is_unit = def.common.is_empty()
         && def.variants.get(tag as usize).is_some_and(|(_, fs)| fs.is_empty());
-    if variant_is_unit {
+    let any_unit = def.common.is_empty()
+        && def.variants.iter().any(|(_, fs)| fs.is_empty());
+    emit_tag_test(bcx, val, target_is_unit, any_unit, tag)
+}
+
+/// Shared by `emit_is_variant` (a nominal union's own declared tag scheme)
+/// and codegen's anonymous-union `TypeTag` test — same runtime shapes
+/// (see gc.rs's "Immediate (unboxed) values"), different source of the
+/// `target_is_immediate`/`any_immediate` facts (a nominal union's
+/// `UnionDef` vs. an anonymous union's flat `Type::Union` member list,
+/// where the only immediate member can ever be `Type::None` — see
+/// `TypedExprKind::Widen`'s doc comment).
+///
+/// Which code this needs comes down to which representations `val` can
+/// actually have:
+///
+///   * the tested member is immediate — then every other value of this
+///     union (boxed or not) has a different bit pattern, so the whole test
+///     is one comparison against a constant;
+///   * the union has no immediate member at all — then `val` is always a
+///     pointer, so the tag can be loaded unconditionally;
+///   * otherwise `val` may be an immediate, which can never match a
+///     boxed member but must not be dereferenced to find that out — so the
+///     load is guarded by the low-bit test.
+fn emit_tag_test(bcx: &mut FunctionBuilder, val: Value, target_is_immediate: bool, any_immediate: bool, tag: u32) -> Value {
+    if target_is_immediate {
         return bcx.ins().icmp_imm(IntCC::Equal, val, gc::immediate_variant(tag));
     }
 
-    let enum_has_immediates = def.common.is_empty()
-        && def.variants.iter().any(|(_, fs)| fs.is_empty());
-    if !enum_has_immediates {
+    if !any_immediate {
         let actual = bcx.ins().load(types::I32, heap_mem(), val, offset_of!(FrogVariant, tag) as i32);
         return bcx.ins().icmp_imm(IntCC::Equal, actual, tag as i64);
     }
@@ -407,6 +449,37 @@ fn emit_is_variant(bcx: &mut FunctionBuilder, val: Value, def: &UnionDef, tag: u
     bcx.switch_to_block(done_bb);
     bcx.seal_block(done_bb);
     bcx.block_params(done_bb)[0]
+}
+
+/// Allocate a `FrogVariant`-shaped box holding `flat_vals` (already-computed
+/// leaf values, e.g. from `struct_fields`-flattening a struct, or a single
+/// scalar) tagged `tag`, and store them in. Shared by `VariantInit` (a
+/// nominal union's non-nullary member) and `TypedExprKind::Widen` (boxing a
+/// scalar or plain struct into an anonymous union) — both need exactly the
+/// same runtime shape, just reached from different typed-AST nodes.
+fn box_into_variant(tag: u32, flat_vals: &[Value], flat_types: &[Type], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
+    let mut ptr_mask: i64 = 0;
+    for (i, t) in flat_types.iter().enumerate() {
+        if is_heap_ty(t) { ptr_mask |= 1i64 << i; }
+    }
+    let tag_val    = bcx.ins().iconst(types::I64, tag as i64);
+    let nslots_val = bcx.ins().iconst(types::I64, flat_vals.len() as i64);
+    let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
+
+    let alloc_id  = ctx.func_ids["frog_alloc_variant"];
+    let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+    let call      = bcx.ins().call(alloc_ref, &[tag_val, nslots_val, mask_val]);
+    let ptr       = bcx.inst_results(call)[0];
+    // Root the new object itself before populating it — matches the
+    // traversal order `for_each_heap_producer` uses for both callers
+    // (fields'/value's own producers first, then `f()` for this box).
+    root_heap_value(bcx, ctx, ptr);
+
+    for (i, (v, t)) in flat_vals.iter().zip(flat_types.iter()).enumerate() {
+        let wire = to_i64_repr(bcx, t, *v);
+        bcx.ins().store(heap_mem(), wire, ptr, variant_slot_offset(i));
+    }
+    ptr
 }
 
 /// If `n > 0`, allocate an `n`-slot stack region and register it as a GC
@@ -1272,29 +1345,7 @@ fn compile_expr_multi(
                 flat_vals.extend(compile_expr_multi(v, bcx, vars, ctx));
                 flat_types.extend(struct_fields(&v.item.ty, ctx.structs).into_iter().map(|(_, t)| t));
             }
-
-            let mut ptr_mask: i64 = 0;
-            for (i, t) in flat_types.iter().enumerate() {
-                if is_heap_ty(t) { ptr_mask |= 1i64 << i; }
-            }
-            let tag_val    = bcx.ins().iconst(types::I64, *tag as i64);
-            let nslots_val = bcx.ins().iconst(types::I64, flat_vals.len() as i64);
-            let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
-
-            let alloc_id  = ctx.func_ids["frog_alloc_variant"];
-            let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
-            let call      = bcx.ins().call(alloc_ref, &[tag_val, nslots_val, mask_val]);
-            let ptr       = bcx.inst_results(call)[0];
-            // Root the new object itself before populating it — matches
-            // the traversal order `for_each_heap_producer`'s `VariantInit`
-            // arm uses (fields' own producers first, then `f()` for this).
-            root_heap_value(bcx, ctx, ptr);
-
-            for (i, (v, t)) in flat_vals.iter().zip(flat_types.iter()).enumerate() {
-                let wire = to_i64_repr(bcx, t, *v);
-                bcx.ins().store(heap_mem(), wire, ptr, variant_slot_offset(i));
-            }
-            vec![ptr]
+            vec![box_into_variant(*tag, &flat_vals, &flat_types, bcx, ctx)]
         },
 
         TypedExprKind::IsVariant { target, enum_name, tag, .. } => {
@@ -1333,6 +1384,57 @@ fn compile_expr_multi(
             bcx.switch_to_block(dead);
             bcx.seal_block(dead);
             Vec::new()
+        },
+
+        TypedExprKind::NoneLit => vec![bcx.ins().iconst(types::I64, 1)],
+
+        TypedExprKind::Widen { value, tag } => {
+            if value.item.ty == Type::None {
+                // `None`'s own compiled form (the generic immediate `1` —
+                // see `TypedExprKind::NoneLit`) isn't reused directly: this
+                // union's own sorted member list may place `None` at a
+                // different tag than `NoneLit`'s own site-independent
+                // encoding, so it's re-encoded with *this* union's tag.
+                // Still compile `value` first for any side effects (none
+                // today, but `Widen` shouldn't assume that).
+                let _ = compile_expr_multi(value, bcx, vars, ctx);
+                vec![bcx.ins().iconst(types::I64, gc::immediate_variant(*tag))]
+            } else {
+                // Box `value` — a scalar or a plain struct — into a
+                // `FrogVariant`-shaped cell the same way a nominal union's
+                // non-nullary member already is. See `box_into_variant`.
+                let flat_vals = compile_expr_multi(value, bcx, vars, ctx);
+                let flat_types: Vec<Type> = struct_fields(&value.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+                vec![box_into_variant(*tag, &flat_vals, &flat_types, bcx, ctx)]
+            }
+        },
+
+        TypedExprKind::Narrow { value, .. } => {
+            if expr.item.ty == Type::None {
+                // `value` here is an immediate, not a pointer — `None` has
+                // no payload to unbox, and the caller already knows (from
+                // a preceding `TypeTag`) which member this is. A single
+                // dummy slot keeps this consistent with every other
+                // member's arity (`struct_fields`'s generic 1-leaf
+                // fallback for a non-struct type).
+                let _ = compile_expr(value, bcx, vars, ctx);
+                vec![bcx.ins().iconst(types::I64, 0)]
+            } else {
+                let ptr = compile_expr(value, bcx, vars, ctx);
+                let leaf_types: Vec<Type> = struct_fields(&expr.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+                read_variant_slots(ptr, 0, &leaf_types, bcx, ctx)
+            }
+        },
+
+        TypedExprKind::TypeTag { target, tag } => {
+            let val = compile_expr(target, bcx, vars, ctx);
+            let members = match &target.item.ty {
+                Type::Union(members) => members,
+                other => unreachable!("TypeTag target must be an anonymous union, got {}", other),
+            };
+            let target_is_immediate = members.get(*tag as usize) == Some(&Type::None);
+            let any_immediate = members.iter().any(|m| *m == Type::None);
+            vec![emit_tag_test(bcx, val, target_is_immediate, any_immediate, *tag)]
         },
     }
 }

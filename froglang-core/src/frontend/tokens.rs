@@ -26,6 +26,14 @@ pub enum Token {
     #[lex("false")]
     False,
 
+    /// The singleton `None` value — see `Type::None`'s doc comment. Needed
+    /// as an explicit literal so a `T?` (`T | None`)-typed expression can
+    /// actually be constructed (`func maybe(): Int? = none`), not just
+    /// arise structurally (a bare `return`, a `for` loop's own type).
+    #[prefix(Grammar::literal)]
+    #[lex("none")]
+    None,
+
     #[infix(Grammar::binary, Precedence::Term)]
     #[lex("+")]
     Plus,

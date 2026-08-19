@@ -426,6 +426,17 @@ impl TypeChecker {
             params: vec![],
             result: Box::new(Type::None),
         });
+        // Prints `msg` then aborts — a deliberate placeholder for real
+        // unwinding (`CONCURRENCY.md` stage 1). `result: Never` means a
+        // call to `panic` unifies with anything and vanishes from any
+        // union it stands in (same as `return`) — see codegen's generic
+        // `Call` arm for the corresponding trap-after-call codegen. `!`
+        // desugars to a call to this (`TypeChecker::build_unwrap_arms`),
+        // rather than `panic` being sugar for `!` — callable directly.
+        ctx.insert("panic".to_string(), Type::Function {
+            params: vec![Type::Str],
+            result: Box::new(Type::Never),
+        });
         ctx
     }
 
@@ -585,9 +596,6 @@ impl TypeChecker {
             Expression::Try(inner) => self.infer_try(inner, expr.span),
             Expression::Unwrap(inner) => self.infer_unwrap(inner, expr.span),
             Expression::Catch { value, handler } => self.infer_catch(value, handler, expr.span),
-            // Only ever synthesized by `lower_unwrap`, after typeck itself
-            // — see `Expression::Panic`'s doc comment.
-            Expression::Panic(_) => Ok(Type::Never),
         }
     }
 
@@ -804,12 +812,15 @@ impl TypeChecker {
         self.lower_match(Box::new(inner), arms, None, span)
     }
 
-    /// `e!`'s match arms: an `Error`-providing member panics (see
-    /// `Expression::Panic`, `TypedExprKind::Panic`, ignoring the
-    /// reconstructed value); every other member passes its value through
+    /// `e!`'s match arms: an `Error`-providing member calls the builtin
+    /// `panic(msg: Str): Never` (see `default_context`), ignoring the
+    /// reconstructed value; every other member passes its value through
     /// unchanged — same join as `?`, except the panicking arm is also
-    /// `Never`-typed (see `infer`'s `Expression::Panic` arm), so it
-    /// vanishes from the join exactly like a `return` arm does.
+    /// `Never`-typed (an ordinary call whose callee's declared result is
+    /// `Never`, resolved the same way any other call's result type is), so
+    /// it vanishes from the join exactly like a `return` arm does. `panic`
+    /// being an ordinary function (not a dedicated node) means user code
+    /// can call it directly too, not just reach it through `!`.
     fn build_unwrap_arms(&mut self, inner: &Spanned<Expression>, span: Span) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
         let entries = self.union_entries(inner, span)?;
         if !entries.iter().any(|e| e.is_error) {
@@ -821,8 +832,9 @@ impl TypeChecker {
         for e in entries {
             let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names };
             let body_expr = if e.is_error {
+                let callee = Spanned::from(Expression::literal(Token::Identifier("panic".to_string())), span);
                 let msg = Spanned::from(Expression::literal(Token::String("unwrapped an error value with '!'".to_string())), span);
-                Expression::Panic(Box::new(msg))
+                Expression::call(callee, vec![msg])
             } else {
                 e.whole_value
             };
@@ -2355,11 +2367,6 @@ impl TypeChecker {
             Expression::Try(inner) => return self.lower_try(*inner, span),
             Expression::Unwrap(inner) => return self.lower_unwrap(*inner, span),
             Expression::Catch { value, handler } => return self.lower_catch(*value, *handler, span),
-
-            Expression::Panic(msg) => {
-                let message = self.check_and_lower(*msg)?;
-                TypedExprKind::Panic { message: Box::new(message) }
-            },
         };
 
         Ok(Spanned::from(TypedExpr { ty: resolved_ty, kind }, span))

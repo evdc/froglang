@@ -6,17 +6,21 @@
 // — literally built as synthetic `MatchArm`s and handed to the same
 // `infer_match`/`lower_match` machinery a source-level `match` uses (see
 // `TypeChecker::union_entries`). Codegen gains no new control flow for any
-// of the three; the only codegen-visible addition is `TypedExprKind::Panic`
-// (`!`'s error arm) and a `Never`-typed `Conditional` fix (see below).
+// of the three; the only codegen-visible addition is a `Never`-typed
+// `Conditional` fix (see below) and a `Never`-typed `Call` codegen path
+// (needed for `panic`, below).
 //
 // `e?`'s error arm is `return __err`, so its join is exactly the doc's
 // "set subtraction" type rule for free — a `return` arm is `Never`-typed
 // and vanishes from `infer_match`'s union-join, leaving only the
-// non-`Error` members. `e!`'s error arm panics (`TypedExprKind::Panic`,
-// also `Never`-typed) instead of returning. `catch`'s handler is inlined
-// per `Error`-providing member (a single-param lambda contributes its own
-// param name as the arm's bind and its body as the arm's body — no actual
-// closure/call codegen needed) rather than called.
+// non-`Error` members. `e!`'s error arm calls the builtin `panic(msg: Str):
+// Never` (registered in `default_context`, exactly like `print`/`gc_dump`)
+// instead of returning — an ordinary function call, not a dedicated node,
+// so user code can call `panic` directly too (see the tests at the bottom
+// of this file). `catch`'s handler is inlined per `Error`-providing member
+// (a single-param lambda contributes its own param name as the arm's bind
+// and its body as the arm's body — no actual closure/call codegen needed)
+// rather than called.
 //
 // Building this surfaced a real, general codegen bug, fixed alongside:
 // `TypedExprKind::Conditional`'s codegen only ever special-cased a `Never`
@@ -267,3 +271,31 @@ fn test_try_survives_gc_pressure() {
 // see `ERRORS.md` Phase 5, real unwinding is `CONCURRENCY.md` stage 1), so
 // actually exercising it here would abort the test binary; only its
 // type-checking and the ok-path are covered.
+
+// ── `panic` as an ordinary builtin ──────────────────────────────────────────
+
+#[test]
+fn test_panic_is_directly_callable_and_unifies_with_any_branch_type() {
+    // `panic` isn't a dedicated node reachable only through `!` — it's a
+    // plain `Function`-typed builtin (`default_context`), so it's callable
+    // like any other function, and (being `Never`-typed) unifies with
+    // whatever real value sits on the other side of a branch. The `false`
+    // branch is never taken at runtime, so this never actually traps —
+    // exercising the ordinary `Never`-returning-`Call` codegen path
+    // without aborting the test binary.
+    assert_eq!(compile_and_run(
+        "if true then 5 else panic(\"unreachable\")"
+    ), 5);
+}
+
+#[test]
+fn test_unwrap_desugars_to_a_panic_call_type_checking_identically() {
+    // `!`'s error arm is exactly `panic(msg)`, so a function whose `!`
+    // never actually reaches its error arm should type-check and run
+    // identically to calling `panic` by hand in the analogous position.
+    assert_eq!(compile_and_run(
+        "error ParseError(msg: Str)\n\
+         func parse(s: Str): Int | ParseError = if s == \"bad\" then ParseError(msg=\"nope\") else 42\n\
+         parse(\"ok\")! + 1"
+    ), 43);
+}

@@ -234,18 +234,15 @@ pub enum Expression {
     /// no new control flow of its own.
     Try(ExprRef),
     /// `e!` — panic-on-error. Same shape as `Try`, but an `Error`-providing
-    /// arm panics (`TypeChecker::lower_unwrap`, `TypedExprKind::Panic`)
-    /// instead of returning.
+    /// arm calls the builtin `panic(msg: Str): Never` instead of returning
+    /// (`TypeChecker::lower_unwrap`) — an ordinary call, not a dedicated
+    /// node, so user code can call `panic` directly too.
     Unwrap(ExprRef),
     /// `value catch handler` — `handler` is either a plain fallback
     /// expression, or a single-parameter lambda (`[e] -> body`) whose body
     /// is inlined per `Error`-providing member with that parameter bound to
     /// it (`TypeChecker::lower_catch`).
     Catch { value: ExprRef, handler: ExprRef },
-    /// Synthetic, never produced by the parser: the panicking arm of `e!`'s
-    /// match desugaring (`TypeChecker::lower_unwrap`). `message` is always
-    /// a `Str` literal.
-    Panic(ExprRef),
 }
 
 
@@ -522,7 +519,6 @@ impl fmt::Display for Expression {
             Expression::Try(inner) => write!(f, "{}?", inner),
             Expression::Unwrap(inner) => write!(f, "{}!", inner),
             Expression::Catch { value, handler } => write!(f, "{} catch {}", value, handler),
-            Expression::Panic(msg) => write!(f, "<panic {}>", msg),
         }
     }
 }

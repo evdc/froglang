@@ -265,10 +265,6 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
             if let Some(v) = value { for_each_heap_producer(v, structs, f); }
         },
 
-        // Like `Return`: allocates nothing itself, but `message` (always a
-        // `Str` literal) is its own heap producer.
-        TypedExprKind::Panic { message } => for_each_heap_producer(message, structs, f),
-
         TypedExprKind::NoneLit => {},
 
         // Boxes `value` into a new heap cell — unless `value`'s type is
@@ -958,9 +954,10 @@ fn compile_expr_multi(
             // nothing downstream of this conditional is ever reachable,
             // `merge_bb` gets no value and no param; each branch supplies
             // its own terminator (`return_`/a nested `Never` conditional's
-            // own trap), or — the "missing tail" case — a `trap` here,
-            // mirroring `TypedExprKind::Panic`'s own shape. `merge_bb`
-            // itself is simply never reached and stays unlaid-out.
+            // own trap, or a `Never`-returning `Call` — e.g. `panic` — own
+            // trap), or — the "missing tail" case — a `trap` here.
+            // `merge_bb` itself is simply never reached and stays
+            // unlaid-out.
             if expr.item.ty == Type::Never {
                 bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
 
@@ -1165,6 +1162,24 @@ fn compile_expr_multi(
             }
 
             let call = bcx.ins().call(local_callee, &arg_vals);
+            if return_ty == Type::Never {
+                // The callee never actually hands control back here —
+                // either it's `panic` (its FFI print call genuinely does
+                // return, so this `trap` is what actually stops execution
+                // — see `default_context`'s registration and
+                // `declare_rt`'s `"panic"` alias) or a user-declared
+                // `: Never` function, whose own tail can only ever be
+                // reached on a dead block (`build_func_body`'s Never-body
+                // handling), so it never really falls through to return
+                // control either — the trap is dead code there, but keeps
+                // this block's IR well-formed regardless. Mirrors
+                // `Conditional`'s own `Type::Never` codegen path exactly.
+                bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
+                let dead = bcx.create_block();
+                bcx.switch_to_block(dead);
+                bcx.seal_block(dead);
+                return Vec::new();
+            }
             if return_ty == Type::None {
                 vec![bcx.ins().iconst(types::I64, 0)]
             } else if matches!(&return_ty, Type::Struct(_)) {
@@ -1454,25 +1469,6 @@ fn compile_expr_multi(
             // for exactly that to skip emitting the jump — so this block
             // is genuinely unreachable, which Cranelift's verifier permits
             // as long as it's syntactically well-formed.
-            let dead = bcx.create_block();
-            bcx.switch_to_block(dead);
-            bcx.seal_block(dead);
-            Vec::new()
-        },
-
-        TypedExprKind::Panic { message } => {
-            // `message` is always `Str`-typed — print it through the same
-            // runtime entry point `print(a_str_value)` uses, then trap: a
-            // real placeholder for "abort the program" (see `ERRORS.md`
-            // Phase 5 — proper unwinding is `CONCURRENCY.md` stage 1). The
-            // trap is a genuine Cranelift terminator, so the block ends
-            // validly; whatever follows in the source needs a fresh block
-            // to land in, exactly like `Return`'s codegen just above.
-            let msg_val = compile_expr(message, bcx, vars, ctx);
-            let func_id = ctx.func_ids["print"];
-            let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
-            bcx.ins().call(callee, &[msg_val]);
-            bcx.ins().trap(TrapCode::user(1).expect("1 is a valid user trap code"));
             let dead = bcx.create_block();
             bcx.switch_to_block(dead);
             bcx.seal_block(dead);
@@ -1802,6 +1798,12 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_bytes_print", "frog_bytes_print", &[I64, I64], None);
         // "print" in froglang calls frog_str_println (with newline).
         declare_rt(&mut module, &mut func_ids, "frog_str_println","print",           &[I64],           None);
+        // `panic`'s own message-printing reuses the same runtime entry
+        // point as `print(a_str_value)` — see `default_context`'s
+        // registration and the generic `Call` codegen's `Type::Never`
+        // handling, which is what actually makes the call diverge (a trap
+        // after it returns).
+        declare_rt(&mut module, &mut func_ids, "frog_str_println","panic",           &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_int_println", "frog_int_println", &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_float_println", "frog_float_println", &[types::F64], None);
         declare_rt(&mut module, &mut func_ids, "frog_bool_println", "frog_bool_println", &[types::I8],  None);

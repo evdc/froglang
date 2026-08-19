@@ -1753,6 +1753,26 @@ impl TypeChecker {
                         .expect("parser only allows a bare identifier as a field-assign base")
                         .to_string();
                     let value = self.check_and_lower(*a.value)?;
+                    // The assigned field is exactly as much a union-typed
+                    // slot as a `StructInit` argument is, so it needs the
+                    // same widening — without it, `c.v = 9` would overwrite
+                    // a boxed `Int | Bool` field with the raw immediate `9`
+                    // and the next `TypeTag`/`Narrow` would dereference it
+                    // as a `FrogVariant*`. The declared field type comes
+                    // from `struct_defs` (via the base's own type), never
+                    // from `a.typ` — a field assignment carries no
+                    // annotation of its own.
+                    let field_ty = self.ctx.get(&base).map(|t| self.lookup(t))
+                        .and_then(|t| match t {
+                            Type::Struct(name) => self.struct_defs.get(&name)
+                                .and_then(|fs| fs.iter().find(|(n, _)| *n == fa.field))
+                                .map(|(_, fty)| fty.clone()),
+                            _ => None,
+                        });
+                    let value = match &field_ty {
+                        Some(t) => self.lower_widen(value, t)?,
+                        None => value,
+                    };
                     TypedExprKind::FieldAssign { base, field: fa.field, value: Box::new(value) }
                 } else {
                     let name  = target_item.get_identifier()

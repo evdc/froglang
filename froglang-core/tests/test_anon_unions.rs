@@ -146,3 +146,21 @@ fn test_str_member_is_not_yet_supported() {
     );
     assert!(err.contains("not yet supported"), "unexpected error: {}", err);
 }
+
+#[test]
+fn test_assigning_into_a_union_typed_struct_field_widens() {
+    // A field assignment places a value into a union-typed slot exactly as
+    // much as `StructInit` does, so it needs the same `lower_widen` — the
+    // field-assign branch of `Expression::Assign` used to skip it, storing
+    // the raw immediate `9` over the boxed field and leaving the following
+    // `TypeTag`/`Narrow` to dereference `9` as a `FrogVariant*`.
+    assert_eq!(compile_and_run(
+        "data Cell(v: Int | Bool)\n\
+         let c = Cell(v=5)\n\
+         c.v = 9\n\
+         match c.v {\n\
+         is Int(n) then n\n\
+         is Bool(b) then -1\n\
+         }"
+    ), 9);
+}

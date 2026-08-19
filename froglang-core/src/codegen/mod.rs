@@ -34,6 +34,15 @@ struct Ctx<'a> {
     string_arena:  &'a mut Vec<Vec<u8>>,
     heap_slot:     Option<StackSlot>,
     heap_cursor:   usize,
+    /// Slots `setup_shadow_frame` actually allocated — i.e. what
+    /// `count_heap_slots` predicted. Only used to assert that the
+    /// `for_each_heap_producer` walk stays in sync with the
+    /// `root_heap_value` calls `compile_expr_multi` really makes: a
+    /// producer the walk fails to count makes `root_heap_value` store
+    /// past the end of the slot *and* leaves that root outside the `len`
+    /// handed to `frog_frame_push`, so the GC never scans it — a silent,
+    /// intermittent memory bug rather than a test failure.
+    heap_max:      usize,
     /// Next unused `Variable` index for mutable-local codegen (see
     /// `get_or_declare_var`). Each function-body compile starts a fresh
     /// counter (0-based) — `Variable` indices only need to be unique within
@@ -56,11 +65,11 @@ struct Ctx<'a> {
 
 /// True iff a value of this type is a GC-managed heap pointer.
 fn is_heap_ty(ty: &Type) -> bool {
-    // A `Type::Union` is only ever codegen'd for a registered nominal union
-    // (`data X is A | B`) — see `Ctx.unions`. Those are GC-boxed exactly
-    // like the old `Type::Enum` was (`runtime::gc::FrogVariant`); an
-    // anonymous structural union (`Int | Str`) has no codegen support and
-    // is never produced by anything `compile_and_run` actually runs.
+    // Both kinds of `Type::Union` are GC-boxed exactly like the old
+    // `Type::Enum` was (`runtime::gc::FrogVariant`): a registered nominal
+    // union (`data X is A | B`, see `Ctx.unions`) and an anonymous
+    // structural one (`Int | Str`), whose boxes `TypedExprKind::Widen`
+    // allocates — so this arm is load-bearing for rooting those too.
     matches!(ty, Type::Str | Type::List(_) | Type::Union(_))
 }
 
@@ -266,10 +275,14 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
             if value.item.ty != Type::None { f(); }
         },
 
-        // Unboxes a payload slot already rooted by whatever produced
-        // `value` (or reads nothing, for a `None` target) — never itself a
-        // fresh allocation.
-        TypedExprKind::Narrow { value, .. } => for_each_heap_producer(value, structs, f),
+        // Unboxes a payload slot: no fresh allocation, but the unboxed
+        // pointer is a fresh heap *read* that `compile_expr_multi` roots
+        // via `read_variant_slots` — one slot per heap-typed leaf of the
+        // narrowed type, exactly like `VariantField` above.
+        TypedExprKind::Narrow { value, .. } => {
+            for_each_heap_producer(value, structs, f);
+            for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
+        },
 
         // A runtime tag test on an anonymous union — no allocation, exactly
         // like `IsVariant`.
@@ -300,6 +313,11 @@ fn count_heap_slots(expr: &Spanned<TypedExpr>, structs: &StructDefs) -> usize {
 /// this function has one (no-op for functions with no heap-typed values).
 fn root_heap_value(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) {
     if let Some(slot) = ctx.heap_slot {
+        debug_assert!(
+            ctx.heap_cursor < ctx.heap_max,
+            "shadow frame overflow: slot {} of {} — `for_each_heap_producer` undercounts this expression's heap producers",
+            ctx.heap_cursor, ctx.heap_max,
+        );
         let offset = (ctx.heap_cursor * 8) as i32;
         bcx.ins().stack_store(val, slot, offset);
         ctx.heap_cursor += 1;
@@ -1792,8 +1810,9 @@ impl Codegen {
             }
         }
 
-        let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, count_heap_slots(body, structs));
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs, unions };
+        let n = count_heap_slots(body, structs);
+        let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
         teardown_shadow_frame(&mut bcx, module, func_ids, heap_slot);
 
@@ -1886,7 +1905,7 @@ impl Codegen {
 
         let n: usize = stmts.iter().map(|s| count_heap_slots(s, structs)).sum();
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, var_counter, structs, unions };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;

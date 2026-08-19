@@ -8,6 +8,12 @@ use crate::frontend::type_expr::TypeExpr;
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
 use crate::utils::format_vec;
 
+/// Reserved name for the builtin `panic` alias that `!` desugars to.
+/// Contains `!`, which the lexer never produces inside an identifier, so
+/// no user-written name can ever collide with or shadow it. See
+/// `TypeChecker::default_context` and `build_unwrap_arms`.
+const UNWRAP_PANIC_NAME: &str = "panic!builtin";
+
 #[derive(Debug)]
 pub struct TypeError {
     pub msg: String
@@ -431,9 +437,21 @@ impl TypeChecker {
         // call to `panic` unifies with anything and vanishes from any
         // union it stands in (same as `return`) — see codegen's generic
         // `Call` arm for the corresponding trap-after-call codegen. `!`
-        // desugars to a call to this (`TypeChecker::build_unwrap_arms`),
-        // rather than `panic` being sugar for `!` — callable directly.
+        // desugars to a call to `UNWRAP_PANIC_NAME` (below), a reserved
+        // alias for this same builtin — rather than `panic` being sugar
+        // for `!` — `panic` itself stays callable directly.
         ctx.insert("panic".to_string(), Type::Function {
+            params: vec![Type::Str],
+            result: Box::new(Type::Never),
+        });
+        // Reserved alias for the same builtin, resolved by
+        // `build_unwrap_arms` instead of `"panic"`. `Token::Identifier`
+        // values built here bypass the lexer (which never produces `!` in
+        // an identifier), so this name can't collide with, or be shadowed
+        // by, any user binding or `func panic(...)` redefinition — `!`
+        // always traps through the real builtin regardless of what's in
+        // scope. See `codegen`'s matching `declare_rt` alias.
+        ctx.insert(UNWRAP_PANIC_NAME.to_string(), Type::Function {
             params: vec![Type::Str],
             result: Box::new(Type::Never),
         });
@@ -832,7 +850,7 @@ impl TypeChecker {
         for e in entries {
             let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names };
             let body_expr = if e.is_error {
-                let callee = Spanned::from(Expression::literal(Token::Identifier("panic".to_string())), span);
+                let callee = Spanned::from(Expression::literal(Token::Identifier(UNWRAP_PANIC_NAME.to_string())), span);
                 let msg = Spanned::from(Expression::literal(Token::String("unwrapped an error value with '!'".to_string())), span);
                 Expression::call(callee, vec![msg])
             } else {
@@ -1614,7 +1632,16 @@ impl TypeChecker {
                     msg: format!("Wrong number of arguments, expected 1, got {}", args.len())
                 }, callable.span));
             }
-            self.infer(&args[0])?;
+            let arg_ty = self.infer(&args[0])?;
+            // If the argument never actually produces a value (e.g.
+            // `print(panic("x"))`), `print` itself never returns either —
+            // propagate `Never` so this call is treated uniformly with any
+            // other `Never`-typed expression by downstream inference and
+            // codegen (join with other branches, dead-code trapping, etc.)
+            // instead of falsely claiming `None`.
+            if arg_ty == Type::Never {
+                return Ok(Type::Never);
+            }
             return Ok(Type::None);
         }
 

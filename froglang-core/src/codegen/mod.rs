@@ -1106,6 +1106,18 @@ fn compile_expr_multi(
             // concrete argument type, so no invalid Str coercion is emitted.
             if func_name == "print" {
                 let arg = &args[0];
+                if arg.item.ty == Type::Never {
+                    // `print`'s builtin signature has no declared param
+                    // type, so typeck doesn't reject a `Never` argument
+                    // (e.g. `print(panic("x"))`) the way it would for an
+                    // ordinary function call. Compile the arg for its
+                    // trapping side effect via `compile_expr_multi` (not
+                    // `compile_expr`, which asserts against multi-valued/
+                    // zero-valued exprs) and propagate `Never` outward.
+                    let vals = compile_expr_multi(arg, bcx, vars, ctx);
+                    debug_assert!(vals.is_empty(), "Never-typed expr produced values");
+                    return Vec::new();
+                }
                 if matches!(&arg.item.ty, Type::Struct(_)) {
                     let values = compile_expr_multi(arg, bcx, vars, ctx);
                     let mut cursor = 0;
@@ -1804,6 +1816,12 @@ impl Codegen {
         // handling, which is what actually makes the call diverge (a trap
         // after it returns).
         declare_rt(&mut module, &mut func_ids, "frog_str_println","panic",           &[I64],           None);
+        // `!`'s desugaring (`TypeChecker::build_unwrap_arms`) resolves to
+        // this reserved alias, not `"panic"`, so it can't be redirected by
+        // a user-defined `func panic(...)` (which would overwrite the
+        // `"panic"` key above via the ordinary user-function registration
+        // path) — see `UNWRAP_PANIC_NAME` in typeck.rs.
+        declare_rt(&mut module, &mut func_ids, "frog_str_println","panic!builtin",  &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_int_println", "frog_int_println", &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_float_println", "frog_float_println", &[types::F64], None);
         declare_rt(&mut module, &mut func_ids, "frog_bool_println", "frog_bool_println", &[types::I8],  None);
@@ -1993,6 +2011,27 @@ impl Codegen {
                     continue;
                 }
                 let vals = compile_expr_multi(stmt, &mut bcx, &mut vars, &mut ctx);
+                if vals.is_empty() {
+                    // `value` is `Never`-typed (e.g. `let x = panic(...)`)
+                    // — the callee trapped and control never reaches here,
+                    // so there's no computed value to store and no real
+                    // binding to create. `bcx` is already on the dead
+                    // block the trap switched to, but later top-level
+                    // statements are still compiled into it (as dead code)
+                    // and may reference `name` — declare its leaf `vars`
+                    // with placeholder zeros so those unreachable
+                    // references don't crash the compiler with "unbound
+                    // variable in codegen". Not pushed to `bindings`: it
+                    // has no real value and nothing ever executes far
+                    // enough to read or write its `out_ptr` slot.
+                    for (path, lty) in struct_fields(&value.item.ty, structs) {
+                        let key = var_key(name, &path);
+                        let var = get_or_declare_var(&mut bcx, &mut vars, &mut ctx, &key, &lty);
+                        let zero = placeholder_value(&mut bcx, cl_type(&lty));
+                        bcx.def_var(var, zero);
+                    }
+                    continue;
+                }
                 last_val = vals[0];
                 // Use `value.item.ty`, not `stmt.item.ty` (the Assign
                 // expression's own — possibly annotation-widened — type):
@@ -2015,6 +2054,12 @@ impl Codegen {
                 continue;
             }
             let vals = compile_expr_multi(stmt, &mut bcx, &mut vars, &mut ctx);
+            if vals.is_empty() {
+                // `stmt` is `Never`-typed (e.g. a bare top-level
+                // `panic(...)`) — control never reaches here; keep
+                // compiling into the dead block the trap switched to.
+                continue;
+            }
             last_val = vals[0];
             last_ty = &stmt.item.ty;
         }

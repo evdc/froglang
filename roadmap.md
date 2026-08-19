@@ -6,6 +6,7 @@
 - Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value (~4M mallocs); after inlining heap access and un-boxing shadow frames it is at 182ms vs 31ms for the same program in Rust, and `malloc`/`free`/`memset` plus the mark phase are ~half of what's left. Secondary: pool/free-list the fixed-size GC blocks, and make shadow frames cheaper than an FFI push/pop + zeroing per call.
 - Error handling, errors as values + early-return sugar, etc — builds on enums (Result/Option as compiler-known enums)
 - Traits/interfaces, explicit-style
+    - Resolve duality between `provides` and trait impls. Explicit `impl Trait for Type` `Type implements Trait {}` blocks?
 - Annotations, and auto-deriving trait implementations (macros/comptime?)
 - Structured concurrency
-- 
+

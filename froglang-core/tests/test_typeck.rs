@@ -229,8 +229,10 @@ fn test_unary_ops() {
 fn test_unary_type_mismatch() {
     let mut t = TypeChecker::new();
 
-    // Not on non-bool should fail
-    let expr = spanned(Expression::unary(Token::Not, int(5)));
+    // `not` on a non-Bool, non-Truthy type (a Function) should still fail —
+    // Int/Float/Str/List/None coerce via `Trait::Truthy` (see ERRORS.md
+    // Phase 6), but a Function doesn't.
+    let expr = spanned(Expression::unary(Token::Not, lambda(vec!["x"], ident("x").item)));
     let res = t.infer(&expr);
     assert!(res.is_err());
 }
@@ -274,14 +276,16 @@ fn test_conditional_no_else() {
 fn test_conditional_non_bool_condition() {
     let mut t = TypeChecker::new();
 
+    // A Function condition is neither Bool nor Truthy (see ERRORS.md Phase
+    // 6) — Int itself now coerces via `Trait::Truthy`, so this test uses a
+    // type that still doesn't.
     let cond = spanned(Expression::conditional(
-        int(1), // Should be bool
+        lambda(vec!["x"], ident("x").item),
         int(2),
         Some(int(3))
     ));
     let res = t.infer(&cond);
     assert!(res.is_err());
-    assert!(res.unwrap_err().item.msg.contains("Incorrect type"));
 }
 
 #[test]
@@ -598,8 +602,11 @@ fn test_for_loop_non_list_iterable_is_error() {
 #[test]
 fn test_for_loop_non_bool_cond_is_error() {
     let mut t = TypeChecker::new();
+    // A Function guard is neither Bool nor Truthy (see ERRORS.md Phase 6) —
+    // Int itself now coerces via `Trait::Truthy`, so this test uses a type
+    // that still doesn't.
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
-    let fl = spanned(Expression::for_loop("x".to_string(), list, Some(int(1)), ident("x")));
+    let fl = spanned(Expression::for_loop("x".to_string(), list, Some(lambda(vec!["y"], ident("y").item)), ident("x")));
     assert!(t.infer(&fl).is_err());
 }
 
@@ -616,10 +623,11 @@ fn test_comprehension_type_inference() {
 #[test]
 fn test_comprehension_with_filter_type_inference() {
     let mut t = TypeChecker::new();
-    // [for x in [1, 2, 3] if x do x]  -- `if` cond must be Bool, so this
-    // is a type error (x is Int, not Bool) even though the shape parses.
+    // [for x in [1, 2, 3] if <Function> do x] — a Function guard is neither
+    // Bool nor Truthy (see ERRORS.md Phase 6); `if x` itself is no longer a
+    // type error since `x: Int` now coerces via `Trait::Truthy`.
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
-    let fl = spanned(Expression::for_loop("x".to_string(), list, Some(ident("x")), ident("x")));
+    let fl = spanned(Expression::for_loop("x".to_string(), list, Some(lambda(vec!["y"], ident("y").item)), ident("x")));
     let comp = spanned(Expression::comprehension(fl));
     assert!(t.infer(&comp).is_err());
 }

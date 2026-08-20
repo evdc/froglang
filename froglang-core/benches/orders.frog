@@ -1,15 +1,27 @@
-// Order-pipeline benchmark — exercises structs, enums + match, and lists.
+// Order-pipeline benchmark — exercises structs, unions + match, `?`/`catch`
+// error propagation, and lists.
 //
 // The shape is deliberately mundane: build a catalogue of line items, then
 // repeatedly filter it into a batch and price every item in that batch,
-// where pricing means classifying the item into a discount variant and then
-// matching on that variant.  Per round this allocates a fresh list (GC
-// pressure) and one boxed enum value per item (more GC pressure), on top of
-// struct field access and integer arithmetic in the inner loop.
+// where pricing means classifying the item into a discount variant, matching
+// on that variant, and validating the result through a fallible function
+// using `?`.  Per round this allocates a fresh list (GC pressure) and one
+// boxed union value per item for the discount, plus (on the — never taken —
+// error path) a boxed `PricingError`, on top of struct field access and
+// integer arithmetic in the inner loop.
+//
+// `Category` and `Discount` are `data X is A | B | ...` unions (ERRORS.md:
+// there is no separate enum mechanism, unions are the one sum type) and
+// `PricingError` is a `data ... provides Error` — the `Error` trait is
+// granted by that clause, not structural, so `checked_gross`'s `?` and the
+// call site's `catch` both typecheck only because of it.
 //
 // The sibling orders.{rs,go,py,lua} files implement exactly this, and
 // run_comparisons.sh reads the two loop bounds below out of *this* file and
-// passes them to the others, so all five stay in lockstep.
+// passes them to the others, so all five stay in lockstep. The catalogue's
+// gross is always non-negative by construction, so the error branch below
+// never actually fires and every implementation still produces the same
+// total — the sibling files don't need a fallible path of their own to match.
 //
 // Run: cargo run --release -- run benches/orders.frog
 
@@ -19,6 +31,8 @@ data Item(sku: Int, category: Category, qty: Int, unit_price: Int)
 
 data Discount is
     NoDiscount | Percent(pct: Int) | Flat(amount: Int) | BulkOver(min_qty: Int, pct: Int)
+
+data PricingError(msg: Str) provides Error
 
 // froglang has no `%` operator yet, so modulo is spelled out.  Every operand
 // here is non-negative, so truncating and flooring division agree and the
@@ -53,6 +67,19 @@ func apply(d: Discount, gross: Int, qty: Int): Int = match d {
     is BulkOver(min_qty, pct) then if qty >= min_qty then gross - gross * pct / 100 else gross
 }
 
+// A corrupted catalogue entry could in principle produce a negative gross;
+// refuse to price it rather than silently returning a wrong total.
+func checked_gross(gross: Int): Int | PricingError =
+    if gross < 0 then PricingError(msg="negative gross") else gross
+
+// `?` propagates `checked_gross`'s error member straight through — no
+// conversion, since `PricingError` is already a member of the declared
+// return union (ERRORS.md's free widening).
+func price_item(it: Item): Int | PricingError = {
+    let gross = checked_gross(it.qty * it.unit_price)?
+    apply(discount_for(it), gross, it.qty)
+}
+
 let items = [for i in 0..2000 do Item(sku=i, category=category_of(hash(i)), qty=1 + modn(hash(i + 7), 9), unit_price=100 + modn(hash(i + 13), 5000))]
 
 let total = 0
@@ -61,7 +88,9 @@ for round in 0..2000 do {
     // catalogue in each batch, so the list can't be hoisted out of the loop.
     let batch = [for it in items if modn(it.sku + round, 3) != 0 do it]
     for it in batch do {
-        total = total + apply(discount_for(it), it.qty * it.unit_price, it.qty)
+        // `catch` falls back to 0 on error — never taken here, but it's the
+        // call site that turns `Int | PricingError` back into a plain `Int`.
+        total = total + (price_item(it) catch 0)
     }
 }
 

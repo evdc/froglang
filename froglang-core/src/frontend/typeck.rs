@@ -5,7 +5,7 @@ use crate::frontend::{
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::type_expr::TypeExpr;
-use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
+use crate::frontend::typed_ast::{TypedExpr, TypedExprKind, TypedExprRef};
 use crate::utils::format_vec;
 
 /// Reserved name for the builtin `panic` alias that `!` desugars to.
@@ -34,15 +34,25 @@ pub enum Trait {
     /// declaration (or implied by the `error X(...)` shorthand), recorded in
     /// `TypeChecker.provides` and consulted only through `type_implements`.
     Error,
+    /// Coercible to `Bool` in condition position only (`if`, a match guard,
+    /// a `for`-loop guard, `and`/`or`/`not`) — never implicitly elsewhere.
+    /// `Int`/`Float`/`Str`/`List` and `None` implement it structurally;
+    /// `Bool` itself needs no coercion. A bare struct does **not** — so a
+    /// union with any non-`Truthy` member (an error type included) doesn't
+    /// either, via the existing "union satisfies a trait iff every member
+    /// does" rule: `if user_result` (a `User | DbError`) fails to compile
+    /// with no special-casing of `Error` needed here at all.
+    Truthy,
 }
 
 impl Display for Trait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Trait::Num   => write!(f, "Num"),
-            Trait::Eq    => write!(f, "Eq"),
-            Trait::Ord   => write!(f, "Ord"),
-            Trait::Error => write!(f, "Error"),
+            Trait::Num    => write!(f, "Num"),
+            Trait::Eq     => write!(f, "Eq"),
+            Trait::Ord    => write!(f, "Ord"),
+            Trait::Error  => write!(f, "Error"),
+            Trait::Truthy => write!(f, "Truthy"),
         }
     }
 }
@@ -319,12 +329,39 @@ impl TypeChecker {
                 self.provides.get(name).map(|ts| ts.contains(tr)).unwrap_or(false)
             },
             _ => match tr {
-                Trait::Num   => matches!(ty, Type::Int | Type::Float),
-                Trait::Eq    => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
-                Trait::Ord   => matches!(ty, Type::Int | Type::Float | Type::Str),
-                Trait::Error => false,
+                Trait::Num    => matches!(ty, Type::Int | Type::Float),
+                Trait::Eq     => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
+                Trait::Ord    => matches!(ty, Type::Int | Type::Float | Type::Str),
+                Trait::Error  => false,
+                Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::None),
             }
         }
+    }
+
+    /// Validate a condition-position type during inference: `Bool` unifies
+    /// directly (as before — this also still pins down an unconstrained
+    /// `TypeVar`, e.g. an unannotated lambda param used as a condition);
+    /// anything else must satisfy `Trait::Truthy`. Pure type-checking, no
+    /// lowering — `coerce_truthy` is `check_and_lower`'s counterpart that
+    /// actually inserts the runtime coercion.
+    fn check_condition(&mut self, cond_ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        if self.unify(cond_ty, &Type::Bool) { return Ok(()); }
+        let resolved = self.lookup(cond_ty);
+        if self.type_implements(&resolved, &Trait::Truthy) { return Ok(()); }
+        Err(Spanned::from(TypeError {
+            msg: format!("condition must be Bool or a Truthy type (Int/Float/Str/List/None), got {}", resolved)
+        }, span))
+    }
+
+    /// `check_condition`'s lowering counterpart: wraps an already-lowered,
+    /// non-`Bool` `Trait::Truthy` value in a `Truthy` node so it actually
+    /// becomes a runtime `Bool` (see that node's doc comment). A no-op for
+    /// an already-`Bool` value. Assumes `check_condition` (or an equivalent
+    /// inference-time check) already validated `e`'s type — this only
+    /// builds the coercion, it doesn't reject anything.
+    fn coerce_truthy(&mut self, e: Spanned<TypedExpr>, span: Span) -> Spanned<TypedExpr> {
+        if e.item.ty == Type::Bool { return e; }
+        Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Truthy(Box::new(e)) }, span)
     }
 
     /// A statement-position value may not silently discard a possible
@@ -992,6 +1029,21 @@ impl TypeChecker {
                         }
                         variants.push((v.name.clone(), vfields));
                     }
+                    // Also register each qualified member name as an
+                    // ordinary struct — common fields, then the variant's
+                    // own — so `Type::Struct("X.Variant")` is a legitimate
+                    // standalone (unboxed) type, not just a tag inside the
+                    // union's own boxed representation. Nothing routed a
+                    // value through this path before flow narrowing
+                    // (ERRORS.md Phase 6, `lower_match`'s narrowing
+                    // prelude) — `VariantInit`/`VariantField`/`IsVariant`
+                    // all go through `union_defs` directly and are
+                    // unaffected by this being additionally present here.
+                    for (vn, vfields) in &variants {
+                        let mut flat = fields.clone();
+                        flat.extend(vfields.clone());
+                        self.struct_defs.insert(format!("{}.{}", d.name, vn), flat);
+                    }
                     let def = self.union_defs.get_mut(&d.name).expect("registered in the first pass, above");
                     def.common = fields;
                     def.variants = variants;
@@ -1194,6 +1246,71 @@ impl TypeChecker {
         }
     }
 
+    /// `is Error` (ERRORS.md Phase 6): a trait-bound arm on a nominal
+    /// union, expanded here into one concrete arm per `Error`-providing
+    /// variant not otherwise literally named `Error` — same `guard`/`body`
+    /// cloned into each, so the *existing* per-arm machinery (bind
+    /// resolution, flow narrowing, `Conditional` chaining) handles each
+    /// expansion exactly like a user-written arm, and exhaustiveness falls
+    /// out for free once every expansion's own `idx` is marked covered.
+    /// Binds are rejected — a single positional bind can't mean the same
+    /// thing across variants with different field lists; flow narrowing
+    /// (no binder, on a bare-identifier subject) is the way to read a
+    /// specific member's own fields after the trait test.
+    fn expand_trait_arms(&self, arms: Vec<MatchArm>, enum_name: &str, def: &UnionDef) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
+        let mut out = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let is_trait_arm = arm.pattern.path.is_none() && arm.pattern.variant == "Error" && def.variant_index("Error").is_none();
+            if !is_trait_arm {
+                out.push(arm);
+                continue;
+            }
+            if !arm.pattern.binds.is_empty() {
+                return Err(Spanned::from(TypeError {
+                    msg: "trait pattern 'Error' cannot bind fields — match on a concrete variant, or use flow narrowing (no binder) to read a specific member's fields".to_string()
+                }, arm.body.span));
+            }
+            for (vn, _) in &def.variants {
+                let ty = Type::Struct(format!("{}.{}", enum_name, vn));
+                if self.type_implements(&ty, &Trait::Error) {
+                    out.push(MatchArm {
+                        pattern: Pattern { path: None, variant: vn.clone(), binds: Vec::new() },
+                        guard: arm.guard.clone(),
+                        body: arm.body.clone(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `expand_trait_arms`'s counterpart for an *anonymous* union subject.
+    fn expand_trait_arms_anon(&self, arms: Vec<MatchArm>, members: &[Type]) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
+        let mut out = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let is_trait_arm = arm.pattern.path.is_none() && arm.pattern.variant == "Error" && self.resolve_type_name("Error").is_none();
+            if !is_trait_arm {
+                out.push(arm);
+                continue;
+            }
+            if !arm.pattern.binds.is_empty() {
+                return Err(Spanned::from(TypeError {
+                    msg: "trait pattern 'Error' cannot bind fields — match on a concrete variant, or use flow narrowing (no binder) to read a specific member's fields".to_string()
+                }, arm.body.span));
+            }
+            for m in members {
+                if self.type_implements(m, &Trait::Error) {
+                    out.push(MatchArm {
+                        pattern: Pattern { path: None, variant: m.to_string(), binds: Vec::new() },
+                        guard: arm.guard.clone(),
+                        body: arm.body.clone(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Validate a match/`is` pattern against `enum_name`'s definition:
     /// the optional qualifier (if present) must name the same enum, the
     /// variant must exist, and — if any binds are given at all — their
@@ -1270,7 +1387,7 @@ impl TypeChecker {
         let enum_name = match self.resolve_union(&resolved_subject) {
             Some((name, _)) => name.to_string(),
             None => return if matches!(&resolved_subject, Type::Union(_)) {
-                self.infer_anon_match(resolved_subject, arms, default, span)
+                self.infer_anon_match(subject, resolved_subject, arms, default, span)
             } else {
                 Err(Spanned::from(TypeError {
                     msg: format!("Can only match on a union value, got {}", resolved_subject)
@@ -1278,30 +1395,38 @@ impl TypeChecker {
             },
         };
         let def = self.union_defs.get(&enum_name).cloned().expect("registered");
+        let arms = self.expand_trait_arms(arms.to_vec(), &enum_name, &def)?;
 
         let mut covered: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut result_ty: Option<Type> = None;
 
-        for arm in arms {
+        for arm in &arms {
             let idx = self.check_pattern(&arm.pattern, &enum_name, &def, arm.body.span)?;
             let variant_fields = &def.variants[idx].1;
-            let bindings: Vec<(String, Type)> = if arm.pattern.binds.is_empty() {
-                Vec::new()
-            } else {
+            let bindings: Vec<(String, Type)> = if !arm.pattern.binds.is_empty() {
                 arm.pattern.binds.iter().zip(variant_fields.iter())
                     .filter(|(b, _)| b.as_str() != "_")
                     .map(|(b, (_, ty))| (b.clone(), ty.clone()))
                     .collect()
+            } else {
+                // Flow narrowing (ERRORS.md Phase 6): a bindless `is
+                // Variant` arm rebinds the subject's own name — when the
+                // subject is itself a bare, already-bound variable — to
+                // the matched variant's own narrower struct type for the
+                // arm's scope, so e.g. `u.code` inside `is DbError` reads
+                // `DbError`'s own field directly, no explicit binder
+                // needed. See `lower_match`'s matching narrowing prelude.
+                match subject.item.get_identifier() {
+                    Some(name) if self.ctx.contains_key(name) =>
+                        vec![(name.to_string(), Type::Struct(format!("{}.{}", enum_name, arm.pattern.variant)))],
+                    _ => Vec::new(),
+                }
             };
 
             let arm_ty = self.with_context(bindings.into_iter(), |t| -> TypeResult {
                 if let Some(g) = &arm.guard {
                     let gt = t.infer(g)?;
-                    if !t.unify(&gt, &Type::Bool) {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("match guard must be Bool, got {}", t.lookup(&gt))
-                        }, g.span));
-                    }
+                    t.check_condition(&gt, g.span)?;
                 }
                 t.infer(&arm.body)
             })?;
@@ -1378,30 +1503,38 @@ impl TypeChecker {
     /// member count), and their bind's bound type (a variant field vs the
     /// whole narrowed member) differently enough that sharing one body
     /// would need more branching than it would save.
-    fn infer_anon_match(&mut self, resolved_subject: Type, arms: &[MatchArm], default: &Option<Box<Spanned<Expression>>>, span: Span) -> TypeResult {
+    fn infer_anon_match(&mut self, subject: &Spanned<Expression>, resolved_subject: Type, arms: &[MatchArm], default: &Option<Box<Spanned<Expression>>>, span: Span) -> TypeResult {
         let members = match &resolved_subject {
             Type::Union(members) => members.clone(),
             _ => unreachable!("caller already checked resolved_subject is a Union"),
         };
+        let arms = self.expand_trait_arms_anon(arms.to_vec(), &members)?;
 
         let mut covered: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut result_ty: Option<Type> = None;
 
-        for arm in arms {
+        for arm in &arms {
             let (idx, member_ty) = self.check_type_pattern(&arm.pattern, &members, arm.body.span)?;
-            let bindings: Vec<(String, Type)> = arm.pattern.binds.iter()
-                .filter(|b| b.as_str() != "_")
-                .map(|b| (b.clone(), member_ty.clone()))
-                .collect();
+            let bindings: Vec<(String, Type)> = if !arm.pattern.binds.is_empty() {
+                arm.pattern.binds.iter()
+                    .filter(|b| b.as_str() != "_")
+                    .map(|b| (b.clone(), member_ty.clone()))
+                    .collect()
+            } else {
+                // Flow narrowing, mirroring `infer_match`'s nominal case
+                // above — a bindless `is Type` arm on an already-bound
+                // bare-identifier subject rebinds that name to the
+                // narrowed member type for the arm's scope.
+                match subject.item.get_identifier() {
+                    Some(name) if self.ctx.contains_key(name) => vec![(name.to_string(), member_ty.clone())],
+                    _ => Vec::new(),
+                }
+            };
 
             let arm_ty = self.with_context(bindings.into_iter(), |t| -> TypeResult {
                 if let Some(g) = &arm.guard {
                     let gt = t.infer(g)?;
-                    if !t.unify(&gt, &Type::Bool) {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("match guard must be Bool, got {}", t.lookup(&gt))
-                        }, g.span));
-                    }
+                    t.check_condition(&gt, g.span)?;
                 }
                 t.infer(&arm.body)
             })?;
@@ -1468,11 +1601,7 @@ impl TypeChecker {
         self.with_context(std::iter::once((fl.var.clone(), elem_ty)), |t| {
             if let Some(cond) = &fl.cond {
                 let cond_ty = t.infer(cond)?;
-                if !t.unify(&cond_ty, &Type::Bool) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("for-loop condition must be Bool, got {}", t.lookup(&cond_ty))
-                    }, cond.span));
-                }
+                t.check_condition(&cond_ty, cond.span)?;
             }
             t.infer(&fl.body)
         })
@@ -1751,22 +1880,14 @@ impl TypeChecker {
         match op {
             "not" => {
                 let argt = self.infer(args[0])?;
-                if !self.unify(&argt, &Type::Bool) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("'not' requires Bool, got {}", self.lookup(&argt))
-                    }, args[0].span));
-                }
+                self.check_condition(&argt, args[0].span)?;
                 Ok(Type::Bool)
             },
 
             "and" | "or" => {
                 for arg in args {
                     let argt = self.infer(arg)?;
-                    if !self.unify(&argt, &Type::Bool) {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("'{}' requires Bool, got {}", op, self.lookup(&argt))
-                        }, arg.span));
-                    }
+                    self.check_condition(&argt, arg.span)?;
                 }
                 Ok(Type::Bool)
             },
@@ -2020,13 +2141,18 @@ impl TypeChecker {
 
             Expression::Unary(u) => {
                 let inner = self.check_and_lower(*u.expr)?;
+                let inner = if u.op == Token::Not { self.coerce_truthy(inner, span) } else { inner };
                 TypedExprKind::Unary { op: u.op, expr: Box::new(inner) }
             },
 
             Expression::Binary(b) => {
                 let left  = self.check_and_lower(*b.left)?;
                 let right = self.check_and_lower(*b.right)?;
-                if matches!(b.op, Token::EqEq | Token::NotEq) {
+                if matches!(b.op, Token::And | Token::Or) {
+                    let left  = self.coerce_truthy(left, span);
+                    let right = self.coerce_truthy(right, span);
+                    TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
+                } else if matches!(b.op, Token::EqEq | Token::NotEq) {
                     if let Type::Struct(name) = left.item.ty.clone() {
                         self.desugar_struct_eq(b.op, left, right, &name, span)
                     } else {
@@ -2057,6 +2183,7 @@ impl TypeChecker {
                 }
 
                 let cond = self.check_and_lower(*c.cond)?;
+                let cond = self.coerce_truthy(cond, span);
 
                 // Each branch is its own scope (see the matching note on
                 // `ConditionalExpr::infer`): a `let` inside one arm must not
@@ -2419,7 +2546,11 @@ impl TypeChecker {
         self.ctx.insert(fl.var.clone(), elem_ty);
         let result = (|| -> Result<_, Spanned<TypeError>> {
             let cond = match fl.cond {
-                Some(c) => Some(Box::new(self.check_and_lower(*c)?)),
+                Some(c) => {
+                    let cond_span = c.span;
+                    let lowered = self.check_and_lower(*c)?;
+                    Some(Box::new(self.coerce_truthy(lowered, cond_span)))
+                },
                 None => None,
             };
             let body = self.check_and_lower(*fl.body)?;
@@ -2441,11 +2572,17 @@ impl TypeChecker {
     /// `desugar_struct_eq`) so a side-effecting subject expression is only
     /// evaluated once, not once per arm's tag test.
     fn lower_match(&mut self, subject: Box<Spanned<Expression>>, arms: Vec<MatchArm>, default: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // Captured before lowering consumes `subject` — see the flow-narrowing
+        // prelude below (mirrors `infer_match`'s own narrowing check).
+        let narrow_target = subject.item.get_identifier()
+            .filter(|name| self.ctx.contains_key(*name))
+            .map(|name| name.to_string());
         let subject = self.check_and_lower(*subject)?;
         let Some((enum_name, _)) = self.resolve_union(&subject.item.ty).map(|(n, d)| (n.to_string(), d.clone())) else {
-            return self.lower_anon_match(subject, arms, default, span);
+            return self.lower_anon_match(subject, narrow_target, arms, default, span);
         };
         let def = self.union_defs.get(&enum_name).cloned().expect("registered");
+        let arms = self.expand_trait_arms(arms, &enum_name, &def)?;
 
         let subject_name = format!("__match_subject_{}", self.next_id); self.next_id += 1;
         let subject_ty = subject.item.ty.clone();
@@ -2496,6 +2633,44 @@ impl TypeChecker {
                     ));
                     bindings.push((bind.clone(), fty.clone()));
                 }
+            } else if let Some(name) = &narrow_target {
+                // Flow narrowing (ERRORS.md Phase 6): rebind the subject's
+                // own name, inside this arm only, to a plain `Type::Struct`
+                // value of the matched variant's own type — reconstructed
+                // by reading every declared field (common fields, via
+                // ordinary `FieldAccess`, then the variant's own, via
+                // `VariantField`) back out, in the same common-then-own
+                // order `hoist_data_decls` registered under this qualified
+                // name in `struct_defs`, so `StructInit`'s flattened
+                // codegen layout lines up.
+                let qualified = format!("{}.{}", enum_name, arm.pattern.variant);
+                let common_fields = def.common.iter().map(|(fname, fty)| {
+                    (fname.clone(), Box::new(Spanned::from(
+                        TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess {
+                            target: Box::new(subject_var.clone()), field: fname.clone(), enum_name: Some(enum_name.clone()),
+                        } },
+                        span,
+                    )))
+                });
+                let own_fields = variant_fields.iter().map(|(fname, fty)| {
+                    (fname.clone(), Box::new(Spanned::from(
+                        TypedExpr { ty: fty.clone(), kind: TypedExprKind::VariantField {
+                            target: Box::new(subject_var.clone()), enum_name: enum_name.clone(), variant: arm.pattern.variant.clone(), field: fname.clone(),
+                        } },
+                        span,
+                    )))
+                });
+                let narrowed_fields: Vec<(String, TypedExprRef)> = common_fields.chain(own_fields).collect();
+                let narrowed_ty = Type::Struct(qualified.clone());
+                let value = Spanned::from(
+                    TypedExpr { ty: narrowed_ty.clone(), kind: TypedExprKind::StructInit { name: qualified, fields: narrowed_fields } },
+                    span,
+                );
+                prelude.push(Spanned::from(
+                    TypedExpr { ty: narrowed_ty.clone(), kind: TypedExprKind::Assign { name: name.clone(), value: Box::new(value) } },
+                    span,
+                ));
+                bindings.push((name.clone(), narrowed_ty));
             }
 
             // A guard's binds must be extracted (the `prelude`) *before*
@@ -2512,7 +2687,11 @@ impl TypeChecker {
             let lowered = (|| -> Result<_, Spanned<TypeError>> {
                 let body = self.check_and_lower(*arm.body)?;
                 let guard = match arm.guard {
-                    Some(g) => Some(self.check_and_lower(*g)?),
+                    Some(g) => {
+                        let guard_span = g.span;
+                        let lowered = self.check_and_lower(*g)?;
+                        Some(self.coerce_truthy(lowered, guard_span))
+                    },
                     None => None,
                 };
                 Ok((guard, body))
@@ -2603,11 +2782,12 @@ impl TypeChecker {
     /// `TypeTag`/`Narrow` in place of `IsVariant`/`VariantField`, and a
     /// bind (there's at most one, checked by `check_type_pattern`) is the
     /// whole narrowed member rather than one of its fields.
-    fn lower_anon_match(&mut self, subject: Spanned<TypedExpr>, arms: Vec<MatchArm>, default: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+    fn lower_anon_match(&mut self, subject: Spanned<TypedExpr>, narrow_target: Option<String>, arms: Vec<MatchArm>, default: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let members = match &subject.item.ty {
             Type::Union(members) => members.clone(),
             other => unreachable!("lower_anon_match subject must be an anonymous union, got {}", other),
         };
+        let arms = self.expand_trait_arms_anon(arms, &members)?;
 
         let subject_name = format!("__match_subject_{}", self.next_id); self.next_id += 1;
         let subject_ty = subject.item.ty.clone();
@@ -2642,7 +2822,12 @@ impl TypeChecker {
 
             let mut prelude = Vec::new();
             let mut bindings = Vec::new();
-            if let Some(bind) = arm.pattern.binds.first() {
+            // An explicit bind takes priority; a bindless arm on an
+            // already-bound bare-identifier subject narrows that name
+            // instead (ERRORS.md Phase 6's flow narrowing) — `Narrow`
+            // already yields the whole member value either way.
+            let bind_name = arm.pattern.binds.first().cloned().or_else(|| narrow_target.clone());
+            if let Some(bind) = bind_name {
                 if bind != "_" {
                     let value = Spanned::from(
                         TypedExpr { ty: member_ty.clone(), kind: TypedExprKind::Narrow {
@@ -2663,7 +2848,11 @@ impl TypeChecker {
             let lowered = (|| -> Result<_, Spanned<TypeError>> {
                 let body = self.check_and_lower(*arm.body)?;
                 let guard = match arm.guard {
-                    Some(g) => Some(self.check_and_lower(*g)?),
+                    Some(g) => {
+                        let guard_span = g.span;
+                        let lowered = self.check_and_lower(*g)?;
+                        Some(self.coerce_truthy(lowered, guard_span))
+                    },
                     None => None,
                 };
                 Ok((guard, body))
@@ -2951,30 +3140,25 @@ impl Infer for ConditionalExpr {
             return tc.infer_match(&ip.subject, &arms, &self.false_branch, span);
         }
         let cond_type = tc.infer(&self.cond)?;
-        if let Type::Bool = cond_type {
-            // Each branch is its own scope, whether or not it's written with
-            // `{ }` — `if c then let y = 5 else 0` must not leave `y` bound
-            // afterward, any more than `if c then { let y = 5 } else 0` does.
-            let true_type = tc.with_context(std::iter::empty(), |t| t.infer(&self.true_branch))?;
-            let false_type = if let Some(fb) = &self.false_branch {
-                tc.with_context(std::iter::empty(), |t| t.infer(fb))?
-            } else {
-                Type::None
-            };
-            if tc.unify(&true_type, &false_type) {
-                Ok(tc.lookup(&true_type))
-            } else {
-                // Branches have incompatible types: produce a union.
-                // Normalizing matters beyond tidiness here — it's what
-                // drops `Never` (a `return`'d branch) out of the result
-                // entirely, so `if c then return 1 else 2` types as plain
-                // `Int` rather than `Never | Int`.
-                Ok(Type::Union(vec![true_type, false_type]).normalize())
-            }
+        tc.check_condition(&cond_type, self.cond.span)?;
+        // Each branch is its own scope, whether or not it's written with
+        // `{ }` — `if c then let y = 5 else 0` must not leave `y` bound
+        // afterward, any more than `if c then { let y = 5 } else 0` does.
+        let true_type = tc.with_context(std::iter::empty(), |t| t.infer(&self.true_branch))?;
+        let false_type = if let Some(fb) = &self.false_branch {
+            tc.with_context(std::iter::empty(), |t| t.infer(fb))?
         } else {
-            Err(Spanned::from(TypeError {
-                msg: format!("Incorrect type {:?} for conditional, should be bool", cond_type)
-            }, span))
+            Type::None
+        };
+        if tc.unify(&true_type, &false_type) {
+            Ok(tc.lookup(&true_type))
+        } else {
+            // Branches have incompatible types: produce a union.
+            // Normalizing matters beyond tidiness here — it's what
+            // drops `Never` (a `return`'d branch) out of the result
+            // entirely, so `if c then return 1 else 2` types as plain
+            // `Int` rather than `Never | Int`.
+            Ok(Type::Union(vec![true_type, false_type]).normalize())
         }
     }
 }

@@ -191,4 +191,12 @@ pub enum TypedExprKind {
         target: TypedExprRef,
         tag:    u32,
     },
+
+    /// Coerce a non-`Bool` `Trait::Truthy` value (`Int`, `Float`, `Str`,
+    /// `List`, or `None`) into `Bool` for condition position (`if`, a
+    /// match guard, a `for`-loop guard, `and`/`or`/`not`) — see
+    /// `TypeChecker::coerce_truthy`. Never wraps an already-`Bool` value;
+    /// `0`/`0.0`/empty-`Str`/empty-`List`/`None` are falsey, everything
+    /// else truthy. Result type is `Type::Bool`.
+    Truthy(TypedExprRef),
 }

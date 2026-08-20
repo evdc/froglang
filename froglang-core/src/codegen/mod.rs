@@ -69,8 +69,63 @@ fn is_heap_ty(ty: &Type) -> bool {
     // `Type::Enum` was (`runtime::gc::FrogVariant`): a registered nominal
     // union (`data X is A | B`, see `Ctx.unions`) and an anonymous
     // structural one (`Int | Str`), whose boxes `TypedExprKind::Widen`
-    // allocates — so this arm is load-bearing for rooting those too.
+    // allocates — so this arm is load-bearing for rooting those too. This
+    // stays `true` even for a two-slot union's payload leaf (see
+    // `is_two_slot_union`) — it's only *sometimes* a pointer, but callers
+    // that need to tell the difference use `root_flat_leaves`, not this
+    // function directly.
     matches!(ty, Type::Str | Type::List(_) | Type::Union(_))
+}
+
+/// True iff `members` (a union's flat member list) contains a bare scalar
+/// (`Int`/`Float`/`Bool`) — the ERRORS.md rule (see its "Union
+/// representation" section) for when a union gets a second,
+/// register-resident payload slot instead of always boxing: `Widen`ing a
+/// scalar member then rides in the payload register directly, no
+/// `frog_alloc_variant` call at all. Nominal unions (`data X is A | B`)
+/// never qualify — every declared variant is a `Type::Struct`/`Type::None`,
+/// never a bare scalar, by construction — so this only ever fires for
+/// anonymous unions (`Int | Str`, `T?`).
+fn is_two_slot_union(members: &[Type]) -> bool {
+    members.iter().any(|t| matches!(t, Type::Int | Type::Float | Type::Bool))
+}
+
+/// True iff a value of `ty` crosses an ABI boundary or a `Conditional`
+/// merge block as more than one flat Cranelift value (see `struct_fields`):
+/// a struct, or a two-slot union.
+fn is_multi_leaf_type(ty: &Type) -> bool {
+    match ty {
+        Type::Struct(_) => true,
+        Type::Union(members) => is_two_slot_union(members),
+        _ => false,
+    }
+}
+
+/// Reject a two-slot union (`is_two_slot_union`) among `leafs` — called
+/// wherever a value is about to be embedded in a GC-scanned aggregate whose
+/// pointer-ness is tracked by a static per-slot `ptr_mask` (a boxed
+/// `FrogVariant`'s payload, a `List`'s element stride): `ptr_mask` has no
+/// way to express "this slot is a pointer only when the *sibling* tag slot
+/// says so", unlike today's one-slot unions, whose only non-pointer bit
+/// pattern is a deliberately odd-tagged immediate — a two-slot union's raw,
+/// unrestricted scalar payload has no such guarantee and could be
+/// misinterpreted as a live pointer during marking. Rejecting this case
+/// outright (until the GC's `ptr_mask` scanning is made tag-aware — see
+/// README's "Up Next") beats silently miscompiling it. Values that only
+/// ever flow through locals/params/returns/`Widen`/`Narrow` never hit this
+/// — see `root_flat_leaves` for that path's (safe) tag-aware rooting.
+fn assert_no_two_slot_union_leaf<'a>(leafs: impl IntoIterator<Item = &'a Type>, context: &str) {
+    for t in leafs {
+        if let Type::Union(members) = t {
+            if is_two_slot_union(members) {
+                panic!(
+                    "unsupported: a union with a scalar member (e.g. `Int | E`) can't yet be used as {} \
+                     — only as a local variable, function parameter/return, or `?`/`catch`/`match` subject.",
+                    context
+                );
+            }
+        }
+    }
 }
 
 /// Recursively flatten `ty` into its ordered leaf `(dotted_path, Type)`
@@ -93,6 +148,14 @@ pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
                 }
             }
             out
+        },
+        // A union with a scalar member gets a second, register-resident
+        // leaf instead of always boxing (see `is_two_slot_union`). The tag
+        // leaf is named `$tag` so `var_key` gives it a distinct binding
+        // from the payload leaf, which keeps the empty-path convention
+        // every other non-struct type uses.
+        Type::Union(members) if is_two_slot_union(members) => {
+            vec![("$tag".to_string(), Type::Int), (String::new(), ty.clone())]
         },
         _ => vec![(String::new(), ty.clone())],
     }
@@ -269,10 +332,19 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
 
         // Boxes `value` into a new heap cell — unless `value`'s type is
         // `None`, which is already the immediate `1` and needs no
-        // allocation at all (see `TypedExprKind::Widen`'s doc comment).
+        // allocation at all (see `TypedExprKind::Widen`'s doc comment), or
+        // `expr`'s union is two-slot (`is_two_slot_union`) and `value`'s
+        // own type is a bare scalar/`None` — that rides in the payload
+        // register directly, no `frog_alloc_variant` call either.
         TypedExprKind::Widen { value, .. } => {
             for_each_heap_producer(value, structs, f);
-            if value.item.ty != Type::None { f(); }
+            let is_two_slot = matches!(&expr.item.ty, Type::Union(members) if is_two_slot_union(members));
+            let needs_box = if is_two_slot {
+                !matches!(value.item.ty, Type::Int | Type::Float | Type::Bool | Type::None)
+            } else {
+                value.item.ty != Type::None
+            };
+            if needs_box { f(); }
         },
 
         // Unboxes a payload slot: no fresh allocation, but the unboxed
@@ -287,6 +359,10 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         // A runtime tag test on an anonymous union — no allocation, exactly
         // like `IsVariant`.
         TypedExprKind::TypeTag { target, .. } => for_each_heap_producer(target, structs, f),
+
+        // A `Bool`-producing test on `value` — no allocation of its own,
+        // just whatever `value` itself produces.
+        TypedExprKind::Truthy(value) => for_each_heap_producer(value, structs, f),
     }
 }
 
@@ -321,6 +397,64 @@ fn root_heap_value(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) {
         let offset = (ctx.heap_cursor * 8) as i32;
         bcx.ins().stack_store(val, slot, offset);
         ctx.heap_cursor += 1;
+    }
+}
+
+/// Root a two-slot union's payload leaf (see `is_two_slot_union`), which is
+/// only a real pointer when `tag` names one of `boxed_tags` — a raw scalar
+/// payload could otherwise be misread as a pointer by the GC (see
+/// `assert_no_two_slot_union_leaf`'s doc comment), so it must never be
+/// rooted unconditionally the way a plain heap-typed leaf is. Branchless: a
+/// `select` picks `payload` when boxed, `0` otherwise (`0` always fails
+/// `is_heap_ptr`, so it's always safe to store), then stores into the next
+/// shadow-stack slot exactly like `root_heap_value`.
+fn root_two_slot_payload(bcx: &mut FunctionBuilder, ctx: &mut Ctx, tag: Value, payload: Value, boxed_tags: &[u32]) {
+    let zero = bcx.ins().iconst(types::I64, 0);
+    if boxed_tags.is_empty() {
+        // No member of this union ever boxes — the payload is never a
+        // pointer, so there's nothing to root.
+        root_heap_value(bcx, ctx, zero);
+        return;
+    }
+    let mut is_boxed = bcx.ins().icmp_imm(IntCC::Equal, tag, boxed_tags[0] as i64);
+    for &t in &boxed_tags[1..] {
+        let eq = bcx.ins().icmp_imm(IntCC::Equal, tag, t as i64);
+        is_boxed = bcx.ins().bor(is_boxed, eq);
+    }
+    let safe = bcx.ins().select(is_boxed, payload, zero);
+    root_heap_value(bcx, ctx, safe);
+}
+
+/// `boxed_tags` for the union `members` — the member indices (`Widen`'s
+/// `tag`) that box rather than riding in the payload register directly.
+fn boxed_member_tags(members: &[Type]) -> Vec<u32> {
+    members.iter().enumerate()
+        .filter(|(_, m)| !matches!(m, Type::Int | Type::Float | Type::Bool | Type::None))
+        .map(|(i, _)| i as u32)
+        .collect()
+}
+
+/// Root every heap-producing leaf in `vals` (aligned 1:1 with `leafs`, e.g.
+/// from `struct_fields`). A plain heap-typed leaf (`Str`/`List`/a one-slot
+/// union) is rooted unconditionally, exactly as `root_heap_value` always
+/// has. A two-slot union's payload leaf goes through `root_two_slot_payload`
+/// instead, paired with `vals[i-1]` — the tag `struct_fields`'s two-slot
+/// `Union` arm always emits immediately before its payload leaf.
+fn root_flat_leaves(bcx: &mut FunctionBuilder, ctx: &mut Ctx, vals: &[Value], leafs: &[(String, Type)]) {
+    let mut i = 0;
+    while i < leafs.len() {
+        let (_, lty) = &leafs[i];
+        if let Type::Union(members) = lty {
+            if is_two_slot_union(members) {
+                root_two_slot_payload(bcx, ctx, vals[i - 1], vals[i], &boxed_member_tags(members));
+                i += 1;
+                continue;
+            }
+        }
+        if is_heap_ty(lty) {
+            root_heap_value(bcx, ctx, vals[i]);
+        }
+        i += 1;
     }
 }
 
@@ -476,6 +610,7 @@ fn emit_tag_test(bcx: &mut FunctionBuilder, val: Value, target_is_immediate: boo
 /// scalar or plain struct into an anonymous union) — both need exactly the
 /// same runtime shape, just reached from different typed-AST nodes.
 fn box_into_variant(tag: u32, flat_vals: &[Value], flat_types: &[Type], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
+    assert_no_two_slot_union_leaf(flat_types, "a boxed union/struct field");
     let mut ptr_mask: i64 = 0;
     for (i, t) in flat_types.iter().enumerate() {
         if is_heap_ty(t) { ptr_mask |= 1i64 << i; }
@@ -996,9 +1131,11 @@ fn compile_expr_multi(
             }
 
             let has_value = expr.item.ty != Type::None;
-            let is_struct = matches!(&expr.item.ty, Type::Struct(_));
+            // Struct-typed *and* two-slot-union-typed results both need the
+            // K-block-param merge below — see `is_multi_leaf_type`.
+            let is_multi = is_multi_leaf_type(&expr.item.ty);
 
-            if !is_struct {
+            if !is_multi {
                 // ── scalar path, unchanged from before structs existed ──
                 let result_ty = cl_type(&expr.item.ty);
                 if has_value {
@@ -1056,9 +1193,13 @@ fn compile_expr_multi(
                     vec![bcx.ins().iconst(types::I64, 0)]
                 }
             } else {
-                // ── struct-typed path: K block params, one per leaf field.
-                // No widening needed — struct unification is nominal/exact,
-                // so both branches' leaf types are identical to expr's own.
+                // ── multi-leaf path: K block params, one per leaf field
+                // (`struct_fields`). Struct unification is nominal/exact,
+                // so both branches' leaf types are identical to expr's own;
+                // a two-slot union's branches instead each carry their own
+                // `Widen`, inserted by typeck at the join (see
+                // `TypeChecker::lower_widen`), so this is still just value
+                // plumbing — no new rooting decision happens here.
                 let leafs = struct_fields(&expr.item.ty, ctx.structs);
                 let param_tys: Vec<types::Type> = leafs.iter().map(|(_, t)| cl_type(t)).collect();
                 for t in &param_tys { bcx.append_block_param(merge_bb, *t); }
@@ -1159,10 +1300,13 @@ fn compile_expr_multi(
 
             let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
             for (i, a) in args.iter().enumerate() {
-                if matches!(&a.item.ty, Type::Struct(_)) {
-                    // Struct args are never widened (nominal/exact match)
-                    // — flatten straight into the call's arg list, in the
-                    // same K-`AbiParam`-per-struct-arg order `make_sig` uses.
+                if is_multi_leaf_type(&a.item.ty) {
+                    // Struct args are never widened (nominal/exact match),
+                    // and a two-slot-union arg is already the exact target
+                    // union type by the time codegen sees it (widening
+                    // happens earlier, at the `Widen` node itself) — either
+                    // way, flatten straight into the call's arg list, in
+                    // the same K-`AbiParam`-per-arg order `make_sig` uses.
                     arg_vals.extend(compile_expr_multi(a, bcx, vars, ctx));
                 } else {
                     let mut v = compile_expr(a, bcx, vars, ctx);
@@ -1194,20 +1338,21 @@ fn compile_expr_multi(
             }
             if return_ty == Type::None {
                 vec![bcx.ins().iconst(types::I64, 0)]
-            } else if matches!(&return_ty, Type::Struct(_)) {
-                // Each heap-typed leaf of a struct return crosses the ABI
-                // boundary as a bare register value — the callee's own
+            } else if is_multi_leaf_type(&return_ty) {
+                // Each heap-producing leaf of a struct return, or a
+                // two-slot union return (`is_two_slot_union`), crosses the
+                // ABI boundary as a bare register value — the callee's own
                 // shadow frame (which rooted it during its own execution)
                 // is already popped by the time we get here, so it must be
                 // re-rooted into *this* function's frame immediately,
-                // exactly like the scalar Str/List case below.
+                // exactly like the scalar Str/List case below. A two-slot
+                // union's payload leaf is only *sometimes* a pointer — the
+                // caller has no static way to know which member the callee
+                // actually returned — so `root_flat_leaves` roots it behind
+                // a runtime tag comparison rather than unconditionally.
                 let results = bcx.inst_results(call).to_vec();
                 let leafs = struct_fields(&return_ty, ctx.structs);
-                for (v, (_, lty)) in results.iter().zip(leafs.iter()) {
-                    if is_heap_ty(lty) {
-                        root_heap_value(bcx, ctx, *v);
-                    }
-                }
+                root_flat_leaves(bcx, ctx, &results, &leafs);
                 results
             } else {
                 let result = bcx.inst_results(call)[0];
@@ -1306,6 +1451,7 @@ fn compile_expr_multi(
                 _ => Type::Int,
             };
             let leafs = struct_fields(&elem_ty, ctx.structs);
+            assert_no_two_slot_union_leaf(leafs.iter().map(|(_, t)| t), "a list element type");
             let stride = (leafs.len().max(1)) as i64;
             let mut ptr_mask: i64 = 0;
             for (i, (_, lty)) in leafs.iter().enumerate() {
@@ -1355,6 +1501,7 @@ fn compile_expr_multi(
 
         TypedExprKind::Comprehension { var, iterable, cond, body } => {
             let leafs = struct_fields(&body.item.ty, ctx.structs);
+            assert_no_two_slot_union_leaf(leafs.iter().map(|(_, t)| t), "a list element type");
             let stride = (leafs.len().max(1)) as i64;
             let mut ptr_mask: i64 = 0;
             for (i, (_, lty)) in leafs.iter().enumerate() {
@@ -1490,7 +1637,36 @@ fn compile_expr_multi(
         TypedExprKind::NoneLit => vec![bcx.ins().iconst(types::I64, 1)],
 
         TypedExprKind::Widen { value, tag } => {
-            if value.item.ty == Type::None {
+            let two_slot_members = match &expr.item.ty {
+                Type::Union(members) if is_two_slot_union(members) => Some(members),
+                _ => None,
+            };
+            if let Some(_members) = two_slot_members {
+                // This union has a scalar member (`is_two_slot_union`), so
+                // it carries its tag in its own register instead of a
+                // boxed `FrogVariant` header — see `struct_fields`'s
+                // two-slot `Union` arm. A scalar/`None` `value` then never
+                // needs `box_into_variant` at all: it rides in the payload
+                // register directly, no allocation.
+                let tag_val = bcx.ins().iconst(types::I64, *tag as i64);
+                if matches!(value.item.ty, Type::Int | Type::Float | Type::Bool | Type::None) {
+                    let vals = compile_expr_multi(value, bcx, vars, ctx);
+                    let payload = if value.item.ty == Type::None {
+                        bcx.ins().iconst(types::I64, 0)
+                    } else {
+                        to_i64_repr(bcx, &value.item.ty, vals[0])
+                    };
+                    vec![tag_val, payload]
+                } else {
+                    // A boxed member (Str/List/struct/nested union): box
+                    // exactly as before, the tag just also rides alongside
+                    // in its own register now.
+                    let flat_vals = compile_expr_multi(value, bcx, vars, ctx);
+                    let flat_types: Vec<Type> = struct_fields(&value.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+                    let ptr = box_into_variant(*tag, &flat_vals, &flat_types, bcx, ctx);
+                    vec![tag_val, ptr]
+                }
+            } else if value.item.ty == Type::None {
                 // `None`'s own compiled form (the generic immediate `1` —
                 // see `TypedExprKind::NoneLit`) isn't reused directly: this
                 // union's own sorted member list may place `None` at a
@@ -1511,7 +1687,26 @@ fn compile_expr_multi(
         },
 
         TypedExprKind::Narrow { value, .. } => {
-            if expr.item.ty == Type::None {
+            let src_two_slot = matches!(&value.item.ty, Type::Union(members) if is_two_slot_union(members));
+            if src_two_slot {
+                // The source union carries its tag in its own register (see
+                // `struct_fields`'s two-slot `Union` arm) — the caller
+                // already knows (from a preceding `TypeTag`) which member
+                // this is, so only the payload leaf (`vals[1]`) matters
+                // here. A scalar target reads it directly, no dereference
+                // at all; a boxed target dereferences it exactly as the
+                // one-slot case below does.
+                let vals = compile_expr_multi(value, bcx, vars, ctx);
+                let payload = vals[1];
+                if expr.item.ty == Type::None {
+                    vec![bcx.ins().iconst(types::I64, 0)]
+                } else if matches!(&expr.item.ty, Type::Int | Type::Float | Type::Bool) {
+                    vec![from_i64_repr(bcx, &expr.item.ty, payload)]
+                } else {
+                    let leaf_types: Vec<Type> = struct_fields(&expr.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+                    read_variant_slots(payload, 0, &leaf_types, bcx, ctx)
+                }
+            } else if expr.item.ty == Type::None {
                 // `value` here is an immediate, not a pointer — `None` has
                 // no payload to unbox, and the caller already knows (from
                 // a preceding `TypeTag`) which member this is. A single
@@ -1528,14 +1723,60 @@ fn compile_expr_multi(
         },
 
         TypedExprKind::TypeTag { target, tag } => {
-            let val = compile_expr(target, bcx, vars, ctx);
             let members = match &target.item.ty {
                 Type::Union(members) => members,
                 other => unreachable!("TypeTag target must be an anonymous union, got {}", other),
             };
-            let target_is_immediate = members.get(*tag as usize) == Some(&Type::None);
-            let any_immediate = members.iter().any(|m| *m == Type::None);
-            vec![emit_tag_test(bcx, val, target_is_immediate, any_immediate, *tag)]
+            if is_two_slot_union(members) {
+                // The tag is already a plain register (`struct_fields`'s
+                // two-slot `Union` arm) — no load, no low-bit branch, just
+                // a direct compare.
+                let vals = compile_expr_multi(target, bcx, vars, ctx);
+                vec![bcx.ins().icmp_imm(IntCC::Equal, vals[0], *tag as i64)]
+            } else {
+                let val = compile_expr(target, bcx, vars, ctx);
+                let target_is_immediate = members.get(*tag as usize) == Some(&Type::None);
+                let any_immediate = members.iter().any(|m| *m == Type::None);
+                vec![emit_tag_test(bcx, val, target_is_immediate, any_immediate, *tag)]
+            }
+        },
+
+        // Coerce a `Trait::Truthy` value into `Bool` for condition position
+        // — see `TypeChecker::coerce_truthy`. Never reached with
+        // `value.item.ty == Type::Bool` (that case is a no-op at lowering
+        // and never wrapped in this node).
+        TypedExprKind::Truthy(value) => {
+            let v = compile_expr(value, bcx, vars, ctx);
+            let truthy = match &value.item.ty {
+                Type::Int => {
+                    let zero = bcx.ins().iconst(types::I64, 0);
+                    bcx.ins().icmp(IntCC::NotEqual, v, zero)
+                },
+                Type::Float => {
+                    let zero = bcx.ins().f64const(0.0);
+                    bcx.ins().fcmp(FloatCC::NotEqual, v, zero)
+                },
+                // `None` is the immediate `1`, always falsey.
+                Type::None => bcx.ins().iconst(types::I8, 0),
+                Type::Str => {
+                    let id     = ctx.func_ids["frog_str_len"];
+                    let callee = ctx.module.declare_func_in_func(id, bcx.func);
+                    let call   = bcx.ins().call(callee, &[v]);
+                    let len    = bcx.inst_results(call)[0];
+                    let zero   = bcx.ins().iconst(types::I64, 0);
+                    bcx.ins().icmp(IntCC::NotEqual, len, zero)
+                },
+                Type::List(_) => {
+                    let id     = ctx.func_ids["frog_list_len"];
+                    let callee = ctx.module.declare_func_in_func(id, bcx.func);
+                    let call   = bcx.ins().call(callee, &[v]);
+                    let len    = bcx.inst_results(call)[0];
+                    let zero   = bcx.ins().iconst(types::I64, 0);
+                    bcx.ins().icmp(IntCC::NotEqual, len, zero)
+                },
+                other => unreachable!("Truthy on non-Truthy type {}", other),
+            };
+            vec![truthy]
         },
     }
 }

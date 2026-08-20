@@ -336,30 +336,3 @@ for l in left, r in right if l == r {
 ```
 
 not sure how valuable any of this is, but at least, I'm interested in exploring alt syntaxes for nested-comprehensions that are less confusing
-
-
----
-
-on falsey-ness and coalescing:
-- should `else` be spelled differently to avoid confusion with if/else? `or`, `orelse`, `catch`, `except`, ...?
-- A `is_error()` / `.is_ok()` changes an error-union to a Bool for truth-testing, explicitly
-- I do still think having "empty types are falsey", e.g. `[]`, `""`, `0` (as in Python) is useful and convenient
-- A postfix `?` operator as shorthand for `is_not_empty()` essentially - can be applied to lists, str, int, etc to coerce to bool - and can also 
-    - then you need a different spelling for the early-return operator
-
-```
-// explicitly:
-func get_user(id: UserId): User | None | DbError = {
-    // lookup user in the db, return None if no row present, or DbError if the conn failed or something
-}
-// assignment is an expression
-match let u = get_user(id) {
-    is User then do_thing(u)
-    is None then log("user not found")
-    is Error then log("DB error: ${e}")
-}
-
-// Implicitly?
-func get_user(id): User? | DbError = ...
-let u = get_user(id)?   // does ? propagate the None, or the DbError, or both?
-```

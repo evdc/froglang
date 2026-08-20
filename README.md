@@ -48,47 +48,94 @@ let f: (Int -> Int) = n -> n * 2
 ```
 
 **Supported expression forms:**
-- Literals: `Int`, `Float`, `Bool` (`true`/`false`), `Str`
+- Literals: `Int`, `Float`, `Bool` (`true`/`false`), `Str`, `none`
 - Arithmetic / comparison / logical operators with correct precedence
 - Unary `-` and `not`
 - Let bindings with optional type annotation: `let x: Int = 5`
 - Lambdas: `x -> x + 1`, `(x, y) -> x + y`
 - Named function declarations: `func f(x: T, y: T): T = body`
+- `return expr` — early exit from a function body
 - Function calls: `f(x, y)`
 - Conditionals: `if cond then a else b` (`else` optional)
+- `match subject { is Pattern then expr ... }` — exhaustive on declared unions, catch-all
+  required on anonymous ones; arms must be newline-separated
+- `?` — propagate a fallible value's `Error` member out of the enclosing function (postfix)
+- `!` — unwrap a fallible value, calling the `panic` builtin on its `Error` member (postfix)
+- `expr catch fallback` / `expr catch [e] -> handler_body` — coalesce a fallible value's
+  `Error` member into a fallback expression or a one-argument handler
 - Block expressions: `{ stmt; stmt; expr }` — newlines and `;` both work as separators
-- Lists: `[1, 2, 3]`
+- Lists: `[1, 2, 3]`, list comprehensions: `[for x in xs if cond do expr]`
+- Ranges: `0..10`
 - Type annotations: `expr : Type`
 - Comments: `// ...`
 - Multi-line expressions: newlines are skipped after `=`, `then`, and `else`
 
 ## Type system
 
-Bidirectional type checker with unification.
+Bidirectional type checker with unification, over a dedicated type-expression grammar
+(`List(T)`, unions, optionals, function types are spellable in every annotation site).
 
-**Primitive types:** `Int`, `Float`, `Bool`, `Str`, `None`
+**Primitive types:** `Int`, `Float`, `Bool`, `Str`, `None`, `Never` (the bottom type — the
+type of `return`, `panic`, and any expression that never produces a value)
 
 **Compound types:**
 - `(T1, T2, ...) -> R` — function types, inferred for lambdas, checked against annotations
 - `List(T)` — homogeneous GC-managed lists
 - Type variables with optional trait bounds
 - `T1 | T2` — sum / union types
+- `T?` — sugar for `T | None`
+- `data Point(x: Int, y: Int)` — nominal structs, unboxed flattened-field representation
+- `data Shape is Circle(r: Int) | Rectangle(w: Int, h: Int)` — sugar for a set of nominal
+  structs (`Shape.Circle`, `Shape.Rectangle`) plus a closed union alias `Shape`; this is
+  froglang's *only* sum-type mechanism — there is no separate enum construct
 
 **Trait-bounded polymorphism:**
 
-| Trait | Satisfying types              | Operators                   |
-|-------|-------------------------------|-----------------------------|
-| `Num` | `Int`, `Float`                | `+` `-` `*` `/` unary `-`  |
-| `Eq`  | `Int`, `Float`, `Bool`, `Str` | `==` `!=`                   |
-| `Ord` | `Int`, `Float`, `Str`         | `<` `>` `<=` `>=`          |
+| Trait   | Satisfying types              | Operators                   |
+|---------|--------------------------------|------------------------------|
+| `Num`   | `Int`, `Float`                | `+` `-` `*` `/` unary `-`  |
+| `Eq`    | `Int`, `Float`, `Bool`, `Str` | `==` `!=`                   |
+| `Ord`   | `Int`, `Float`, `Str`         | `<` `>` `<=` `>=`          |
+| `Error` | granted, not structural        | `?`, `!`, `catch`           |
 
 Bound propagation: `x -> x + x` infers as `(Num t) => t -> t`.
+
+Unlike the structural traits above, `Error` is granted only by a `provides Error` clause on
+a `data` declaration, or the `error X(...)` shorthand for `data X(...) provides Error` — it
+marks "this type can flow into `?`/`!`/`catch`", not "this type happens to look a certain
+way". A union satisfies `Error` iff every member does, so `provides Error` on a `data ... is
+...` union grants it to every variant and the alias gets it for free.
 
 **Union types:**
 - Mismatched if-else branches produce a union: `if c then 1 else "hi"` has type `Int | Str`
 - An `if` without an `else` has an implicit `else None` so its type is `T | None`
 - Unions normalize (flatten, deduplicate, sort): `Str | Int | Int` → `Int | Str`
-- Subtype relation: `T ≤ (T | U)`
+- Subtype relation: `T ≤ (T | U)`, checked at every site a type is expected (annotated
+  `let`, `return`, function args/return, struct fields, `if`/`match` branch joins) — this is
+  the *only* way a union value comes into being; there is no explicit union constructor
+- Field access `u.f` on a union is legal iff every member has a compatibly-typed `.f`
+- `is`/`match` narrow a union to one member; on an anonymous union the runtime tag is a
+  boxed `FrogVariant` for every non-primitive, non-`None` member
+
+**Error handling** (see `ERRORS.md`): a fallible function returns `T | E` where `E: Error` —
+there is no separate `Result` type, so propagating an error into a broader error union is
+free widening, not a conversion:
+
+```
+error ParseError(msg: Str)
+
+func parse(s: Str): Int | ParseError =
+  if s == "bad" then ParseError(msg="nope") else 42
+
+func run(s: Str): Int | ParseError = parse(s)? * 2   // ? propagates ParseError out of run
+func lenient(s: Str): Int = parse(s) catch 0          // catch coalesces it into a fallback
+func trusted(s: Str): Int = parse(s)!                 // ! panics on the error member
+```
+
+A statement-position value whose type is or contains an `Error`-providing type must be
+consumed (bound, matched, or handled) — silently discarding a fallible call is a type error.
+Binding it to a `let` counts as handling (defers it to the binding's later use); a tail
+position or comprehension body does too.
 
 ## Cranelift JIT backend
 
@@ -102,10 +149,18 @@ Supported in codegen:
 - Let bindings and variable references
 - Named and anonymous functions, including mutual recursion
 - Function calls (direct and via value)
-- `if-then-else` expressions
+- `if-then-else` expressions, including `Never`-typed conditionals (every branch supplies
+  its own terminator — a `trap` rather than a merge block — when both arms are `Never`)
+- `return`, and any `Never`-returning call (a `trap` after the call, then a fresh dead block)
+- `match` over structs, nominal unions, and anonymous unions
+- `?`/`!`/`catch` (desugared entirely in the type checker into an ordinary `match`; no
+  dedicated codegen node)
 - Block expressions (sequenced statements; result is the final expression)
 - String allocation, concatenation, equality, `print`
-- List allocation, indexing, push
+- List allocation, indexing, push, list comprehensions
+- Struct construction and field access (unboxed, flattened fields)
+- Union construction via implicit widening; boxed as `FrogVariant` except for `None` and
+  other nullary members, which are unboxed tagged immediates
 
 ## Runtime / GC
 
@@ -127,6 +182,7 @@ heap, set via an `ACTIVE_HEAP` thread-local pointer during JIT execution.
 |---|---|---|
 | `print(value)` | `Any -> None` | Coerce a value to text and print it with a newline |
 | `gc_dump()` | `() -> None` | Dump GC heap contents to stderr |
+| `panic(msg: Str)` | `Str -> Never` | Trap the process; `!`'s error arm just calls this, so it's callable directly too |
 
 ## REPL
 
@@ -183,24 +239,37 @@ of them must print the same result — a differing row means one of them is wron
   arithmetic, no allocation.
 - **`orders`** — an order-pricing pipeline over 2000 `Item` structs, repeated
   2000 rounds. Each round filters the catalogue into a fresh list, classifies
-  every item into a `Discount` enum variant, and matches on that variant to
-  price it. Exercises structs, enums + `match`, list construction, and the GC.
+  every item into a `Discount` union variant, matches on that variant, and
+  runs the result through a fallible `price_item` using `?` and `catch`.
+  Exercises structs, unions + `match`, error propagation, list construction,
+  and the GC. The other four implementations have no equivalent of `?`/
+  `catch`, but since the error branch is never actually taken on this data,
+  all five implementations must still print the same total.
 
 Apple M-series, release build; times are the whole process, so froglang's
 include JIT compilation:
 
 | | fib(35) | orders |
 |---|---|---|
-| Rust -O3        | 50ms   | 31ms  |
-| Go (gc)         | 52ms   | 38ms  |
-| LuaJIT          | 71ms   | 56ms  |
-| **froglang**    | 64ms   | 182ms |
-| Lua             | 670ms  | 579ms |
-| Python 3        | 2359ms | 1381ms |
+| Rust -O3        | 50ms   | 32ms  |
+| Go (gc)         | 52ms   | 37ms  |
+| LuaJIT          | 71ms   | 58ms  |
+| **froglang**    | 66ms   | 441ms |
+| Lua             | 673ms  | 583ms |
+| Python 3        | 2351ms | 1395ms |
 
 On straight-line arithmetic froglang sits between Go and LuaJIT, as expected
-from a Cranelift backend. `orders` is where the runtime shows: it started at
-427ms, and two rounds of profiling took it to 182ms.
+from a Cranelift backend. `orders` is where the runtime shows, and it regressed
+sharply with this round of changes: the same pipeline without the `?`/`catch`
+wrapping around `price_item` runs in ~180ms on this machine, so routing every
+item through one fallible call and one `catch` roughly *doubles* wall time even
+though the error branch is never taken. `?`/`catch` desugar to an ordinary
+`match` over the subject's union members (see `ERRORS.md` phase 5), so the
+"non-error path is free" property depends entirely on that match, and the
+`Int` member of `Int | PricingError` still has to go through boxed-union
+machinery meant for the general (`Str`/struct/list) case. Cheapening the
+all-primitive-members case of a union match is the next real perf target —
+before this change, the story was allocation:
 
 - **Inline heap access.** Reading a list element, reading or writing a variant
   payload slot, and appending to a list with spare capacity were each an
@@ -211,12 +280,10 @@ from a Cranelift backend. `orders` is where the runtime shows: it started at
   GC shadow frame; each one was a `Box`, so a `malloc`/`free` pair per call.
   Keeping them in a `Vec` took 242ms → 182ms.
 
-What's left is allocation: one `FrogVariant` per enum value, so this program
-mallocs ~4M times, and `malloc`/`free`/`memset` plus the mark phase are now
-about half its profile. Payload-less variants are already unboxed into
-immediates; unboxing variants *with* payloads — flattening them into
-tag-plus-fields slots the way structs already are, and boxing only what is
-recursive — is the next real win.
+Payload-less union members are already unboxed into immediates; unboxing
+members *with* payloads — flattening them into tag-plus-fields slots the way
+structs already are, and boxing only what is recursive — is still on the
+table too.
 
 ---
 
@@ -253,13 +320,19 @@ Roughly in priority order:
 
 ### Types and constructs
 
-- **Named struct and enum types** — `type Shape = Circle { r: Int } | Rect { w: Int, h: Int }`,
-  with field access and exhaustive `match`.
+- **Cheaper primitive-member union matches** — see the `orders` benchmark regression above;
+  `?`/`catch`/`is`/`match` on a union whose non-error member is `Int`/`Float`/`Bool` still
+  goes through the same boxed-union machinery as the `Str`/struct/list case.
+- **Flow narrowing and `Truthy`** — ERRORS.md phases 6-7: narrowing a union after an `is`
+  check without a full `match`, the `Truthy` trait for condition-position coercion, and
+  error return traces. `lower_match`'s guard-clause cloning also has a known exponential-size
+  bug to fix alongside phase 6.
 - **User-defined traits and impls** — `trait Foo { ... }`, `impl Foo for MyType`, and
-  explicit `T: Trait` bounds in function signatures.
-- **`Result` / `Option` built-ins** — sugar over union types, plus `?` propagation syntax.
-- **`match` expressions** — the primary way to consume `Union` types and destructure
-  enums.
+  explicit `T: Trait` bounds in function signatures. `Error` is currently the only
+  user-grantable trait, via `provides`.
+- **Qualified variant names in type position** — `ParseError.UnexpectedEof` isn't yet
+  spellable in a `TypeExpr` annotation, nor resolvable as an `is`/`match` pattern nested
+  inside a further anonymous union.
 
 ### Embedding
 

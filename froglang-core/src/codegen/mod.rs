@@ -8,7 +8,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::tokens::{Spanned, Token};
-use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
+use crate::frontend::typed_ast::{TypedExpr, TypedExprKind, TypedExprRef};
 use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
 use crate::runtime::{ffi, gc};
 use crate::runtime::gc::{FrogList, FrogVariant};
@@ -1192,421 +1192,12 @@ fn compile_expr_multi(
             }]
         },
 
-        TypedExprKind::Binary { op, left, right } => {
-            // ── String operations (must short-circuit before numeric path) ──
-            if left.item.ty == Type::Str {
-                let lv = compile_expr(left,  bcx, vars, ctx);
-                let rv = compile_expr(right, bcx, vars, ctx);
-                return vec![match op {
-                    Token::Plus => {
-                        let id     = ctx.func_ids["frog_str_concat"];
-                        let callee = ctx.module.declare_func_in_func(id, bcx.func);
-                        let call   = bcx.ins().call(callee, &[lv, rv]);
-                        let result = bcx.inst_results(call)[0];
-                        root_heap_value(bcx, ctx, result);
-                        result
-                    },
-                    Token::EqEq | Token::NotEq => {
-                        let id     = ctx.func_ids["frog_str_eq"];
-                        let callee = ctx.module.declare_func_in_func(id, bcx.func);
-                        let call   = bcx.ins().call(callee, &[lv, rv]);
-                        let result = bcx.inst_results(call)[0];
-                        if *op == Token::NotEq {
-                            let one   = bcx.ins().iconst(types::I64, 1);
-                            let xored = bcx.ins().bxor(result, one);
-                            bcx.ins().ireduce(types::I8, xored)
-                        } else {
-                            bcx.ins().ireduce(types::I8, result)
-                        }
-                    },
-                    Token::Lt | Token::Gt | Token::LtEq | Token::GtEq => {
-                        let id     = ctx.func_ids["frog_str_cmp"];
-                        let callee = ctx.module.declare_func_in_func(id, bcx.func);
-                        let call   = bcx.ins().call(callee, &[lv, rv]);
-                        let cmp    = bcx.inst_results(call)[0];
-                        let zero   = bcx.ins().iconst(types::I64, 0);
-                        let cc = match op {
-                            Token::Lt   => IntCC::SignedLessThan,
-                            Token::Gt   => IntCC::SignedGreaterThan,
-                            Token::LtEq => IntCC::SignedLessThanOrEqual,
-                            Token::GtEq => IntCC::SignedGreaterThanOrEqual,
-                            _ => unreachable!(),
-                        };
-                        bcx.ins().icmp(cc, cmp, zero)
-                    },
-                    _ => unimplemented!("string binary op {:?}", op),
-                }];
-            }
+        TypedExprKind::Binary { op, left, right } => compile_binary(op, left, right, bcx, vars, ctx),
 
-            // ── Logical and/or (must short-circuit — `right` can have side
-            // effects, e.g. `print`, and must not run when `left` already
-            // decides the result) ────────────────────────────────────────
-            if *op == Token::And || *op == Token::Or {
-                let lv = compile_expr(left, bcx, vars, ctx);
+        TypedExprKind::Conditional { cond, true_branch, false_branch } =>
+            compile_conditional(expr, cond, true_branch, false_branch, bcx, vars, ctx),
 
-                let rhs_bb   = bcx.create_block();
-                let merge_bb = bcx.create_block();
-                bcx.append_block_param(merge_bb, types::I8);
-
-                if *op == Token::And {
-                    // `false and right` == false, without evaluating `right`.
-                    let zero = bcx.ins().iconst(types::I8, 0);
-                    bcx.ins().brif(lv, rhs_bb, &[], merge_bb, &[zero]);
-                } else {
-                    // `true or right` == true, without evaluating `right`.
-                    let one = bcx.ins().iconst(types::I8, 1);
-                    bcx.ins().brif(lv, merge_bb, &[one], rhs_bb, &[]);
-                }
-
-                bcx.switch_to_block(rhs_bb);
-                bcx.seal_block(rhs_bb);
-                let rv = compile_expr(right, bcx, vars, ctx);
-                bcx.ins().jump(merge_bb, &[rv]);
-
-                bcx.switch_to_block(merge_bb);
-                bcx.seal_block(merge_bb);
-                return vec![bcx.block_params(merge_bb)[0]];
-            }
-
-            // ── Numeric operations ──────────────────────────────────────────
-            let lv = compile_expr(left,  bcx, vars, ctx);
-            let rv = compile_expr(right, bcx, vars, ctx);
-            let op_ty = numeric_join(&left.item.ty, &right.item.ty).unwrap_or_else(|| left.item.ty.clone());
-            let lv = coerce_value(lv, &left.item.ty, &op_ty, bcx);
-            let rv = coerce_value(rv, &right.item.ty, &op_ty, bcx);
-            let is_float = op_ty == Type::Float;
-            vec![match op {
-                Token::Plus  => if is_float { bcx.ins().fadd(lv, rv) } else { bcx.ins().iadd(lv, rv) },
-                Token::Minus => if is_float { bcx.ins().fsub(lv, rv) } else { bcx.ins().isub(lv, rv) },
-                Token::Star  => if is_float { bcx.ins().fmul(lv, rv) } else { bcx.ins().imul(lv, rv) },
-                Token::Slash => if is_float {
-                    // IEEE division never faults — x/0.0 is ±inf, 0.0/0.0 is
-                    // NaN — so no guard here, only on the integer path.
-                    bcx.ins().fdiv(lv, rv)
-                } else {
-                    emit_int_div_guard(bcx, ctx, lv, rv);
-                    bcx.ins().sdiv(lv, rv)
-                },
-                Token::EqEq  => if is_float { bcx.ins().fcmp(FloatCC::Equal,               lv, rv) } else { bcx.ins().icmp(IntCC::Equal,                    lv, rv) },
-                Token::NotEq => if is_float { bcx.ins().fcmp(FloatCC::NotEqual,            lv, rv) } else { bcx.ins().icmp(IntCC::NotEqual,                 lv, rv) },
-                Token::Lt    => if is_float { bcx.ins().fcmp(FloatCC::LessThan,            lv, rv) } else { bcx.ins().icmp(IntCC::SignedLessThan,            lv, rv) },
-                Token::Gt    => if is_float { bcx.ins().fcmp(FloatCC::GreaterThan,         lv, rv) } else { bcx.ins().icmp(IntCC::SignedGreaterThan,         lv, rv) },
-                Token::LtEq  => if is_float { bcx.ins().fcmp(FloatCC::LessThanOrEqual,    lv, rv) } else { bcx.ins().icmp(IntCC::SignedLessThanOrEqual,     lv, rv) },
-                Token::GtEq  => if is_float { bcx.ins().fcmp(FloatCC::GreaterThanOrEqual,  lv, rv) } else { bcx.ins().icmp(IntCC::SignedGreaterThanOrEqual,  lv, rv) },
-                // Token::And/Or are handled above, before `rv` is computed,
-                // so they short-circuit — they never reach this match.
-                _ => unimplemented!("binary op {:?}", op),
-            }]
-        },
-
-        TypedExprKind::Conditional { cond, true_branch, false_branch } => {
-            let cond_val = compile_expr(cond, bcx, vars, ctx);
-
-            let true_bb  = bcx.create_block();
-            let false_bb = bcx.create_block();
-            let merge_bb = bcx.create_block();
-
-            // `expr.item.ty == Never` means *both* branches terminate
-            // (each is itself `Never`-typed, or — a match's "missing tail"
-            // default, see `lower_match` — is absent and stands for
-            // provably-unreachable code; the type system only ever unifies
-            // to `Never` when every contributing side is `Never`, so this
-            // is inductive, not an assumption). `?`/`!`'s match desugaring
-            // (`ERRORS.md` Phase 5) is the first thing that actually builds
-            // this shape at codegen — every arm before it always paired a
-            // `Never` branch with a real value on the other side. Since
-            // nothing downstream of this conditional is ever reachable,
-            // `merge_bb` gets no value and no param; each branch supplies
-            // its own terminator (`return_`/a nested `Never` conditional's
-            // own trap, or a `Never`-returning `Call` — e.g. `panic` — own
-            // trap), or — the "missing tail" case — a `trap` here.
-            // `merge_bb` itself is simply never reached and stays
-            // unlaid-out.
-            if expr.item.ty == Type::Never {
-                bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
-
-                bcx.switch_to_block(true_bb);
-                bcx.seal_block(true_bb);
-                compile_expr_multi(true_branch, bcx, vars, ctx);
-                if true_branch.item.ty != Type::Never {
-                    bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
-                }
-
-                bcx.switch_to_block(false_bb);
-                bcx.seal_block(false_bb);
-                match false_branch {
-                    Some(fb) => {
-                        compile_expr_multi(fb, bcx, vars, ctx);
-                        if fb.item.ty != Type::Never {
-                            bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
-                        }
-                    }
-                    None => { bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code")); }
-                }
-
-                // Every path above already ended in a terminator (a nested
-                // `Never` conditional's own trap, `return_`, or the `trap`
-                // just emitted) — this conditional itself is `Never`-typed,
-                // so it might be the tail of its enclosing function body
-                // (`build_func_body`'s own tail `return_`/`teardown_shadow_frame`
-                // would otherwise try to append to an already-filled
-                // block), or nested inside a `Block`/another `Conditional`
-                // that keeps building after it. Either way it needs a
-                // fresh block to land in — see `Return`'s codegen.
-                let dead = bcx.create_block();
-                bcx.switch_to_block(dead);
-                bcx.seal_block(dead);
-                return Vec::new();
-            }
-
-            let has_value = expr.item.ty != Type::None;
-            // Struct-typed *and* two-slot-union-typed results both need the
-            // K-block-param merge below — see `is_multi_leaf_type`.
-            let is_multi = is_multi_leaf_type(&expr.item.ty);
-
-            if !is_multi {
-                // ── scalar path, unchanged from before structs existed ──
-                let result_ty = cl_type(&expr.item.ty);
-                if has_value {
-                    bcx.append_block_param(merge_bb, result_ty);
-                }
-
-                bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
-
-                bcx.switch_to_block(true_bb);
-                bcx.seal_block(true_bb);
-                // `compile_expr_multi`, not `compile_expr` — a `Never`-typed
-                // branch (a `return`) yields zero values, which the
-                // single-value wrapper's assertion would reject; every other
-                // scalar branch still yields exactly one, unpacked below.
-                let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
-                // A `Never`-typed branch has already emitted its own
-                // terminator — jumping to `merge_bb` on top of that would
-                // be a second terminator in the same block, which
-                // Cranelift rejects. Every other branch shape reaches here
-                // normally and joins as before.
-                if true_branch.item.ty != Type::Never {
-                    if has_value {
-                        let tv = ensure_width(tv[0], &true_branch.item.ty, result_ty, bcx);
-                        bcx.ins().jump(merge_bb, &[tv]);
-                    } else {
-                        bcx.ins().jump(merge_bb, &[]);
-                    }
-                }
-
-                bcx.switch_to_block(false_bb);
-                bcx.seal_block(false_bb);
-                if let Some(fb) = false_branch {
-                    let fv = compile_expr_multi(fb, bcx, vars, ctx);
-                    if fb.item.ty != Type::Never {
-                        if has_value {
-                            let fv = ensure_width(fv[0], &fb.item.ty, result_ty, bcx);
-                            bcx.ins().jump(merge_bb, &[fv]);
-                        } else {
-                            bcx.ins().jump(merge_bb, &[]);
-                        }
-                    }
-                } else if has_value {
-                    let fv = bcx.ins().iconst(result_ty, 0);
-                    bcx.ins().jump(merge_bb, &[fv]);
-                } else {
-                    bcx.ins().jump(merge_bb, &[]);
-                }
-
-                bcx.switch_to_block(merge_bb);
-                bcx.seal_block(merge_bb);
-
-                if has_value {
-                    vec![bcx.block_params(merge_bb)[0]]
-                } else {
-                    vec![bcx.ins().iconst(types::I64, 0)]
-                }
-            } else {
-                // ── multi-leaf path: K block params, one per leaf field
-                // (`struct_fields`). Struct unification is nominal/exact,
-                // so both branches' leaf types are identical to expr's own;
-                // a two-slot union's branches instead each carry their own
-                // `Widen`, inserted by typeck at the join (see
-                // `TypeChecker::lower_widen`), so this is still just value
-                // plumbing — no new rooting decision happens here.
-                let leafs = struct_fields(&expr.item.ty, ctx.structs);
-                let param_tys: Vec<types::Type> = leafs.iter().map(|(_, t)| cl_type(t)).collect();
-                for t in &param_tys { bcx.append_block_param(merge_bb, *t); }
-
-                bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
-
-                bcx.switch_to_block(true_bb);
-                bcx.seal_block(true_bb);
-                let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
-                // See the scalar path above for why a `Never`-typed branch
-                // must not also jump — it already terminated itself.
-                if true_branch.item.ty != Type::Never {
-                    bcx.ins().jump(merge_bb, &tv);
-                }
-
-                bcx.switch_to_block(false_bb);
-                bcx.seal_block(false_bb);
-                match false_branch {
-                    Some(fb) => {
-                        let fv = compile_expr_multi(fb, bcx, vars, ctx);
-                        if fb.item.ty != Type::Never {
-                            bcx.ins().jump(merge_bb, &fv);
-                        }
-                    }
-                    None => {
-                        let fv: Vec<Value> = param_tys.iter().map(|&t| placeholder_value(bcx, t)).collect();
-                        bcx.ins().jump(merge_bb, &fv);
-                    }
-                };
-
-                bcx.switch_to_block(merge_bb);
-                bcx.seal_block(merge_bb);
-                bcx.block_params(merge_bb).to_vec()
-            }
-        },
-
-        TypedExprKind::Call { callable, args } => {
-            let func_name = match &callable.item.kind {
-                TypedExprKind::Var(name) => name.clone(),
-                _ => panic!("only named function calls supported in codegen"),
-            };
-
-            // `print` accepts values of any type.  Its runtime entry
-            // point is selected here, after type checking has established the
-            // concrete argument type, so no invalid Str coercion is emitted.
-            if func_name == "print" {
-                let arg = &args[0];
-                if arg.item.ty == Type::Never {
-                    // `print`'s builtin signature has no declared param
-                    // type, so typeck doesn't reject a `Never` argument
-                    // (e.g. `print(panic("x"))`) the way it would for an
-                    // ordinary function call. Compile the arg for its
-                    // trapping side effect via `compile_expr_multi` (not
-                    // `compile_expr`, which asserts against multi-valued/
-                    // zero-valued exprs) and propagate `Never` outward.
-                    let vals = compile_expr_multi(arg, bcx, vars, ctx);
-                    debug_assert!(vals.is_empty(), "Never-typed expr produced values");
-                    return Vec::new();
-                }
-                if matches!(&arg.item.ty, Type::Struct(_)) {
-                    let values = compile_expr_multi(arg, bcx, vars, ctx);
-                    let mut cursor = 0;
-                    print_value(&arg.item.ty, &values, &mut cursor, bcx, ctx);
-                    print_fragment("\n", bcx, ctx);
-                    return vec![bcx.ins().iconst(types::I64, 0)];
-                }
-                if let Type::Union(members) = &arg.item.ty {
-                    // Unlike the `Struct` case above, `print_value` can't
-                    // just walk a union's flattened leaves — which
-                    // member's leaves they even *are* is a runtime fact
-                    // (the tag), whether it's a one-slot boxed union (a
-                    // nominal `data ... is A | B`, represented as an
-                    // anonymous `Union` of its variant structs) or a
-                    // two-slot union with a scalar member. Dispatch on the
-                    // tag at runtime (mirroring what `match`'s `TypeTag`/
-                    // `Narrow` desugaring does for user code) and print
-                    // whichever member matched.
-                    let values = compile_expr_multi(arg, bcx, vars, ctx);
-                    print_union(members, &values, bcx, ctx);
-                    print_fragment("\n", bcx, ctx);
-                    return vec![bcx.ins().iconst(types::I64, 0)];
-                }
-                let arg_val = compile_expr(arg, bcx, vars, ctx);
-                let (rt_name, extra_arg) = match &arg.item.ty {
-                    Type::Str => ("print", None),
-                    Type::Int => ("frog_int_println", None),
-                    Type::Float => ("frog_float_println", None),
-                    Type::Bool => ("frog_bool_println", None),
-                    Type::List(inner) => ("frog_list_println", Some(list_elem_kind(inner))),
-                    ty => panic!("print codegen does not support {:?}", ty),
-                };
-                let func_id = ctx.func_ids[rt_name];
-                let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
-                if let Some(kind) = extra_arg {
-                    let kind = bcx.ins().iconst(types::I64, kind);
-                    bcx.ins().call(callee, &[arg_val, kind]);
-                } else {
-                    bcx.ins().call(callee, &[arg_val]);
-                }
-                return vec![bcx.ins().iconst(types::I64, 0)];
-            }
-
-            let func_id = ctx.func_ids[&func_name];
-            let local_callee = ctx.module.declare_func_in_func(func_id, bcx.func);
-
-            let param_types: Vec<Type> = match &callable.item.ty {
-                Type::Function { params, .. } => params.clone(),
-                _ => vec![],
-            };
-            let return_ty: Type = match &callable.item.ty {
-                Type::Function { result, .. } => *result.clone(),
-                _ => Type::Int,
-            };
-
-            let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
-            for (i, a) in args.iter().enumerate() {
-                if is_multi_leaf_type(&a.item.ty) {
-                    // Struct args are never widened (nominal/exact match),
-                    // and a two-slot-union arg is already the exact target
-                    // union type by the time codegen sees it (widening
-                    // happens earlier, at the `Widen` node itself) — either
-                    // way, flatten straight into the call's arg list, in
-                    // the same K-`AbiParam`-per-arg order `make_sig` uses.
-                    arg_vals.extend(compile_expr_multi(a, bcx, vars, ctx));
-                } else {
-                    let mut v = compile_expr(a, bcx, vars, ctx);
-                    if let Some(param_ty) = param_types.get(i) {
-                        v = coerce_value(v, &a.item.ty, param_ty, bcx);
-                    }
-                    arg_vals.push(v);
-                }
-            }
-
-            let call = bcx.ins().call(local_callee, &arg_vals);
-            if return_ty == Type::Never {
-                // The callee never actually hands control back here —
-                // either it's `panic` (its FFI print call genuinely does
-                // return, so this `trap` is what actually stops execution
-                // — see `default_context`'s registration and
-                // `declare_rt`'s `"panic"` alias) or a user-declared
-                // `: Never` function, whose own tail can only ever be
-                // reached on a dead block (`build_func_body`'s Never-body
-                // handling), so it never really falls through to return
-                // control either — the trap is dead code there, but keeps
-                // this block's IR well-formed regardless. Mirrors
-                // `Conditional`'s own `Type::Never` codegen path exactly.
-                bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
-                let dead = bcx.create_block();
-                bcx.switch_to_block(dead);
-                bcx.seal_block(dead);
-                return Vec::new();
-            }
-            if return_ty == Type::None {
-                vec![bcx.ins().iconst(types::I64, 0)]
-            } else if is_multi_leaf_type(&return_ty) {
-                // Each heap-producing leaf of a struct return, or a
-                // two-slot union return (`is_two_slot_union`), crosses the
-                // ABI boundary as a bare register value — the callee's own
-                // shadow frame (which rooted it during its own execution)
-                // is already popped by the time we get here, so it must be
-                // re-rooted into *this* function's frame immediately,
-                // exactly like the scalar Str/List case below. A two-slot
-                // union's payload leaf is only *sometimes* a pointer — the
-                // caller has no static way to know which member the callee
-                // actually returned — so `root_flat_leaves` roots it behind
-                // a runtime tag comparison rather than unconditionally.
-                let results = bcx.inst_results(call).to_vec();
-                let leafs = struct_fields(&return_ty, ctx.structs);
-                root_flat_leaves(bcx, ctx, &results, &leafs);
-                results
-            } else {
-                let result = bcx.inst_results(call)[0];
-                if is_heap_ty(&return_ty) {
-                    root_heap_value(bcx, ctx, result);
-                }
-                vec![result]
-            }
-        },
+        TypedExprKind::Call { callable, args } => compile_call(callable, args, bcx, vars, ctx),
 
         TypedExprKind::Index { target, index } => {
             let list_val = compile_expr(target, bcx, vars, ctx);
@@ -1690,54 +1281,7 @@ fn compile_expr_multi(
             vec![bcx.ins().iconst(types::I64, 0)]
         },
 
-        TypedExprKind::List(elems) => {
-            let elem_ty = match &expr.item.ty {
-                Type::List(inner) => (**inner).clone(),
-                _ => Type::Int,
-            };
-            let leafs = struct_fields(&elem_ty, ctx.structs);
-            assert_no_two_slot_union_leaf(leafs.iter().map(|(_, t)| t), "a list element type");
-            let stride = (leafs.len().max(1)) as i64;
-            let mut ptr_mask: i64 = 0;
-            for (i, (_, lty)) in leafs.iter().enumerate() {
-                if is_heap_ty(lty) { ptr_mask |= 1i64 << i; }
-            }
-
-            let n = elems.len() as i64;
-            let cap_val    = bcx.ins().iconst(types::I64, n.max(1));
-            let stride_val = bcx.ins().iconst(types::I64, stride);
-            let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
-
-            let alloc_id = ctx.func_ids["frog_alloc_list"];
-            let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
-            let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, stride_val, mask_val]);
-            let list_ptr = bcx.inst_results(alloc_call)[0];
-            // Root the list itself *before* compiling its elements: an
-            // element expression (e.g. a Str) can allocate and trigger a
-            // collection, and the list must already be reachable by then.
-            root_heap_value(bcx, ctx, list_ptr);
-
-            for elem in elems {
-                // A struct element compiles to `leafs.len()` values, pushed
-                // back-to-back — matching `stride` exactly is what makes the
-                // list's flat backing store self-describing (see FrogList's
-                // doc comment in runtime/gc.rs).
-                let evs = compile_expr_multi(elem, bcx, vars, ctx);
-                for (ev, (_, lty)) in evs.iter().zip(leafs.iter()) {
-                    // The list's backing store is a flat i64 buffer (see
-                    // FrogList in runtime/gc.rs); Float and Bool elements need
-                    // the same bitcast/zero-extend conversion applied to every
-                    // other i64-wire-format value (see to_i64_repr). Without
-                    // this, pushing an F64 or I8 SSA value into an i64-typed
-                    // call argument is a Cranelift type mismatch — a "Verifier
-                    // errors" panic, not a bug in the pushed value itself.
-                    let ev = to_i64_repr(bcx, lty, *ev);
-                    emit_list_push(bcx, ctx, list_ptr, ev);
-                }
-            }
-
-            vec![list_ptr]
-        },
+        TypedExprKind::List(elems) => compile_list_lit(&expr.item.ty, elems, bcx, vars, ctx),
 
         TypedExprKind::ForLoop { var, iterable, cond, body } => {
             compile_for_loop(var, iterable, cond, body, None, bcx, vars, ctx);
@@ -1816,30 +1360,7 @@ fn compile_expr_multi(
             vec![bcx.ins().iconst(types::I64, 0)]
         },
 
-        TypedExprKind::VariantInit { fields, tag, .. } => {
-            // A variant with no fields at all — neither its own nor common
-            // ones its enum declares — carries no information beyond its
-            // tag, so it needs no heap object: emit the tag as an unboxed
-            // immediate. `fields` is the enum's common fields followed by
-            // this variant's own (see `check_and_lower`'s variant-call arm),
-            // so it being empty is exactly the "nothing to store" test.
-            // See gc.rs's "Immediate (unboxed) values" for the encoding and
-            // why the GC can tell the two apart.
-            if fields.is_empty() {
-                return vec![bcx.ins().iconst(types::I64, gc::immediate_variant(*tag))];
-            }
-
-            // Compute every field's flattened leaf values first (mirrors
-            // `StructInit` exactly) — each heap-typed leaf among them
-            // roots itself already, via its own producer's codegen.
-            let mut flat_vals: Vec<Value> = Vec::new();
-            let mut flat_types: Vec<Type> = Vec::new();
-            for (_, v) in fields {
-                flat_vals.extend(compile_expr_multi(v, bcx, vars, ctx));
-                flat_types.extend(struct_fields(&v.item.ty, ctx.structs).into_iter().map(|(_, t)| t));
-            }
-            vec![box_into_variant(*tag, &flat_vals, &flat_types, bcx, ctx)]
-        },
+        TypedExprKind::VariantInit { fields, tag, .. } => compile_variant_init(fields, *tag, bcx, vars, ctx),
 
         TypedExprKind::IsVariant { target, enum_name, tag, .. } => {
             let val = compile_expr(target, bcx, vars, ctx);
@@ -1853,119 +1374,13 @@ fn compile_expr_multi(
             read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
         },
 
-        TypedExprKind::Return(value) => {
-            let results = match value {
-                Some(v) => compile_expr_multi(v, bcx, vars, ctx),
-                None => Vec::new(),
-            };
-            // Every path out of the function pops the shadow frame first —
-            // this is an *early* exit, so it must do the same thing
-            // `build_func_body`'s own tail `return_` does, not skip it.
-            teardown_shadow_frame(bcx, ctx.module, ctx.func_ids, ctx.heap_slot);
-            bcx.ins().return_(&results);
-            // Cranelift requires every block to end in exactly one
-            // terminator, and `return_` is one — so whatever IR follows
-            // this `Return` in the source (there is always some: it sits
-            // inside a `Block`/`Conditional` whose caller keeps building)
-            // needs a fresh block to land in. Nothing ever jumps to it —
-            // the branch/block that contains an unconditional `return`
-            // has `Type::Never`, and the `Conditional` join (below) checks
-            // for exactly that to skip emitting the jump — so this block
-            // is genuinely unreachable, which Cranelift's verifier permits
-            // as long as it's syntactically well-formed.
-            let dead = bcx.create_block();
-            bcx.switch_to_block(dead);
-            bcx.seal_block(dead);
-            Vec::new()
-        },
+        TypedExprKind::Return(value) => compile_return(value, bcx, vars, ctx),
 
         TypedExprKind::NoneLit => vec![bcx.ins().iconst(types::I64, 1)],
 
-        TypedExprKind::Widen { value, tag } => {
-            let two_slot_members = match &expr.item.ty {
-                Type::Union(members) if is_two_slot_union(members) => Some(members),
-                _ => None,
-            };
-            if let Some(_members) = two_slot_members {
-                // This union has a scalar member (`is_two_slot_union`), so
-                // it carries its tag in its own register instead of a
-                // boxed `FrogVariant` header — see `struct_fields`'s
-                // two-slot `Union` arm. A scalar/`None` `value` then never
-                // needs `box_into_variant` at all: it rides in the payload
-                // register directly, no allocation.
-                let tag_val = bcx.ins().iconst(types::I64, *tag as i64);
-                if matches!(value.item.ty, Type::Int | Type::Float | Type::Bool | Type::None) {
-                    let vals = compile_expr_multi(value, bcx, vars, ctx);
-                    let payload = if value.item.ty == Type::None {
-                        bcx.ins().iconst(types::I64, 0)
-                    } else {
-                        to_i64_repr(bcx, &value.item.ty, vals[0])
-                    };
-                    vec![tag_val, payload]
-                } else {
-                    // A boxed member (Str/List/struct/nested union): box
-                    // exactly as before, the tag just also rides alongside
-                    // in its own register now.
-                    let flat_vals = compile_expr_multi(value, bcx, vars, ctx);
-                    let flat_types: Vec<Type> = struct_fields(&value.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
-                    let ptr = box_into_variant(*tag, &flat_vals, &flat_types, bcx, ctx);
-                    vec![tag_val, ptr]
-                }
-            } else if value.item.ty == Type::None {
-                // `None`'s own compiled form (the generic immediate `1` —
-                // see `TypedExprKind::NoneLit`) isn't reused directly: this
-                // union's own sorted member list may place `None` at a
-                // different tag than `NoneLit`'s own site-independent
-                // encoding, so it's re-encoded with *this* union's tag.
-                // Still compile `value` first for any side effects (none
-                // today, but `Widen` shouldn't assume that).
-                let _ = compile_expr_multi(value, bcx, vars, ctx);
-                vec![bcx.ins().iconst(types::I64, gc::immediate_variant(*tag))]
-            } else {
-                // Box `value` — a scalar or a plain struct — into a
-                // `FrogVariant`-shaped cell the same way a nominal union's
-                // non-nullary member already is. See `box_into_variant`.
-                let flat_vals = compile_expr_multi(value, bcx, vars, ctx);
-                let flat_types: Vec<Type> = struct_fields(&value.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
-                vec![box_into_variant(*tag, &flat_vals, &flat_types, bcx, ctx)]
-            }
-        },
+        TypedExprKind::Widen { value, tag } => compile_widen(&expr.item.ty, value, *tag, bcx, vars, ctx),
 
-        TypedExprKind::Narrow { value, .. } => {
-            let src_two_slot = matches!(&value.item.ty, Type::Union(members) if is_two_slot_union(members));
-            if src_two_slot {
-                // The source union carries its tag in its own register (see
-                // `struct_fields`'s two-slot `Union` arm) — the caller
-                // already knows (from a preceding `TypeTag`) which member
-                // this is, so only the payload leaf (`vals[1]`) matters
-                // here. A scalar target reads it directly, no dereference
-                // at all; a boxed target dereferences it exactly as the
-                // one-slot case below does.
-                let vals = compile_expr_multi(value, bcx, vars, ctx);
-                let payload = vals[1];
-                if expr.item.ty == Type::None {
-                    vec![bcx.ins().iconst(types::I64, 0)]
-                } else if matches!(&expr.item.ty, Type::Int | Type::Float | Type::Bool) {
-                    vec![from_i64_repr(bcx, &expr.item.ty, payload)]
-                } else {
-                    let leaf_types: Vec<Type> = struct_fields(&expr.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
-                    read_variant_slots(payload, 0, &leaf_types, bcx, ctx)
-                }
-            } else if expr.item.ty == Type::None {
-                // `value` here is an immediate, not a pointer — `None` has
-                // no payload to unbox, and the caller already knows (from
-                // a preceding `TypeTag`) which member this is. A single
-                // dummy slot keeps this consistent with every other
-                // member's arity (`struct_fields`'s generic 1-leaf
-                // fallback for a non-struct type).
-                let _ = compile_expr(value, bcx, vars, ctx);
-                vec![bcx.ins().iconst(types::I64, 0)]
-            } else {
-                let ptr = compile_expr(value, bcx, vars, ctx);
-                let leaf_types: Vec<Type> = struct_fields(&expr.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
-                read_variant_slots(ptr, 0, &leaf_types, bcx, ctx)
-            }
-        },
+        TypedExprKind::Narrow { value, .. } => compile_narrow(&expr.item.ty, value, bcx, vars, ctx),
 
         TypedExprKind::TypeTag { target, tag } => {
             let members = match &target.item.ty {
@@ -1999,40 +1414,661 @@ fn compile_expr_multi(
             vec![coerce_value(v, &value.item.ty, &expr.item.ty, bcx)]
         },
 
-        TypedExprKind::Truthy(value) => {
-            let v = compile_expr(value, bcx, vars, ctx);
-            let truthy = match &value.item.ty {
-                Type::Int => {
-                    let zero = bcx.ins().iconst(types::I64, 0);
-                    bcx.ins().icmp(IntCC::NotEqual, v, zero)
-                },
-                Type::Float => {
-                    let zero = bcx.ins().f64const(0.0);
-                    bcx.ins().fcmp(FloatCC::NotEqual, v, zero)
-                },
-                // `None` is the immediate `1`, always falsey.
-                Type::None => bcx.ins().iconst(types::I8, 0),
-                Type::Str => {
-                    let id     = ctx.func_ids["frog_str_len"];
-                    let callee = ctx.module.declare_func_in_func(id, bcx.func);
-                    let call   = bcx.ins().call(callee, &[v]);
-                    let len    = bcx.inst_results(call)[0];
-                    let zero   = bcx.ins().iconst(types::I64, 0);
-                    bcx.ins().icmp(IntCC::NotEqual, len, zero)
-                },
-                Type::List(_) => {
-                    let id     = ctx.func_ids["frog_list_len"];
-                    let callee = ctx.module.declare_func_in_func(id, bcx.func);
-                    let call   = bcx.ins().call(callee, &[v]);
-                    let len    = bcx.inst_results(call)[0];
-                    let zero   = bcx.ins().iconst(types::I64, 0);
-                    bcx.ins().icmp(IntCC::NotEqual, len, zero)
-                },
-                other => unreachable!("Truthy on non-Truthy type {}", other),
-            };
-            vec![truthy]
-        },
+        TypedExprKind::Truthy(value) => compile_truthy(value, bcx, vars, ctx),
     }
+}
+
+fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    // ── String operations (must short-circuit before numeric path) ──
+    if left.item.ty == Type::Str {
+        let lv = compile_expr(left,  bcx, vars, ctx);
+        let rv = compile_expr(right, bcx, vars, ctx);
+        return vec![match op {
+            Token::Plus => {
+                let id     = ctx.func_ids["frog_str_concat"];
+                let callee = ctx.module.declare_func_in_func(id, bcx.func);
+                let call   = bcx.ins().call(callee, &[lv, rv]);
+                let result = bcx.inst_results(call)[0];
+                root_heap_value(bcx, ctx, result);
+                result
+            },
+            Token::EqEq | Token::NotEq => {
+                let id     = ctx.func_ids["frog_str_eq"];
+                let callee = ctx.module.declare_func_in_func(id, bcx.func);
+                let call   = bcx.ins().call(callee, &[lv, rv]);
+                let result = bcx.inst_results(call)[0];
+                if *op == Token::NotEq {
+                    let one   = bcx.ins().iconst(types::I64, 1);
+                    let xored = bcx.ins().bxor(result, one);
+                    bcx.ins().ireduce(types::I8, xored)
+                } else {
+                    bcx.ins().ireduce(types::I8, result)
+                }
+            },
+            Token::Lt | Token::Gt | Token::LtEq | Token::GtEq => {
+                let id     = ctx.func_ids["frog_str_cmp"];
+                let callee = ctx.module.declare_func_in_func(id, bcx.func);
+                let call   = bcx.ins().call(callee, &[lv, rv]);
+                let cmp    = bcx.inst_results(call)[0];
+                let zero   = bcx.ins().iconst(types::I64, 0);
+                let cc = match op {
+                    Token::Lt   => IntCC::SignedLessThan,
+                    Token::Gt   => IntCC::SignedGreaterThan,
+                    Token::LtEq => IntCC::SignedLessThanOrEqual,
+                    Token::GtEq => IntCC::SignedGreaterThanOrEqual,
+                    _ => unreachable!(),
+                };
+                bcx.ins().icmp(cc, cmp, zero)
+            },
+            _ => unimplemented!("string binary op {:?}", op),
+        }];
+    }
+
+    // ── Logical and/or (must short-circuit — `right` can have side
+    // effects, e.g. `print`, and must not run when `left` already
+    // decides the result) ────────────────────────────────────────
+    if *op == Token::And || *op == Token::Or {
+        let lv = compile_expr(left, bcx, vars, ctx);
+
+        let rhs_bb   = bcx.create_block();
+        let merge_bb = bcx.create_block();
+        bcx.append_block_param(merge_bb, types::I8);
+
+        if *op == Token::And {
+            // `false and right` == false, without evaluating `right`.
+            let zero = bcx.ins().iconst(types::I8, 0);
+            bcx.ins().brif(lv, rhs_bb, &[], merge_bb, &[zero]);
+        } else {
+            // `true or right` == true, without evaluating `right`.
+            let one = bcx.ins().iconst(types::I8, 1);
+            bcx.ins().brif(lv, merge_bb, &[one], rhs_bb, &[]);
+        }
+
+        bcx.switch_to_block(rhs_bb);
+        bcx.seal_block(rhs_bb);
+        let rv = compile_expr(right, bcx, vars, ctx);
+        bcx.ins().jump(merge_bb, &[rv]);
+
+        bcx.switch_to_block(merge_bb);
+        bcx.seal_block(merge_bb);
+        return vec![bcx.block_params(merge_bb)[0]];
+    }
+
+    // ── Numeric operations ──────────────────────────────────────────
+    let lv = compile_expr(left,  bcx, vars, ctx);
+    let rv = compile_expr(right, bcx, vars, ctx);
+    let op_ty = numeric_join(&left.item.ty, &right.item.ty).unwrap_or_else(|| left.item.ty.clone());
+    let lv = coerce_value(lv, &left.item.ty, &op_ty, bcx);
+    let rv = coerce_value(rv, &right.item.ty, &op_ty, bcx);
+    let is_float = op_ty == Type::Float;
+    vec![match op {
+        Token::Plus  => if is_float { bcx.ins().fadd(lv, rv) } else { bcx.ins().iadd(lv, rv) },
+        Token::Minus => if is_float { bcx.ins().fsub(lv, rv) } else { bcx.ins().isub(lv, rv) },
+        Token::Star  => if is_float { bcx.ins().fmul(lv, rv) } else { bcx.ins().imul(lv, rv) },
+        Token::Slash => if is_float {
+            // IEEE division never faults — x/0.0 is ±inf, 0.0/0.0 is
+            // NaN — so no guard here, only on the integer path.
+            bcx.ins().fdiv(lv, rv)
+        } else {
+            emit_int_div_guard(bcx, ctx, lv, rv);
+            bcx.ins().sdiv(lv, rv)
+        },
+        Token::EqEq  => if is_float { bcx.ins().fcmp(FloatCC::Equal,               lv, rv) } else { bcx.ins().icmp(IntCC::Equal,                    lv, rv) },
+        Token::NotEq => if is_float { bcx.ins().fcmp(FloatCC::NotEqual,            lv, rv) } else { bcx.ins().icmp(IntCC::NotEqual,                 lv, rv) },
+        Token::Lt    => if is_float { bcx.ins().fcmp(FloatCC::LessThan,            lv, rv) } else { bcx.ins().icmp(IntCC::SignedLessThan,            lv, rv) },
+        Token::Gt    => if is_float { bcx.ins().fcmp(FloatCC::GreaterThan,         lv, rv) } else { bcx.ins().icmp(IntCC::SignedGreaterThan,         lv, rv) },
+        Token::LtEq  => if is_float { bcx.ins().fcmp(FloatCC::LessThanOrEqual,    lv, rv) } else { bcx.ins().icmp(IntCC::SignedLessThanOrEqual,     lv, rv) },
+        Token::GtEq  => if is_float { bcx.ins().fcmp(FloatCC::GreaterThanOrEqual,  lv, rv) } else { bcx.ins().icmp(IntCC::SignedGreaterThanOrEqual,  lv, rv) },
+        // Token::And/Or are handled above, before `rv` is computed,
+        // so they short-circuit — they never reach this match.
+        _ => unimplemented!("binary op {:?}", op),
+    }]
+}
+
+/// `TypedExprKind::Conditional`'s codegen — `expr` is the whole conditional
+/// node (needed for `expr.item.ty`, both to pick the `Never`/scalar/
+/// multi-leaf join shape and, in the multi-leaf case, to lay out
+/// `merge_bb`'s block params via `struct_fields`).
+fn compile_conditional(
+    expr: &Spanned<TypedExpr>,
+    cond: &Spanned<TypedExpr>,
+    true_branch: &Spanned<TypedExpr>,
+    false_branch: &Option<TypedExprRef>,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> Vec<Value> {
+    let cond_val = compile_expr(cond, bcx, vars, ctx);
+
+    let true_bb  = bcx.create_block();
+    let false_bb = bcx.create_block();
+    let merge_bb = bcx.create_block();
+
+    // `expr.item.ty == Never` means *both* branches terminate
+    // (each is itself `Never`-typed, or — a match's "missing tail"
+    // default, see `lower_match` — is absent and stands for
+    // provably-unreachable code; the type system only ever unifies
+    // to `Never` when every contributing side is `Never`, so this
+    // is inductive, not an assumption). `?`/`!`'s match desugaring
+    // (`ERRORS.md` Phase 5) is the first thing that actually builds
+    // this shape at codegen — every arm before it always paired a
+    // `Never` branch with a real value on the other side. Since
+    // nothing downstream of this conditional is ever reachable,
+    // `merge_bb` gets no value and no param; each branch supplies
+    // its own terminator (`return_`/a nested `Never` conditional's
+    // own trap, or a `Never`-returning `Call` — e.g. `panic` — own
+    // trap), or — the "missing tail" case — a `trap` here.
+    // `merge_bb` itself is simply never reached and stays
+    // unlaid-out.
+    if expr.item.ty == Type::Never {
+        bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
+
+        bcx.switch_to_block(true_bb);
+        bcx.seal_block(true_bb);
+        compile_expr_multi(true_branch, bcx, vars, ctx);
+        if true_branch.item.ty != Type::Never {
+            bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
+        }
+
+        bcx.switch_to_block(false_bb);
+        bcx.seal_block(false_bb);
+        match false_branch {
+            Some(fb) => {
+                compile_expr_multi(fb, bcx, vars, ctx);
+                if fb.item.ty != Type::Never {
+                    bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
+                }
+            }
+            None => { bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code")); }
+        }
+
+        // Every path above already ended in a terminator (a nested
+        // `Never` conditional's own trap, `return_`, or the `trap`
+        // just emitted) — this conditional itself is `Never`-typed,
+        // so it might be the tail of its enclosing function body
+        // (`build_func_body`'s own tail `return_`/`teardown_shadow_frame`
+        // would otherwise try to append to an already-filled
+        // block), or nested inside a `Block`/another `Conditional`
+        // that keeps building after it. Either way it needs a
+        // fresh block to land in — see `Return`'s codegen.
+        let dead = bcx.create_block();
+        bcx.switch_to_block(dead);
+        bcx.seal_block(dead);
+        return Vec::new();
+    }
+
+    let has_value = expr.item.ty != Type::None;
+    // Struct-typed *and* two-slot-union-typed results both need the
+    // K-block-param merge below — see `is_multi_leaf_type`.
+    let is_multi = is_multi_leaf_type(&expr.item.ty);
+
+    if !is_multi {
+        // ── scalar path, unchanged from before structs existed ──
+        let result_ty = cl_type(&expr.item.ty);
+        if has_value {
+            bcx.append_block_param(merge_bb, result_ty);
+        }
+
+        bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
+
+        bcx.switch_to_block(true_bb);
+        bcx.seal_block(true_bb);
+        // `compile_expr_multi`, not `compile_expr` — a `Never`-typed
+        // branch (a `return`) yields zero values, which the
+        // single-value wrapper's assertion would reject; every other
+        // scalar branch still yields exactly one, unpacked below.
+        let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
+        // A `Never`-typed branch has already emitted its own
+        // terminator — jumping to `merge_bb` on top of that would
+        // be a second terminator in the same block, which
+        // Cranelift rejects. Every other branch shape reaches here
+        // normally and joins as before.
+        if true_branch.item.ty != Type::Never {
+            if has_value {
+                let tv = ensure_width(tv[0], &true_branch.item.ty, result_ty, bcx);
+                bcx.ins().jump(merge_bb, &[tv]);
+            } else {
+                bcx.ins().jump(merge_bb, &[]);
+            }
+        }
+
+        bcx.switch_to_block(false_bb);
+        bcx.seal_block(false_bb);
+        if let Some(fb) = false_branch {
+            let fv = compile_expr_multi(fb, bcx, vars, ctx);
+            if fb.item.ty != Type::Never {
+                if has_value {
+                    let fv = ensure_width(fv[0], &fb.item.ty, result_ty, bcx);
+                    bcx.ins().jump(merge_bb, &[fv]);
+                } else {
+                    bcx.ins().jump(merge_bb, &[]);
+                }
+            }
+        } else if has_value {
+            let fv = bcx.ins().iconst(result_ty, 0);
+            bcx.ins().jump(merge_bb, &[fv]);
+        } else {
+            bcx.ins().jump(merge_bb, &[]);
+        }
+
+        bcx.switch_to_block(merge_bb);
+        bcx.seal_block(merge_bb);
+
+        if has_value {
+            vec![bcx.block_params(merge_bb)[0]]
+        } else {
+            vec![bcx.ins().iconst(types::I64, 0)]
+        }
+    } else {
+        // ── multi-leaf path: K block params, one per leaf field
+        // (`struct_fields`). Struct unification is nominal/exact,
+        // so both branches' leaf types are identical to expr's own;
+        // a two-slot union's branches instead each carry their own
+        // `Widen`, inserted by typeck at the join (see
+        // `TypeChecker::lower_widen`), so this is still just value
+        // plumbing — no new rooting decision happens here.
+        let leafs = struct_fields(&expr.item.ty, ctx.structs);
+        let param_tys: Vec<types::Type> = leafs.iter().map(|(_, t)| cl_type(t)).collect();
+        for t in &param_tys { bcx.append_block_param(merge_bb, *t); }
+
+        bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
+
+        bcx.switch_to_block(true_bb);
+        bcx.seal_block(true_bb);
+        let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
+        // See the scalar path above for why a `Never`-typed branch
+        // must not also jump — it already terminated itself.
+        if true_branch.item.ty != Type::Never {
+            bcx.ins().jump(merge_bb, &tv);
+        }
+
+        bcx.switch_to_block(false_bb);
+        bcx.seal_block(false_bb);
+        match false_branch {
+            Some(fb) => {
+                let fv = compile_expr_multi(fb, bcx, vars, ctx);
+                if fb.item.ty != Type::Never {
+                    bcx.ins().jump(merge_bb, &fv);
+                }
+            }
+            None => {
+                let fv: Vec<Value> = param_tys.iter().map(|&t| placeholder_value(bcx, t)).collect();
+                bcx.ins().jump(merge_bb, &fv);
+            }
+        };
+
+        bcx.switch_to_block(merge_bb);
+        bcx.seal_block(merge_bb);
+        bcx.block_params(merge_bb).to_vec()
+    }
+}
+
+fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    let func_name = match &callable.item.kind {
+        TypedExprKind::Var(name) => name.clone(),
+        _ => panic!("only named function calls supported in codegen"),
+    };
+
+    // `print` accepts values of any type.  Its runtime entry
+    // point is selected here, after type checking has established the
+    // concrete argument type, so no invalid Str coercion is emitted.
+    if func_name == "print" {
+        let arg = &args[0];
+        if arg.item.ty == Type::Never {
+            // `print`'s builtin signature has no declared param
+            // type, so typeck doesn't reject a `Never` argument
+            // (e.g. `print(panic("x"))`) the way it would for an
+            // ordinary function call. Compile the arg for its
+            // trapping side effect via `compile_expr_multi` (not
+            // `compile_expr`, which asserts against multi-valued/
+            // zero-valued exprs) and propagate `Never` outward.
+            let vals = compile_expr_multi(arg, bcx, vars, ctx);
+            debug_assert!(vals.is_empty(), "Never-typed expr produced values");
+            return Vec::new();
+        }
+        if matches!(&arg.item.ty, Type::Struct(_)) {
+            let values = compile_expr_multi(arg, bcx, vars, ctx);
+            let mut cursor = 0;
+            print_value(&arg.item.ty, &values, &mut cursor, bcx, ctx);
+            print_fragment("\n", bcx, ctx);
+            return vec![bcx.ins().iconst(types::I64, 0)];
+        }
+        if let Type::Union(members) = &arg.item.ty {
+            // Unlike the `Struct` case above, `print_value` can't
+            // just walk a union's flattened leaves — which
+            // member's leaves they even *are* is a runtime fact
+            // (the tag), whether it's a one-slot boxed union (a
+            // nominal `data ... is A | B`, represented as an
+            // anonymous `Union` of its variant structs) or a
+            // two-slot union with a scalar member. Dispatch on the
+            // tag at runtime (mirroring what `match`'s `TypeTag`/
+            // `Narrow` desugaring does for user code) and print
+            // whichever member matched.
+            let values = compile_expr_multi(arg, bcx, vars, ctx);
+            print_union(members, &values, bcx, ctx);
+            print_fragment("\n", bcx, ctx);
+            return vec![bcx.ins().iconst(types::I64, 0)];
+        }
+        let arg_val = compile_expr(arg, bcx, vars, ctx);
+        let (rt_name, extra_arg) = match &arg.item.ty {
+            Type::Str => ("print", None),
+            Type::Int => ("frog_int_println", None),
+            Type::Float => ("frog_float_println", None),
+            Type::Bool => ("frog_bool_println", None),
+            Type::List(inner) => ("frog_list_println", Some(list_elem_kind(inner))),
+            ty => panic!("print codegen does not support {:?}", ty),
+        };
+        let func_id = ctx.func_ids[rt_name];
+        let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
+        if let Some(kind) = extra_arg {
+            let kind = bcx.ins().iconst(types::I64, kind);
+            bcx.ins().call(callee, &[arg_val, kind]);
+        } else {
+            bcx.ins().call(callee, &[arg_val]);
+        }
+        return vec![bcx.ins().iconst(types::I64, 0)];
+    }
+
+    let func_id = ctx.func_ids[&func_name];
+    let local_callee = ctx.module.declare_func_in_func(func_id, bcx.func);
+
+    let param_types: Vec<Type> = match &callable.item.ty {
+        Type::Function { params, .. } => params.clone(),
+        _ => vec![],
+    };
+    let return_ty: Type = match &callable.item.ty {
+        Type::Function { result, .. } => *result.clone(),
+        _ => Type::Int,
+    };
+
+    let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        if is_multi_leaf_type(&a.item.ty) {
+            // Struct args are never widened (nominal/exact match),
+            // and a two-slot-union arg is already the exact target
+            // union type by the time codegen sees it (widening
+            // happens earlier, at the `Widen` node itself) — either
+            // way, flatten straight into the call's arg list, in
+            // the same K-`AbiParam`-per-arg order `make_sig` uses.
+            arg_vals.extend(compile_expr_multi(a, bcx, vars, ctx));
+        } else {
+            let mut v = compile_expr(a, bcx, vars, ctx);
+            if let Some(param_ty) = param_types.get(i) {
+                v = coerce_value(v, &a.item.ty, param_ty, bcx);
+            }
+            arg_vals.push(v);
+        }
+    }
+
+    let call = bcx.ins().call(local_callee, &arg_vals);
+    if return_ty == Type::Never {
+        // The callee never actually hands control back here —
+        // either it's `panic` (its FFI print call genuinely does
+        // return, so this `trap` is what actually stops execution
+        // — see `default_context`'s registration and
+        // `declare_rt`'s `"panic"` alias) or a user-declared
+        // `: Never` function, whose own tail can only ever be
+        // reached on a dead block (`build_func_body`'s Never-body
+        // handling), so it never really falls through to return
+        // control either — the trap is dead code there, but keeps
+        // this block's IR well-formed regardless. Mirrors
+        // `Conditional`'s own `Type::Never` codegen path exactly.
+        bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
+        let dead = bcx.create_block();
+        bcx.switch_to_block(dead);
+        bcx.seal_block(dead);
+        return Vec::new();
+    }
+    if return_ty == Type::None {
+        vec![bcx.ins().iconst(types::I64, 0)]
+    } else if is_multi_leaf_type(&return_ty) {
+        // Each heap-producing leaf of a struct return, or a
+        // two-slot union return (`is_two_slot_union`), crosses the
+        // ABI boundary as a bare register value — the callee's own
+        // shadow frame (which rooted it during its own execution)
+        // is already popped by the time we get here, so it must be
+        // re-rooted into *this* function's frame immediately,
+        // exactly like the scalar Str/List case below. A two-slot
+        // union's payload leaf is only *sometimes* a pointer — the
+        // caller has no static way to know which member the callee
+        // actually returned — so `root_flat_leaves` roots it behind
+        // a runtime tag comparison rather than unconditionally.
+        let results = bcx.inst_results(call).to_vec();
+        let leafs = struct_fields(&return_ty, ctx.structs);
+        root_flat_leaves(bcx, ctx, &results, &leafs);
+        results
+    } else {
+        let result = bcx.inst_results(call)[0];
+        if is_heap_ty(&return_ty) {
+            root_heap_value(bcx, ctx, result);
+        }
+        vec![result]
+    }
+}
+
+fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    let elem_ty = match list_ty {
+        Type::List(inner) => (**inner).clone(),
+        _ => Type::Int,
+    };
+    let leafs = struct_fields(&elem_ty, ctx.structs);
+    assert_no_two_slot_union_leaf(leafs.iter().map(|(_, t)| t), "a list element type");
+    let stride = (leafs.len().max(1)) as i64;
+    let mut ptr_mask: i64 = 0;
+    for (i, (_, lty)) in leafs.iter().enumerate() {
+        if is_heap_ty(lty) { ptr_mask |= 1i64 << i; }
+    }
+
+    let n = elems.len() as i64;
+    let cap_val    = bcx.ins().iconst(types::I64, n.max(1));
+    let stride_val = bcx.ins().iconst(types::I64, stride);
+    let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
+
+    let alloc_id = ctx.func_ids["frog_alloc_list"];
+    let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+    let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, stride_val, mask_val]);
+    let list_ptr = bcx.inst_results(alloc_call)[0];
+    // Root the list itself *before* compiling its elements: an
+    // element expression (e.g. a Str) can allocate and trigger a
+    // collection, and the list must already be reachable by then.
+    root_heap_value(bcx, ctx, list_ptr);
+
+    for elem in elems {
+        // A struct element compiles to `leafs.len()` values, pushed
+        // back-to-back — matching `stride` exactly is what makes the
+        // list's flat backing store self-describing (see FrogList's
+        // doc comment in runtime/gc.rs).
+        let evs = compile_expr_multi(elem, bcx, vars, ctx);
+        for (ev, (_, lty)) in evs.iter().zip(leafs.iter()) {
+            // The list's backing store is a flat i64 buffer (see
+            // FrogList in runtime/gc.rs); Float and Bool elements need
+            // the same bitcast/zero-extend conversion applied to every
+            // other i64-wire-format value (see to_i64_repr). Without
+            // this, pushing an F64 or I8 SSA value into an i64-typed
+            // call argument is a Cranelift type mismatch — a "Verifier
+            // errors" panic, not a bug in the pushed value itself.
+            let ev = to_i64_repr(bcx, lty, *ev);
+            emit_list_push(bcx, ctx, list_ptr, ev);
+        }
+    }
+
+    vec![list_ptr]
+}
+
+fn compile_variant_init(fields: &[(String, TypedExprRef)], tag: u32, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    // A variant with no fields at all — neither its own nor common
+    // ones its enum declares — carries no information beyond its
+    // tag, so it needs no heap object: emit the tag as an unboxed
+    // immediate. `fields` is the enum's common fields followed by
+    // this variant's own (see `check_and_lower`'s variant-call arm),
+    // so it being empty is exactly the "nothing to store" test.
+    // See gc.rs's "Immediate (unboxed) values" for the encoding and
+    // why the GC can tell the two apart.
+    if fields.is_empty() {
+        return vec![bcx.ins().iconst(types::I64, gc::immediate_variant(tag))];
+    }
+
+    // Compute every field's flattened leaf values first (mirrors
+    // `StructInit` exactly) — each heap-typed leaf among them
+    // roots itself already, via its own producer's codegen.
+    let mut flat_vals: Vec<Value> = Vec::new();
+    let mut flat_types: Vec<Type> = Vec::new();
+    for (_, v) in fields {
+        flat_vals.extend(compile_expr_multi(v, bcx, vars, ctx));
+        flat_types.extend(struct_fields(&v.item.ty, ctx.structs).into_iter().map(|(_, t)| t));
+    }
+    vec![box_into_variant(tag, &flat_vals, &flat_types, bcx, ctx)]
+}
+
+fn compile_return(value: &Option<TypedExprRef>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    let results = match value {
+        Some(v) => compile_expr_multi(v, bcx, vars, ctx),
+        None => Vec::new(),
+    };
+    // Every path out of the function pops the shadow frame first —
+    // this is an *early* exit, so it must do the same thing
+    // `build_func_body`'s own tail `return_` does, not skip it.
+    teardown_shadow_frame(bcx, ctx.module, ctx.func_ids, ctx.heap_slot);
+    bcx.ins().return_(&results);
+    // Cranelift requires every block to end in exactly one
+    // terminator, and `return_` is one — so whatever IR follows
+    // this `Return` in the source (there is always some: it sits
+    // inside a `Block`/`Conditional` whose caller keeps building)
+    // needs a fresh block to land in. Nothing ever jumps to it —
+    // the branch/block that contains an unconditional `return`
+    // has `Type::Never`, and the `Conditional` join checks
+    // for exactly that to skip emitting the jump — so this block
+    // is genuinely unreachable, which Cranelift's verifier permits
+    // as long as it's syntactically well-formed.
+    let dead = bcx.create_block();
+    bcx.switch_to_block(dead);
+    bcx.seal_block(dead);
+    Vec::new()
+}
+
+/// Coerce `value` (a strict, narrower member type) up into an anonymous
+/// union carrying `tag` — see `TypedExprKind::Widen`.
+fn compile_widen(union_ty: &Type, value: &Spanned<TypedExpr>, tag: u32, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    let two_slot_members = match union_ty {
+        Type::Union(members) if is_two_slot_union(members) => Some(members),
+        _ => None,
+    };
+    if let Some(_members) = two_slot_members {
+        // This union has a scalar member (`is_two_slot_union`), so
+        // it carries its tag in its own register instead of a
+        // boxed `FrogVariant` header — see `struct_fields`'s
+        // two-slot `Union` arm. A scalar/`None` `value` then never
+        // needs `box_into_variant` at all: it rides in the payload
+        // register directly, no allocation.
+        let tag_val = bcx.ins().iconst(types::I64, tag as i64);
+        if matches!(value.item.ty, Type::Int | Type::Float | Type::Bool | Type::None) {
+            let vals = compile_expr_multi(value, bcx, vars, ctx);
+            let payload = if value.item.ty == Type::None {
+                bcx.ins().iconst(types::I64, 0)
+            } else {
+                to_i64_repr(bcx, &value.item.ty, vals[0])
+            };
+            vec![tag_val, payload]
+        } else {
+            // A boxed member (Str/List/struct/nested union): box
+            // exactly as before, the tag just also rides alongside
+            // in its own register now.
+            let flat_vals = compile_expr_multi(value, bcx, vars, ctx);
+            let flat_types: Vec<Type> = struct_fields(&value.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+            let ptr = box_into_variant(tag, &flat_vals, &flat_types, bcx, ctx);
+            vec![tag_val, ptr]
+        }
+    } else if value.item.ty == Type::None {
+        // `None`'s own compiled form (the generic immediate `1` —
+        // see `TypedExprKind::NoneLit`) isn't reused directly: this
+        // union's own sorted member list may place `None` at a
+        // different tag than `NoneLit`'s own site-independent
+        // encoding, so it's re-encoded with *this* union's tag.
+        // Still compile `value` first for any side effects (none
+        // today, but `Widen` shouldn't assume that).
+        let _ = compile_expr_multi(value, bcx, vars, ctx);
+        vec![bcx.ins().iconst(types::I64, gc::immediate_variant(tag))]
+    } else {
+        // Box `value` — a scalar or a plain struct — into a
+        // `FrogVariant`-shaped cell the same way a nominal union's
+        // non-nullary member already is. See `box_into_variant`.
+        let flat_vals = compile_expr_multi(value, bcx, vars, ctx);
+        let flat_types: Vec<Type> = struct_fields(&value.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+        vec![box_into_variant(tag, &flat_vals, &flat_types, bcx, ctx)]
+    }
+}
+
+/// The inverse of `compile_widen`: unbox `value` (an anonymous-union-typed
+/// expression, already known — from a preceding `TypeTag` test — to
+/// currently hold `target_ty`) back out as a plain value of that type.
+fn compile_narrow(target_ty: &Type, value: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    let src_two_slot = matches!(&value.item.ty, Type::Union(members) if is_two_slot_union(members));
+    if src_two_slot {
+        // The source union carries its tag in its own register (see
+        // `struct_fields`'s two-slot `Union` arm) — the caller
+        // already knows (from a preceding `TypeTag`) which member
+        // this is, so only the payload leaf (`vals[1]`) matters
+        // here. A scalar target reads it directly, no dereference
+        // at all; a boxed target dereferences it exactly as the
+        // one-slot case below does.
+        let vals = compile_expr_multi(value, bcx, vars, ctx);
+        let payload = vals[1];
+        if *target_ty == Type::None {
+            vec![bcx.ins().iconst(types::I64, 0)]
+        } else if matches!(target_ty, Type::Int | Type::Float | Type::Bool) {
+            vec![from_i64_repr(bcx, target_ty, payload)]
+        } else {
+            let leaf_types: Vec<Type> = struct_fields(target_ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+            read_variant_slots(payload, 0, &leaf_types, bcx, ctx)
+        }
+    } else if *target_ty == Type::None {
+        // `value` here is an immediate, not a pointer — `None` has
+        // no payload to unbox, and the caller already knows (from
+        // a preceding `TypeTag`) which member this is. A single
+        // dummy slot keeps this consistent with every other
+        // member's arity (`struct_fields`'s generic 1-leaf
+        // fallback for a non-struct type).
+        let _ = compile_expr(value, bcx, vars, ctx);
+        vec![bcx.ins().iconst(types::I64, 0)]
+    } else {
+        let ptr = compile_expr(value, bcx, vars, ctx);
+        let leaf_types: Vec<Type> = struct_fields(target_ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+        read_variant_slots(ptr, 0, &leaf_types, bcx, ctx)
+    }
+}
+
+fn compile_truthy(value: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    let v = compile_expr(value, bcx, vars, ctx);
+    let truthy = match &value.item.ty {
+        Type::Int => {
+            let zero = bcx.ins().iconst(types::I64, 0);
+            bcx.ins().icmp(IntCC::NotEqual, v, zero)
+        },
+        Type::Float => {
+            let zero = bcx.ins().f64const(0.0);
+            bcx.ins().fcmp(FloatCC::NotEqual, v, zero)
+        },
+        // `None` is the immediate `1`, always falsey.
+        Type::None => bcx.ins().iconst(types::I8, 0),
+        Type::Str => {
+            let id     = ctx.func_ids["frog_str_len"];
+            let callee = ctx.module.declare_func_in_func(id, bcx.func);
+            let call   = bcx.ins().call(callee, &[v]);
+            let len    = bcx.inst_results(call)[0];
+            let zero   = bcx.ins().iconst(types::I64, 0);
+            bcx.ins().icmp(IntCC::NotEqual, len, zero)
+        },
+        Type::List(_) => {
+            let id     = ctx.func_ids["frog_list_len"];
+            let callee = ctx.module.declare_func_in_func(id, bcx.func);
+            let call   = bcx.ins().call(callee, &[v]);
+            let len    = bcx.inst_results(call)[0];
+            let zero   = bcx.ins().iconst(types::I64, 0);
+            bcx.ins().icmp(IntCC::NotEqual, len, zero)
+        },
+        other => unreachable!("Truthy on non-Truthy type {}", other),
+    };
+    vec![truthy]
 }
 
 /// Read `leaf_types.len()` consecutive payload slots starting at `offset`

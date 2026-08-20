@@ -1,7 +1,11 @@
 use std::{collections::HashMap, fmt::Display, vec};
 
 use crate::frontend::{
-    expression::{Expression, ForLoopExpr, LiteralExpr, MatchArm, Pattern},
+    expression::{
+        AnnotatedExpr, AssignExpr, BinaryExpr, CallExpr, ConditionalExpr, Expression,
+        FieldAccessExpr, ForLoopExpr, FunctionExpr, IndexExpr, IsPatternExpr, LiteralExpr,
+        MatchArm, Pattern, RangeExpr, SliceExpr, UnaryExpr,
+    },
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::type_expr::TypeExpr;
@@ -1836,715 +1840,736 @@ impl TypeChecker {
     ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let span = expr.span;
 
-        let (kind, ty) = match expr.item {
-            Expression::Literal(lit) => match lit.token {
-                Token::Int(n)         => (TypedExprKind::IntLit(n),    Type::Int),
-                Token::Float(f)       => (TypedExprKind::FloatLit(f),  Type::Float),
-                Token::String(s)      => (TypedExprKind::StrLit(s),    Type::Str),
-                Token::True           => (TypedExprKind::BoolLit(true),  Type::Bool),
-                Token::False          => (TypedExprKind::BoolLit(false), Type::Bool),
-                Token::None           => (TypedExprKind::NoneLit,      Type::None),
-                // A bound value takes priority; otherwise this might be a
-                // nullary enum variant used without call syntax (`Red` for
-                // `data Color is Red | ...`) — see `infer_bare_variant`.
-                Token::Identifier(nm) => match self.ctx.get(&nm).cloned() {
-                    Some(bound) => {
-                        let ty = self.lookup(&bound);
-                        (TypedExprKind::Var(nm), ty)
-                    },
-                    None => {
-                        let ty = self.infer_bare_variant(&nm, span)?;
-                        let enum_name = self.variant_owners.get(&nm).and_then(|owners| owners.first()).cloned()
-                            .expect("infer_bare_variant already resolved this name to exactly one owning union");
-                        let def = self.union_defs.get(&enum_name).expect("registered");
-                        let tag = def.variant_index(&nm).expect("registered") as u32;
-                        (TypedExprKind::VariantInit { enum_name, variant: nm, tag, fields: Vec::new() }, ty)
-                    },
-                },
-                _ => unreachable!("unexpected literal token"),
-            },
-
-            Expression::Unary(u) => {
-                let op = match u.op {
-                    Token::Minus => "<unaryminus>",
-                    Token::Not   => "not",
-                    _ => unreachable!("weird unary"),
-                };
-                let inner = self.check_and_lower(*u.expr)?;
-                let ty = self.builtin_op_type(op, &[(inner.item.ty.clone(), inner.span)], span)?;
-                let inner = if u.op == Token::Not { self.coerce_truthy(inner, span) } else { inner };
-                (TypedExprKind::Unary { op: u.op, expr: Box::new(inner) }, ty)
-            },
-
-            Expression::Binary(b) => {
-                let left  = self.check_and_lower(*b.left)?;
-                let right = self.check_and_lower(*b.right)?;
-                let op = format!("{}", b.op);
-                let ty = self.builtin_op_type(
-                    &op,
-                    &[(left.item.ty.clone(), left.span), (right.item.ty.clone(), right.span)],
-                    span,
-                )?;
-                if matches!(b.op, Token::And | Token::Or) {
-                    let left  = self.coerce_truthy(left, span);
-                    let right = self.coerce_truthy(right, span);
-                    (TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }, ty)
-                } else if matches!(b.op, Token::EqEq | Token::NotEq) {
-                    if let Type::Struct(name) = self.lookup(&left.item.ty) {
-                        (self.desugar_struct_eq(b.op, left, right, &name, span), ty)
-                    } else {
-                        (TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }, ty)
-                    }
-                } else {
-                    (TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }, ty)
-                }
-            },
-
-            Expression::Conditional(c) => {
-                // `if subject is Pattern then A (else B)?` — a binding
-                // pattern is only meaningful with a `then`-scope to bind
-                // into, so this is intercepted here (before the pattern
-                // ever reaches the generic `IsPattern` arm, which rejects
-                // binds) and handled as sugar for a single-arm `match`,
-                // which `lower_match` already knows how to desugar.
-                if matches!(&c.cond.item, Expression::IsPattern(_)) {
-                    let ip = match c.cond.item {
-                        Expression::IsPattern(ip) => ip,
-                        _ => unreachable!(),
-                    };
-                    let arms = vec![crate::frontend::expression::MatchArm {
-                        pattern: ip.pattern,
-                        guard: None,
-                        body: c.true_branch,
-                    }];
-                    return self.lower_match(ip.subject, arms, c.false_branch, span);
-                }
-
-                let cond = self.check_and_lower(*c.cond)?;
-                self.check_condition(&cond.item.ty.clone(), cond.span)?;
-                let cond = self.coerce_truthy(cond, span);
-
-                // Each branch is its own scope, whether or not it's written
-                // with `{ }` — `if c then let y = 5 else 0` must not leave
-                // `y` bound afterward, any more than
-                // `if c then { let y = 5 } else 0` does.
-                let true_branch = self.in_scope(|t| t.check_and_lower(*c.true_branch))?;
-                let false_branch = match c.false_branch {
-                    Some(fb) => Some(self.in_scope(|t| t.check_and_lower(*fb))?),
-                    None => None,
-                };
-
-                // `join_types` handles both "the branches agree" and
-                // "they don't, so produce a union" — plus, critically, the
-                // case where one branch is *already* union-typed and the
-                // other a plain member of it (e.g. `if c then 999 else
-                // <union-typed expr>`), which needs the same union
-                // promotion, not just `unify`'s permissive-but-non-binding
-                // compatibility check. Normalizing matters beyond tidiness:
-                // it's what drops `Never` (a `return`ed branch) out of the
-                // result entirely, so `if c then return 1 else 2` types as
-                // plain `Int` rather than `Never | Int`.
-                let true_ty  = true_branch.item.ty.clone();
-                let false_ty = false_branch.as_ref().map(|b| b.item.ty.clone()).unwrap_or(Type::None);
-                let result_ty = self.join_types(&true_ty, &false_ty);
-
-                // Each branch is widened into the joined type, so a branch
-                // that produced a bare member of a union result actually
-                // gets boxed — see `lower_widen`.
-                let true_branch = self.lower_widen(true_branch, &result_ty)?;
-                let false_branch = match false_branch {
-                    Some(fb) => Some(Box::new(self.lower_widen(fb, &result_ty)?)),
-                    None => None,
-                };
-                (
-                    TypedExprKind::Conditional {
-                        cond:         Box::new(cond),
-                        true_branch:  Box::new(true_branch),
-                        false_branch,
-                    },
-                    result_ty,
-                )
-            },
-
-            Expression::Assign(a) => {
-                // `alice.age = 43` — rebind-sugar for struct "mutation".
-                // `Grammar::assign` only lets this parse when the
-                // FieldAccess's own target is a bare identifier, so
-                // `get_identifier` below is guaranteed to succeed.
-                if let Expression::FieldAccess(fa) = a.target.item {
-                    let base = fa.target.item.get_identifier()
-                        .expect("parser only allows a bare identifier as a field-assign base")
-                        .to_string();
-                    let base_ty = self.get(&base, span)?;
-                    let resolved_base = self.lookup(&base_ty);
-                    let Type::Struct(struct_name) = &resolved_base else {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("Can't assign field '{}' on {}, expected a struct", fa.field, resolved_base)
-                        }, span));
-                    };
-                    let field_defs = self.struct_defs.get(struct_name).cloned().unwrap_or_default();
-                    let field_ty = field_defs.iter().find(|(n, _)| n == &fa.field)
-                        .map(|(_, t)| t.clone())
-                        .ok_or_else(|| Spanned::from(TypeError {
-                            msg: format!("Struct {} has no field '{}'", struct_name, fa.field)
-                        }, span))?;
-                    // The assigned field is exactly as much a union-typed
-                    // slot as a `StructInit` argument is, so it needs the
-                    // same check-and-widen — without the widen, `c.v = 9`
-                    // would overwrite a boxed `Int | Bool` field with the
-                    // raw immediate `9` and the next `TypeTag`/`Narrow`
-                    // would dereference it as a `FrogVariant*`. The declared
-                    // field type comes from `struct_defs` (via the base's
-                    // own type), never from `a.typ` — a field assignment
-                    // carries no annotation of its own.
-                    let value = self.lower_expected(*a.value, &field_ty)?;
-                    // A field assignment is a statement: codegen rebinds the
-                    // touched leaf `Variable`s and yields one dummy value,
-                    // so `None` is both the documented result type and the
-                    // only single-slot type that can't disagree with that.
-                    (TypedExprKind::FieldAssign { base, field: fa.field, value: Box::new(value) }, Type::None)
-                } else {
-                    let name = a.target.item.get_identifier()
-                        .expect("assignment target must be identifier").to_string();
-                    match &a.typ {
-                        Some(ann) => {
-                            let annotated_ty = self.resolve_type_expr(ann)?;
-                            // Validate *and* lower the value against the
-                            // annotation, then bind the name at the
-                            // annotation type (not the value's own). For
-                            // function types that distinction matters: the
-                            // body's type is not the variable's type.
-                            let value = self.lower_expected(*a.value, &annotated_ty)?;
-                            self.ctx.insert(name.clone(), annotated_ty.clone());
-                            (TypedExprKind::Assign { name, value: Box::new(value) }, annotated_ty)
-                        },
-                        None => {
-                            // Pre-bind fully-annotated functions so the body
-                            // can reference the function by name (enabling
-                            // recursion).
-                            if let Expression::Function(func) = &a.value.item {
-                                if func.return_type.is_some() && func.params.iter().all(|p| p.ty.is_some()) {
-                                    let param_tys: Result<Vec<Type>, _> = func.params.iter()
-                                        .map(|p| self.resolve_type_expr(p.ty.as_ref().expect("all params annotated — checked above")))
-                                        .collect();
-                                    let ret_ty = self.resolve_type_expr(func.return_type.as_ref().expect("return type present — checked above"))?;
-                                    let func_ty = Type::Function { params: param_tys?, result: Box::new(ret_ty) };
-                                    self.ctx.insert(name.clone(), func_ty);
-                                }
-                            }
-                            let value = self.check_and_lower(*a.value)?;
-                            let ty = self.lookup(&value.item.ty);
-                            self.ctx.insert(name.clone(), ty.clone());
-                            (TypedExprKind::Assign { name, value: Box::new(value) }, ty)
-                        },
-                    }
-                }
-            },
-
-            Expression::Function(f) => {
-                let mut param_bindings: Vec<(String, Type)> = Vec::with_capacity(f.params.len());
-                for p in &f.params {
-                    let param_ty = match &p.ty {
-                        Some(annotation) => self.resolve_type_expr(annotation)?,
-                        None => self.fresh_var(),
-                    };
-                    param_bindings.push((p.name.clone(), param_ty));
-                }
-
-                // `return`'s type rule needs to know what it's returning
-                // into, even when the body has no `: RetType` annotation at
-                // all — a fresh, unbound type var serves as that slot in the
-                // unannotated case, and gets pinned down the same way any
-                // other inferred type does: every `return e` unifies against
-                // it, and so does the body's own tail value below.
-                let declared_ret = match &f.return_type {
-                    Some(ann) => Some(self.resolve_type_expr(ann)?),
-                    None => None,
-                };
-                let return_slot = declared_ret.clone().unwrap_or_else(|| self.fresh_var());
-
-                // Parameters are bound for the body only. With a declared
-                // return type the body is *checked* against it, which both
-                // widens its tail value into a union-typed slot and pushes
-                // the type down into a list literal
-                // (`func f(): List(Str) = []`); without one it's
-                // synthesized and unified with the `return`s below.
-                let body = self.with_context(param_bindings.iter().cloned(), |t| {
-                    t.return_types.push(return_slot.clone());
-                    let result = match &declared_ret {
-                        Some(ret_ty) => t.lower_expected(*f.body, ret_ty),
-                        None         => t.check_and_lower(*f.body),
-                    };
-                    t.return_types.pop();
-                    result
-                })?;
-
-                let body_type = body.item.ty.clone();
-                let return_type = if declared_ret.is_some() || body_type == Type::Never {
-                    // `Never` means the body ends in an unconditional
-                    // `return`, so it never falls through to a final value —
-                    // the `return` statements alone determine the result
-                    // type, and there is nothing to unify with. (`Never`
-                    // unifies with nothing, so without this every
-                    // unannotated function ending in `return` would fail.)
-                    self.lookup(&return_slot)
-                } else if self.unify(&return_slot, &body_type) {
-                    self.lookup(&return_slot)
-                } else {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!(
-                            "Function's return statements disagree with its final value: {} vs {}",
-                            self.lookup(&return_slot), body_type
-                        )
-                    }, span));
-                };
-
-                let params: Vec<(String, Type)> = param_bindings.into_iter()
-                    .map(|(n, t)| { let t = self.lookup(&t); (n, t) })
-                    .collect();
-                let ty = Type::Function {
-                    params: params.iter().map(|(_, t)| t.clone()).collect(),
-                    result: Box::new(return_type.clone()),
-                };
-                (TypedExprKind::Function { params, return_type, body: Box::new(body) }, ty)
-            },
-
-            Expression::Call(c) => {
-                let callee_span = c.callable.span;
-
-                // Struct construction: `Person(name="Alice", age=42)` looks
-                // like an ordinary call syntactically (there's no dedicated
-                // construction grammar — see `Grammar::data_decl`'s doc
-                // comment), so it's disambiguated here, before the generic
-                // function-call path, by checking whether the callee name is
-                // a registered struct.
-                let struct_name = c.callable.item.get_identifier()
-                    .filter(|n| self.struct_defs.contains_key(*n))
-                    .map(|n| n.to_string());
-                // Enum variant construction: `Circle(r=4)` (bare, unique
-                // owner) or `Shape.Circle(r=4)` (qualified) — same syntactic
-                // shape, disambiguated the same way.
-                let variant_callee = self.resolve_variant_callee(&c.callable.item);
-                // `print` is a builtin conversion: unlike ordinary
-                // functions its argument is accepted at any type and is
-                // formatted as text by the code generator/runtime.
-                let is_print = matches!(
-                    &c.callable.item,
-                    Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "print"
-                );
-
-                if let Some(name) = struct_name {
-                    let field_defs = self.struct_defs.get(&name).cloned().unwrap_or_default();
-                    let ordered = self.lower_record_args(&name, &field_defs, c.args, callee_span)?;
-                    let ty = Type::Struct(name.clone());
-                    (TypedExprKind::StructInit { name, fields: ordered }, ty)
-                } else if let Some((enum_name, variant)) = variant_callee.map_err(|msg| Spanned::from(TypeError { msg }, callee_span))? {
-                    let def = self.union_defs.get(&enum_name).cloned()
-                        .expect("enum_name resolved via variant_owners/union_defs, must be registered");
-                    let variant_fields = def.variants.iter().find(|(n, _)| n == &variant)
-                        .map(|(_, fs)| fs.clone())
-                        .expect("variant resolved via variant_owners/union_defs, must be registered");
-                    let mut field_defs = def.common.clone();
-                    field_defs.extend(variant_fields);
-
-                    let kind_name = format!("{}.{}", enum_name, variant);
-                    let ordered = self.lower_record_args(&kind_name, &field_defs, c.args, callee_span)?;
-                    let tag = def.variant_index(&variant).expect("registered") as u32;
-                    (TypedExprKind::VariantInit { enum_name, variant, tag, fields: ordered }, def.ty.clone())
-                } else if is_print {
-                    if c.args.len() != 1 {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
-                        }, callee_span));
-                    }
-                    let callable = self.check_and_lower(*c.callable)?;
-                    let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
-                    // If the argument never actually produces a value (e.g.
-                    // `print(panic("x"))`), `print` itself never returns
-                    // either — propagate `Never` so this call is treated
-                    // uniformly with any other `Never`-typed expression
-                    // (join with other branches, dead-code trapping, etc.)
-                    // instead of falsely claiming `None`.
-                    let ty = if arg.item.ty == Type::Never { Type::Never } else { Type::None };
-                    (TypedExprKind::Call { callable: Box::new(callable), args: vec![arg] }, ty)
-                } else {
-                    let callable = self.check_and_lower(*c.callable)?;
-                    let func_type = self.lookup(&callable.item.ty);
-
-                    // If the callee is an unbound TypeVar (e.g. a lambda
-                    // parameter used as a function), bind it to a fresh
-                    // function type whose arity matches this call site.
-                    let func_type = if let Type::TypeVar { name, .. } = &func_type {
-                        let param_types: Vec<Type> = c.args.iter().map(|_| self.fresh_var()).collect();
-                        let result_type = self.fresh_var();
-                        let fn_ty = Type::Function { params: param_types, result: Box::new(result_type) };
-                        self.substitutions.insert(name.clone(), fn_ty.clone());
-                        fn_ty
-                    } else {
-                        func_type
-                    };
-
-                    let Type::Function { params, result } = func_type else {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("Not callable: {}", func_type)
-                        }, callee_span));
-                    };
-                    if c.args.len() != params.len() {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("Wrong number of arguments, expected {}, got {}", params.len(), c.args.len())
-                        }, callee_span));
-                    }
-                    let mut args = Vec::with_capacity(c.args.len());
-                    for (arg, param) in c.args.into_iter().zip(params.iter()) {
-                        let arg_span = arg.span;
-                        let lowered = self.check_and_lower(arg)?;
-                        let resolved_argt  = self.lookup(&lowered.item.ty);
-                        let resolved_param = self.lookup(param);
-                        // Allow implicit widening coercions at call sites (e.g. Int→Float).
-                        if !widens_to(&resolved_argt, &resolved_param) && !self.unify(&lowered.item.ty, param) {
-                            return Err(Spanned::from(TypeError {
-                                msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_param)
-                            }, arg_span));
-                        }
-                        args.push(self.lower_widen(lowered, param)?);
-                    }
-                    let ty = self.lookup(&result);
-                    (TypedExprKind::Call { callable: Box::new(callable), args }, ty)
-                }
-            },
-
-            Expression::Tuple(elems) => {
-                if elems.is_empty() {
-                    (TypedExprKind::List(Vec::new()), Type::List(Box::new(self.fresh_var())))
-                } else {
-                    let mut items: Vec<Spanned<TypedExpr>> = Vec::with_capacity(elems.len());
-                    let mut first_ty: Option<Type> = None;
-                    for e in elems {
-                        let elem_span = e.span;
-                        let lowered = self.check_and_lower(e)?;
-                        match &first_ty {
-                            None => first_ty = Some(lowered.item.ty.clone()),
-                            Some(first) => {
-                                let first = first.clone();
-                                if !self.unify(&first, &lowered.item.ty) {
-                                    return Err(Spanned::from(TypeError {
-                                        msg: format!(
-                                            "List elements must have the same type, got {} and {}",
-                                            self.lookup(&first), self.lookup(&lowered.item.ty)
-                                        )
-                                    }, elem_span));
-                                }
-                            },
-                        }
-                        items.push(lowered);
-                    }
-                    let elem_ty = self.lookup(&first_ty.expect("elems is non-empty"));
-                    (TypedExprKind::List(items), Type::List(Box::new(elem_ty)))
-                }
-            },
-
-            // A block is its own lexical scope: bindings made by a `let`
-            // inside it (directly, or via a nested block/conditional branch)
-            // must not leak to whatever follows the block. Without this,
-            // codegen can be asked to reference an SSA value that only
-            // exists on one control-flow path (e.g. one arm of an `if`),
-            // which is invalid IR, not just a stale-name bug.
-            //
-            // `check_and_lower` is only ever called directly (not via
-            // `check_and_lower_entry`) on a *nested* block, since the
-            // top-level program/REPL entry goes through
-            // `check_and_lower_entry` instead, which does not scope.
-            Expression::Block(stmts) => {
-                self.hoist_data_decls(&stmts)?;
-                let lowered = self.in_scope(|t| -> Result<Vec<Spanned<TypedExpr>>, Spanned<TypeError>> {
-                    let mut lowered = Vec::with_capacity(stmts.len());
-                    for s in stmts {
-                        if matches!(s.item, Expression::DataDecl(_)) { continue; }
-                        lowered.push(t.check_and_lower(s)?);
-                    }
-                    Ok(lowered)
-                })?;
-                // Must-handle: every non-tail statement's value is
-                // discarded, so none may be a possible Error — see
-                // `check_must_handle`. The tail is exempt; its value
-                // propagates to whatever position this Block itself sits
-                // in, which is checked there instead.
-                if let Some((_, rest)) = lowered.split_last() {
-                    for t in rest {
-                        self.check_must_handle(t)?;
-                    }
-                }
-                let ty = lowered.last().map(|t| t.item.ty.clone()).unwrap_or(Type::None);
-                (TypedExprKind::Block(lowered), ty)
-            },
-
-            // The annotation is absorbed into this node's own type: lower
-            // the inner expression *against* it (see `lower_expected`) and
-            // reuse the result directly.
-            Expression::Annotated(a) => {
-                let annotated_ty = self.resolve_type_expr(&a.ty)?;
-                let lowered = self.lower_expected(*a.expr, &annotated_ty)?;
-                (lowered.item.kind, lowered.item.ty)
-            },
-
-            Expression::Index(idx) => {
-                let target_span = idx.target.span;
-                let target = self.check_and_lower(*idx.target)?;
-                let target_ty = target.item.ty.clone();
-                let resolved_target = self.lookup(&target_ty);
-                let elem_ty = match &resolved_target {
-                    Type::List(inner) => (**inner).clone(),
-                    Type::TypeVar { .. } => {
-                        let elem = self.fresh_var();
-                        if !self.unify(&target_ty, &Type::List(Box::new(elem.clone()))) {
-                            return Err(Spanned::from(TypeError {
-                                msg: format!("Can't index into {}", resolved_target)
-                            }, target_span));
-                        }
-                        elem
-                    },
-                    _ => return Err(Spanned::from(TypeError {
-                        msg: format!("Can't index into {}, expected a List", resolved_target)
-                    }, target_span)),
-                };
-
-                let index_span = idx.index.span;
-                let index = self.check_and_lower(*idx.index)?;
-                if !self.unify(&index.item.ty, &Type::Int) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("List index must be Int, got {}", self.lookup(&index.item.ty))
-                    }, index_span));
-                }
-
-                let ty = self.lookup(&elem_ty);
-                (TypedExprKind::Index { target: Box::new(target), index: Box::new(index) }, ty)
-            },
-
-            Expression::Slice(s) => {
-                let target_span = s.target.span;
-                let target = self.check_and_lower(*s.target)?;
-                let target_ty = target.item.ty.clone();
-                let resolved_target = self.lookup(&target_ty);
-                let list_ty = match &resolved_target {
-                    Type::List(_) => resolved_target.clone(),
-                    Type::TypeVar { .. } => {
-                        let elem = self.fresh_var();
-                        let list_ty = Type::List(Box::new(elem));
-                        if !self.unify(&target_ty, &list_ty) {
-                            return Err(Spanned::from(TypeError {
-                                msg: format!("Can't slice {}", resolved_target)
-                            }, target_span));
-                        }
-                        list_ty
-                    },
-                    _ => return Err(Spanned::from(TypeError {
-                        msg: format!("Can't slice {}, expected a List", resolved_target)
-                    }, target_span)),
-                };
-
-                let mut bounds = Vec::with_capacity(2);
-                for bound in [s.start, s.end] {
-                    bounds.push(match bound {
-                        Some(e) => {
-                            let bound_span = e.span;
-                            let lowered = self.check_and_lower(*e)?;
-                            if !self.unify(&lowered.item.ty, &Type::Int) {
-                                return Err(Spanned::from(TypeError {
-                                    msg: format!("Slice bound must be Int, got {}", self.lookup(&lowered.item.ty))
-                                }, bound_span));
-                            }
-                            Some(Box::new(lowered))
-                        },
-                        None => None,
-                    });
-                }
-                let end = bounds.pop().expect("two bounds pushed");
-                let start = bounds.pop().expect("two bounds pushed");
-
-                let ty = self.lookup(&list_ty);
-                (TypedExprKind::Slice { target: Box::new(target), start, end }, ty)
-            },
-
-            Expression::Range(r) => {
-                let start_span = r.start.span;
-                let start = self.check_and_lower(*r.start)?;
-                if !self.unify(&start.item.ty, &Type::Int) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("Range start must be Int, got {}", self.lookup(&start.item.ty))
-                    }, start_span));
-                }
-                let end_span = r.end.span;
-                let end = self.check_and_lower(*r.end)?;
-                if !self.unify(&end.item.ty, &Type::Int) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("Range end must be Int, got {}", self.lookup(&end.item.ty))
-                    }, end_span));
-                }
-                (
-                    TypedExprKind::Range { start: Box::new(start), end: Box::new(end) },
-                    Type::List(Box::new(Type::Int)),
-                )
-            },
-
-            Expression::ForLoop(fl) => {
-                let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
-                // Each iteration discards the body's value exactly like a
-                // non-tail Block statement does — same must-handle rule.
-                self.check_must_handle(&body)?;
-                (TypedExprKind::ForLoop { var, iterable, cond, body }, Type::None)
-            },
-
-            Expression::Comprehension(inner) => {
-                let fl = match inner.item {
-                    Expression::ForLoop(fl) => fl,
-                    _ => unreachable!("Comprehension always wraps a ForLoop — see Grammar::tuple"),
-                };
-                // A comprehension collects the body's value into the
-                // result list rather than discarding it, so must-handle
-                // does not apply here — unlike a plain ForLoop.
-                let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
-                let ty = Type::List(Box::new(self.lookup(&body.item.ty)));
-                (TypedExprKind::Comprehension { var, iterable, cond, body }, ty)
-            },
-
+        match expr.item {
+            Expression::Literal(lit)         => self.lower_literal(lit, span),
+            Expression::Unary(u)             => self.lower_unary(u, span),
+            Expression::Binary(b)            => self.lower_binary(b, span),
+            Expression::Conditional(c)       => self.lower_conditional(c, span),
+            Expression::Assign(a)            => self.lower_assign(a, span),
+            Expression::Function(f)          => self.lower_function(f, span),
+            Expression::Call(c)              => self.lower_call(c, span),
+            Expression::Tuple(elems)         => self.lower_tuple(elems, span),
+            Expression::Block(stmts)         => self.lower_block(stmts, span),
+            Expression::Annotated(a)         => self.lower_annotated(a, span),
+            Expression::Index(idx)           => self.lower_index(idx, span),
+            Expression::Slice(s)             => self.lower_slice(s, span),
+            Expression::Range(r)             => self.lower_range(r, span),
+            Expression::ForLoop(fl)          => self.lower_for_loop_expr(fl, span),
+            Expression::Comprehension(inner) => self.lower_comprehension(inner, span),
             // Handled entirely by `hoist_data_decls` — never reaches codegen.
-            Expression::DataDecl(_) => (TypedExprKind::IntLit(0), Type::None),
-
-            Expression::FieldAccess(fa) => {
-                let target_span = fa.target.span;
-                let target = self.check_and_lower(*fa.target)?;
-                let resolved = self.lookup(&target.item.ty);
-                if let Type::Struct(sname) = &resolved {
-                    let field_ty = self.struct_defs.get(sname)
-                        .and_then(|fs| fs.iter().find(|(n, _)| *n == fa.field))
-                        .map(|(_, t)| t.clone())
-                        .ok_or_else(|| Spanned::from(TypeError {
-                            msg: format!("Struct {} has no field '{}'", sname, fa.field)
-                        }, span))?;
-                    (
-                        TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field, enum_name: None },
-                        field_ty,
-                    )
-                } else if let Some((ename, def)) = self.resolve_union(&resolved).map(|(n, d)| (n.to_string(), d.clone())) {
-                    // Only common fields (declared on the union head) are
-                    // readable without matching — a variant-only field
-                    // requires a `match`/`is` to narrow the value first (see
-                    // DESIGN.md's `shape.r` example).
-                    if let Some((_, t)) = def.common.iter().find(|(n, _)| *n == fa.field) {
-                        let field_ty = t.clone();
-                        (
-                            TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field, enum_name: Some(ename) },
-                            field_ty,
-                        )
-                    } else if def.variants.iter().any(|(_, fs)| fs.iter().any(|(n, _)| *n == fa.field)) {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("'{}' is a variant-specific field of {} — match on it to access it", fa.field, ename)
-                        }, span));
-                    } else {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("{} has no field '{}'", ename, fa.field)
-                        }, span));
-                    }
-                } else {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("Can't access field '{}' on {}, expected a struct or union", fa.field, resolved)
-                    }, target_span));
-                }
-            },
-
-            Expression::Match(m) => return self.lower_match(m.subject, m.arms, m.default, span),
-
-            // Standalone (non-if-condition) `subject is Variant`/`subject is
-            // Type` — a plain tag test. Binds are rejected: there is no
-            // `then`-scope for them to enter (`if subject is P then ...` is
-            // intercepted by the `Conditional` arm above, which routes
-            // through `lower_match` so its binds *are* reachable).
-            Expression::IsPattern(ip) => {
-                let subject_span = ip.subject.span;
-                let target = self.check_and_lower(*ip.subject)?;
-                let resolved = self.lookup(&target.item.ty);
-                let nominal = self.resolve_union(&resolved).map(|(n, d)| (n.to_string(), d.clone()));
-                let kind = match nominal {
-                    Some((enum_name, def)) => {
-                        let idx = self.check_pattern(&ip.pattern, &enum_name, &def, span)?;
-                        TypedExprKind::IsVariant {
-                            target: Box::new(target), enum_name, variant: ip.pattern.variant.clone(), tag: idx as u32,
-                        }
-                    },
-                    None => {
-                        let Type::Union(members) = &resolved else {
-                            return Err(Spanned::from(TypeError {
-                                msg: format!("Can only use 'is' on a union value, got {}", resolved)
-                            }, subject_span));
-                        };
-                        let (idx, _) = self.check_type_pattern(&ip.pattern, members, span)?;
-                        TypedExprKind::TypeTag { target: Box::new(target), tag: idx as u32 }
-                    },
-                };
-                if !ip.pattern.binds.is_empty() {
-                    return Err(Spanned::from(TypeError {
-                        msg: "pattern bindings with 'is' are only allowed as the entire condition of an 'if'".to_string()
-                    }, span));
-                }
-                (kind, Type::Bool)
-            },
-
+            Expression::DataDecl(_) => Ok(Spanned::from(TypedExpr { ty: Type::None, kind: TypedExprKind::IntLit(0) }, span)),
+            Expression::FieldAccess(fa)      => self.lower_field_access(fa, span),
+            Expression::Match(m)             => self.lower_match(m.subject, m.arms, m.default, span),
+            Expression::IsPattern(ip)        => self.lower_is_pattern(ip, span),
             Expression::Import(_) => unreachable!(
                 "Expression::Import must be resolved and stripped by frontend::modules before typeck ever sees it"
             ),
+            Expression::Return(value)        => self.lower_return(value, span),
+            Expression::Try(inner)           => self.lower_try(*inner, span),
+            Expression::Unwrap(inner)        => self.lower_unwrap(*inner, span),
+            Expression::Catch { value, handler } => self.lower_catch(*value, *handler, span),
+        }
+    }
 
-            // `return`, or `return value`. Always typed `Never` — see
-            // `Type::Never` and `TypeChecker::return_types`.
-            //
-            // With a declared enclosing return type, `lower_expected` is
-            // used: it gives subtype acceptance (returning an `Int` into a
-            // declared `Int | Str` works), inserts the matching `Widen`, and
-            // pushes expected types down into an unannotated lambda literal.
-            // But an *unannotated* function's return type is a fresh,
-            // still-unbound type var (see the `Function` arm above), and
-            // `lower_expected` assumes its expectation is already concrete —
-            // so that case unifies directly instead, exactly like any other
-            // site that pins down a fresh var from a synthesized type.
-            Expression::Return(value) => {
-                let return_ty = self.return_types.last().cloned().ok_or_else(|| Spanned::from(
-                    TypeError { msg: "'return' used outside of a function".to_string() }, span
-                ))?;
-                let resolved_return_ty = self.lookup(&return_ty);
-                let still_unbound = matches!(resolved_return_ty, Type::TypeVar { .. });
-
-                let value = match value {
-                    Some(v) if still_unbound => {
-                        let lowered = self.check_and_lower(*v)?;
-                        if !self.unify(&lowered.item.ty, &return_ty) {
-                            return Err(Spanned::from(TypeError {
-                                msg: format!("Function's return statements disagree: {} vs {}", self.lookup(&return_ty), lowered.item.ty)
-                            }, span));
-                        }
-                        Some(Box::new(lowered))
-                    },
-                    Some(v) => Some(Box::new(self.lower_expected(*v, &resolved_return_ty)?)),
-                    None if still_unbound => {
-                        if !self.unify(&Type::None, &return_ty) {
-                            return Err(Spanned::from(TypeError {
-                                msg: format!("Function's return statements disagree: {} vs None", self.lookup(&return_ty))
-                            }, span));
-                        }
-                        None
-                    },
-                    None => {
-                        self.check_ty(Type::None, &resolved_return_ty, span)?;
-                        None
-                    },
-                };
-                (TypedExprKind::Return(value), Type::Never)
+    fn lower_literal(&mut self, lit: LiteralExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let (kind, ty) = match lit.token {
+            Token::Int(n)         => (TypedExprKind::IntLit(n),    Type::Int),
+            Token::Float(f)       => (TypedExprKind::FloatLit(f),  Type::Float),
+            Token::String(s)      => (TypedExprKind::StrLit(s),    Type::Str),
+            Token::True           => (TypedExprKind::BoolLit(true),  Type::Bool),
+            Token::False          => (TypedExprKind::BoolLit(false), Type::Bool),
+            Token::None           => (TypedExprKind::NoneLit,      Type::None),
+            // A bound value takes priority; otherwise this might be a
+            // nullary enum variant used without call syntax (`Red` for
+            // `data Color is Red | ...`) — see `infer_bare_variant`.
+            Token::Identifier(nm) => match self.ctx.get(&nm).cloned() {
+                Some(bound) => {
+                    let ty = self.lookup(&bound);
+                    (TypedExprKind::Var(nm), ty)
+                },
+                None => {
+                    let ty = self.infer_bare_variant(&nm, span)?;
+                    let enum_name = self.variant_owners.get(&nm).and_then(|owners| owners.first()).cloned()
+                        .expect("infer_bare_variant already resolved this name to exactly one owning union");
+                    let def = self.union_defs.get(&enum_name).expect("registered");
+                    let tag = def.variant_index(&nm).expect("registered") as u32;
+                    (TypedExprKind::VariantInit { enum_name, variant: nm, tag, fields: Vec::new() }, ty)
+                },
             },
+            _ => unreachable!("unexpected literal token"),
+        };
+        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+    }
 
-            Expression::Try(inner) => return self.lower_try(*inner, span),
-            Expression::Unwrap(inner) => return self.lower_unwrap(*inner, span),
-            Expression::Catch { value, handler } => return self.lower_catch(*value, *handler, span),
+    fn lower_unary(&mut self, u: UnaryExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let op = match u.op {
+            Token::Minus => "<unaryminus>",
+            Token::Not   => "not",
+            _ => unreachable!("weird unary"),
+        };
+        let inner = self.check_and_lower(*u.expr)?;
+        let ty = self.builtin_op_type(op, &[(inner.item.ty.clone(), inner.span)], span)?;
+        let inner = if u.op == Token::Not { self.coerce_truthy(inner, span) } else { inner };
+        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Unary { op: u.op, expr: Box::new(inner) } }, span))
+    }
+
+    fn lower_binary(&mut self, b: BinaryExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let left  = self.check_and_lower(*b.left)?;
+        let right = self.check_and_lower(*b.right)?;
+        let op = format!("{}", b.op);
+        let ty = self.builtin_op_type(
+            &op,
+            &[(left.item.ty.clone(), left.span), (right.item.ty.clone(), right.span)],
+            span,
+        )?;
+        let kind = if matches!(b.op, Token::And | Token::Or) {
+            let left  = self.coerce_truthy(left, span);
+            let right = self.coerce_truthy(right, span);
+            TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
+        } else if matches!(b.op, Token::EqEq | Token::NotEq) {
+            if let Type::Struct(name) = self.lookup(&left.item.ty) {
+                self.desugar_struct_eq(b.op, left, right, &name, span)
+            } else {
+                TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
+            }
+        } else {
+            TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
+        };
+        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+    }
+
+    fn lower_conditional(&mut self, c: ConditionalExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // `if subject is Pattern then A (else B)?` — a binding
+        // pattern is only meaningful with a `then`-scope to bind
+        // into, so this is intercepted here (before the pattern
+        // ever reaches the generic `IsPattern` arm, which rejects
+        // binds) and handled as sugar for a single-arm `match`,
+        // which `lower_match` already knows how to desugar.
+        if matches!(&c.cond.item, Expression::IsPattern(_)) {
+            let ip = match c.cond.item {
+                Expression::IsPattern(ip) => ip,
+                _ => unreachable!(),
+            };
+            let arms = vec![crate::frontend::expression::MatchArm {
+                pattern: ip.pattern,
+                guard: None,
+                body: c.true_branch,
+            }];
+            return self.lower_match(ip.subject, arms, c.false_branch, span);
+        }
+
+        let cond = self.check_and_lower(*c.cond)?;
+        self.check_condition(&cond.item.ty.clone(), cond.span)?;
+        let cond = self.coerce_truthy(cond, span);
+
+        // Each branch is its own scope, whether or not it's written
+        // with `{ }` — `if c then let y = 5 else 0` must not leave
+        // `y` bound afterward, any more than
+        // `if c then { let y = 5 } else 0` does.
+        let true_branch = self.in_scope(|t| t.check_and_lower(*c.true_branch))?;
+        let false_branch = match c.false_branch {
+            Some(fb) => Some(self.in_scope(|t| t.check_and_lower(*fb))?),
+            None => None,
         };
 
+        // `join_types` handles both "the branches agree" and
+        // "they don't, so produce a union" — plus, critically, the
+        // case where one branch is *already* union-typed and the
+        // other a plain member of it (e.g. `if c then 999 else
+        // <union-typed expr>`), which needs the same union
+        // promotion, not just `unify`'s permissive-but-non-binding
+        // compatibility check. Normalizing matters beyond tidiness:
+        // it's what drops `Never` (a `return`ed branch) out of the
+        // result entirely, so `if c then return 1 else 2` types as
+        // plain `Int` rather than `Never | Int`.
+        let true_ty  = true_branch.item.ty.clone();
+        let false_ty = false_branch.as_ref().map(|b| b.item.ty.clone()).unwrap_or(Type::None);
+        let result_ty = self.join_types(&true_ty, &false_ty);
+
+        // Each branch is widened into the joined type, so a branch
+        // that produced a bare member of a union result actually
+        // gets boxed — see `lower_widen`.
+        let true_branch = self.lower_widen(true_branch, &result_ty)?;
+        let false_branch = match false_branch {
+            Some(fb) => Some(Box::new(self.lower_widen(fb, &result_ty)?)),
+            None => None,
+        };
+        Ok(Spanned::from(TypedExpr {
+            ty: result_ty,
+            kind: TypedExprKind::Conditional {
+                cond:         Box::new(cond),
+                true_branch:  Box::new(true_branch),
+                false_branch,
+            },
+        }, span))
+    }
+
+    fn lower_assign(&mut self, a: AssignExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // `alice.age = 43` — rebind-sugar for struct "mutation".
+        // `Grammar::assign` only lets this parse when the
+        // FieldAccess's own target is a bare identifier, so
+        // `get_identifier` below is guaranteed to succeed.
+        let (kind, ty) = if let Expression::FieldAccess(fa) = a.target.item {
+            let base = fa.target.item.get_identifier()
+                .expect("parser only allows a bare identifier as a field-assign base")
+                .to_string();
+            let base_ty = self.get(&base, span)?;
+            let resolved_base = self.lookup(&base_ty);
+            let Type::Struct(struct_name) = &resolved_base else {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Can't assign field '{}' on {}, expected a struct", fa.field, resolved_base)
+                }, span));
+            };
+            let field_defs = self.struct_defs.get(struct_name).cloned().unwrap_or_default();
+            let field_ty = field_defs.iter().find(|(n, _)| n == &fa.field)
+                .map(|(_, t)| t.clone())
+                .ok_or_else(|| Spanned::from(TypeError {
+                    msg: format!("Struct {} has no field '{}'", struct_name, fa.field)
+                }, span))?;
+            // The assigned field is exactly as much a union-typed
+            // slot as a `StructInit` argument is, so it needs the
+            // same check-and-widen — without the widen, `c.v = 9`
+            // would overwrite a boxed `Int | Bool` field with the
+            // raw immediate `9` and the next `TypeTag`/`Narrow`
+            // would dereference it as a `FrogVariant*`. The declared
+            // field type comes from `struct_defs` (via the base's
+            // own type), never from `a.typ` — a field assignment
+            // carries no annotation of its own.
+            let value = self.lower_expected(*a.value, &field_ty)?;
+            // A field assignment is a statement: codegen rebinds the
+            // touched leaf `Variable`s and yields one dummy value,
+            // so `None` is both the documented result type and the
+            // only single-slot type that can't disagree with that.
+            (TypedExprKind::FieldAssign { base, field: fa.field, value: Box::new(value) }, Type::None)
+        } else {
+            let name = a.target.item.get_identifier()
+                .expect("assignment target must be identifier").to_string();
+            match &a.typ {
+                Some(ann) => {
+                    let annotated_ty = self.resolve_type_expr(ann)?;
+                    // Validate *and* lower the value against the
+                    // annotation, then bind the name at the
+                    // annotation type (not the value's own). For
+                    // function types that distinction matters: the
+                    // body's type is not the variable's type.
+                    let value = self.lower_expected(*a.value, &annotated_ty)?;
+                    self.ctx.insert(name.clone(), annotated_ty.clone());
+                    (TypedExprKind::Assign { name, value: Box::new(value) }, annotated_ty)
+                },
+                None => {
+                    // Pre-bind fully-annotated functions so the body
+                    // can reference the function by name (enabling
+                    // recursion).
+                    if let Expression::Function(func) = &a.value.item {
+                        if func.return_type.is_some() && func.params.iter().all(|p| p.ty.is_some()) {
+                            let param_tys: Result<Vec<Type>, _> = func.params.iter()
+                                .map(|p| self.resolve_type_expr(p.ty.as_ref().expect("all params annotated — checked above")))
+                                .collect();
+                            let ret_ty = self.resolve_type_expr(func.return_type.as_ref().expect("return type present — checked above"))?;
+                            let func_ty = Type::Function { params: param_tys?, result: Box::new(ret_ty) };
+                            self.ctx.insert(name.clone(), func_ty);
+                        }
+                    }
+                    let value = self.check_and_lower(*a.value)?;
+                    let ty = self.lookup(&value.item.ty);
+                    self.ctx.insert(name.clone(), ty.clone());
+                    (TypedExprKind::Assign { name, value: Box::new(value) }, ty)
+                },
+            }
+        };
         Ok(Spanned::from(TypedExpr { ty, kind }, span))
+    }
+
+    fn lower_function(&mut self, f: FunctionExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let mut param_bindings: Vec<(String, Type)> = Vec::with_capacity(f.params.len());
+        for p in &f.params {
+            let param_ty = match &p.ty {
+                Some(annotation) => self.resolve_type_expr(annotation)?,
+                None => self.fresh_var(),
+            };
+            param_bindings.push((p.name.clone(), param_ty));
+        }
+
+        // `return`'s type rule needs to know what it's returning
+        // into, even when the body has no `: RetType` annotation at
+        // all — a fresh, unbound type var serves as that slot in the
+        // unannotated case, and gets pinned down the same way any
+        // other inferred type does: every `return e` unifies against
+        // it, and so does the body's own tail value below.
+        let declared_ret = match &f.return_type {
+            Some(ann) => Some(self.resolve_type_expr(ann)?),
+            None => None,
+        };
+        let return_slot = declared_ret.clone().unwrap_or_else(|| self.fresh_var());
+
+        // Parameters are bound for the body only. With a declared
+        // return type the body is *checked* against it, which both
+        // widens its tail value into a union-typed slot and pushes
+        // the type down into a list literal
+        // (`func f(): List(Str) = []`); without one it's
+        // synthesized and unified with the `return`s below.
+        let body = self.with_context(param_bindings.iter().cloned(), |t| {
+            t.return_types.push(return_slot.clone());
+            let result = match &declared_ret {
+                Some(ret_ty) => t.lower_expected(*f.body, ret_ty),
+                None         => t.check_and_lower(*f.body),
+            };
+            t.return_types.pop();
+            result
+        })?;
+
+        let body_type = body.item.ty.clone();
+        let return_type = if declared_ret.is_some() || body_type == Type::Never {
+            // `Never` means the body ends in an unconditional
+            // `return`, so it never falls through to a final value —
+            // the `return` statements alone determine the result
+            // type, and there is nothing to unify with. (`Never`
+            // unifies with nothing, so without this every
+            // unannotated function ending in `return` would fail.)
+            self.lookup(&return_slot)
+        } else if self.unify(&return_slot, &body_type) {
+            self.lookup(&return_slot)
+        } else {
+            return Err(Spanned::from(TypeError {
+                msg: format!(
+                    "Function's return statements disagree with its final value: {} vs {}",
+                    self.lookup(&return_slot), body_type
+                )
+            }, span));
+        };
+
+        let params: Vec<(String, Type)> = param_bindings.into_iter()
+            .map(|(n, t)| { let t = self.lookup(&t); (n, t) })
+            .collect();
+        let ty = Type::Function {
+            params: params.iter().map(|(_, t)| t.clone()).collect(),
+            result: Box::new(return_type.clone()),
+        };
+        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Function { params, return_type, body: Box::new(body) } }, span))
+    }
+
+    fn lower_call(&mut self, c: CallExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let callee_span = c.callable.span;
+
+        // Struct construction: `Person(name="Alice", age=42)` looks
+        // like an ordinary call syntactically (there's no dedicated
+        // construction grammar — see `Grammar::data_decl`'s doc
+        // comment), so it's disambiguated here, before the generic
+        // function-call path, by checking whether the callee name is
+        // a registered struct.
+        let struct_name = c.callable.item.get_identifier()
+            .filter(|n| self.struct_defs.contains_key(*n))
+            .map(|n| n.to_string());
+        // Enum variant construction: `Circle(r=4)` (bare, unique
+        // owner) or `Shape.Circle(r=4)` (qualified) — same syntactic
+        // shape, disambiguated the same way.
+        let variant_callee = self.resolve_variant_callee(&c.callable.item);
+        // `print` is a builtin conversion: unlike ordinary
+        // functions its argument is accepted at any type and is
+        // formatted as text by the code generator/runtime.
+        let is_print = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "print"
+        );
+
+        let (kind, ty) = if let Some(name) = struct_name {
+            let field_defs = self.struct_defs.get(&name).cloned().unwrap_or_default();
+            let ordered = self.lower_record_args(&name, &field_defs, c.args, callee_span)?;
+            let ty = Type::Struct(name.clone());
+            (TypedExprKind::StructInit { name, fields: ordered }, ty)
+        } else if let Some((enum_name, variant)) = variant_callee.map_err(|msg| Spanned::from(TypeError { msg }, callee_span))? {
+            let def = self.union_defs.get(&enum_name).cloned()
+                .expect("enum_name resolved via variant_owners/union_defs, must be registered");
+            let variant_fields = def.variants.iter().find(|(n, _)| n == &variant)
+                .map(|(_, fs)| fs.clone())
+                .expect("variant resolved via variant_owners/union_defs, must be registered");
+            let mut field_defs = def.common.clone();
+            field_defs.extend(variant_fields);
+
+            let kind_name = format!("{}.{}", enum_name, variant);
+            let ordered = self.lower_record_args(&kind_name, &field_defs, c.args, callee_span)?;
+            let tag = def.variant_index(&variant).expect("registered") as u32;
+            (TypedExprKind::VariantInit { enum_name, variant, tag, fields: ordered }, def.ty.clone())
+        } else if is_print {
+            if c.args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
+                }, callee_span));
+            }
+            let callable = self.check_and_lower(*c.callable)?;
+            let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
+            // If the argument never actually produces a value (e.g.
+            // `print(panic("x"))`), `print` itself never returns
+            // either — propagate `Never` so this call is treated
+            // uniformly with any other `Never`-typed expression
+            // (join with other branches, dead-code trapping, etc.)
+            // instead of falsely claiming `None`.
+            let ty = if arg.item.ty == Type::Never { Type::Never } else { Type::None };
+            (TypedExprKind::Call { callable: Box::new(callable), args: vec![arg] }, ty)
+        } else {
+            let callable = self.check_and_lower(*c.callable)?;
+            let func_type = self.lookup(&callable.item.ty);
+
+            // If the callee is an unbound TypeVar (e.g. a lambda
+            // parameter used as a function), bind it to a fresh
+            // function type whose arity matches this call site.
+            let func_type = if let Type::TypeVar { name, .. } = &func_type {
+                let param_types: Vec<Type> = c.args.iter().map(|_| self.fresh_var()).collect();
+                let result_type = self.fresh_var();
+                let fn_ty = Type::Function { params: param_types, result: Box::new(result_type) };
+                self.substitutions.insert(name.clone(), fn_ty.clone());
+                fn_ty
+            } else {
+                func_type
+            };
+
+            let Type::Function { params, result } = func_type else {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Not callable: {}", func_type)
+                }, callee_span));
+            };
+            if c.args.len() != params.len() {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected {}, got {}", params.len(), c.args.len())
+                }, callee_span));
+            }
+            let mut args = Vec::with_capacity(c.args.len());
+            for (arg, param) in c.args.into_iter().zip(params.iter()) {
+                let arg_span = arg.span;
+                let lowered = self.check_and_lower(arg)?;
+                let resolved_argt  = self.lookup(&lowered.item.ty);
+                let resolved_param = self.lookup(param);
+                // Allow implicit widening coercions at call sites (e.g. Int→Float).
+                if !widens_to(&resolved_argt, &resolved_param) && !self.unify(&lowered.item.ty, param) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_param)
+                    }, arg_span));
+                }
+                args.push(self.lower_widen(lowered, param)?);
+            }
+            let ty = self.lookup(&result);
+            (TypedExprKind::Call { callable: Box::new(callable), args }, ty)
+        };
+        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+    }
+
+    fn lower_tuple(&mut self, elems: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let (kind, ty) = if elems.is_empty() {
+            (TypedExprKind::List(Vec::new()), Type::List(Box::new(self.fresh_var())))
+        } else {
+            let mut items: Vec<Spanned<TypedExpr>> = Vec::with_capacity(elems.len());
+            let mut first_ty: Option<Type> = None;
+            for e in elems {
+                let elem_span = e.span;
+                let lowered = self.check_and_lower(e)?;
+                match &first_ty {
+                    None => first_ty = Some(lowered.item.ty.clone()),
+                    Some(first) => {
+                        let first = first.clone();
+                        if !self.unify(&first, &lowered.item.ty) {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!(
+                                    "List elements must have the same type, got {} and {}",
+                                    self.lookup(&first), self.lookup(&lowered.item.ty)
+                                )
+                            }, elem_span));
+                        }
+                    },
+                }
+                items.push(lowered);
+            }
+            let elem_ty = self.lookup(&first_ty.expect("elems is non-empty"));
+            (TypedExprKind::List(items), Type::List(Box::new(elem_ty)))
+        };
+        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+    }
+
+    // A block is its own lexical scope: bindings made by a `let`
+    // inside it (directly, or via a nested block/conditional branch)
+    // must not leak to whatever follows the block. Without this,
+    // codegen can be asked to reference an SSA value that only
+    // exists on one control-flow path (e.g. one arm of an `if`),
+    // which is invalid IR, not just a stale-name bug.
+    //
+    // `check_and_lower` is only ever called directly (not via
+    // `check_and_lower_entry`) on a *nested* block, since the
+    // top-level program/REPL entry goes through
+    // `check_and_lower_entry` instead, which does not scope.
+    fn lower_block(&mut self, stmts: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        self.hoist_data_decls(&stmts)?;
+        let lowered = self.in_scope(|t| -> Result<Vec<Spanned<TypedExpr>>, Spanned<TypeError>> {
+            let mut lowered = Vec::with_capacity(stmts.len());
+            for s in stmts {
+                if matches!(s.item, Expression::DataDecl(_)) { continue; }
+                lowered.push(t.check_and_lower(s)?);
+            }
+            Ok(lowered)
+        })?;
+        // Must-handle: every non-tail statement's value is
+        // discarded, so none may be a possible Error — see
+        // `check_must_handle`. The tail is exempt; its value
+        // propagates to whatever position this Block itself sits
+        // in, which is checked there instead.
+        if let Some((_, rest)) = lowered.split_last() {
+            for t in rest {
+                self.check_must_handle(t)?;
+            }
+        }
+        let ty = lowered.last().map(|t| t.item.ty.clone()).unwrap_or(Type::None);
+        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Block(lowered) }, span))
+    }
+
+    // The annotation is absorbed into this node's own type: lower
+    // the inner expression *against* it (see `lower_expected`) and
+    // reuse the result directly.
+    fn lower_annotated(&mut self, a: AnnotatedExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let annotated_ty = self.resolve_type_expr(&a.ty)?;
+        let lowered = self.lower_expected(*a.expr, &annotated_ty)?;
+        Ok(Spanned::from(TypedExpr { ty: lowered.item.ty, kind: lowered.item.kind }, span))
+    }
+
+    fn lower_index(&mut self, idx: IndexExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let target_span = idx.target.span;
+        let target = self.check_and_lower(*idx.target)?;
+        let target_ty = target.item.ty.clone();
+        let resolved_target = self.lookup(&target_ty);
+        let elem_ty = match &resolved_target {
+            Type::List(inner) => (**inner).clone(),
+            Type::TypeVar { .. } => {
+                let elem = self.fresh_var();
+                if !self.unify(&target_ty, &Type::List(Box::new(elem.clone()))) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Can't index into {}", resolved_target)
+                    }, target_span));
+                }
+                elem
+            },
+            _ => return Err(Spanned::from(TypeError {
+                msg: format!("Can't index into {}, expected a List", resolved_target)
+            }, target_span)),
+        };
+
+        let index_span = idx.index.span;
+        let index = self.check_and_lower(*idx.index)?;
+        if !self.unify(&index.item.ty, &Type::Int) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("List index must be Int, got {}", self.lookup(&index.item.ty))
+            }, index_span));
+        }
+
+        let ty = self.lookup(&elem_ty);
+        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Index { target: Box::new(target), index: Box::new(index) } }, span))
+    }
+
+    fn lower_slice(&mut self, s: SliceExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let target_span = s.target.span;
+        let target = self.check_and_lower(*s.target)?;
+        let target_ty = target.item.ty.clone();
+        let resolved_target = self.lookup(&target_ty);
+        let list_ty = match &resolved_target {
+            Type::List(_) => resolved_target.clone(),
+            Type::TypeVar { .. } => {
+                let elem = self.fresh_var();
+                let list_ty = Type::List(Box::new(elem));
+                if !self.unify(&target_ty, &list_ty) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Can't slice {}", resolved_target)
+                    }, target_span));
+                }
+                list_ty
+            },
+            _ => return Err(Spanned::from(TypeError {
+                msg: format!("Can't slice {}, expected a List", resolved_target)
+            }, target_span)),
+        };
+
+        let mut bounds = Vec::with_capacity(2);
+        for bound in [s.start, s.end] {
+            bounds.push(match bound {
+                Some(e) => {
+                    let bound_span = e.span;
+                    let lowered = self.check_and_lower(*e)?;
+                    if !self.unify(&lowered.item.ty, &Type::Int) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Slice bound must be Int, got {}", self.lookup(&lowered.item.ty))
+                        }, bound_span));
+                    }
+                    Some(Box::new(lowered))
+                },
+                None => None,
+            });
+        }
+        let end = bounds.pop().expect("two bounds pushed");
+        let start = bounds.pop().expect("two bounds pushed");
+
+        let ty = self.lookup(&list_ty);
+        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Slice { target: Box::new(target), start, end } }, span))
+    }
+
+    fn lower_range(&mut self, r: RangeExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let start_span = r.start.span;
+        let start = self.check_and_lower(*r.start)?;
+        if !self.unify(&start.item.ty, &Type::Int) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Range start must be Int, got {}", self.lookup(&start.item.ty))
+            }, start_span));
+        }
+        let end_span = r.end.span;
+        let end = self.check_and_lower(*r.end)?;
+        if !self.unify(&end.item.ty, &Type::Int) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Range end must be Int, got {}", self.lookup(&end.item.ty))
+            }, end_span));
+        }
+        Ok(Spanned::from(TypedExpr {
+            ty: Type::List(Box::new(Type::Int)),
+            kind: TypedExprKind::Range { start: Box::new(start), end: Box::new(end) },
+        }, span))
+    }
+
+    fn lower_for_loop_expr(&mut self, fl: ForLoopExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
+        // Each iteration discards the body's value exactly like a
+        // non-tail Block statement does — same must-handle rule.
+        self.check_must_handle(&body)?;
+        Ok(Spanned::from(TypedExpr { ty: Type::None, kind: TypedExprKind::ForLoop { var, iterable, cond, body } }, span))
+    }
+
+    fn lower_comprehension(&mut self, inner: Box<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let fl = match inner.item {
+            Expression::ForLoop(fl) => fl,
+            _ => unreachable!("Comprehension always wraps a ForLoop — see Grammar::tuple"),
+        };
+        // A comprehension collects the body's value into the
+        // result list rather than discarding it, so must-handle
+        // does not apply here — unlike a plain ForLoop.
+        let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
+        let ty = Type::List(Box::new(self.lookup(&body.item.ty)));
+        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Comprehension { var, iterable, cond, body } }, span))
+    }
+
+    fn lower_field_access(&mut self, fa: FieldAccessExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let target_span = fa.target.span;
+        let target = self.check_and_lower(*fa.target)?;
+        let resolved = self.lookup(&target.item.ty);
+        let (kind, ty) = if let Type::Struct(sname) = &resolved {
+            let field_ty = self.struct_defs.get(sname)
+                .and_then(|fs| fs.iter().find(|(n, _)| *n == fa.field))
+                .map(|(_, t)| t.clone())
+                .ok_or_else(|| Spanned::from(TypeError {
+                    msg: format!("Struct {} has no field '{}'", sname, fa.field)
+                }, span))?;
+            (
+                TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field, enum_name: None },
+                field_ty,
+            )
+        } else if let Some((ename, def)) = self.resolve_union(&resolved).map(|(n, d)| (n.to_string(), d.clone())) {
+            // Only common fields (declared on the union head) are
+            // readable without matching — a variant-only field
+            // requires a `match`/`is` to narrow the value first (see
+            // DESIGN.md's `shape.r` example).
+            if let Some((_, t)) = def.common.iter().find(|(n, _)| *n == fa.field) {
+                let field_ty = t.clone();
+                (
+                    TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field, enum_name: Some(ename) },
+                    field_ty,
+                )
+            } else if def.variants.iter().any(|(_, fs)| fs.iter().any(|(n, _)| *n == fa.field)) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is a variant-specific field of {} — match on it to access it", fa.field, ename)
+                }, span));
+            } else {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("{} has no field '{}'", ename, fa.field)
+                }, span));
+            }
+        } else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Can't access field '{}' on {}, expected a struct or union", fa.field, resolved)
+            }, target_span));
+        };
+        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+    }
+
+    // Standalone (non-if-condition) `subject is Variant`/`subject is
+    // Type` — a plain tag test. Binds are rejected: there is no
+    // `then`-scope for them to enter (`if subject is P then ...` is
+    // intercepted by `lower_conditional`, which routes through
+    // `lower_match` so its binds *are* reachable).
+    fn lower_is_pattern(&mut self, ip: IsPatternExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let subject_span = ip.subject.span;
+        let target = self.check_and_lower(*ip.subject)?;
+        let resolved = self.lookup(&target.item.ty);
+        let nominal = self.resolve_union(&resolved).map(|(n, d)| (n.to_string(), d.clone()));
+        let kind = match nominal {
+            Some((enum_name, def)) => {
+                let idx = self.check_pattern(&ip.pattern, &enum_name, &def, span)?;
+                TypedExprKind::IsVariant {
+                    target: Box::new(target), enum_name, variant: ip.pattern.variant.clone(), tag: idx as u32,
+                }
+            },
+            None => {
+                let Type::Union(members) = &resolved else {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Can only use 'is' on a union value, got {}", resolved)
+                    }, subject_span));
+                };
+                let (idx, _) = self.check_type_pattern(&ip.pattern, members, span)?;
+                TypedExprKind::TypeTag { target: Box::new(target), tag: idx as u32 }
+            },
+        };
+        if !ip.pattern.binds.is_empty() {
+            return Err(Spanned::from(TypeError {
+                msg: "pattern bindings with 'is' are only allowed as the entire condition of an 'if'".to_string()
+            }, span));
+        }
+        Ok(Spanned::from(TypedExpr { ty: Type::Bool, kind }, span))
+    }
+
+    // `return`, or `return value`. Always typed `Never` — see
+    // `Type::Never` and `TypeChecker::return_types`.
+    //
+    // With a declared enclosing return type, `lower_expected` is
+    // used: it gives subtype acceptance (returning an `Int` into a
+    // declared `Int | Str` works), inserts the matching `Widen`, and
+    // pushes expected types down into an unannotated lambda literal.
+    // But an *unannotated* function's return type is a fresh,
+    // still-unbound type var (see `lower_function`), and
+    // `lower_expected` assumes its expectation is already concrete —
+    // so that case unifies directly instead, exactly like any other
+    // site that pins down a fresh var from a synthesized type.
+    fn lower_return(&mut self, value: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let return_ty = self.return_types.last().cloned().ok_or_else(|| Spanned::from(
+            TypeError { msg: "'return' used outside of a function".to_string() }, span
+        ))?;
+        let resolved_return_ty = self.lookup(&return_ty);
+        let still_unbound = matches!(resolved_return_ty, Type::TypeVar { .. });
+
+        let value = match value {
+            Some(v) if still_unbound => {
+                let lowered = self.check_and_lower(*v)?;
+                if !self.unify(&lowered.item.ty, &return_ty) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Function's return statements disagree: {} vs {}", self.lookup(&return_ty), lowered.item.ty)
+                    }, span));
+                }
+                Some(Box::new(lowered))
+            },
+            Some(v) => Some(Box::new(self.lower_expected(*v, &resolved_return_ty)?)),
+            None if still_unbound => {
+                if !self.unify(&Type::None, &return_ty) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Function's return statements disagree: {} vs None", self.lookup(&return_ty))
+                    }, span));
+                }
+                None
+            },
+            None => {
+                self.check_ty(Type::None, &resolved_return_ty, span)?;
+                None
+            },
+        };
+        Ok(Spanned::from(TypedExpr { ty: Type::Never, kind: TypedExprKind::Return(value) }, span))
     }
 
     /// Shared lowering for `for var in iterable (if cond)? body`, used by

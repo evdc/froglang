@@ -22,10 +22,10 @@ func eval(n: Node): Int | DivideByZero = {
 }
 
 func main() = {
-    let expr: Node = Div(Add(Lit(2), Lit(4)), Lit(3))
+    let expr = Div(Add(Lit(2), Lit(4)), Lit(3))
     print(eval(expr))
 
-    let bad: Node = Div(Lit(12), Lit(0))
+    let bad = Div(Lit(12), Lit(0))
     print(eval(bad))
 }
 

@@ -626,15 +626,11 @@ fn rewrite(
                 }
             }
             for p in &mut d.fields {
-                if let Some(ty) = &mut p.ty {
-                    rewrite_type_expr(ty, subst, qualified);
-                }
+                rewrite_type_expr(&mut p.ty, subst, qualified);
             }
             for v in &mut d.variants {
                 for p in &mut v.fields {
-                    if let Some(ty) = &mut p.ty {
-                        rewrite_type_expr(ty, subst, qualified);
-                    }
+                    rewrite_type_expr(&mut p.ty, subst, qualified);
                 }
             }
         }

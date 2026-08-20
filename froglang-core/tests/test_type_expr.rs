@@ -96,10 +96,19 @@ fn test_optional_resolves_to_union_with_none() {
     assert_eq!(infer_src("let x: Int? = 5").unwrap(), Type::Union(vec![Type::Int, Type::None]).normalize());
 }
 
+// `Int | Bool` rather than `Int | Str` here and below: a `Str` member of a
+// union that needs boxing is a lowering limitation `lower_widen` rejects
+// outright (`"Str is not yet supported as a member of a union that needs
+// boxing"`), so `let x: Int | Str = "a"` is not a program that compiles.
+// These tests are about the type *grammar* reaching these annotation sites,
+// so they use a member pair the back end can actually represent. Before the
+// front end became a single pass they read `Int | Str` and passed, because
+// `infer` stopped short of lowering and never reached that check — the
+// programs themselves were rejected by `run` all the same.
 #[test]
 fn test_union_annotation_accepts_either_member() {
-    assert_eq!(infer_src("let x: Int | Str = 5").unwrap(), Type::Union(vec![Type::Int, Type::Str]).normalize());
-    assert_eq!(infer_src("let x: Int | Str = \"a\"").unwrap(), Type::Union(vec![Type::Int, Type::Str]).normalize());
+    assert_eq!(infer_src("let x: Int | Bool = 5").unwrap(), Type::Union(vec![Type::Int, Type::Bool]).normalize());
+    assert_eq!(infer_src("let x: Int | Bool = true").unwrap(), Type::Union(vec![Type::Int, Type::Bool]).normalize());
 }
 
 #[test]
@@ -130,10 +139,12 @@ fn test_none_is_a_nameable_type() {
 
 #[test]
 fn test_func_return_type_may_be_a_union() {
-    let src = "func f(b: Bool): Int | Str = if b then 1 else \"a\"\nf(true)";
+    // See the note above `test_union_annotation_accepts_either_member` on
+    // why the member pair is `Int | Bool` rather than `Int | Str`.
+    let src = "func f(n: Int): Int | Bool = if n > 0 then 1 else true\nf(1)";
     assert_eq!(
         infer_src(src).unwrap(),
-        Type::Union(vec![Type::Int, Type::Str]).normalize(),
+        Type::Union(vec![Type::Int, Type::Bool]).normalize(),
     );
 }
 

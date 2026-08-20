@@ -293,13 +293,18 @@ fn test_conditional_branch_mismatch_produces_union() {
     let mut t = TypeChecker::new();
 
     // Mismatched branches produce a union type instead of an error.
+    // `Int | Bool` rather than `Int | Str`: `infer` now lowers as it goes
+    // (one pass), and `lower_widen` rejects a `Str` member of a union that
+    // needs boxing outright — so `if c then 1 else "hello"` is not a program
+    // that compiles, and never was; the old two-pass `infer` just stopped
+    // before finding out.
     let cond = spanned(Expression::conditional(
         bool_lit(true),
-        int(1),           // Int
-        Some(string("hello"))  // Str
+        int(1),            // Int
+        Some(bool_lit(false))  // Bool
     ));
     let res = t.infer(&cond).unwrap();
-    assert_eq!(res, Type::Union(vec![Type::Int, Type::Str]));
+    assert_eq!(res, Type::Union(vec![Type::Bool, Type::Int]));
 }
 
 #[test]
@@ -749,18 +754,22 @@ fn test_infer_num_lambda() {
 #[test]
 fn test_union_from_conditional() {
     let mut t = TypeChecker::new();
-    // if true then 1 else "hello"  →  Int | Str
-    let cond = spanned(Expression::conditional(bool_lit(true), int(1), Some(string("hello"))));
-    assert_eq!(t.infer(&cond).unwrap(), Type::Union(vec![Type::Int, Type::Str]));
+    // if true then 1 else false  →  Bool | Int (see the note on
+    // `test_conditional_branch_mismatch_produces_union` for why not `Str`)
+    let cond = spanned(Expression::conditional(bool_lit(true), int(1), Some(bool_lit(false))));
+    assert_eq!(t.infer(&cond).unwrap(), Type::Union(vec![Type::Bool, Type::Int]));
 }
 
 #[test]
 fn test_is_subtype_via_check() {
     let mut t = TypeChecker::new();
-    // An Int value satisfies an expected type of Int | Str.
-    let expected = Type::Union(vec![Type::Int, Type::Str]);
+    // An Int value satisfies an expected type of Int | Bool. `check`
+    // reports the type the value checks *at* — the union, since that is
+    // what the value has once it has been widened into the slot, not the
+    // narrower `Int` it started as.
+    let expected = Type::Union(vec![Type::Bool, Type::Int]);
     let res = t.check(&int(1), &expected).unwrap();
-    assert_eq!(res, Type::Int);
+    assert_eq!(res, expected);
 }
 
 // --- Union normalization ---
@@ -1017,14 +1026,14 @@ fn test_union_num_both_operands() {
 
 #[test]
 fn test_union_partial_num_still_errors() {
-    // Int | Str does not satisfy Num
-    assert!(infer_src("(if true then 1 else \"hi\") + 2").is_err());
+    // Int | Bool does not satisfy Num
+    assert!(infer_src("(if true then 1 else false) + 2").is_err());
 }
 
 #[test]
 fn test_union_eq_constraint() {
-    // Bool | Str satisfies Eq, so == is valid
-    let ty = infer_src("(if true then true else \"hi\") == true").unwrap();
+    // Bool | Int satisfies Eq, so == is valid
+    let ty = infer_src("(if true then true else 1) == true").unwrap();
     assert_eq!(ty, Type::Bool);
 }
 

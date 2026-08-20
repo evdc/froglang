@@ -1,0 +1,32 @@
+data Node is
+    Lit(Int)
+    | Add(Node, Node)
+    | Sub(Node, Node)
+    | Mul(Node, Node)
+    | Div(Node, Node)
+
+data DivideByZero() provides Error
+
+func eval(n: Node): Int | DivideByZero = {
+    match n {
+        is Lit(i) then i
+        is Add(l, r) then eval(l)? + eval(r)?
+        is Sub(l, r) then eval(l)? - eval(r)?
+        is Mul(l, r) then eval(l)? * eval(r)?
+        is Div(l, r) then {
+            let lhs = eval(l)?
+            let rhs = eval(r)?
+            if rhs == 0 then DivideByZero() else (lhs / rhs)
+        }
+    }
+}
+
+func main() = {
+    let expr: Node = Div(Add(Lit(2), Lit(4)), Lit(3))
+    print(eval(expr))
+
+    let bad: Node = Div(Lit(12), Lit(0))
+    print(eval(bad))
+}
+
+main()

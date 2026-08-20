@@ -141,9 +141,18 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// A comma-(or other-`separator`-)delimited expression list, bounded by
+    /// an explicit `terminator` token (e.g. `(...)`'s `)`, `[...]`'s `]`).
+    /// Because the terminator is unambiguous, newlines around elements are
+    /// always safe to skip here — unlike top-level statements, nothing
+    /// inside an open paren/bracket could be mistaken for the start of a
+    /// new statement — so this list (and therefore any call args, struct
+    /// constructor args, and list/tuple literals) may freely span multiple
+    /// lines.
     pub fn expression_list(&mut self, separator: &Token, terminator: &Token) -> Vec<Spanned<Expression>> {
         let mut exprs = Vec::new();
-    
+        self.skip_newlines();
+
         // Handle empty list: if current token is already the terminator (e.g., "[]")
         if self.check(terminator) {
             return exprs; // Return empty vector
@@ -154,7 +163,7 @@ impl<'a> Parser<'a> {
             if self.check(terminator) || self.check(&Token::EOF) {
                 break;
             }
-    
+
             let maybe_expr = self.expression(Precedence::Assign);
             match maybe_expr {
                 Ok(expr) => exprs.push(expr),
@@ -165,22 +174,25 @@ impl<'a> Parser<'a> {
                 }
             };
 
+            self.skip_newlines();
+
             // After an expression, expect a separator or the terminator.
             if self.check(terminator) {
                 // Next token is the terminator (e.g., ']'), which is valid
                 break;
             } else if !self.check(separator) {
                 // Next token is neither the separator nor the terminator - this is an error!
-                let err = self.current_token.clone().map(|t| 
+                let err = self.current_token.clone().map(|t|
                     ParseError::ExpectedButFound(separator.clone(), t)
                 );
                 self.errors.push(err);
                 // Don't return early - let the outer parsing function handle this error
                 return exprs;
             }
-    
+
             // Consume the separator and continue
             let _ = self.advance();
+            self.skip_newlines();
         }
         exprs
     }
@@ -278,6 +290,48 @@ impl<'a> Parser<'a> {
     pub fn skip_newlines(&mut self) {
         while self.check(&Token::Newline) {
             let _ = self.advance();
+        }
+    }
+
+    /// Snapshot parser state (current token + lexer position) for a later
+    /// `restore` — a general one-token(-or-more)-of-lookahead-with-rollback
+    /// primitive, e.g. for `Grammar::field_list`'s "was that identifier a
+    /// field name or the start of a bare positional type?" check.
+    pub fn snapshot(&self) -> (Lexer<'a>, Spanned<Token>) {
+        (self.lexer.clone(), self.current_token.clone())
+    }
+
+    pub fn restore(&mut self, snapshot: (Lexer<'a>, Spanned<Token>)) {
+        self.lexer = snapshot.0;
+        self.current_token = snapshot.1;
+    }
+
+    /// Look past any newlines to see whether `expected` follows, without
+    /// committing to skipping them: if it does, the newlines (and any
+    /// leading whitespace-only lines) are consumed and this returns `true`;
+    /// if it doesn't, parser state is rolled back to exactly where it
+    /// started (still sitting on the first `Newline`) and this returns
+    /// `false`. Used where a newline is ambiguous between "this statement
+    /// continues on the next line" and "this statement just ended" — e.g. a
+    /// `data ... is` variant list, where a *leading* `|` on the next line
+    /// should continue the list, but any other token means the declaration
+    /// is over and the newline is an ordinary statement separator that must
+    /// be left for the caller to consume.
+    pub fn peek_past_newlines_is(&mut self, expected: &Token) -> bool {
+        if !self.check(&Token::Newline) {
+            return self.check(expected);
+        }
+        let saved_lexer = self.lexer.clone();
+        let saved_token = self.current_token.clone();
+        let saved_errors_len = self.errors.len();
+        self.skip_newlines();
+        if self.check(expected) {
+            true
+        } else {
+            self.lexer = saved_lexer;
+            self.current_token = saved_token;
+            self.errors.truncate(saved_errors_len);
+            false
         }
     }
 }

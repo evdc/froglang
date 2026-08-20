@@ -7,28 +7,8 @@
 //! `print`'s side effect on stdout, by running the compiled binary as a
 //! subprocess (in-process `compile_and_run` has no stdout to capture).
 
-use std::process::Command;
-
-/// Run `src` through the `froglang-core` binary and return its stdout.
-/// Writes `src` to a scratch `.frog` file, avoiding a dependency on the
-/// `tempfile` crate; the file is removed again once the process exits.
-fn run(src: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "frog_test_{}_{}.frog",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    ));
-    std::fs::write(&path, src).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_froglang-core"))
-        .args(["run", path.to_str().unwrap()])
-        .output()
-        .expect("failed to run froglang-core binary");
-    let _ = std::fs::remove_file(&path);
-
-    assert!(output.status.success(), "program failed: {}", String::from_utf8_lossy(&output.stderr));
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
+mod common;
+use common::run;
 
 // These rely on the CLI's own auto-print of the program's trailing expression
 // value (which handles `Bool` directly) to

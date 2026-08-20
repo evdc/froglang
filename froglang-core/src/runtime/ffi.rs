@@ -190,7 +190,11 @@ pub extern "C" fn frog_list_print(list: i64, kind: i64) {
         let value = unsafe { *list.data.add(i) };
         match kind {
             0 => out.push_str(&value.to_string()),
-            1 => out.push_str(&f64::from_bits(value as u64).to_string()),
+            // `{:?}`, not `Display`/`to_string` — Rust's `Display` for f64
+            // renders 1.0 as "1", which would make a `List(Float)` print
+            // identically to a `List(Int)`. `frog_float_print` already uses
+            // `{:?}` for the scalar case; this keeps the two agreeing.
+            1 => out.push_str(&format!("{:?}", f64::from_bits(value as u64))),
             2 => out.push_str(&(value != 0).to_string()),
             3 => unsafe {
                 let s = value as *const FrogStr;
@@ -234,8 +238,50 @@ pub extern "C" fn frog_list_len(list: i64) -> i64 {
 /// produce a clean error. `process::exit` never unwinds, so it's the only
 /// safe way out of this call frame.
 fn frog_index_out_of_bounds(idx: i64, len: i64) -> ! {
-    eprintln!("frog: index {} out of bounds for list of length {}", idx, len);
+    frog_abort(format_args!("index {} out of bounds for list of length {}", idx, len));
+}
+
+/// Terminate the process with `msg` — the single exit point every froglang
+/// runtime abort goes through, so they all report the same way (see
+/// `frog_index_out_of_bounds`'s note on why this is `process::exit` and not
+/// a Rust panic).
+///
+/// Prefer this over emitting a Cranelift `trap` for anything a *program*
+/// can trigger. A `trap` raises SIGILL, which kills the process with exit
+/// 132 and no diagnostic whatsoever — `panic("boom")` used to print its
+/// message and then die that way, and `1 / 0` died that way with no output
+/// at all. `trap` stays correct for genuinely unreachable IR (a `Never`-typed
+/// tail), which is what it's for.
+fn frog_abort(msg: std::fmt::Arguments) -> ! {
+    let _ = std::io::stdout().flush();
+    eprintln!("frog: {}", msg);
     std::process::exit(1);
+}
+
+/// Report an explicit `panic(msg)` (and `!`'s unwrap-failure desugaring,
+/// which resolves to the same reserved builtin) and terminate.
+#[no_mangle]
+pub extern "C" fn frog_panic(s: i64) -> ! {
+    let ptr = s as *const FrogStr;
+    let msg = unsafe {
+        let len = (*ptr).len as usize;
+        let data = (ptr as *const u8).add(std::mem::size_of::<FrogStr>());
+        String::from_utf8_lossy(std::slice::from_raw_parts(data, len)).into_owned()
+    };
+    frog_abort(format_args!("{}", msg));
+}
+
+/// Report an integer-division fault and terminate. `is_zero` is non-zero for
+/// a divide-by-zero and zero for the one other case `sdiv`/`srem` fault on,
+/// `Int::MIN / -1`, whose true quotient is not representable. Codegen tests
+/// both conditions ahead of the division and passes the flag, so one call
+/// site covers both messages — see `emit_int_div_guard` in `codegen/mod.rs`.
+#[no_mangle]
+pub extern "C" fn frog_div_error(is_zero: i64) -> ! {
+    if is_zero != 0 {
+        frog_abort(format_args!("division by zero"));
+    }
+    frog_abort(format_args!("division overflow: Int.MIN / -1 is not representable"));
 }
 
 /// Resolve a possibly-negative index (Python-style: -1 is the last element)

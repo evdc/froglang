@@ -4,7 +4,7 @@
 // All three desugar entirely in `TypeChecker` (`lower_try`/`lower_unwrap`/
 // `lower_catch`) into an ordinary `match` over the subject's union members
 // — literally built as synthetic `MatchArm`s and handed to the same
-// `infer_match`/`lower_match` machinery a source-level `match` uses (see
+// `lower_match` machinery a source-level `match` uses (see
 // `TypeChecker::union_entries`). Codegen gains no new control flow for any
 // of the three; the only codegen-visible addition is a `Never`-typed
 // `Conditional` fix (see below) and a `Never`-typed `Call` codegen path
@@ -12,7 +12,7 @@
 //
 // `e?`'s error arm is `return __err`, so its join is exactly the doc's
 // "set subtraction" type rule for free — a `return` arm is `Never`-typed
-// and vanishes from `infer_match`'s union-join, leaving only the
+// and vanishes from `lower_match`'s union-join, leaving only the
 // non-`Error` members. `e!`'s error arm calls the builtin `panic(msg: Str):
 // Never` (registered in `default_context`, exactly like `print`/`gc_dump`)
 // instead of returning — an ordinary function call, not a dedicated node,

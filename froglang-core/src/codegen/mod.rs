@@ -9,7 +9,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::tokens::{Spanned, Token};
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
-use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join};
+use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
 use crate::runtime::{ffi, gc};
 use crate::runtime::gc::{FrogList, FrogVariant};
 
@@ -61,6 +61,17 @@ struct Ctx<'a> {
     /// (`enum_field_leaf_types`), never to flatten a union value into more
     /// than one `Value`.
     unions:        &'a UnionDefs,
+    /// Anonymous-union "shapes" (keyed by their `Debug`-formatted member
+    /// list — stable identity for the same union type) currently being
+    /// printed, innermost call last — see `print_union`. A union-typed
+    /// struct field is stored as a single opaque boxed pointer, never
+    /// flattened (that's what makes a self-referential type like
+    /// `data Node is Add(lhs: Node, ...) | ...` representable at all), so
+    /// printing one recursively re-derives the same union type at codegen
+    /// time with no static bound on depth — `print_union` uses this stack
+    /// to detect that recursion and fail clearly instead of blowing the
+    /// (necessarily finite) shadow-stack slot count.
+    printing_unions: Vec<String>,
 }
 
 /// True iff a value of this type is a GC-managed heap pointer.
@@ -208,6 +219,21 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         TypedExprKind::Call { callable, args } => {
             for_each_heap_producer(callable, structs, f);
             for arg in args { for_each_heap_producer(arg, structs, f); }
+            // `print`'s codegen (`print_union`) reads whichever member of a
+            // union-typed argument matched at runtime via
+            // `read_variant_slots`, rooting one slot per heap-typed leaf of
+            // that member. Which member is a runtime fact, so — mirroring
+            // how `Conditional` below counts both branches even though only
+            // one runs — conservatively reserve for every member.
+            if let (TypedExprKind::Var(name), [arg, ..]) = (&callable.item.kind, args.as_slice()) {
+                if name == "print" {
+                    if let Type::Union(members) = &arg.item.ty {
+                        for m in members {
+                            for _ in 0..heap_leaf_count(m, structs) { f(); }
+                        }
+                    }
+                }
+            }
             // A struct-typed return re-roots one heap-typed leaf at a time
             // (see the `Call` arm of `compile_expr_multi`) — count matches.
             for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
@@ -363,6 +389,10 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         // A `Bool`-producing test on `value` — no allocation of its own,
         // just whatever `value` itself produces.
         TypedExprKind::Truthy(value) => for_each_heap_producer(value, structs, f),
+
+        // A numeric promotion produces no heap value of its own — only its
+        // operand can.
+        TypedExprKind::Coerce(value) => for_each_heap_producer(value, structs, f),
     }
 }
 
@@ -804,6 +834,44 @@ fn declare_rt(
     func_ids.insert(key.to_string(), id);
 }
 
+/// Emit the fault check that must precede an integer `sdiv`.
+///
+/// Cranelift's `sdiv` traps on the two inputs whose result isn't
+/// representable — `rv == 0`, and `Int.MIN / -1` — and a trap is SIGILL,
+/// which killed the process with exit 132 and no diagnostic at all. Both
+/// conditions are folded into one branch here so the common path costs a
+/// handful of well-predicted ALU ops and a not-taken jump; the fault path
+/// calls `ffi::frog_div_error`, which reports and exits cleanly. The flag
+/// passed to it distinguishes the two messages, so one call site covers both.
+///
+/// Emitting this leaves the builder positioned in a fresh "ok" block, so the
+/// caller's following `sdiv` lands after the guard.
+fn emit_int_div_guard(bcx: &mut FunctionBuilder, ctx: &mut Ctx, lv: Value, rv: Value) {
+    let is_zero = bcx.ins().icmp_imm(IntCC::Equal, rv, 0);
+    let is_neg1 = bcx.ins().icmp_imm(IntCC::Equal, rv, -1);
+    let is_min  = bcx.ins().icmp_imm(IntCC::Equal, lv, i64::MIN);
+    let is_ovf  = bcx.ins().band(is_neg1, is_min);
+    let is_bad  = bcx.ins().bor(is_zero, is_ovf);
+
+    let fault_bb = bcx.create_block();
+    let ok_bb    = bcx.create_block();
+    bcx.ins().brif(is_bad, fault_bb, &[], ok_bb, &[]);
+
+    bcx.switch_to_block(fault_bb);
+    bcx.seal_block(fault_bb);
+    let flag = bcx.ins().uextend(types::I64, is_zero);
+    let id = ctx.func_ids["frog_div_error"];
+    let callee = ctx.module.declare_func_in_func(id, bcx.func);
+    bcx.ins().call(callee, &[flag]);
+    // `frog_div_error` is `-> !` and never comes back, but Cranelift still
+    // needs this block terminated — and unlike a program-triggerable fault,
+    // *this* really is unreachable, which is what `trap` is for.
+    bcx.ins().trap(TrapCode::user(3).expect("3 is a valid user trap code"));
+
+    bcx.switch_to_block(ok_bb);
+    bcx.seal_block(ok_bb);
+}
+
 /// Emit a non-GC string fragment used while formatting composite values.
 fn print_fragment(text: &str, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
     let bytes = text.as_bytes().to_vec();
@@ -840,17 +908,38 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
         Type::Struct(name) => {
             print_fragment(&format!("{}(", name), bcx, ctx);
             let fields = ctx.structs.get(name).expect("known struct in codegen");
+            // A positionally-declared ("tuple struct") field has no
+            // source-level name — `field_name_or_positional` gave it its
+            // index instead (`is_positional_fields`) — so print it bare
+            // (`Point(1, 2)`), not with that synthetic name attached
+            // (`Point(0=1, 1=2)`).
+            let positional = is_positional_fields(fields);
             for (i, (field, field_ty)) in fields.iter().enumerate() {
                 if i != 0 { print_fragment(", ", bcx, ctx); }
-                print_fragment(&format!("{}=", field), bcx, ctx);
+                if !positional { print_fragment(&format!("{}=", field), bcx, ctx); }
                 print_value(field_ty, values, cursor, bcx, ctx);
             }
             print_fragment(")", bcx, ctx);
+        }
+        Type::Union(members) => {
+            // Mirrors `struct_fields`'s `Union` arm: a one-slot (boxed)
+            // union consumes 1 leaf (the pointer/immediate), a two-slot
+            // union (`is_two_slot_union`) consumes 2 (`$tag`, payload).
+            let n = if is_two_slot_union(members) { 2 } else { 1 };
+            print_union(members, &values[*cursor..*cursor + n], bcx, ctx);
+            *cursor += n;
         }
         Type::Str => {
             let id = ctx.func_ids["frog_str_repr_print"];
             let callee = ctx.module.declare_func_in_func(id, bcx.func);
             bcx.ins().call(callee, &[values[*cursor]]);
+            *cursor += 1;
+        }
+        // `None` carries no data — its slot exists only so leaf counts line
+        // up (`struct_fields` gives it one, and `print_union_member`
+        // materialises a dummy for it), so consume it and print the literal.
+        Type::None => {
+            print_fragment("None", bcx, ctx);
             *cursor += 1;
         }
         Type::Int | Type::Float | Type::Bool | Type::List(_) => {
@@ -872,6 +961,139 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
         }
         other => panic!("print codegen does not support {:?}", other),
     }
+}
+
+/// Print an anonymous union's actual member at runtime — `arg_vals` is
+/// `compile_expr_multi`'s output for the union-typed expression: `[ptr_or_
+/// immediate]` for a one-slot (boxed `FrogVariant`) union, `[tag, payload]`
+/// for a two-slot union (`is_two_slot_union`), whose tag rides in its own
+/// register instead of a boxed header. Branches on the tag at runtime — one
+/// comparison block per member except the last, which needs none since the
+/// tag is guaranteed to be one of `members`' indices — and prints whichever
+/// member actually matched, each in its own block so only that one runs.
+fn print_union(members: &[Type], arg_vals: &[Value], bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    // A union-typed struct field (e.g. `Add(lhs: Node, rhs: Node)`'s own
+    // `lhs`/`rhs`) is stored as a single opaque boxed pointer, never
+    // flattened — that's exactly what lets a self-referential type like
+    // `Node` exist at all (see `hoist_data_decls`'s self-reference check,
+    // which only rejects an *unboxed* cycle). Printing recurses through
+    // `print_union_member` → `print_value` back into `print_union` for that
+    // same field type, so a genuinely recursive union would need unbounded
+    // branch trees at codegen time — reject it clearly instead of either
+    // hanging the compiler or (since shadow-stack slots are necessarily
+    // finite) blowing `root_heap_value`'s slot count.
+    let shape = format!("{:?}", members);
+    if ctx.printing_unions.contains(&shape) {
+        panic!(
+            "unsupported: printing a recursive union type ({}) isn't supported yet \
+             — write a recursive function that formats it field-by-field instead.",
+            Type::Union(members.to_vec())
+        );
+    }
+    ctx.printing_unions.push(shape);
+    print_union_body(members, arg_vals, bcx, ctx);
+    ctx.printing_unions.pop();
+}
+
+/// Resolve a `Type::Union` back to the nominal `data X is A | B | ...` it
+/// stands for, if it is one. Every `UnionDef` stores the exact normalized
+/// `Type::Union` its name denotes (`UnionDef.ty`), so this is a direct
+/// lookup rather than a reconstruction — the same relation
+/// `TypeChecker::resolve_union` provides on the front-end side.
+///
+/// The distinction is not cosmetic. A nominal union's runtime tag is its
+/// variant's **declaration** index (that's what `VariantInit` writes),
+/// whereas a `Type::Union`'s members are sorted by display string
+/// (`Type::normalize` step 3). Treating the sorted position as the tag
+/// therefore mislabels every variant whose declared order isn't
+/// alphabetical, and treating a payload-less variant as boxed dereferences
+/// its immediate.
+fn resolve_nominal_union<'a>(members: &[Type], unions: &'a UnionDefs) -> Option<(&'a str, &'a UnionDef)> {
+    unions.iter()
+        .find(|(_, def)| matches!(&def.ty, Type::Union(m) if m.as_slice() == members))
+        .map(|(name, def)| (name.as_str(), def))
+}
+
+fn print_union_body(members: &[Type], arg_vals: &[Value], bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    let two_slot = is_two_slot_union(members);
+    // The value carrying each member's own fields once its tag is known:
+    // a two-slot union's payload register, or a one-slot union's sole
+    // pointer/immediate value (dereferenced per-member by `print_union_member`).
+    let payload = if two_slot { arg_vals[1] } else { arg_vals[0] };
+
+    // A two-slot union always has a bare scalar member, which a nominal
+    // union can never have (see `is_two_slot_union`), so only the one-slot
+    // shape is worth resolving.
+    let nominal = if two_slot { None } else { resolve_nominal_union(members, ctx.unions) };
+
+    // What to test for, and what to print, per case: a nominal union walks
+    // its variants in declared order (index == tag); an anonymous one walks
+    // the normalized member list, whose position *is* the tag `Widen`
+    // assigned.
+    let cases: Vec<(Type, u32)> = match nominal {
+        Some((name, def)) => def.variants.iter().enumerate()
+            .map(|(i, (variant, _))| (Type::Struct(format!("{}.{}", name, variant)), i as u32))
+            .collect(),
+        None => members.iter().cloned().zip(0u32..).collect(),
+    };
+
+    // Anonymous unions only ever have `None` as an immediate member — see
+    // `TypedExprKind::Widen`. A nominal union's immediates come from its
+    // `UnionDef` instead, via `emit_is_variant`.
+    let any_immediate = members.iter().any(|m| *m == Type::None);
+    let merge_bb = bcx.create_block();
+    let last = cases.len() - 1;
+
+    for (i, (member_ty, tag)) in cases.iter().enumerate() {
+        let body_bb = bcx.create_block();
+        // The final case needs no test: the tag is guaranteed to be one of
+        // these, so whatever is left must be it.
+        let cont_bb = if i < last { Some(bcx.create_block()) } else { None };
+
+        if let Some(cont_bb) = cont_bb {
+            let is_match = if two_slot {
+                bcx.ins().icmp_imm(IntCC::Equal, arg_vals[0], *tag as i64)
+            } else if let Some((_, def)) = nominal {
+                emit_is_variant(bcx, arg_vals[0], def, *tag)
+            } else {
+                emit_tag_test(bcx, arg_vals[0], *member_ty == Type::None, any_immediate, *tag)
+            };
+            bcx.ins().brif(is_match, body_bb, &[], cont_bb, &[]);
+        } else {
+            bcx.ins().jump(body_bb, &[]);
+        }
+
+        bcx.switch_to_block(body_bb);
+        bcx.seal_block(body_bb);
+        print_union_member(member_ty, payload, bcx, ctx);
+        bcx.ins().jump(merge_bb, &[]);
+
+        if let Some(cont_bb) = cont_bb {
+            bcx.switch_to_block(cont_bb);
+            bcx.seal_block(cont_bb);
+        }
+    }
+
+    bcx.switch_to_block(merge_bb);
+    bcx.seal_block(merge_bb);
+}
+
+/// Narrow a union member's carrier value (see `print_union`) into
+/// `member_ty`'s own leaf values — the same unboxing
+/// `TypedExprKind::Narrow` does (scalar members ride directly in the
+/// register/immediate, everything else is a boxed `FrogVariant` pointer to
+/// dereference) — and print it.
+fn print_union_member(member_ty: &Type, carrier: Value, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    let values = if *member_ty == Type::None {
+        vec![bcx.ins().iconst(types::I64, 0)]
+    } else if matches!(member_ty, Type::Int | Type::Float | Type::Bool) {
+        vec![from_i64_repr(bcx, member_ty, carrier)]
+    } else {
+        let leaf_types: Vec<Type> = struct_fields(member_ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+        read_variant_slots(carrier, 0, &leaf_types, bcx, ctx)
+    };
+    let mut cursor = 0;
+    print_value(member_ty, &values, &mut cursor, bcx, ctx);
 }
 
 /// Compile a scalar (non-struct-typed) expression into Cranelift IR,
@@ -1057,7 +1279,14 @@ fn compile_expr_multi(
                 Token::Plus  => if is_float { bcx.ins().fadd(lv, rv) } else { bcx.ins().iadd(lv, rv) },
                 Token::Minus => if is_float { bcx.ins().fsub(lv, rv) } else { bcx.ins().isub(lv, rv) },
                 Token::Star  => if is_float { bcx.ins().fmul(lv, rv) } else { bcx.ins().imul(lv, rv) },
-                Token::Slash => if is_float { bcx.ins().fdiv(lv, rv) } else { bcx.ins().sdiv(lv, rv) },
+                Token::Slash => if is_float {
+                    // IEEE division never faults — x/0.0 is ±inf, 0.0/0.0 is
+                    // NaN — so no guard here, only on the integer path.
+                    bcx.ins().fdiv(lv, rv)
+                } else {
+                    emit_int_div_guard(bcx, ctx, lv, rv);
+                    bcx.ins().sdiv(lv, rv)
+                },
                 Token::EqEq  => if is_float { bcx.ins().fcmp(FloatCC::Equal,               lv, rv) } else { bcx.ins().icmp(IntCC::Equal,                    lv, rv) },
                 Token::NotEq => if is_float { bcx.ins().fcmp(FloatCC::NotEqual,            lv, rv) } else { bcx.ins().icmp(IntCC::NotEqual,                 lv, rv) },
                 Token::Lt    => if is_float { bcx.ins().fcmp(FloatCC::LessThan,            lv, rv) } else { bcx.ins().icmp(IntCC::SignedLessThan,            lv, rv) },
@@ -1263,6 +1492,22 @@ fn compile_expr_multi(
                     let values = compile_expr_multi(arg, bcx, vars, ctx);
                     let mut cursor = 0;
                     print_value(&arg.item.ty, &values, &mut cursor, bcx, ctx);
+                    print_fragment("\n", bcx, ctx);
+                    return vec![bcx.ins().iconst(types::I64, 0)];
+                }
+                if let Type::Union(members) = &arg.item.ty {
+                    // Unlike the `Struct` case above, `print_value` can't
+                    // just walk a union's flattened leaves — which
+                    // member's leaves they even *are* is a runtime fact
+                    // (the tag), whether it's a one-slot boxed union (a
+                    // nominal `data ... is A | B`, represented as an
+                    // anonymous `Union` of its variant structs) or a
+                    // two-slot union with a scalar member. Dispatch on the
+                    // tag at runtime (mirroring what `match`'s `TypeTag`/
+                    // `Narrow` desugaring does for user code) and print
+                    // whichever member matched.
+                    let values = compile_expr_multi(arg, bcx, vars, ctx);
+                    print_union(members, &values, bcx, ctx);
                     print_fragment("\n", bcx, ctx);
                     return vec![bcx.ins().iconst(types::I64, 0)];
                 }
@@ -1745,6 +1990,15 @@ fn compile_expr_multi(
         // — see `TypeChecker::coerce_truthy`. Never reached with
         // `value.item.ty == Type::Bool` (that case is a no-op at lowering
         // and never wrapped in this node).
+        // A non-lossy numeric promotion — the same `coerce_value` the
+        // binary-operator path uses to bring two operands to a common type,
+        // applied here at a declared-slot boundary instead. See
+        // `TypedExprKind::Coerce`.
+        TypedExprKind::Coerce(value) => {
+            let v = compile_expr(value, bcx, vars, ctx);
+            vec![coerce_value(v, &value.item.ty, &expr.item.ty, bcx)]
+        },
+
         TypedExprKind::Truthy(value) => {
             let v = compile_expr(value, bcx, vars, ctx);
             let truthy = match &value.item.ty {
@@ -2013,6 +2267,8 @@ impl Codegen {
         builder.symbol("frog_str_repr_print", ffi::frog_str_repr_print as *const u8);
         builder.symbol("frog_bytes_print", ffi::frog_bytes_print as *const u8);
         builder.symbol("frog_str_println", ffi::frog_str_println as *const u8);
+        builder.symbol("frog_panic",       ffi::frog_panic       as *const u8);
+        builder.symbol("frog_div_error",   ffi::frog_div_error   as *const u8);
         builder.symbol("frog_int_println", ffi::frog_int_println as *const u8);
         builder.symbol("frog_float_println", ffi::frog_float_println as *const u8);
         builder.symbol("frog_bool_println", ffi::frog_bool_println as *const u8);
@@ -2051,18 +2307,22 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_bytes_print", "frog_bytes_print", &[I64, I64], None);
         // "print" in froglang calls frog_str_println (with newline).
         declare_rt(&mut module, &mut func_ids, "frog_str_println","print",           &[I64],           None);
-        // `panic`'s own message-printing reuses the same runtime entry
-        // point as `print(a_str_value)` — see `default_context`'s
-        // registration and the generic `Call` codegen's `Type::Never`
-        // handling, which is what actually makes the call diverge (a trap
-        // after it returns).
-        declare_rt(&mut module, &mut func_ids, "frog_str_println","panic",           &[I64],           None);
+        // `panic` prints its message and exits the process from the runtime
+        // side (`ffi::frog_panic`); it never returns. It used to be an alias
+        // for `frog_str_println`, relying on the generic `Call` codegen's
+        // `Type::Never` handling to emit a `trap` once the call came back —
+        // but a `trap` is SIGILL, so `panic("boom")` printed its message and
+        // then died with exit 132 instead of a clean 1. The `Never` trap
+        // after the call is now dead code, which is exactly what it's for.
+        declare_rt(&mut module, &mut func_ids, "frog_panic",     "panic",           &[I64],           None);
         // `!`'s desugaring (`TypeChecker::build_unwrap_arms`) resolves to
         // this reserved alias, not `"panic"`, so it can't be redirected by
         // a user-defined `func panic(...)` (which would overwrite the
         // `"panic"` key above via the ordinary user-function registration
         // path) — see `UNWRAP_PANIC_NAME` in typeck.rs.
-        declare_rt(&mut module, &mut func_ids, "frog_str_println","panic!builtin",  &[I64],           None);
+        declare_rt(&mut module, &mut func_ids, "frog_panic",     "panic!builtin",   &[I64],           None);
+        // Integer-division fault reporting — see `emit_int_div_guard`.
+        declare_rt(&mut module, &mut func_ids, "frog_div_error", "frog_div_error",  &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_int_println", "frog_int_println", &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_float_println", "frog_float_println", &[types::F64], None);
         declare_rt(&mut module, &mut func_ids, "frog_bool_println", "frog_bool_println", &[types::I8],  None);
@@ -2148,7 +2408,7 @@ impl Codegen {
 
         let n = count_heap_slots(body, structs);
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new() };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
         teardown_shadow_frame(&mut bcx, module, func_ids, heap_slot);
 
@@ -2241,7 +2501,7 @@ impl Codegen {
 
         let n: usize = stmts.iter().map(|s| count_heap_slots(s, structs)).sum();
         let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new() };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;

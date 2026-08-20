@@ -23,6 +23,7 @@ pub enum LexerError {
     InvalidNumber,
 }
 
+#[derive(Clone)]
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     current_line: u32,

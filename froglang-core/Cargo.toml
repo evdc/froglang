@@ -3,6 +3,11 @@ name = "froglang-core"
 version = "0.1.0"
 edition = "2021"
 default-run = "froglang-core"
+# `benches/` also holds the hand-written Rust/Go/Lua/Python reimplementations
+# that `run_comparisons.sh` builds for cross-language timing. Those are
+# standalone programs, not cargo bench targets, so declare the real ones
+# explicitly rather than letting cargo pick up every file in the directory.
+autobenches = false
 
 [features]
 # Enable verbose GC tracing to stderr (allocations, collections, marks, frees).
@@ -21,4 +26,11 @@ cranelift-native   = "0.113"
 [[bin]]
 name = "froglang-core"
 path = "src/main.rs"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
 

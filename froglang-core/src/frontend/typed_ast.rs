@@ -199,4 +199,22 @@ pub enum TypedExprKind {
     /// `0`/`0.0`/empty-`Str`/empty-`List`/`None` are falsey, everything
     /// else truthy. Result type is `Type::Bool`.
     Truthy(TypedExprRef),
+
+    /// A non-lossy numeric promotion of the inner value — today only
+    /// `Int -> Float` (`widens_to` is the authority on which pairs
+    /// qualify). The target is this node's own `.ty`, so codegen just
+    /// needs the inner value's type and this one's; see `coerce_value` in
+    /// `codegen/mod.rs`, which the binary-operator path already uses for
+    /// exactly the same job.
+    ///
+    /// Inserted by `TypeChecker::lower_widen` wherever a value flows into
+    /// a wider declared slot: a struct/variant field, a list element, an
+    /// annotation, a declared return type. Without it, inference accepted
+    /// `data P(w: Float)` + `P(w=1)` (via `widens_to`) while lowering left
+    /// the argument typed `Int`, so codegen wrote an `i64` into an `f64`
+    /// slot and the Cranelift verifier rejected the function. Function
+    /// *call arguments* were the one path that already worked, because
+    /// codegen coerces those against the callee's signature — this makes
+    /// every other slot behave the same way.
+    Coerce(TypedExprRef),
 }

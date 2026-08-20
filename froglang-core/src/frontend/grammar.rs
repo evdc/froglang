@@ -1,4 +1,4 @@
-use crate::frontend::{expression::{DataDeclExpr, Expression, ImportExpr, ImportKind, MatchArm, MatchExpr, Parameter, Pattern, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
+use crate::frontend::{expression::{DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, MatchArm, MatchExpr, Parameter, Pattern, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
 
 /// Result of parsing a type annotation. Parallel to `ParseResult`, but over
 /// the type grammar (`crate::frontend::type_expr`) rather than `Expression`.
@@ -547,37 +547,69 @@ impl Grammar {
         })
     }
 
-    /// `(field: Type, ...)` — every field requires a type annotation
-    /// (unlike function params, where it's optional). Shared by struct
-    /// fields, enum common fields, and enum variant fields. Assumes the
-    /// opening `(` has not yet been consumed; returns the field list and
-    /// the closing paren's span.
-    fn field_list(parser: &mut Parser) -> Result<(Vec<Parameter>, Span), Spanned<ParseError>> {
+    /// `(name: Type, ...)` (named fields) or `(Type, ...)` (positional
+    /// "tuple struct" fields, ERRORS.md's positional-args followup) —
+    /// every field requires a type annotation (unlike function params,
+    /// where it's optional). Shared by struct fields, enum common fields,
+    /// and enum variant fields. Assumes the opening `(` has not yet been
+    /// consumed; returns the field list and the closing paren's span.
+    ///
+    /// Which shape a given field is takes one token of lookahead past a
+    /// leading identifier: `Foo(x: Int)`'s `x` is a field name (followed
+    /// by `:`), but `Foo(Node)`'s `Node` is a bare type (not followed by
+    /// `:`) — indistinguishable until that next token is seen, since a
+    /// type name is itself an identifier. `Parser::snapshot`/`restore`
+    /// resolves it: consume the identifier, check for `:`, and if it's
+    /// absent, roll back and parse a type expression from scratch instead
+    /// (needed for a positional field whose type is more than one token,
+    /// e.g. `List[Int]` or `A | B`).
+    ///
+    /// A single field list must be all-named or all-positional — never
+    /// mixed, per the same reasoning `Grammar::data_decl`'s positional
+    /// story is built on: a field list's own calling convention (named
+    /// args vs. positional args, see `TypeChecker::lower_record_args`)
+    /// has to be unambiguous from the declaration alone.
+    fn field_list(parser: &mut Parser) -> Result<(Vec<FieldDecl>, Span), Spanned<ParseError>> {
         parser.consume(Token::LeftParen)?;
         let mut fields = Vec::new();
         while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
-            let field_tok = parser.identifier()?;
-            let field_name = match &field_tok.item {
-                Token::Identifier(s) => s.clone(),
-                _ => unreachable!(),
+            let snapshot = parser.snapshot();
+            let name = if let Token::Identifier(s) = parser.current_token.item.clone() {
+                parser.advance()?;
+                if parser.check(&Token::Colon) {
+                    parser.advance()?;
+                    Some(s)
+                } else {
+                    parser.restore(snapshot);
+                    None
+                }
+            } else {
+                None
             };
-            parser.consume(Token::Colon)?;
             let ty = Self::type_expr(parser)?;
-            fields.push(Parameter { name: field_name, ty: Some(ty) });
+            fields.push(FieldDecl { name, ty });
             if parser.check(&Token::Comma) {
                 parser.advance()?;
             }
         }
         let closing = parser.consume(Token::RightParen)?;
+        let named = fields.iter().filter(|f| f.name.is_some()).count();
+        if named != 0 && named != fields.len() {
+            return Err(Spanned::new(
+                ParseError::Other("a field list must be all named (`x: T`) or all positional (`T`), not a mix".to_string()),
+                closing.span.start, closing.span.end,
+            ));
+        }
         Ok((fields, closing.span))
     }
 
     /// `data Name(field: Type, ...)` for a struct, or
     /// `data Name(common: Type, ...) is A(...) | B(...) | ...` for an enum
     /// (the common-field parens are optional in either form; empty ⇒ none).
-    /// A multi-line variant list is written with a trailing `|` at the end
-    /// of each line (the parser has no lookahead past a newline to safely
-    /// know whether a *leading* `|` on the next line is coming).
+    /// A multi-line variant list may use either a trailing `|` at the end
+    /// of each line or a leading `|` at the start of the next (see
+    /// `Parser::peek_past_newlines_is`, which disambiguates the latter from
+    /// an ordinary statement-ending newline).
     pub fn data_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
         Self::data_decl_body(parser, token, false)
     }
@@ -625,7 +657,7 @@ impl Grammar {
                 };
                 variants.push(VariantDecl { name: variant_name, fields: variant_fields });
 
-                if parser.check(&Token::Pipe) {
+                if parser.peek_past_newlines_is(&Token::Pipe) {
                     parser.advance()?;
                     parser.skip_newlines();
                     continue;

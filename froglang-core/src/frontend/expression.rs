@@ -103,20 +103,34 @@ pub struct ForLoopExpr {
     pub body: ExprRef
 }
 
-/// One variant of an enum declaration: `Circle(r: Int)` or a nullary
-/// `Red`. Fields (if any) are on top of whatever common fields the
-/// enclosing `DataDeclExpr` declares.
+/// One field in a struct/variant field list: `name: Type` (a named field)
+/// or a bare `Type` (a positional/"tuple struct" field, `name: None`) —
+/// see `Grammar::field_list`. Unlike `Parameter` (function params, where
+/// the type is optional and the name never is), a field's type is always
+/// required and its name is the part that may be absent — the two are
+/// different enough shapes that reusing `Parameter` here would just make
+/// both look partially-optional. A single field list is always
+/// all-named or all-positional, never mixed (`Grammar::field_list`
+/// rejects a mix at parse time) — checked per list, so e.g. a union's
+/// common fields and a variant's own fields may independently pick either
+/// style.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDecl {
+    pub name: Option<String>,
+    pub ty:   Spanned<TypeExpr>,
+}
+
+/// One variant of an enum declaration: `Circle(r: Int)`, a positional
+/// `Circle(Int)`, or a nullary `Red`. Fields (if any) are on top of
+/// whatever common fields the enclosing `DataDeclExpr` declares.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariantDecl {
     pub name:   String,
-    pub fields: Vec<Parameter>,
+    pub fields: Vec<FieldDecl>,
 }
 
 /// `data Name(field: Type, ...)` for a struct, or
 /// `data Name(common: Type, ...) is A(...) | B(...)` for an enum.
-/// Field type annotations stay as unresolved expressions (see
-/// `Parameter`) until type checking, mirroring function params exactly —
-/// reuses `Parameter` rather than a new struct.
 /// An empty `variants` list means this is a plain struct declaration;
 /// `fields` holds the struct's own fields, or the enum's common fields.
 /// `provides` is the trait-name list from a trailing `provides X, Y`
@@ -127,7 +141,7 @@ pub struct VariantDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataDeclExpr {
     pub name:     String,
-    pub fields:   Vec<Parameter>,
+    pub fields:   Vec<FieldDecl>,
     pub variants: Vec<VariantDecl>,
     pub provides: Vec<String>,
 }
@@ -458,9 +472,9 @@ impl fmt::Display for Expression {
                 write!(f, "data {}(", d.name)?;
                 for (i, p) in d.fields.iter().enumerate() {
                     if i > 0 { write!(f, ", ")?; }
-                    match &p.ty {
-                        Some(ty) => write!(f, "{}: {}", p.name, ty.item)?,
-                        None => write!(f, "{}", p.name)?,
+                    match &p.name {
+                        Some(name) => write!(f, "{}: {}", name, p.ty.item)?,
+                        None => write!(f, "{}", p.ty.item)?,
                     }
                 }
                 write!(f, ")")?;
@@ -473,9 +487,9 @@ impl fmt::Display for Expression {
                             write!(f, "(")?;
                             for (j, p) in v.fields.iter().enumerate() {
                                 if j > 0 { write!(f, ", ")?; }
-                                match &p.ty {
-                                    Some(ty) => write!(f, "{}: {}", p.name, ty.item)?,
-                                    None => write!(f, "{}", p.name)?,
+                                match &p.name {
+                                    Some(name) => write!(f, "{}: {}", name, p.ty.item)?,
+                                    None => write!(f, "{}", p.ty.item)?,
                                 }
                             }
                             write!(f, ")")?;

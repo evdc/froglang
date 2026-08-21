@@ -139,12 +139,66 @@ fn test_is_on_a_non_union_value_is_rejected() {
     assert!(err.contains("Can only use 'is' on a union value"), "unexpected error: {}", err);
 }
 
+// ── Str/List members ────────────────────────────────────────────────────────
+//
+// `Str`/`List` used to be rejected as union members (`TypeChecker::lower_widen`
+// used to special-case them out) because nothing had actually verified the
+// double-boxing story: a `Str`/`List` value is already its own heap object
+// (`FrogStr`/`FrogList`, self-describing via `ObjKind`), so widening one into
+// a union boxes it a *second* time — a `FrogVariant` whose single payload
+// slot holds a pointer to the already-heap-allocated value — exactly the
+// same `box_into_variant` path a plain struct member already used. That
+// turned out to need no new codegen at all (`box_into_variant`,
+// `compile_narrow`, and `for_each_heap_producer`'s `Widen` arm are all
+// already generic over the boxed value's type), so only the `lower_widen`
+// rejection itself was ever the blocker.
+
 #[test]
-fn test_str_member_is_not_yet_supported() {
-    let err = type_error(
-        "func describe(x: Int | Str): Int = match x {\nis Int(n) then n\nis Str(s) then -1\n}\ndescribe(\"hi\")"
-    );
-    assert!(err.contains("not yet supported"), "unexpected error: {}", err);
+fn test_str_member_round_trips() {
+    assert_eq!(compile_and_run(
+        "func describe(x: Int | Str): Int = match x {\n\
+         is Int(n) then n\n\
+         is Str(s) then -1\n\
+         }\n\
+         describe(\"hi\") * 1000 + describe(5)"
+    ), -1 * 1000 + 5);
+}
+
+#[test]
+fn test_list_member_round_trips() {
+    // `Str | List(Int)` has no scalar (`Int`/`Float`/`Bool`) member, so this
+    // is the one-slot boxed path, not the two-slot `cond_mask` one — both
+    // members are boxed via `box_into_variant` exactly the same way.
+    //
+    // Discriminates via `is Str` only, not `is List(l)`: pattern-matching a
+    // bare parametric type name is a separate, pre-existing gap
+    // (`TypeChecker::check_type_pattern`'s `resolve_type_name` has no case
+    // for `List`, `Function`, etc — unrelated to whether `List` is a legal
+    // union member, which is what this test is actually about) — a
+    // `List`-typed union member is fully constructible and discriminable by
+    // tag today, just not yet destructurable by a `List(...)` pattern.
+    assert_eq!(compile_and_run(
+        "func is_str(x: Str | List(Int)): Int = if x is Str then 1 else 0\n\
+         is_str(\"hi\") * 10 + is_str([1, 2, 3])"
+    ), 10);
+}
+
+#[test]
+fn test_str_union_member_survives_gc_pressure() {
+    // Half the elements box a fresh `Str` (a real heap allocation each
+    // time) into `Int | Str`'s single payload slot, forcing several real
+    // collections while the list is still being built. A wrong `ptr_mask`
+    // on the wrapping `FrogVariant` would either free a still-live boxed
+    // string or crash trying to follow a raw `Int` payload as a pointer.
+    assert_eq!(compile_and_run(
+        "let xs: List(Int | Str) = [for i in 0..8000 do (if i - (i / 2) * 2 == 0 then i else \"hello\")]\n\
+         let total = 0\n\
+         for i in 0..8000 do (total = total + match xs[i] {\n\
+         is Int(n) then n\n\
+         is Str(s) then 0\n\
+         })\n\
+         total"
+    ), (0..8000i64).step_by(2).sum());
 }
 
 #[test]
@@ -163,4 +217,122 @@ fn test_assigning_into_a_union_typed_struct_field_widens() {
          is Bool(b) then -1\n\
          }"
     ), 9);
+}
+
+// ── a scalar-carrying union as a list element (`cond_mask`) ────────────────────
+//
+// A `List(Int | Point)` element uses the same unboxed `{tag, payload}` pair
+// a local `Int | Point` binding does (no allocation for the `Int` case) —
+// but `ptr_mask`, the list's static per-slot "is this a pointer" bitmask,
+// can't express "the payload slot is a pointer only when the tag says so".
+// `FrogList`/`FrogVariant` gained a `cond_mask` + `boxed_tags` pair for
+// exactly this (see `codegen::gc_masks` and `GcHeap::mark` in
+// `runtime/gc.rs`) — these tests exercise it end to end, including under
+// real GC pressure, where a wrong `cond_mask` would either free a still-live
+// boxed member (read-after-free) or follow a raw `Int` payload as if it
+// were a pointer (a crash or worse).
+
+#[test]
+fn test_list_of_scalar_and_struct_union_round_trips() {
+    assert_eq!(compile_and_run(
+        "data Point(x: Int, y: Int)\n\
+         let xs: List(Int | Point) = [1, Point(x=3, y=4), 5]\n\
+         let a = match xs[0] { is Int(n) then n\nis Point(p) then -1\n }\n\
+         let b = match xs[1] { is Int(n) then -1\nis Point(p) then p.x + p.y\n }\n\
+         let c = match xs[2] { is Int(n) then n\nis Point(p) then -1\n }\n\
+         a * 100 + b * 10 + c"
+    ), 1 * 100 + 7 * 10 + 5);
+}
+
+#[test]
+fn test_list_of_scalar_union_survives_gc_pressure() {
+    // Half the elements box a `Point` (a real heap allocation each time),
+    // forcing several real collections while the list is still growing via
+    // the comprehension — if `cond_mask`/`boxed_tags` were wrong, either the
+    // still-live `Point`s would get swept as garbage (the odd-index reads
+    // below would read freed memory) or a raw `Int` payload would get
+    // misread as a pointer during marking (a crash, not a wrong answer).
+    assert_eq!(compile_and_run(
+        "data Point(x: Int, y: Int)\n\
+         let xs: List(Int | Point) = [for i in 0..6000 do (if i - (i / 2) * 2 == 0 then i else Point(x=i, y=i))]\n\
+         let total = 0\n\
+         for i in 0..6000 do (total = total + match xs[i] {\n\
+         is Int(n) then n\n\
+         is Point(p) then p.x\n\
+         })\n\
+         total"
+    ), 6000 * 5999 / 2);
+}
+
+#[test]
+fn test_two_distinct_scalar_unions_in_one_struct_rejected() {
+    // `codegen::gc_masks` tracks one shared `boxed_tags` set per
+    // GC-scanned aggregate — two *different* scalar-carrying union shapes
+    // in the same struct can't both be represented by it, so
+    // `TypeChecker::check_scalar_union_consistency` rejects the combination
+    // (only reachable once the struct itself is embedded in an aggregate,
+    // e.g. a list — a plain top-level binding never boxes anything).
+    //
+    // This check runs in `TypeChecker::validate_codegen_constraints`, a
+    // post-lowering pass wired into `FrogState::eval` (not the ordinary
+    // `check_and_lower` the `type_error` helper above calls), so it's
+    // exercised through `FrogState` directly.
+    use froglang_core::state::{FrogState, FrogError};
+    let mut s = FrogState::new();
+    let result = s.eval(
+        "data Point(x: Int, y: Int)\n\
+         data Line(a: Point, b: Point)\n\
+         data Bad(m: Int | Point, n: Float | Line)\n\
+         let items: List(Bad) = [Bad(m=1, n=2.0)]\n\
+         items"
+    );
+    match result {
+        Err(FrogError::Type(msg)) => {
+            assert!(msg.contains("two different scalar-carrying union types"), "unexpected error: {}", msg);
+        },
+        other => panic!("expected a type error, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_for_loop_over_scalar_union_list_allocating_in_the_body() {
+    // Regression: `compile_for_loop` used to root each element leaf on
+    // `is_heap_ty(leaf)` alone, which is `true` for a two-slot union — so
+    // the *scalar* payload of an `Int` element (a raw integer, not a
+    // pointer) was pushed onto the shadow stack as a live root. The
+    // collector dereferences every non-zero root unchecked, so any
+    // collection triggered from inside the loop body dereferenced 4000004
+    // as a heap object. Rooting now goes through the tag-aware
+    // `root_flat_leaves`; `burn` allocates hard enough to force real
+    // collections while the loop variable is live.
+    assert_eq!(compile_and_run(
+        "data Point(x: Int, y: Int)\n\
+         func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\
+         let xs: List(Int | Point) = [4000000, 4000002, 4000004]\n\
+         let total = 0\n\
+         for x in xs do (total = total + burn(1) + match x {\n\
+         is Int(n) then n\n\
+         is Point(p) then p.x\n\
+         })\n\
+         total"
+    ), 4000000 + 4000002 + 4000004 + 3);
+}
+
+#[test]
+fn test_indexing_a_scalar_union_list_allocating_between_reads() {
+    // The same mis-rooting as above, on the `xs[i]` path
+    // (`TypedExprKind::Index`): the read below is interleaved with an
+    // allocation heavy enough to collect while the indexed element is
+    // still rooted.
+    assert_eq!(compile_and_run(
+        "data Point(x: Int, y: Int)\n\
+         func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\
+         let xs: List(Int | Point) = [4000000, 4000002, 4000004]\n\
+         let total = 0\n\
+         for i in 0..3 do (total = total + match xs[i] {\n\
+         is Int(n) then n + burn(1)\n\
+         is Point(p) then p.x + burn(1)\n\
+         })\n\
+         total"
+    ), 4000000 + 4000002 + 4000004 + 3);
 }

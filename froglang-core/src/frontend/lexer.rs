@@ -23,6 +23,16 @@ pub enum LexerError {
     InvalidNumber,
 }
 
+impl std::fmt::Display for LexerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LexerError::UnexpectedCharacter => write!(f, "unexpected character"),
+            LexerError::UnterminatedString  => write!(f, "unterminated string literal"),
+            LexerError::InvalidNumber       => write!(f, "invalid number literal"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,

@@ -104,8 +104,20 @@ impl std::fmt::Display for FrogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrogError::Parse(errs) => {
-                write!(f, "Parse error")?;
-                for e in errs { write!(f, ": {:?}", e)?; }
+                // A single lex error routinely cascades into several
+                // downstream parse errors at the same (or nearby) span —
+                // dedup identical (span, error) pairs so the user sees each
+                // distinct problem once, not three copies of it.
+                let mut seen: Vec<&Spanned<ParseError>> = Vec::new();
+                for e in errs {
+                    if !seen.iter().any(|s| s.span == e.span && s.item == e.item) {
+                        seen.push(e);
+                    }
+                }
+                for (i, e) in seen.iter().enumerate() {
+                    if i > 0 { writeln!(f)?; }
+                    write!(f, "{}: {}", e.span.start, e.item)?;
+                }
                 Ok(())
             },
             FrogError::Module(msg)  => write!(f, "Module error: {}", msg),
@@ -213,6 +225,10 @@ impl FrogState {
                 return Err(FrogError::Type(e.to_string()));
             }
         };
+        if let Err(e) = self.tc.validate_codegen_constraints(&typed) {
+            self.tc.restore(cp);
+            return Err(FrogError::Type(e.to_string()));
+        }
 
         let result_ty = typed.item.ty.clone();
 

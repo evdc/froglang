@@ -24,6 +24,24 @@ pub enum ParseError {
     Other(String)
 }
 
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::ExpectedButFound(expected, found) =>
+                write!(f, "expected {}, found {}", expected, found),
+            ParseError::ExpectedExpression => write!(f, "expected an expression"),
+            ParseError::ExpectedOperator    => write!(f, "expected an operator"),
+            ParseError::ExpectedIdentifier  => write!(f, "expected an identifier"),
+            ParseError::LexError(e)         => write!(f, "{}", e),
+            ParseError::FunctionTypeNeedsParens =>
+                write!(f, "a function type needs parentheses, e.g. `(A -> B)`"),
+            ParseError::InvalidAssignmentTarget =>
+                write!(f, "invalid assignment target"),
+            ParseError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
 // similar pattern to LexResult
 pub type ParseResult = Result<Spanned<Expression>, Spanned<ParseError>>;
 

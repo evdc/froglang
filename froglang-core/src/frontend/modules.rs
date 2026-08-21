@@ -44,7 +44,17 @@ impl std::fmt::Display for ModuleError {
             }
             ModuleError::Parse { path, errors } => {
                 write!(f, "parse error(s) in module '{}':", path.display())?;
-                for e in errors { write!(f, " {:?}", e)?; }
+                // A single lex error routinely cascades into several
+                // downstream parse errors at the same (or nearby) span —
+                // dedup identical (span, error) pairs so each distinct
+                // problem is reported once, not several times.
+                let mut seen: Vec<&Spanned<ParseError>> = Vec::new();
+                for e in errors {
+                    if !seen.iter().any(|s| s.span == e.span && s.item == e.item) {
+                        seen.push(e);
+                    }
+                }
+                for e in seen { write!(f, "\n  {}: {}", e.span.start, e.item)?; }
                 Ok(())
             }
             ModuleError::Cycle { chain } => {

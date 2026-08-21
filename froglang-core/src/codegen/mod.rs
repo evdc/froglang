@@ -112,31 +112,56 @@ fn is_multi_leaf_type(ty: &Type) -> bool {
     }
 }
 
-/// Reject a two-slot union (`is_two_slot_union`) among `leafs` — called
-/// wherever a value is about to be embedded in a GC-scanned aggregate whose
-/// pointer-ness is tracked by a static per-slot `ptr_mask` (a boxed
-/// `FrogVariant`'s payload, a `List`'s element stride): `ptr_mask` has no
-/// way to express "this slot is a pointer only when the *sibling* tag slot
-/// says so", unlike today's one-slot unions, whose only non-pointer bit
-/// pattern is a deliberately odd-tagged immediate — a two-slot union's raw,
-/// unrestricted scalar payload has no such guarantee and could be
-/// misinterpreted as a live pointer during marking. Rejecting this case
-/// outright (until the GC's `ptr_mask` scanning is made tag-aware — see
-/// README's "Up Next") beats silently miscompiling it. Values that only
-/// ever flow through locals/params/returns/`Widen`/`Narrow` never hit this
-/// — see `root_flat_leaves` for that path's (safe) tag-aware rooting.
-fn assert_no_two_slot_union_leaf<'a>(leafs: impl IntoIterator<Item = &'a Type>, context: &str) {
-    for t in leafs {
-        if let Type::Union(members) = t {
-            if is_two_slot_union(members) {
-                panic!(
-                    "unsupported: a union with a scalar member (e.g. `Int | E`) can't yet be used as {} \
-                     — only as a local variable, function parameter/return, or `?`/`catch`/`match` subject.",
-                    context
+/// Compute the three GC layout masks for a flattened leaf list
+/// (`struct_fields`'s output) that's about to be embedded in a GC-scanned
+/// aggregate (a boxed `FrogVariant`'s payload, or a `List`'s element
+/// stride): `ptr_mask` marks slots that are unconditionally heap pointers,
+/// exactly as before. A two-slot union leaf (`is_two_slot_union` — a
+/// scalar-carrying anonymous union like `Int | Str`, which rides as an
+/// unboxed `{tag, payload}` pair rather than allocating) can't be described
+/// by `ptr_mask` alone: its payload slot is a pointer only when its tag
+/// slot (always the immediately preceding leaf — see `struct_fields`'s
+/// two-slot `Union` arm) names one of the union's boxed members. That's
+/// what `cond_mask`/`boxed_tags` are for — see `FrogList`/`FrogVariant`'s
+/// own doc comments in `runtime/gc.rs`, and the mark loop that consumes
+/// them.
+///
+/// At most one *distinct* two-slot-union shape is supported per aggregate:
+/// `boxed_tags` is one shared set, so two different scalar-carrying unions
+/// in the same list/struct/variant can't both be represented correctly.
+/// `TypeChecker::check_scalar_union_consistency` rejects that combination
+/// with a type error before codegen ever sees it. Because that check runs
+/// on the type-checking path and this runs on the codegen path — which
+/// `compile_and_run` exposes independently — the invariant is re-asserted
+/// here rather than merely trusted: silently keeping the last shape's
+/// `boxed_tags` miscompiles into a use-after-free (every box whose tag bit
+/// the surviving mask doesn't set gets swept while still live).
+fn gc_masks<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> (i64, i64, i64) {
+    let mut ptr_mask: i64 = 0;
+    let mut cond_mask: i64 = 0;
+    let mut boxed_tags: i64 = 0;
+    for (i, t) in leafs.into_iter().enumerate() {
+        match t {
+            Type::Union(members) if is_two_slot_union(members) => {
+                let tags = members.iter().enumerate()
+                    .filter(|(_, m)| !matches!(m, Type::Int | Type::Float | Type::Bool | Type::None))
+                    .fold(0i64, |acc, (tag, _)| acc | (1i64 << tag));
+                assert!(
+                    cond_mask == 0 || boxed_tags == tags,
+                    "two scalar-carrying unions with different boxed-member layouts in one \
+                     GC aggregate ({:#x} vs {:#x}) — `boxed_tags` is a single shared set, so \
+                     this cannot be represented; `TypeChecker::check_scalar_union_consistency` \
+                     is supposed to reject it before codegen",
+                    boxed_tags, tags,
                 );
+                cond_mask |= 1i64 << i;
+                boxed_tags = tags;
             }
+            _ if is_heap_ty(t) => ptr_mask |= 1i64 << i,
+            _ => {}
         }
     }
+    (ptr_mask, cond_mask, boxed_tags)
 }
 
 /// Recursively flatten `ty` into its ordered leaf `(dotted_path, Type)`
@@ -464,16 +489,22 @@ fn boxed_member_tags(members: &[Type]) -> Vec<u32> {
         .collect()
 }
 
-/// Root every heap-producing leaf in `vals` (aligned 1:1 with `leafs`, e.g.
-/// from `struct_fields`). A plain heap-typed leaf (`Str`/`List`/a one-slot
-/// union) is rooted unconditionally, exactly as `root_heap_value` always
-/// has. A two-slot union's payload leaf goes through `root_two_slot_payload`
-/// instead, paired with `vals[i-1]` — the tag `struct_fields`'s two-slot
-/// `Union` arm always emits immediately before its payload leaf.
-fn root_flat_leaves(bcx: &mut FunctionBuilder, ctx: &mut Ctx, vals: &[Value], leafs: &[(String, Type)]) {
+/// Root every heap-producing leaf in `vals` (aligned 1:1 with `leaf_tys`,
+/// e.g. `struct_fields`'s output types). A plain heap-typed leaf
+/// (`Str`/`List`/a one-slot union) is rooted unconditionally, exactly as
+/// `root_heap_value` always has. A two-slot union's payload leaf goes
+/// through `root_two_slot_payload` instead, paired with `vals[i-1]` — the
+/// tag `struct_fields`'s two-slot `Union` arm always emits immediately
+/// before its payload leaf. Every site that reads flattened leaves out of
+/// a heap object (list element, variant payload) or off an ABI boundary
+/// must root through here rather than testing `is_heap_ty` per leaf:
+/// `is_heap_ty` is `true` for a two-slot union, but its payload slot holds
+/// a raw `Int`/`Float` whenever the tag names a scalar member, and the
+/// collector dereferences every non-zero shadow-stack root unchecked.
+fn root_flat_leaves(bcx: &mut FunctionBuilder, ctx: &mut Ctx, vals: &[Value], leaf_tys: &[Type]) {
     let mut i = 0;
-    while i < leafs.len() {
-        let (_, lty) = &leafs[i];
+    while i < leaf_tys.len() {
+        let lty = &leaf_tys[i];
         if let Type::Union(members) = lty {
             if is_two_slot_union(members) {
                 root_two_slot_payload(bcx, ctx, vals[i - 1], vals[i], &boxed_member_tags(members));
@@ -640,18 +671,16 @@ fn emit_tag_test(bcx: &mut FunctionBuilder, val: Value, target_is_immediate: boo
 /// scalar or plain struct into an anonymous union) — both need exactly the
 /// same runtime shape, just reached from different typed-AST nodes.
 fn box_into_variant(tag: u32, flat_vals: &[Value], flat_types: &[Type], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
-    assert_no_two_slot_union_leaf(flat_types, "a boxed union/struct field");
-    let mut ptr_mask: i64 = 0;
-    for (i, t) in flat_types.iter().enumerate() {
-        if is_heap_ty(t) { ptr_mask |= 1i64 << i; }
-    }
+    let (ptr_mask, cond_mask, boxed_tags) = gc_masks(flat_types);
     let tag_val    = bcx.ins().iconst(types::I64, tag as i64);
     let nslots_val = bcx.ins().iconst(types::I64, flat_vals.len() as i64);
-    let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
+    let mask_val      = bcx.ins().iconst(types::I64, ptr_mask);
+    let cond_mask_val  = bcx.ins().iconst(types::I64, cond_mask);
+    let boxed_tags_val = bcx.ins().iconst(types::I64, boxed_tags);
 
     let alloc_id  = ctx.func_ids["frog_alloc_variant"];
     let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
-    let call      = bcx.ins().call(alloc_ref, &[tag_val, nslots_val, mask_val]);
+    let call      = bcx.ins().call(alloc_ref, &[tag_val, nslots_val, mask_val, cond_mask_val, boxed_tags_val]);
     let ptr       = bcx.inst_results(call)[0];
     // Root the new object itself before populating it — matches the
     // traversal order `for_each_heap_producer` uses for both callers
@@ -1211,12 +1240,13 @@ fn compile_expr_multi(
                 let off_val = bcx.ins().iconst(types::I64, i as i64);
                 let call = bcx.ins().call(callee, &[list_val, idx_val, off_val]);
                 let raw = bcx.inst_results(call)[0];
-                let result = from_i64_repr(bcx, lty, raw);
-                if is_heap_ty(lty) {
-                    root_heap_value(bcx, ctx, result);
-                }
-                results.push(result);
+                results.push(from_i64_repr(bcx, lty, raw));
             }
+            // Root only once every leaf has been read: `frog_list_get`
+            // can't collect, and a two-slot union leaf's payload is
+            // rootable only alongside the tag leaf that precedes it.
+            let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
+            root_flat_leaves(bcx, ctx, &results, &leaf_tys);
             results
         },
 
@@ -1290,20 +1320,18 @@ fn compile_expr_multi(
 
         TypedExprKind::Comprehension { var, iterable, cond, body } => {
             let leafs = struct_fields(&body.item.ty, ctx.structs);
-            assert_no_two_slot_union_leaf(leafs.iter().map(|(_, t)| t), "a list element type");
+            let (ptr_mask, cond_mask, boxed_tags) = gc_masks(leafs.iter().map(|(_, t)| t));
             let stride = (leafs.len().max(1)) as i64;
-            let mut ptr_mask: i64 = 0;
-            for (i, (_, lty)) in leafs.iter().enumerate() {
-                if is_heap_ty(lty) { ptr_mask |= 1i64 << i; }
-            }
 
             let cap_val    = bcx.ins().iconst(types::I64, 1);
             let stride_val = bcx.ins().iconst(types::I64, stride);
-            let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
+            let mask_val      = bcx.ins().iconst(types::I64, ptr_mask);
+            let cond_mask_val  = bcx.ins().iconst(types::I64, cond_mask);
+            let boxed_tags_val = bcx.ins().iconst(types::I64, boxed_tags);
 
             let alloc_id = ctx.func_ids["frog_alloc_list"];
             let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
-            let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, stride_val, mask_val]);
+            let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, stride_val, mask_val, cond_mask_val, boxed_tags_val]);
             let result_list = bcx.inst_results(alloc_call)[0];
             // Root the result list before the loop runs at all: it must
             // already be reachable by the time the first pushed element
@@ -1834,8 +1862,9 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], bcx:
         // actually returned — so `root_flat_leaves` roots it behind
         // a runtime tag comparison rather than unconditionally.
         let results = bcx.inst_results(call).to_vec();
-        let leafs = struct_fields(&return_ty, ctx.structs);
-        root_flat_leaves(bcx, ctx, &results, &leafs);
+        let leaf_tys: Vec<Type> = struct_fields(&return_ty, ctx.structs)
+            .into_iter().map(|(_, t)| t).collect();
+        root_flat_leaves(bcx, ctx, &results, &leaf_tys);
         results
     } else {
         let result = bcx.inst_results(call)[0];
@@ -1852,21 +1881,19 @@ fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut Func
         _ => Type::Int,
     };
     let leafs = struct_fields(&elem_ty, ctx.structs);
-    assert_no_two_slot_union_leaf(leafs.iter().map(|(_, t)| t), "a list element type");
+    let (ptr_mask, cond_mask, boxed_tags) = gc_masks(leafs.iter().map(|(_, t)| t));
     let stride = (leafs.len().max(1)) as i64;
-    let mut ptr_mask: i64 = 0;
-    for (i, (_, lty)) in leafs.iter().enumerate() {
-        if is_heap_ty(lty) { ptr_mask |= 1i64 << i; }
-    }
 
     let n = elems.len() as i64;
     let cap_val    = bcx.ins().iconst(types::I64, n.max(1));
     let stride_val = bcx.ins().iconst(types::I64, stride);
-    let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
+    let mask_val      = bcx.ins().iconst(types::I64, ptr_mask);
+    let cond_mask_val  = bcx.ins().iconst(types::I64, cond_mask);
+    let boxed_tags_val = bcx.ins().iconst(types::I64, boxed_tags);
 
     let alloc_id = ctx.func_ids["frog_alloc_list"];
     let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
-    let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, stride_val, mask_val]);
+    let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, stride_val, mask_val, cond_mask_val, boxed_tags_val]);
     let list_ptr = bcx.inst_results(alloc_call)[0];
     // Root the list itself *before* compiling its elements: an
     // element expression (e.g. a Str) can allocate and trigger a
@@ -2083,10 +2110,9 @@ fn read_variant_slots(ptr: Value, offset: usize, leaf_types: &[Type], bcx: &mut 
         // Only a variant that has payload slots to read is ever boxed, so
         // `ptr` here is always a real pointer, never an unboxed immediate.
         let raw = bcx.ins().load(types::I64, heap_mem(), ptr, variant_slot_offset(offset + i));
-        let v = from_i64_repr(bcx, lty, raw);
-        if is_heap_ty(lty) { root_heap_value(bcx, ctx, v); }
-        out.push(v);
+        out.push(from_i64_repr(bcx, lty, raw));
     }
+    root_flat_leaves(bcx, ctx, &out, leaf_types);
     out
 }
 
@@ -2207,14 +2233,19 @@ fn compile_for_loop(
     // read needs no bounds check, just the slot arithmetic `frog_list_get`
     // would have done: `i * stride + leaf_idx`.
     let base_slot = bcx.ins().imul(i, stride_val);
-    for (leaf_idx, (leaf_path, lty)) in elem_leafs.iter().enumerate() {
+    let mut elem_vals = Vec::with_capacity(elem_leafs.len());
+    for (leaf_idx, (_, lty)) in elem_leafs.iter().enumerate() {
         let slot = bcx.ins().iadd_imm(base_slot, leaf_idx as i64);
         let addr = list_slot_addr(bcx, list_val, slot);
         let raw = bcx.ins().load(types::I64, heap_mem(), addr, 0);
-        let elem_val = from_i64_repr(bcx, lty, raw);
-        if is_heap_ty(lty) {
-            root_heap_value(bcx, ctx, elem_val);
-        }
+        elem_vals.push(from_i64_repr(bcx, lty, raw));
+    }
+    // Root every leaf before binding any of them: the loads above can't
+    // collect, and a two-slot union leaf's payload can only be rooted
+    // together with the tag leaf that precedes it.
+    let elem_leaf_tys: Vec<Type> = elem_leafs.iter().map(|(_, t)| t.clone()).collect();
+    root_flat_leaves(bcx, ctx, &elem_vals, &elem_leaf_tys);
+    for ((leaf_path, lty), elem_val) in elem_leafs.iter().zip(elem_vals) {
         let key = var_key(var, leaf_path);
         let var_id = get_or_declare_var(bcx, vars, ctx, &key, lty);
         bcx.def_var(var_id, elem_val);
@@ -2367,7 +2398,7 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_bool_print", "frog_bool_print", &[types::I8], None);
         declare_rt(&mut module, &mut func_ids, "frog_list_print", "frog_list_print", &[I64, I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_list_println", "frog_list_println", &[I64, I64], None);
-        declare_rt(&mut module, &mut func_ids, "frog_alloc_list", "frog_alloc_list", &[I64, I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_alloc_list", "frog_alloc_list", &[I64, I64, I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_list_len",   "frog_list_len",   &[I64],           Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_list_get",   "frog_list_get",   &[I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_list_set",   "frog_list_set",   &[I64, I64, I64, I64], None);
@@ -2377,7 +2408,7 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_gc_dump",    "gc_dump",         &[],               None);
         declare_rt(&mut module, &mut func_ids, "frog_frame_push", "frog_frame_push", &[I64, I64],      None);
         declare_rt(&mut module, &mut func_ids, "frog_frame_pop",  "frog_frame_pop",  &[],              None);
-        declare_rt(&mut module, &mut func_ids, "frog_alloc_variant", "frog_alloc_variant", &[I64, I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_alloc_variant", "frog_alloc_variant", &[I64, I64, I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_variant_tag", "frog_variant_tag", &[I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_variant_get", "frog_variant_get", &[I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_variant_set", "frog_variant_set", &[I64, I64, I64], None);

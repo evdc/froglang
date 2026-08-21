@@ -56,6 +56,20 @@ pub struct FrogList {
     pub cap:      u32,
     pub stride:   u32,
     pub ptr_mask: u64,
+    /// Bit `i` set means slot `i` within each element block is a
+    /// *conditional* pointer: a heap pointer iff the element's slot `i-1`
+    /// (its tag — always the immediately preceding leaf, see
+    /// `struct_fields`'s two-slot `Union` arm) holds one of `boxed_tags`'s
+    /// bits. Exists because a scalar-carrying union (`Int | Str`) uses an
+    /// unboxed `{tag, payload}` pair when it's a local/param/return (no
+    /// allocation needed), but `ptr_mask` alone can't express "this slot is
+    /// a pointer only sometimes" — see `codegen::gc_masks`, the one place
+    /// that computes this. At most one distinct such union shape is
+    /// supported per list (`TypeChecker::check_scalar_union_consistency`
+    /// rejects more before codegen ever sees them), so one `boxed_tags` set
+    /// is enough regardless of how many `cond_mask` bits are set.
+    pub cond_mask:  u64,
+    pub boxed_tags: u64,
     pub data:     *mut i64,
 }
 
@@ -77,6 +91,11 @@ pub struct FrogVariant {
     pub tag:      u32,
     pub nslots:   u32,
     pub ptr_mask: u64,
+    /// See `FrogList::cond_mask`'s doc comment — the identical mechanism,
+    /// applied to a boxed union/struct's own payload slots instead of a
+    /// list's per-element slots.
+    pub cond_mask:  u64,
+    pub boxed_tags: u64,
     _data: [i64; 0],  // zero-sized marker; slots live at (ptr + size_of::<FrogVariant>())
 }
 
@@ -266,13 +285,24 @@ impl GcHeap {
                 ObjKind::List => {
                     let list = obj as *mut FrogList;
                     let mask = (*list).ptr_mask;
-                    if mask != 0 {
+                    let cond_mask = (*list).cond_mask;
+                    let boxed_tags = (*list).boxed_tags;
+                    if mask != 0 || cond_mask != 0 {
                         let stride = ((*list).stride as usize).max(1);
                         let elem_len = (*list).len as usize / stride;
                         for i in 0..elem_len {
                             let base = i * stride;
                             for bit in 0..stride {
-                                if mask & (1u64 << bit) != 0 {
+                                let unconditional = mask & (1u64 << bit) != 0;
+                                // A conditional slot's own pointer-ness
+                                // depends on its tag, the immediately
+                                // preceding slot (see `cond_mask`'s doc
+                                // comment) — always in-bounds, since the
+                                // tag leaf is never the first of a field.
+                                let conditional = cond_mask & (1u64 << bit) != 0
+                                    && bit > 0
+                                    && boxed_tags & (1u64 << *(*list).data.add(base + bit - 1)) != 0;
+                                if unconditional || conditional {
                                     let elem = *(*list).data.add(base + bit);
                                     if is_heap_ptr(elem) {
                                         worklist.push(elem as *mut GcHeader);
@@ -285,11 +315,17 @@ impl GcHeap {
                 ObjKind::Variant => {
                     let variant = obj as *mut FrogVariant;
                     let mask = (*variant).ptr_mask;
-                    if mask != 0 {
+                    let cond_mask = (*variant).cond_mask;
+                    let boxed_tags = (*variant).boxed_tags;
+                    if mask != 0 || cond_mask != 0 {
                         let nslots = (*variant).nslots as usize;
                         let data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
                         for i in 0..nslots {
-                            if mask & (1u64 << i) != 0 {
+                            let unconditional = mask & (1u64 << i) != 0;
+                            let conditional = cond_mask & (1u64 << i) != 0
+                                && i > 0
+                                && boxed_tags & (1u64 << *data.add(i - 1)) != 0;
+                            if unconditional || conditional {
                                 let elem = *data.add(i);
                                 if is_heap_ptr(elem) {
                                     worklist.push(elem as *mut GcHeader);
@@ -399,7 +435,7 @@ impl GcHeap {
     /// type). `ptr_mask` marks which of the `stride` per-element slot
     /// offsets are heap pointers — see `FrogList`'s doc comment.
     /// The data buffer is separately allocated (not a GC object).
-    pub fn alloc_list(&mut self, cap: usize, stride: usize, ptr_mask: u64) -> *mut FrogList {
+    pub fn alloc_list(&mut self, cap: usize, stride: usize, ptr_mask: u64, cond_mask: u64, boxed_tags: u64) -> *mut FrogList {
         let stride = stride.max(1);
         let actual_elem_cap = cap.max(1);
         let slot_cap = actual_elem_cap * stride;
@@ -415,11 +451,13 @@ impl GcHeap {
                 marked: false,
                 kind:   ObjKind::List,
             };
-            (*ptr).len      = 0;
-            (*ptr).cap      = slot_cap as u32;
-            (*ptr).stride   = stride as u32;
-            (*ptr).ptr_mask = ptr_mask;
-            (*ptr).data     = data;
+            (*ptr).len        = 0;
+            (*ptr).cap        = slot_cap as u32;
+            (*ptr).stride     = stride as u32;
+            (*ptr).ptr_mask   = ptr_mask;
+            (*ptr).cond_mask  = cond_mask;
+            (*ptr).boxed_tags = boxed_tags;
+            (*ptr).data       = data;
         }
 
         self.head = ptr as *mut GcHeader;
@@ -435,7 +473,7 @@ impl GcHeap {
     /// garbage through an as-yet-unwritten slot — mirrors why
     /// `push_frame` zeroes shadow-stack slots). `ptr_mask` marks which
     /// slots are heap pointers, exactly like `alloc_list`'s.
-    pub fn alloc_variant(&mut self, tag: u32, nslots: usize, ptr_mask: u64) -> *mut FrogVariant {
+    pub fn alloc_variant(&mut self, tag: u32, nslots: usize, ptr_mask: u64, cond_mask: u64, boxed_tags: u64) -> *mut FrogVariant {
         let struct_size = std::mem::size_of::<FrogVariant>();
         let data_size = nslots * std::mem::size_of::<i64>();
         let total = struct_size + data_size;
@@ -449,9 +487,11 @@ impl GcHeap {
                 marked: false,
                 kind:   ObjKind::Variant,
             };
-            (*ptr).tag      = tag;
-            (*ptr).nslots   = nslots as u32;
-            (*ptr).ptr_mask = ptr_mask;
+            (*ptr).tag        = tag;
+            (*ptr).nslots     = nslots as u32;
+            (*ptr).ptr_mask   = ptr_mask;
+            (*ptr).cond_mask  = cond_mask;
+            (*ptr).boxed_tags = boxed_tags;
             if nslots > 0 {
                 let dst = (ptr as *mut u8).add(struct_size) as *mut i64;
                 std::ptr::write_bytes(dst, 0, nslots);

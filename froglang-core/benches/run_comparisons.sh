@@ -92,10 +92,16 @@ FROG_BIN=""
 # Cargo workspaces place the binary in the workspace root's target/, not the
 # crate's own directory.  `cargo build --message-format json` would give the
 # exact path, but parsing that is overkill; just probe both locations.
+#
+# Anchored on $BENCH_DIR (this script's own directory) rather than $(pwd):
+# probing relative to the working directory only found the binary when the
+# script happened to be invoked from the crate or workspace root, and
+# printed "could not locate froglang-core binary" — silently dropping the
+# one row the table exists for — when it was run from benches/ itself.
 if cargo build --release --quiet 2>/dev/null; then
     for candidate in \
-        "$(pwd)/target/release/froglang-core" \
-        "$(pwd)/../target/release/froglang-core"
+        "$BENCH_DIR/../target/release/froglang-core" \
+        "$BENCH_DIR/../../target/release/froglang-core"
     do
         if [[ -x "$candidate" ]]; then
             FROG_BIN="$candidate"

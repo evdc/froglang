@@ -32,6 +32,24 @@
 //! a reasonable time. `orders` in particular runs a fraction of the
 //! iterations `benches/orders.frog` does, so the two numbers are not
 //! comparable to each other; only to their own history.
+//!
+//! The workloads are chosen to isolate *different* subsystems, so a
+//! regression points at a culprit rather than just "something got slower".
+//! Between them they cover: raw call/arithmetic throughput with no heap at
+//! all (`fib`), unboxed struct field access and copying (`structs`), the
+//! allocator and collector under pure churn (`alloc`) and under a large
+//! *retained* live set that every collection must re-mark (`gc_pressure`),
+//! string building and comparison (`strings`), list allocation, growth and
+//! indexing (`lists`), recursive boxed unions and `match` dispatch (`tree`),
+//! and everything at once (`orders`).
+//!
+//! `fallible`/`infallible` are a deliberate pair: the same arithmetic
+//! pipeline, once written plainly and once threaded through `?`/`catch`
+//! over an `Int | Bad` union. Their *ratio* is the cost of froglang's error
+//! propagation, and it is the number to watch — wrapping `orders`'s hot
+//! path in `?`/`catch` once doubled its wall time even though the error
+//! branch was never taken, and nothing in the suite would have localised
+//! that to error handling rather than to structs, lists or the GC.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::hint::black_box;
@@ -131,6 +149,144 @@ for i in 0..20000 do {
 sink
 ";
 
+/// Unboxed structs and nothing else: nested `data` values passed by value
+/// into and out of functions, rebound field by field, with no allocation
+/// anywhere. Struct values are flattened into one SSA value per leaf field
+/// rather than boxed (`struct_fields` in codegen), so this should track
+/// `fib` closely — if it drifts away from `fib`, struct passing has stopped
+/// being free.
+const STRUCTS: &str = "\
+data Vec3(x: Int, y: Int, z: Int)
+data Body(pos: Vec3, vel: Vec3, mass: Int)
+func advance(p: Vec3, v: Vec3): Vec3 = Vec3(x=p.x + v.x, y=p.y + v.y, z=p.z + v.z)
+func step(b: Body): Body = {
+    b.pos = advance(b.pos, b.vel)
+    b
+}
+func energy(b: Body): Int = b.mass * (b.vel.x * b.vel.x + b.vel.y * b.vel.y + b.vel.z * b.vel.z)
+let b = Body(pos=Vec3(x=0, y=0, z=0), vel=Vec3(x=1, y=2, z=3), mass=7)
+let total = 0
+for i in 0..500000 do {
+    b = step(b)
+    total = total + energy(b)
+}
+total + b.pos.x
+";
+
+/// String building and comparison: every iteration concatenates several
+/// short strings into a fresh one and compares it against a literal. Each
+/// `+` is a `frog_str_concat` — a GC allocation plus a copy of both
+/// operands — so this is the workload that notices a change to string
+/// representation or to concat's own buffering.
+const STRINGS: &str = "\
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+func digit(d: Int): Str =
+    if d == 0 then \"0\" else if d == 1 then \"1\" else if d == 2 then \"2\"
+    else if d == 3 then \"3\" else if d == 4 then \"4\" else if d == 5 then \"5\"
+    else if d == 6 then \"6\" else if d == 7 then \"7\" else if d == 8 then \"8\" else \"9\"
+func render(n: Int): Str = digit(modn(n / 100, 10)) + digit(modn(n / 10, 10)) + digit(modn(n, 10))
+let hits = 0
+for i in 0..8000 do {
+    let key = \"id-\" + render(i) + \"/\" + render(i + 1)
+    if key == \"id-000/001\" then hits = hits + 1 else hits = hits
+}
+hits
+";
+
+/// Lists specifically: a fresh 1500-element comprehension per round (which
+/// grows its backing store by repeated doubling from a capacity of one),
+/// then a scattered read pass over it. Separates list allocation, growth
+/// and bounds-checked indexing from the struct/union work `orders` mixes
+/// them with.
+const LISTS: &str = "\
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+let total = 0
+for round in 0..500 do {
+    let xs = [for i in 0..1500 do i * 3 + round]
+    let s = 0
+    for j in 0..1500 do { s = s + xs[modn(j * 7 + round, 1500)] }
+    total = total + modn(s, 1000003)
+}
+total
+";
+
+/// Recursive boxed unions: build a complete binary `Tree` and walk it with
+/// `match`. Unlike a struct, a union value is always a heap-boxed
+/// `FrogVariant`, so this measures variant allocation, tag dispatch and
+/// destructuring on a deep object graph — and, because each tree stays
+/// wholly reachable while it is summed, a mark phase that has to chase
+/// pointers rather than scan a flat list.
+const TREE: &str = "\
+data Tree is Leaf | Node(v: Int, l: Tree, r: Tree)
+func build(depth: Int, v: Int): Tree =
+    if depth == 0 then Leaf else Node(v=v, l=build(depth - 1, v * 2), r=build(depth - 1, v * 2 + 1))
+func sum(t: Tree): Int = match t {
+    is Leaf then 0
+    is Node(v, l, r) then v + sum(l) + sum(r)
+}
+let total = 0
+for i in 0..40 do { total = total + sum(build(12, i)) }
+total
+";
+
+/// Collector scaling against a large *retained* live set. `live` is a
+/// 4000-cell chain that stays reachable for the whole run, so every
+/// collection triggered by the garbage in the loop below must re-mark all
+/// of it. `alloc` measures allocation with almost nothing live; this
+/// measures the mark phase, which is the half that grows with the heap
+/// rather than with the allocation rate — a non-generational collector's
+/// characteristic cliff.
+const GC_PRESSURE: &str = "\
+data Node is Empty | Cell(v: Int, rest: Node)
+func chain(n: Int, acc: Node): Node = if n == 0 then acc else chain(n - 1, Cell(v=n, rest=acc))
+func total(t: Node): Int = match t {
+    is Empty then 0
+    is Cell(v, rest) then v + total(rest)
+}
+let live = chain(4000, Empty)
+let sink = 0
+for i in 0..400 do {
+    let garbage = chain(200, Empty)
+    sink = sink + total(garbage)
+}
+sink + total(live)
+";
+
+/// The control half of the `?`/`catch` pair: a plain arithmetic pipeline of
+/// ordinary `Int`-returning calls. Identical in shape and result to
+/// `FALLIBLE`; the only difference is that nothing here is fallible.
+const INFALLIBLE: &str = "\
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+func scale(x: Int): Int = if x < 0 then 0 else x * 3 + 1
+func pipeline(x: Int): Int = scale(scale(x))
+let total = 0
+for i in 0..800000 do { total = total + modn(pipeline(i), 1000003) }
+total
+";
+
+/// The same pipeline with every step returning `Int | Bad`, propagated with
+/// `?` and collapsed back to an `Int` with `catch` at the call site. The
+/// error branch is never taken, so any gap against `INFALLIBLE` is pure
+/// overhead in the mechanism: the union representation, the tag test `?`
+/// emits per call, and the `catch` landing pad.
+///
+/// `Int | Bad` has a scalar member, so it should ride in an unboxed
+/// `{tag, payload}` register pair rather than allocating a `FrogVariant`
+/// per call. A sudden jump in this ratio most likely means some change made
+/// that union box again.
+const FALLIBLE: &str = "\
+data Bad(msg: Str) provides Error
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+func scale(x: Int): Int | Bad = if x < 0 then Bad(msg=\"negative\") else x * 3 + 1
+func pipeline(x: Int): Int | Bad = {
+    let a = scale(x)?
+    scale(a)
+}
+let total = 0
+for i in 0..800000 do { total = total + modn(pipeline(i) catch 0, 1000003) }
+total
+";
+
 /// Front-end-only workload: a wide program with many independent
 /// declarations, sized to make parsing and type-checking (rather than
 /// execution) the whole cost. Compiled but never run.
@@ -145,12 +301,59 @@ fn wide_program() -> String {
     src
 }
 
+/// The other front-end axis: one *deeply* nested expression rather than
+/// many shallow declarations. `wide` grows the number of top-level items,
+/// which a linear front end handles linearly; this grows the nesting depth
+/// of a single expression, which is where a type-checker that re-walks a
+/// subtree per level turns quadratic and where the recursion limits bite.
+/// Compiled but never run.
+fn deep_program() -> String {
+    let mut src = String::from("func f(x: Int): Int = x + 1
+let y = 1
+let z = ");
+    for _ in 0..300 {
+        src.push_str("f(");
+    }
+    src.push('y');
+    for _ in 0..300 {
+        src.push(')');
+    }
+    src.push_str("
+z
+");
+    src
+}
+
 // ── benchmark groups ─────────────────────────────────────────────────────────
+
+/// Every runnable workload, in the order both groups report them.
+/// `infallible` sits immediately before `fallible` so their ratio — the
+/// cost of `?`/`catch` — is two adjacent lines in the output.
+fn runnable() -> [(&'static str, &'static str); 10] {
+    [
+        ("fib", FIB),
+        ("structs", STRUCTS),
+        ("alloc", ALLOC),
+        ("gc_pressure", GC_PRESSURE),
+        ("strings", STRINGS),
+        ("lists", LISTS),
+        ("tree", TREE),
+        ("infallible", INFALLIBLE),
+        ("fallible", FALLIBLE),
+        ("orders", ORDERS),
+    ]
+}
 
 fn bench_compile(c: &mut Criterion) {
     let wide = wide_program();
+    let deep = deep_program();
     let mut group = c.benchmark_group("compile");
-    for (name, src) in [("fib", FIB), ("orders", ORDERS), ("alloc", ALLOC), ("wide", wide.as_str())] {
+    // The front end sees the same programs the back end does, plus the two
+    // that exist only to stress it.
+    let mut cases: Vec<(&str, &str)> = runnable().to_vec();
+    cases.push(("wide", wide.as_str()));
+    cases.push(("deep", deep.as_str()));
+    for (name, src) in cases {
         group.bench_with_input(BenchmarkId::from_parameter(name), src, |b, src| {
             b.iter(|| compile_only(black_box(src)))
         });
@@ -160,9 +363,9 @@ fn bench_compile(c: &mut Criterion) {
 
 fn bench_end_to_end(c: &mut Criterion) {
     let mut group = c.benchmark_group("end_to_end");
-    // `wide` is deliberately absent: it exists to stress the front end, and
-    // running it would only add a constant.
-    for (name, src) in [("fib", FIB), ("orders", ORDERS), ("alloc", ALLOC)] {
+    // `wide` and `deep` are deliberately absent: they exist to stress the
+    // front end, and running them would only add a constant.
+    for (name, src) in runnable() {
         group.bench_with_input(BenchmarkId::from_parameter(name), src, |b, src| {
             b.iter(|| black_box(compile_and_run(black_box(src))))
         });

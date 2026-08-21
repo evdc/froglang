@@ -372,6 +372,16 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
         let list_ptr = list as *mut FrogList;
         unsafe {
             if (*list_ptr).len == (*list_ptr).cap {
+                // `realloc` must be handed the layout the buffer was
+                // allocated with. `GcHeap::alloc_list` allocates `cap`
+                // whole `i64` slots, 8-byte aligned, whether that block
+                // came fresh from the system allocator or off a free list
+                // (`GcHeap::alloc_bytes` rounds every size class to whole
+                // 8-byte words, so a recycled block's original layout is
+                // byte-for-byte this one) — so `Layout::array::<i64>(cap)`
+                // is exactly right in both cases. The grown buffer is a
+                // plain global-allocator block of `new_cap` slots, which is
+                // what `free_obj` later recycles at that same size.
                 let old_cap = (*list_ptr).cap as usize;
                 let new_cap = old_cap * 2;
                 let old_layout = Layout::array::<i64>(old_cap).expect("list realloc layout");
@@ -470,21 +480,15 @@ pub extern "C" fn frog_gc_dump() {
     super::gc::gc_dump();
 }
 
-// ── Shadow stack (GC roots for JIT-local heap pointers) ────────────────────────
+// ── Shadow stack (GC roots for JIT-local heap pointers) ───────────────────────
 //
-// Called from the prologue/epilogue codegen emits around every JIT function
-// that has at least one heap-typed subexpression. See gc.rs's "Shadow stack"
-// section for the rooting invariant this maintains.
-
-#[no_mangle]
-pub extern "C" fn frog_frame_push(slots: i64, len: i64) {
-    with_heap(|heap| heap.push_frame(slots as *mut i64, len as usize));
-}
-
-#[no_mangle]
-pub extern "C" fn frog_frame_pop() {
-    with_heap(|heap| heap.pop_frame());
-}
+// Deliberately absent: there is no `frog_frame_push`/`frog_frame_pop` FFI
+// pair any more. A shadow-stack frame is now a `gc::ShadowFrame` embedded
+// in the JIT function's own native stack frame, linked and unlinked by four
+// inline loads/stores that `setup_shadow_frame`/`teardown_shadow_frame`
+// (codegen/mod.rs) emit directly — no call, no thread-local lookup, no
+// `memset` libcall. See `gc::ShadowFrame` for the layout and
+// `gc::GcHeap::set_shadow_top` for how the collector finds the chain.
 
 #[cfg(test)]
 mod tests {

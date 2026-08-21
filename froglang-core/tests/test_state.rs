@@ -188,3 +188,80 @@ fn test_let_in_conditional_branch_visible_within_branch_and_state_recovers() {
     let (recovered, _) = s.eval("1 + 1").unwrap();
     assert_eq!(int(&recovered), 2);
 }
+
+/// End-to-end stress for the two GC mechanisms a program exercises on every
+/// heap-touching call: the intrusive shadow-frame chain that codegen links
+/// into `Codegen`'s `ShadowTop` cell, and the size-class free lists
+/// `GcHeap::sweep` recycles blocks onto.
+///
+/// Both replaced simpler-but-slower designs (an out-of-line
+/// `frog_frame_push` maintaining a `Vec<ShadowFrame>`, and a straight
+/// `alloc`/`dealloc` per object). Their failure mode is not a wrong answer
+/// in the small — every existing test still passes against a shadow chain
+/// that drops a frame, or a free list that hands out a block still reachable
+/// from somewhere — but corruption that only appears once collections
+/// actually fire *while* a deep call stack holds heap values in registers.
+/// That needs three things at once, which is what this builds:
+///
+///   * a large structure that stays reachable across many collections
+///     (`spine`), so the mark phase has to find it through the shadow chain
+///     rather than trivially through the entry frame;
+///   * enough garbage churn to drive many collections and so recycle
+///     thousands of blocks through the free lists;
+///   * recursion deep enough that the shadow chain is many frames long when
+///     a collection fires mid-call.
+///
+/// The assertion is that the retained structure still sums correctly at the
+/// end. A dropped frame or a prematurely recycled block shows up here as a
+/// wrong total or a crash, not as a subtle slowdown.
+#[test]
+fn test_gc_survives_churn_against_a_deep_retained_structure() {
+    let mut s = FrogState::new();
+    s.eval(
+        r#"
+data Chain is Nil | Link(v: Int, rest: Chain)
+func build(n: Int, acc: Chain): Chain = if n == 0 then acc else build(n - 1, Link(v=n, rest=acc))
+func total(c: Chain): Int = match c {
+    is Nil then 0
+    is Link(v, rest) then v + total(rest)
+}
+"#,
+    )
+    .unwrap();
+
+    // 1..=800 == 320400. Retained for the whole test.
+    s.eval("let spine = build(800, Nil)").unwrap();
+
+    // Churn: each round builds and discards a chain of its own, and also
+    // re-walks `spine` — so `spine`'s cells are live, in registers, and
+    // deep in the shadow chain at the moment a collection fires.
+    let (v, _) = s
+        .eval(
+            r#"
+let checksum = 0
+for round in 0..300 do {
+    let garbage = build(120, Nil)
+    checksum = checksum + total(garbage) + total(spine)
+}
+checksum
+"#,
+        )
+        .unwrap();
+    // Per round: 1..=120 (7260) + 1..=800 (320400) = 327660, times 300.
+    assert_eq!(int(&v), 327660 * 300);
+
+    // `spine` must have survived every one of those collections intact.
+    let (after, _) = s.eval("total(spine)").unwrap();
+    assert_eq!(int(&after), 320400);
+
+    // And a forced sweep must reclaim all the garbage, leaving only the
+    // spine — the free lists recycle blocks rather than returning them to
+    // the system allocator, but `bytes_allocated` still counts live bytes
+    // only, so this is the same bound it always was.
+    s.heap.force_collect();
+    assert!(
+        s.heap.bytes_allocated < 200_000,
+        "expected the churn to be collected, but {} bytes are still live",
+        s.heap.bytes_allocated
+    );
+}

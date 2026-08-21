@@ -176,6 +176,13 @@ impl FrogState {
     /// Set `ACTIVE_HEAP` to this state's heap, call `func_ptr` with the
     /// out-buffer pointer, then clear it.
     fn call_jit(&mut self, func_ptr: fn(i64) -> i64, out_ptr: i64) -> i64 {
+        // The compiled code links its shadow-stack frames into the head
+        // cell owned by `self.codegen`; point the heap at that cell so a
+        // collection triggered from inside `func_ptr` can walk them. Set
+        // here rather than once at construction because `Codegen`'s cell
+        // address is only meaningful for code *it* compiled, and a
+        // `FrogState` may be moved after `new`.
+        self.heap.set_shadow_top(self.codegen.shadow_top());
         ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut GcHeap));
         let result = func_ptr(out_ptr);
         ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
@@ -296,16 +303,24 @@ impl FrogState {
         // any entry had ever produced — including ones since shadowed or
         // rebound — stayed alive for the process's lifetime.
         self.heap.clear_roots();
-        if matches!(&result_ty, Type::Str | Type::List(_)) {
+        // `Type::Union` belongs here alongside `Str`/`List`: a union value
+        // is a GC-boxed `FrogVariant` exactly like the other two are heap
+        // objects (`codegen::is_heap_ty`). It used to be missing, so the
+        // result of an entry that produced a `data`-union value was left
+        // unrooted for as long as `from_bits` needed it below.
+        if matches!(&result_ty, Type::Str | Type::List(_) | Type::Union(_)) {
             self.heap.push_root(bits, true);
         }
         for (name, ty) in &self.env_types {
             if let Some(vals) = self.env.get(name) {
                 let leafs = crate::codegen::struct_fields(ty, self.tc.struct_defs());
-                for (v, (_, lty)) in vals.iter().zip(leafs.iter()) {
-                    if matches!(lty, Type::Str | Type::List(_)) {
-                        self.heap.push_root(*v, true);
-                    }
+                // Not a plain per-leaf `matches!` on the type: a two-slot
+                // union's payload leaf is only *sometimes* a pointer, and
+                // rooting it when its tag says otherwise would hand the
+                // collector an integer to dereference. See
+                // `codegen::heap_roots_in_leaves`.
+                for v in crate::codegen::heap_roots_in_leaves(vals, &leafs) {
+                    self.heap.push_root(v, true);
                 }
             }
         }

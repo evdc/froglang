@@ -17,6 +17,20 @@ pub struct Codegen {
     pub module: JITModule,
     func_ids: HashMap<String, FuncId>,
     builder_ctx: FunctionBuilderContext,
+    /// The one shadow-stack head cell this `Codegen`'s generated functions
+    /// link themselves into. Boxed because `setup_shadow_frame` bakes its
+    /// address into the machine code as a constant, so it must not move
+    /// when the `Codegen` itself does. See `gc::ShadowTop`.
+    shadow_top: Box<gc::ShadowTop>,
+}
+
+impl Codegen {
+    /// Address of this `Codegen`'s shadow-stack head cell. Hand this to
+    /// `GcHeap::set_shadow_top` before running any function compiled here,
+    /// or the collector will not see the JIT's roots.
+    pub fn shadow_top(&self) -> *const gc::ShadowTop {
+        &*self.shadow_top as *const gc::ShadowTop
+    }
 }
 
 /// Per-function-compilation context threaded through `compile_expr`.
@@ -72,6 +86,9 @@ struct Ctx<'a> {
     /// to detect that recursion and fail clearly instead of blowing the
     /// (necessarily finite) shadow-stack slot count.
     printing_unions: Vec<String>,
+    /// Constant address of the owning `Codegen`'s `gc::ShadowTop` cell —
+    /// see `setup_shadow_frame`, the only consumer.
+    shadow_top_addr: i64,
 }
 
 /// True iff a value of this type is a GC-managed heap pointer.
@@ -195,6 +212,50 @@ pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
         },
         _ => vec![(String::new(), ty.clone())],
     }
+}
+
+/// Pick out, from one value's flattened leaves, the raw bits an embedder
+/// must hand to `GcHeap::push_root` — i.e. the leaves that really are heap
+/// pointers right now.
+///
+/// `vals` and `leaf_tys` are aligned 1:1, `leaf_tys` being `struct_fields`'s
+/// output for the value's type. This is the out-of-JIT counterpart to
+/// `root_flat_leaves`, and it has to make the same distinction that
+/// function does: a plain `Str`/`List`/one-slot-union leaf is always a
+/// pointer (or 0, or an unboxed immediate — `GcHeap::mark` screens those
+/// with `is_heap_ptr`), but a *two-slot* union's payload leaf holds a
+/// pointer only when its tag says so, and is a bare `Int`/`Float`/`Bool`
+/// otherwise. Rooting such a payload unconditionally would hand the
+/// collector an integer to chase.
+///
+/// `FrogState::eval` uses this to re-derive its explicit root set from
+/// `env` after every entry. Before it existed, that code tested for
+/// `Str | List` only and silently dropped every union-typed binding, so a
+/// `data`-union value bound in one REPL entry was collected out from under
+/// the next one.
+pub fn heap_roots_in_leaves(vals: &[i64], leaf_tys: &[(String, Type)]) -> Vec<i64> {
+    let mut out = Vec::new();
+    for (i, (_, ty)) in leaf_tys.iter().enumerate() {
+        let Some(&v) = vals.get(i) else { break };
+        if !is_heap_ty(ty) {
+            continue;
+        }
+        if let Type::Union(members) = ty {
+            if is_two_slot_union(members) {
+                // The tag is always the leaf immediately before the
+                // payload — see `struct_fields`'s two-slot `Union` arm.
+                let tag = match i.checked_sub(1).and_then(|j| vals.get(j)) {
+                    Some(&t) => t,
+                    None => continue,
+                };
+                if !boxed_member_tags(members).iter().any(|&b| b as i64 == tag) {
+                    continue;
+                }
+            }
+        }
+        out.push(v);
+    }
+    out
 }
 
 /// Build the `vars` map key for leaf `leaf_path` (from `struct_fields`) of
@@ -449,7 +510,7 @@ fn root_heap_value(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) {
             "shadow frame overflow: slot {} of {} — `for_each_heap_producer` undercounts this expression's heap producers",
             ctx.heap_cursor, ctx.heap_max,
         );
-        let offset = (ctx.heap_cursor * 8) as i32;
+        let offset = SHADOW_SLOTS_OFFSET + (ctx.heap_cursor * 8) as i32;
         bcx.ins().stack_store(val, slot, offset);
         ctx.heap_cursor += 1;
     }
@@ -694,41 +755,90 @@ fn box_into_variant(tag: u32, flat_vals: &[Value], flat_types: &[Type], bcx: &mu
     ptr
 }
 
-/// If `n > 0`, allocate an `n`-slot stack region and register it as a GC
-/// shadow-stack frame via `frog_frame_push`. Returns `None` — and emits no
-/// IR at all — for functions with no heap-typed subexpressions.
+/// Byte offset of a shadow frame's first root slot — the `gc::ShadowFrame`
+/// header (`prev`, `len`) sits in front of them, in the same stack
+/// allocation. `root_heap_value` adds `8 * cursor` to this.
+const SHADOW_SLOTS_OFFSET: i32 = std::mem::size_of::<gc::ShadowFrame>() as i32;
+
+/// If `n > 0`, allocate a stack region holding a `gc::ShadowFrame` header
+/// followed by `n` root slots, and link it onto the front of the shadow
+/// stack. Returns `None` — and emits no IR at all — for functions with no
+/// heap-typed subexpressions.
+///
+/// This is all inline: a load of the head cell, two header stores, the
+/// zeroing of the slots, and a store back to the head cell. It used to be a
+/// `frog_frame_push` call, which cost an out-of-line call, a thread-local
+/// lookup to find the active heap, a `Vec` push, and a `memset` libcall —
+/// together the largest single entry in `benches/orders.frog`'s profile.
+/// `shadow_top_addr` is the (constant, `is_pic == false`) address of the
+/// owning `Codegen`'s `gc::ShadowTop` cell.
 fn setup_shadow_frame(
     bcx: &mut FunctionBuilder,
     module: &mut JITModule,
-    func_ids: &HashMap<String, FuncId>,
+    shadow_top_addr: i64,
     n: usize,
 ) -> Option<StackSlot> {
     if n == 0 { return None; }
+    let header = SHADOW_SLOTS_OFFSET as u32;
     let slot = bcx.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
-        (n * 8) as u32,
+        header + (n * 8) as u32,
         3, // 8-byte aligned (align_shift = log2(8))
     ));
-    let base = bcx.ins().stack_addr(types::I64, slot, 0);
+    let frame = bcx.ins().stack_addr(types::I64, slot, 0);
+    let top_cell = bcx.ins().iconst(types::I64, shadow_top_addr);
+
+    // frame.prev = *top_cell; frame.len = n;
+    let prev = bcx.ins().load(types::I64, heap_mem(), top_cell, 0);
+    bcx.ins().store(heap_mem(), prev, frame, 0);
     let len_val = bcx.ins().iconst(types::I64, n as i64);
-    let func_id = func_ids["frog_frame_push"];
-    let callee = module.declare_func_in_func(func_id, bcx.func);
-    bcx.ins().call(callee, &[base, len_val]);
+    bcx.ins().store(heap_mem(), len_val, frame, 8);
+
+    // Zero the root slots: an unwritten slot otherwise holds stack garbage
+    // that the mark phase would follow as a pointer.
+    //
+    // Emitted as plain stores rather than via `emit_small_memset`, whose
+    // own inline-vs-libcall threshold is only a few stores — small enough
+    // that an ordinary hot function's frame became a `memset` call per
+    // invocation, which is exactly what removing `frog_frame_push` was
+    // meant to avoid. Past `INLINE_ZERO_SLOTS` the store count would start
+    // to cost more in code size than the call does in time, and a frame
+    // that wide belongs to a big top-level body entered once, not to a
+    // function in a loop.
+    const INLINE_ZERO_SLOTS: usize = 16;
+    if n <= INLINE_ZERO_SLOTS {
+        let zero = bcx.ins().iconst(types::I64, 0);
+        for i in 0..n {
+            bcx.ins().stack_store(zero, slot, SHADOW_SLOTS_OFFSET + (i * 8) as i32);
+        }
+    } else {
+        let slots = bcx.ins().stack_addr(types::I64, slot, SHADOW_SLOTS_OFFSET);
+        let config = module.target_config();
+        bcx.emit_small_memset(config, slots, 0, (n * 8) as u64, 8, heap_mem());
+    }
+
+    // *top_cell = frame — publish only now that the frame is fully
+    // initialised, so a collection triggered from anywhere after this point
+    // sees zeroed slots rather than garbage.
+    bcx.ins().store(heap_mem(), frame, top_cell, 0);
     Some(slot)
 }
 
-/// Pop the shadow-stack frame pushed by `setup_shadow_frame`, if any.
-/// Must run on every path out of the function, before `return_`.
+/// Unlink the frame `setup_shadow_frame` pushed, if any, by restoring the
+/// head cell to this frame's `prev`. Must run on every path out of the
+/// function, before `return_`.
 fn teardown_shadow_frame(
     bcx: &mut FunctionBuilder,
-    module: &mut JITModule,
-    func_ids: &HashMap<String, FuncId>,
+    shadow_top_addr: i64,
     slot: Option<StackSlot>,
 ) {
-    if slot.is_none() { return; }
-    let func_id = func_ids["frog_frame_pop"];
-    let callee = module.declare_func_in_func(func_id, bcx.func);
-    bcx.ins().call(callee, &[]);
+    let Some(slot) = slot else { return };
+    // Reload `prev` from the frame rather than reusing the entry block's
+    // value: this runs from whichever block holds the `return`, and a
+    // reload is valid in all of them.
+    let prev = bcx.ins().stack_load(types::I64, slot, 0);
+    let top_cell = bcx.ins().iconst(types::I64, shadow_top_addr);
+    bcx.ins().store(heap_mem(), prev, top_cell, 0);
 }
 
 /// Look up `name`'s Cranelift `Variable`, declaring a fresh one (with `ty`'s
@@ -1955,7 +2065,7 @@ fn compile_return(value: &Option<TypedExprRef>, bcx: &mut FunctionBuilder, vars:
     // Every path out of the function pops the shadow frame first —
     // this is an *early* exit, so it must do the same thing
     // `build_func_body`'s own tail `return_` does, not skip it.
-    teardown_shadow_frame(bcx, ctx.module, ctx.func_ids, ctx.heap_slot);
+    teardown_shadow_frame(bcx, ctx.shadow_top_addr, ctx.heap_slot);
     bcx.ins().return_(&results);
     // Cranelift requires every block to end in exactly one
     // terminator, and `return_` is one — so whatever IR follows
@@ -2352,8 +2462,6 @@ impl Codegen {
         builder.symbol("frog_list_slice",  ffi::frog_list_slice  as *const u8);
         builder.symbol("frog_range",       ffi::frog_range       as *const u8);
         builder.symbol("frog_gc_dump",     ffi::frog_gc_dump     as *const u8);
-        builder.symbol("frog_frame_push",  ffi::frog_frame_push  as *const u8);
-        builder.symbol("frog_frame_pop",   ffi::frog_frame_pop   as *const u8);
         builder.symbol("frog_alloc_variant", ffi::frog_alloc_variant as *const u8);
         builder.symbol("frog_variant_tag", ffi::frog_variant_tag as *const u8);
         builder.symbol("frog_variant_get", ffi::frog_variant_get as *const u8);
@@ -2406,8 +2514,6 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_list_slice", "frog_list_slice", &[I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_range",      "frog_range",      &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_gc_dump",    "gc_dump",         &[],               None);
-        declare_rt(&mut module, &mut func_ids, "frog_frame_push", "frog_frame_push", &[I64, I64],      None);
-        declare_rt(&mut module, &mut func_ids, "frog_frame_pop",  "frog_frame_pop",  &[],              None);
         declare_rt(&mut module, &mut func_ids, "frog_alloc_variant", "frog_alloc_variant", &[I64, I64, I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_variant_tag", "frog_variant_tag", &[I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_variant_get", "frog_variant_get", &[I64, I64], Some(I64));
@@ -2417,6 +2523,7 @@ impl Codegen {
             module,
             func_ids,
             builder_ctx: FunctionBuilderContext::new(),
+            shadow_top: Box::new(gc::ShadowTop::new()),
         }
     }
 
@@ -2451,6 +2558,7 @@ impl Codegen {
         string_arena: &mut Vec<Vec<u8>>,
         structs: &StructDefs,
         unions: &UnionDefs,
+        shadow_top_addr: i64,
     ) {
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
         let entry = bcx.create_block();
@@ -2474,10 +2582,10 @@ impl Codegen {
         }
 
         let n = count_heap_slots(body, structs);
-        let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new() };
+        let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
-        teardown_shadow_frame(&mut bcx, module, func_ids, heap_slot);
+        teardown_shadow_frame(&mut bcx, shadow_top_addr, heap_slot);
 
         if *return_type != Type::None {
             // If the body's own type is `Never`, it already returned
@@ -2537,6 +2645,7 @@ impl Codegen {
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
         unions: &UnionDefs,
+        shadow_top_addr: i64,
     ) -> Vec<(String, Type)> {
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
         let entry = bcx.create_block();
@@ -2567,8 +2676,8 @@ impl Codegen {
         let mut last_ty = &Type::Int;
 
         let n: usize = stmts.iter().map(|s| count_heap_slots(s, structs)).sum();
-        let heap_slot = setup_shadow_frame(&mut bcx, module, func_ids, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new() };
+        let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;
@@ -2632,7 +2741,7 @@ impl Codegen {
             last_ty = &stmt.item.ty;
         }
 
-        teardown_shadow_frame(&mut bcx, module, func_ids, heap_slot);
+        teardown_shadow_frame(&mut bcx, shadow_top_addr, heap_slot);
 
         // __frog_main[_N] always returns a single i64 (see this function's
         // doc comment — a struct-typed final result only reports its first
@@ -2690,6 +2799,12 @@ impl Codegen {
             }
         }
 
+        // Every function compiled below links its shadow frame into *this*
+        // `Codegen`'s head cell, whose address is a constant in the emitted
+        // code (`setup_shadow_frame`). Read it once, before the `&mut self`
+        // borrows below.
+        let shadow_top_addr = self.shadow_top() as i64;
+
         // ── Pass 2: Define all function bodies ───────────────────────────────
         let func_defs: Vec<(String, FuncId, Vec<(String, Type)>, Type, Box<Spanned<TypedExpr>>)> =
             stmts.iter().filter_map(|stmt| {
@@ -2727,6 +2842,7 @@ impl Codegen {
                 string_arena,
                 structs,
                 unions,
+                shadow_top_addr,
             );
 
             self.module
@@ -2758,6 +2874,7 @@ impl Codegen {
             env_types,
             structs,
             unions,
+            shadow_top_addr,
         );
 
         self.module
@@ -2786,6 +2903,12 @@ pub fn compile_and_run(src: &str) -> i64 {
     let (main_id, bindings) = codegen.compile_entry(
         typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),
     );
+
+    // No `FrogState` here, so nothing has set `ACTIVE_HEAP`: the generated
+    // code allocates against the thread-local `GC_HEAP`, and that heap is
+    // the one that has to know where this `Codegen`'s shadow frames live.
+    let shadow_top = codegen.shadow_top();
+    gc::GC_HEAP.with(|h| h.borrow_mut().set_shadow_top(shadow_top));
 
     let ptr = codegen.module.get_finalized_function(main_id);
     let f: fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };

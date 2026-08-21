@@ -146,9 +146,37 @@ pub fn immediate_variant_tag(v: i64) -> i64 {
 // under-roots, since a value stays reachable until the frame that stored it
 // returns.
 
+/// One JIT function's shadow-stack frame, living *inside* that function's
+/// own native stack frame: a `prev` link to the caller's frame, this
+/// frame's root-slot count, then `len` `i64` root slots laid out inline
+/// immediately after (offset `size_of::<ShadowFrame>()`).
+///
+/// Codegen emits the push and the pop as a handful of plain loads and
+/// stores in the prologue/epilogue (`setup_shadow_frame` /
+/// `teardown_shadow_frame` in codegen/mod.rs). This used to be a
+/// `Vec<ShadowFrame>` entry pushed by an out-of-line `frog_frame_push`
+/// call, and that call — plus the thread-local lookup it needed to find
+/// the heap, plus the `memset` libcall it made to zero the slots — was the
+/// single largest cost in the `orders` benchmark's profile, ahead of both
+/// `malloc`/`free` and the collector itself.
+#[repr(C)]
 pub struct ShadowFrame {
-    pub slots: *mut i64,
-    pub len:   usize,
+    pub prev: *mut ShadowFrame,
+    pub len:  usize,
+}
+
+/// The "innermost live frame" cell that the JIT prologue/epilogue update.
+/// Its address is baked into the generated machine code as a constant, so
+/// the cell must never move: `Codegen` owns exactly one in a `Box` and
+/// hands `GcHeap` a pointer to it before any JIT code runs (see
+/// `FrogState::call_jit`). One cell per `Codegen` — not a process global —
+/// keeps `FrogState`s on different threads independent, as they have
+/// always been.
+#[repr(transparent)]
+pub struct ShadowTop(pub *mut ShadowFrame);
+
+impl ShadowTop {
+    pub fn new() -> Self { ShadowTop(std::ptr::null_mut()) }
 }
 
 // ── GcHeap ───────────────────────────────────────────────────────────────────
@@ -158,13 +186,33 @@ pub struct GcHeap {
     pub bytes_allocated: usize,
     gc_threshold:    usize,
     roots:           Vec<(i64, bool)>,  // (value, is_ptr)
-    // The JIT shadow stack (see above), innermost frame last. A `Vec` rather
-    // than a linked list of boxed frames: frames are pushed and popped in
-    // strict LIFO order by every JIT call that touches the heap, so boxing
-    // each one cost a `malloc`/`free` pair per call — enough of the `orders`
-    // benchmark's time to show up in its profile. The `Vec` reaches its
-    // high-water mark once and reuses that storage afterwards.
-    shadow_frames:   Vec<ShadowFrame>,
+    /// Head of the JIT shadow stack: a pointer to the `ShadowTop` cell the
+    /// generated code writes, whose `.0` is the innermost live
+    /// `ShadowFrame`. Null until `set_shadow_top` is called, which is the
+    /// state for a heap that no JIT code has ever run against (an embedding
+    /// that only uses `alloc_*` directly, and every unit test in this file).
+    shadow_top:      *const ShadowTop,
+    /// Recycled blocks from swept objects, bucketed by size in 8-byte
+    /// words: `free_lists[w]` heads an intrusive singly-linked list of
+    /// blocks of exactly `w * 8` bytes (the `next` link lives in the
+    /// block's first word, which is always at least 8 bytes wide).
+    ///
+    /// Without this, every `data`-union value the `orders` benchmark builds
+    /// costs a `malloc` when it is created and a `free` when it is swept —
+    /// together about a fifth of that benchmark's profile, for blocks whose
+    /// sizes repeat endlessly. Sizes above `MAX_FREE_WORDS` (rare, and not
+    /// repetitive enough to be worth retaining) go straight back to the
+    /// system allocator.
+    ///
+    /// Recycled bytes are held for the process's lifetime rather than
+    /// returned to the OS. That is the usual trade for a bump/free-list
+    /// nursery: `bytes_allocated` still counts only *live* bytes, so the
+    /// collection threshold is unaffected.
+    free_lists:      Vec<*mut u8>,
+    /// Reusable mark-phase worklist. Kept on the heap rather than allocated
+    /// per `mark` call: `mark` is invoked once per root, so a fresh `Vec`
+    /// each time is a `malloc`/`free` pair per root per collection.
+    mark_worklist:   Vec<*mut GcHeader>,
 }
 
 thread_local! {
@@ -174,14 +222,71 @@ thread_local! {
     pub static ACTIVE_HEAP: Cell<*mut GcHeap> = Cell::new(std::ptr::null_mut());
 }
 
+/// Largest block size, in 8-byte words, that `GcHeap::free_bytes` keeps on
+/// a free list instead of handing back to the system allocator. 64 words is
+/// 512 bytes — comfortably above every `FrogVariant` and `FrogStr` a
+/// realistic program allocates in bulk, and above a short list's data
+/// buffer too.
+const MAX_FREE_WORDS: usize = 64;
+
+/// Round `size` up to a whole number of 8-byte words. Every block this
+/// module allocates is 8-byte aligned and freed at its rounded size, so
+/// allocation and deallocation always agree on the layout even when the
+/// caller's natural size isn't a multiple of 8 (a `FrogStr`'s trailing
+/// bytes plus NUL, typically).
+#[inline]
+fn words_for(size: usize) -> usize {
+    // Never zero: a recycled block has to be wide enough to hold the free
+    // list's `next` pointer in its first word, and a zero-sized `Layout` is
+    // not valid to pass to `alloc` in the first place. No caller currently
+    // asks for zero bytes (every object has a header), so this is a floor,
+    // not a case that fires.
+    ((size + 7) / 8).max(1)
+}
+
 impl GcHeap {
+    /// Allocate `size` bytes (rounded up to a word), reusing a recycled
+    /// block of that exact size class if one is available. All GC object
+    /// allocation goes through here.
+    #[inline]
+    fn alloc_bytes(&mut self, size: usize) -> *mut u8 {
+        let words = words_for(size);
+        if words <= MAX_FREE_WORDS {
+            let head = self.free_lists[words];
+            if !head.is_null() {
+                // The block's first word holds the next link — see
+                // `free_bytes`. Nothing else in it is meaningful; every
+                // caller overwrites the header immediately.
+                self.free_lists[words] = unsafe { *(head as *mut *mut u8) };
+                return head;
+            }
+        }
+        let layout = Layout::from_size_align(words * 8, 8).expect("gc block layout");
+        unsafe { alloc(layout) }
+    }
+
+    /// Return `size` bytes at `ptr` (as passed to `alloc_bytes`) for reuse.
+    #[inline]
+    fn free_bytes(&mut self, ptr: *mut u8, size: usize) {
+        let words = words_for(size);
+        if words <= MAX_FREE_WORDS {
+            unsafe { *(ptr as *mut *mut u8) = self.free_lists[words]; }
+            self.free_lists[words] = ptr;
+            return;
+        }
+        let layout = Layout::from_size_align(words * 8, 8).expect("gc block layout");
+        unsafe { dealloc(ptr, layout) }
+    }
+
     pub fn new() -> Self {
         GcHeap {
             head:            std::ptr::null_mut(),
             bytes_allocated: 0,
             gc_threshold:    1024 * 1024,  // 1 MB initial threshold
             roots:           Vec::new(),
-            shadow_frames:   Vec::new(),
+            shadow_top:      std::ptr::null(),
+            free_lists:      vec![std::ptr::null_mut(); MAX_FREE_WORDS + 1],
+            mark_worklist:   Vec::new(),
         }
     }
 
@@ -198,25 +303,15 @@ impl GcHeap {
         self.roots.clear();
     }
 
-    /// Push a new shadow-stack frame describing `len` `i64` root slots at
-    /// `slots` (owned by the JIT function's own stack frame). Zeroes the
-    /// slots first: an unwritten slot otherwise holds stack garbage that
-    /// `mark` would follow as a pointer.
-    pub fn push_frame(&mut self, slots: *mut i64, len: usize) {
-        if len > 0 {
-            unsafe { std::ptr::write_bytes(slots, 0, len); }
-        }
-        self.shadow_frames.push(ShadowFrame { slots, len });
-    }
-
-    /// Pop the most recently pushed shadow-stack frame. Must be called
-    /// exactly once per `push_frame`, in LIFO order (i.e. matching the
-    /// native call stack — codegen emits one push/pop pair per function
-    /// invocation).
-    pub fn pop_frame(&mut self) {
-        // A popped frame's `slots` is not owned memory — it points into the
-        // JIT function's own stack frame, which its epilogue reclaims.
-        self.shadow_frames.pop();
+    /// Point this heap at the `ShadowTop` cell the JIT code it is about to
+    /// run updates, so `collect` can walk that code's frames. `top` must
+    /// outlive every collection this heap performs — `Codegen` owns it in a
+    /// `Box` for exactly that reason.
+    ///
+    /// Frames themselves are pushed and popped entirely by generated code;
+    /// the runtime never sees an individual push or pop.
+    pub fn set_shadow_top(&mut self, top: *const ShadowTop) {
+        self.shadow_top = top;
     }
 
     pub fn maybe_collect(&mut self) {
@@ -243,22 +338,34 @@ impl GcHeap {
         gc_trace!("marking {} roots", roots.len());
         for (value, is_ptr) in roots {
             if is_ptr && is_heap_ptr(value) {
-                unsafe { Self::mark(value as *mut GcHeader); }
+                unsafe { Self::mark_from(&mut self.mark_worklist, value as *mut GcHeader); }
             }
         }
 
-        // ...plus every live JIT shadow-stack frame.
-        for f in &self.shadow_frames {
-            for i in 0..f.len {
-                unsafe {
-                    let v = *f.slots.add(i);
+        // ...plus every live JIT shadow-stack frame, walked from the
+        // innermost outwards along the `prev` chain the generated
+        // prologues built.
+        let mut _nframes = 0usize;
+        let mut frame = if self.shadow_top.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { (*self.shadow_top).0 }
+        };
+        while !frame.is_null() {
+            unsafe {
+                let len = (*frame).len;
+                let slots = (frame as *mut u8).add(std::mem::size_of::<ShadowFrame>()) as *const i64;
+                for i in 0..len {
+                    let v = *slots.add(i);
                     if is_heap_ptr(v) {
-                        Self::mark(v as *mut GcHeader);
+                        Self::mark_from(&mut self.mark_worklist, v as *mut GcHeader);
                     }
                 }
+                frame = (*frame).prev;
             }
+            _nframes += 1;
         }
-        gc_trace!("marked {} shadow frame(s)", self.shadow_frames.len());
+        gc_trace!("marked {} shadow frame(s)", _nframes);
 
         // Sweep phase
         let before = self.bytes_allocated;
@@ -274,8 +381,14 @@ impl GcHeap {
     /// Mark `obj` and everything transitively reachable from it. Iterative
     /// (explicit worklist) rather than recursive, since the shadow stack
     /// makes deep object graphs reachable from ordinary programs.
-    unsafe fn mark(obj: *mut GcHeader) {
-        let mut worklist = vec![obj];
+    ///
+    /// `worklist` is supplied by the caller (`GcHeap::mark_worklist`) and
+    /// left empty on return, so a collection with many roots reuses one
+    /// allocation instead of making a fresh `Vec` — and freeing it — per
+    /// root.
+    unsafe fn mark_from(worklist: &mut Vec<*mut GcHeader>, obj: *mut GcHeader) {
+        debug_assert!(worklist.is_empty());
+        worklist.push(obj);
         while let Some(obj) = worklist.pop() {
             if (*obj).marked { continue; }
             (*obj).marked = true;
@@ -359,40 +472,41 @@ impl GcHeap {
         }
     }
 
-    /// Free a single GC object; returns the number of bytes freed.
-    unsafe fn free_obj(&self, obj: *mut GcHeader) -> usize {
+    /// Free a single GC object; returns the number of bytes freed. The
+    /// blocks go onto `free_lists` for reuse rather than back to the system
+    /// allocator — see `free_bytes`. The byte counts returned here are the
+    /// same rounded sizes the matching `alloc_*` added to
+    /// `bytes_allocated`, so the running total stays exact.
+    unsafe fn free_obj(&mut self, obj: *mut GcHeader) -> usize {
         match (*obj).kind {
             ObjKind::Str => {
                 let str_ptr = obj as *mut FrogStr;
                 let len = (*str_ptr).len as usize;
-                let total = std::mem::size_of::<FrogStr>() + len + 1;
-                let layout = Layout::from_size_align(total, std::mem::align_of::<FrogStr>())
-                    .expect("FrogStr layout");
+                let total = words_for(std::mem::size_of::<FrogStr>() + len + 1) * 8;
                 gc_trace!("sweep free {:p} Str  {} bytes", obj, total);
-                dealloc(obj as *mut u8, layout);
+                self.free_bytes(obj as *mut u8, total);
                 total
             }
             ObjKind::List => {
                 let list_ptr = obj as *mut FrogList;
                 let cap = (*list_ptr).cap as usize;
                 let data_size = cap * std::mem::size_of::<i64>();
-                let list_size = std::mem::size_of::<FrogList>();
+                let list_size = words_for(std::mem::size_of::<FrogList>()) * 8;
                 gc_trace!("sweep free {:p} List {} bytes", obj, list_size + data_size);
+                let data = (*list_ptr).data as *mut u8;
+                self.free_bytes(obj as *mut u8, list_size);
                 if cap > 0 {
-                    let data_layout = Layout::array::<i64>(cap).expect("list data layout");
-                    dealloc((*list_ptr).data as *mut u8, data_layout);
+                    self.free_bytes(data, data_size);
                 }
-                dealloc(obj as *mut u8, Layout::new::<FrogList>());
                 list_size + data_size
             }
             ObjKind::Variant => {
                 let variant_ptr = obj as *mut FrogVariant;
                 let nslots = (*variant_ptr).nslots as usize;
-                let total = std::mem::size_of::<FrogVariant>() + nslots * std::mem::size_of::<i64>();
-                let layout = Layout::from_size_align(total, std::mem::align_of::<FrogVariant>())
-                    .expect("FrogVariant layout");
+                let total = words_for(
+                    std::mem::size_of::<FrogVariant>() + nslots * std::mem::size_of::<i64>()) * 8;
                 gc_trace!("sweep free {:p} Variant {} bytes", obj, total);
-                dealloc(obj as *mut u8, layout);
+                self.free_bytes(obj as *mut u8, total);
                 total
             }
         }
@@ -404,11 +518,8 @@ impl GcHeap {
     /// Appends a NUL terminator. `data` only needs to be valid for the duration of this call.
     pub fn alloc_str(&mut self, data: *const u8, len: usize) -> *mut FrogStr {
         let struct_size = std::mem::size_of::<FrogStr>();
-        let total = struct_size + len + 1;
-        let layout = Layout::from_size_align(total, std::mem::align_of::<FrogStr>())
-            .expect("FrogStr layout");
-
-        let ptr = unsafe { alloc(layout) as *mut FrogStr };
+        let total = words_for(struct_size + len + 1) * 8;
+        let ptr = self.alloc_bytes(total) as *mut FrogStr;
         unsafe {
             (*ptr).header = GcHeader {
                 next:   self.head,
@@ -439,11 +550,11 @@ impl GcHeap {
         let stride = stride.max(1);
         let actual_elem_cap = cap.max(1);
         let slot_cap = actual_elem_cap * stride;
-        let data_layout = Layout::array::<i64>(slot_cap).expect("list data layout");
-        let data = unsafe { alloc(data_layout) as *mut i64 };
+        let data_size = slot_cap * std::mem::size_of::<i64>();
+        let data = self.alloc_bytes(data_size) as *mut i64;
 
-        let list_layout = Layout::new::<FrogList>();
-        let ptr = unsafe { alloc(list_layout) as *mut FrogList };
+        let list_size = words_for(std::mem::size_of::<FrogList>()) * 8;
+        let ptr = self.alloc_bytes(list_size) as *mut FrogList;
 
         unsafe {
             (*ptr).header = GcHeader {
@@ -461,9 +572,9 @@ impl GcHeap {
         }
 
         self.head = ptr as *mut GcHeader;
-        self.bytes_allocated += list_layout.size() + data_layout.size();
+        self.bytes_allocated += list_size + data_size;
         gc_trace!("alloc List {} bytes -> {:p}  (total: {} bytes)",
-            list_layout.size() + data_layout.size(), ptr, self.bytes_allocated);
+            list_size + data_size, ptr, self.bytes_allocated);
         ptr
     }
 
@@ -471,16 +582,13 @@ impl GcHeap {
     /// slots, zero-initialized (so a collection triggered while a
     /// still-being-populated field is being computed never follows
     /// garbage through an as-yet-unwritten slot — mirrors why
-    /// `push_frame` zeroes shadow-stack slots). `ptr_mask` marks which
+    /// `setup_shadow_frame` zeroes shadow-stack slots). `ptr_mask` marks which
     /// slots are heap pointers, exactly like `alloc_list`'s.
     pub fn alloc_variant(&mut self, tag: u32, nslots: usize, ptr_mask: u64, cond_mask: u64, boxed_tags: u64) -> *mut FrogVariant {
         let struct_size = std::mem::size_of::<FrogVariant>();
         let data_size = nslots * std::mem::size_of::<i64>();
-        let total = struct_size + data_size;
-        let layout = Layout::from_size_align(total, std::mem::align_of::<FrogVariant>())
-            .expect("FrogVariant layout");
-
-        let ptr = unsafe { alloc(layout) as *mut FrogVariant };
+        let total = words_for(struct_size + data_size) * 8;
+        let ptr = self.alloc_bytes(total) as *mut FrogVariant;
         unsafe {
             (*ptr).header = GcHeader {
                 next:   self.head,
@@ -492,9 +600,20 @@ impl GcHeap {
             (*ptr).ptr_mask   = ptr_mask;
             (*ptr).cond_mask  = cond_mask;
             (*ptr).boxed_tags = boxed_tags;
-            if nslots > 0 {
-                let dst = (ptr as *mut u8).add(struct_size) as *mut i64;
-                std::ptr::write_bytes(dst, 0, nslots);
+            // Zero the payload. `write_bytes` compiles to a `memset`
+            // *call* even for one or two slots, which is the common case
+            // here and showed up in `benches/orders.frog`'s profile costing
+            // as much as the allocation it belongs to. Store the small
+            // counts directly and keep the libcall for genuinely wide
+            // payloads.
+            let dst = (ptr as *mut u8).add(struct_size) as *mut i64;
+            match nslots {
+                0 => {}
+                1 => { *dst = 0; }
+                2 => { *dst = 0; *dst.add(1) = 0; }
+                3 => { *dst = 0; *dst.add(1) = 0; *dst.add(2) = 0; }
+                4 => { *dst = 0; *dst.add(1) = 0; *dst.add(2) = 0; *dst.add(3) = 0; }
+                _ => std::ptr::write_bytes(dst, 0, nslots),
             }
         }
 

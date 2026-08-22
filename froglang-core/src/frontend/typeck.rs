@@ -1696,7 +1696,17 @@ impl TypeChecker {
     /// `self.in_scope(|t| ...)?` rather than `self.in_scope(|t| ...?)`.
     fn in_scope<F, R>(&mut self, closure: F) -> R where F: FnOnce(&mut Self) -> R {
         let mark = self.ctx.open();
+        // `func_mut_params` is a flat name->mutability-list map with no
+        // scope structure of its own, so it is saved and restored around
+        // every scope alongside `ctx`. Without this, a nested `func f`
+        // kept dictating argument mutability for calls to an *outer* `f`
+        // after the inner one went out of scope, and a local binding that
+        // shadowed a `func` left the shadowed function's list in place.
+        // Restoring wholesale (rather than tracking marks) is cheap: the
+        // map has one entry per named `func`, not one per binding.
+        let saved_mut_params = self.func_mut_params.clone();
         let result = closure(self);
+        self.func_mut_params = saved_mut_params;
         self.ctx.close(mark);
         result
     }
@@ -2640,16 +2650,20 @@ impl TypeChecker {
             // reappearing as any other argument in the same call
             // (`swap(mut a, mut a)`, `merge(mut xs, xs)`), the exclusivity
             // rule that's cheap here only because nothing else aliases.
-            let mut all_roots: Vec<(String, Span)> = Vec::new();
+            //
+            // One entry per argument, `None` for an argument that isn't a
+            // bare identifier — the exclusivity loop below indexes this by
+            // *argument* position, so pushing only the identifier ones
+            // would misalign it. `f(g(x), mut a)` used to push a single
+            // entry and then index it at 1.
+            let mut all_roots: Vec<Option<(String, Span)>> = Vec::with_capacity(c.args.len());
             for (i, (arg, param)) in c.args.into_iter().zip(params.iter()).enumerate() {
                 let arg_span = arg.span;
                 let (is_mut, inner) = match arg.item {
                     Expression::MutArg(inner) => (true, *inner),
                     other => (false, Spanned::from(other, arg_span)),
                 };
-                if let Some(root) = inner.item.get_identifier() {
-                    all_roots.push((root.to_string(), arg_span));
-                }
+                all_roots.push(inner.item.get_identifier().map(|r| (r.to_string(), arg_span)));
                 if is_mut {
                     let root = inner.item.get_identifier().map(|s| s.to_string()).ok_or_else(|| Spanned::from(TypeError {
                         msg: "'mut' argument must be a plain mutable binding, not an expression".to_string()
@@ -2664,7 +2678,13 @@ impl TypeChecker {
                         Some(true) => {},
                     }
                 }
-                match declared_mut.as_ref().map(|d| d[i]) {
+                // `.get(i)`, not `d[i]`: `func_mut_params` is keyed by bare
+                // name with no scoping, so a local binding that shadows a
+                // `func` of the same name can produce a shorter list than
+                // this call has arguments. Treating a missing entry as
+                // "not declared mut" is the same answer an indirect call
+                // gets, which is the conservative one.
+                match declared_mut.as_ref().and_then(|d| d.get(i)).copied() {
                     Some(true) if !is_mut => return Err(Spanned::from(TypeError {
                         msg: format!("argument {} must be marked 'mut' — the callee's parameter is 'mut'", i + 1)
                     }, arg_span)),
@@ -2692,13 +2712,15 @@ impl TypeChecker {
             // argument's root in this same call.
             for (i, is_mut) in mut_args.iter().enumerate() {
                 if !is_mut { continue; }
-                let (root, _) = &all_roots[i];
+                // A `mut` argument is always a bare identifier — the check
+                // above rejects anything else — so this entry is `Some`.
+                let Some((root, root_span)) = &all_roots[i] else { continue };
                 let aliases = all_roots.iter().enumerate()
-                    .any(|(j, (n, _))| j != i && n == root);
+                    .any(|(j, other)| j != i && other.as_ref().is_some_and(|(n, _)| n == root));
                 if aliases {
                     return Err(Spanned::from(TypeError {
                         msg: format!("'{}' can't be passed 'mut' and also appear as another argument in the same call", root)
-                    }, all_roots[i].1));
+                    }, *root_span));
                 }
             }
             let ty = self.lookup(&result);

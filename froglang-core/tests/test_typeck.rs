@@ -1121,3 +1121,65 @@ fn test_curried_function_type_annotation() {
     let ty = infer_src("let f: (Int -> Int -> Int) = x -> y -> x + y").unwrap();
     assert!(matches!(ty, Type::Function { .. }));
 }
+
+// ── `mut` argument checking: scoping and positional alignment ─────────────────
+
+#[test]
+fn mut_exclusivity_check_stays_aligned_with_argument_positions() {
+    // `lower_call` built `all_roots` by pushing only the arguments that are
+    // bare identifiers, then indexed it by *argument* position in the
+    // exclusivity loop. Any non-identifier argument before a `mut` one
+    // therefore shifted the two out of step: this call has two arguments
+    // and one identifier among them, so the loop indexed a length-1 vector
+    // at 1 and panicked ("index out of bounds").
+    //
+    // It is a panic rather than a wrong answer, which is why no amount of
+    // existing `mut` testing caught it — every prior test passed bare
+    // identifiers for every argument.
+    let src = "\
+        func plain(x: Int): Int = x + 1\n\
+        func bump(a: Int, mut b: Int): Int = { b = b + a\nb }\n\
+        mut n = 1\n\
+        bump(plain(2), mut n)";
+    assert!(infer_src(src).is_ok(), "expected this to type-check: {:?}", infer_src(src));
+}
+
+#[test]
+fn mut_exclusivity_still_rejects_a_repeated_root_past_a_non_identifier_argument() {
+    // The other half of the same fix: realigning the vector must not lose
+    // the check it exists for. `n` is passed `mut` and also appears as a
+    // later argument, with a non-identifier argument in front to exercise
+    // the alignment.
+    let src = "\
+        func plain(x: Int): Int = x + 1\n\
+        func f(a: Int, mut b: Int, c: Int): Int = { b = b + a + c\nb }\n\
+        mut n = 1\n\
+        f(plain(2), mut n, n)";
+    let err = infer_src(src).expect_err("expected an exclusivity error");
+    assert!(
+        err.contains("can't be passed 'mut' and also appear as another argument"),
+        "unexpected error: {}", err,
+    );
+}
+
+#[test]
+fn a_nested_funcs_mut_parameters_do_not_leak_to_the_outer_scope() {
+    // `func_mut_params` is a flat name -> mutability-list map with no scope
+    // structure, so an inner `func f` used to keep dictating argument
+    // mutability for calls to the *outer* `f` after its scope closed. Here
+    // the inner `f` declares a `mut` first parameter, so the later
+    // top-level `f(5)` was rejected with "argument 1 must be marked 'mut'"
+    // — an error about a function that has no `mut` parameters at all.
+    //
+    // Checked at the type-checker level rather than by running it: a nested
+    // named `func` is a separate, pre-existing codegen limitation.
+    let src = "\
+        func f(x: Int): Int = x * 10\n\
+        func outer(): Int = {\n\
+          func f(mut a: Int, b: Int): Int = { a = a + b\na }\n\
+          mut m = 1\n\
+          f(mut m, 2)\n\
+        }\n\
+        f(5)";
+    assert!(infer_src(src).is_ok(), "expected this to type-check: {:?}", infer_src(src));
+}

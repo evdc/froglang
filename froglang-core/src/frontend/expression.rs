@@ -36,17 +36,36 @@ pub struct ConditionalExpr {
     pub false_branch: Option<ExprRef>
 }
 
+/// Whether an `AssignExpr` declares a fresh binding, and if so, whether
+/// that binding accepts later reassignment. `None` means this node is an
+/// assignment to an *existing* binding (`x = ...`, no `let`/`mut` keyword),
+/// which `TypeChecker::lower_assign` resolves by lookup rather than by
+/// introducing a name — see `MUTABILITY.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutability {
+    Immutable,
+    Mutable,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssignExpr {
     pub target: ExprRef,
     pub typ: Option<Spanned<TypeExpr>>,
-    pub value: ExprRef
+    pub value: ExprRef,
+    /// `Some(Immutable)` for `let`, `Some(Mutable)` for `mut`, `None` for
+    /// a plain `target = value` assignment to a binding declared earlier.
+    pub decl: Option<Mutability>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Parameter { 
+pub struct Parameter {
     pub name: String,
-    pub ty: Option<Spanned<TypeExpr>>
+    pub ty: Option<Spanned<TypeExpr>>,
+    /// `func f(mut p: T)` — `p` writes back to the caller's argument at
+    /// this call, rather than being an ordinary by-value copy. See
+    /// `MUTABILITY.md`. Never set by lambda parameter syntax, which has
+    /// no room for a `mut` marker.
+    pub mutable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -257,6 +276,14 @@ pub enum Expression {
     /// is inlined per `Error`-providing member with that parameter bound to
     /// it (`TypeChecker::lower_catch`).
     Catch { value: ExprRef, handler: ExprRef },
+    /// `mut name` in call-argument position (`bump(mut a)`) — marks `name`
+    /// as the target of a `mut` parameter at this call, per
+    /// `MUTABILITY.md`. Grammar produces this only where `mut` is
+    /// immediately followed by a bare identifier and *not* `:`/`=` (which
+    /// would make it a declaration instead — see `Grammar::mut_prefix`);
+    /// anywhere else `TypeChecker` rejects it, since it's only meaningful
+    /// as one of `lower_call`'s own arguments.
+    MutArg(ExprRef),
 }
 
 
@@ -281,8 +308,12 @@ impl Expression {
         Expression::Conditional(ConditionalExpr { cond: Box::new(cond), true_branch: Box::new(true_branch), false_branch: false_branch.map(Box::new) })
     }
 
-    pub fn assign(target: Spanned<Expression>, typ: Option<Spanned<TypeExpr>>, value: Spanned<Expression>) -> Expression {
-        Expression::Assign(AssignExpr { target: Box::new(target), typ, value: Box::new(value) })
+    pub fn assign(target: Spanned<Expression>, typ: Option<Spanned<TypeExpr>>, value: Spanned<Expression>, decl: Option<Mutability>) -> Expression {
+        Expression::Assign(AssignExpr { target: Box::new(target), typ, value: Box::new(value), decl })
+    }
+
+    pub fn mut_arg(name: Spanned<Expression>) -> Expression {
+        Expression::MutArg(Box::new(name))
     }
 
     pub fn function(params: Vec<Parameter>, body: Spanned<Expression>) -> Expression {
@@ -533,6 +564,7 @@ impl fmt::Display for Expression {
             Expression::Try(inner) => write!(f, "{}?", inner),
             Expression::Unwrap(inner) => write!(f, "{}!", inner),
             Expression::Catch { value, handler } => write!(f, "{} catch {}", value, handler),
+            Expression::MutArg(name) => write!(f, "mut {}", name),
         }
     }
 }

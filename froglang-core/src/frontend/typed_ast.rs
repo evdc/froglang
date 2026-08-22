@@ -13,6 +13,24 @@ pub struct TypedExpr {
     pub kind: TypedExprKind,
 }
 
+/// One step of a `PlaceAssign` path — see its doc comment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlaceSeg {
+    Field(String),
+    Index {
+        /// Already type-checked (unified against `Int`) and lowered —
+        /// evaluated once, at the point this step is reached.
+        index: TypedExprRef,
+        /// The indexed list's element type, resolved once by
+        /// `TypeChecker::lower_place_assign` — codegen needs it to lay
+        /// out the write (`struct_fields(elem_ty)`) but has no other way
+        /// to recover it, since a path's later segments (if this isn't
+        /// the last one) only know the element's *fields*, never its
+        /// whole type.
+        elem_ty: Type,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprKind {
     IntLit(i64),
@@ -46,12 +64,28 @@ pub enum TypedExprKind {
     /// Parameters are `(name, resolved_type)` — the `Option<ExprRef>` annotation
     /// expressions from the untyped AST are gone; types are resolved.
     Function {
-        params:      Vec<(String, Type)>,
+        /// `(name, type, mutable)` — `mutable` is `true` only for a `mut`
+        /// parameter (`MUTABILITY.md`) on a `func` declaration; codegen
+        /// (`build_func_body`/`make_sig`) uses it to append the
+        /// parameter's final value to the function's own return values,
+        /// which the caller (`compile_expr_multi`'s `Call` arm) rebinds
+        /// into the `mut`-marked argument's leaf `Variable`(s) — copy-in,
+        /// copy-out, never a reference, since exclusivity
+        /// (`TypeChecker::lower_call`) guarantees no aliasing to protect.
+        params:      Vec<(String, Type, bool)>,
         return_type: Type,
         body:        TypedExprRef,
     },
 
-    Call { callable: TypedExprRef, args: Vec<Spanned<TypedExpr>> },
+    /// `mut_args[i]` is `true` iff `args[i]` was written `mut name` at this
+    /// call site (`bump(mut a)`) — `TypeChecker::lower_call` has already
+    /// validated it matches the callee's own declared parameter
+    /// mutability exactly, so codegen (`compile_call`) can trust it
+    /// without re-deriving anything: a `true` entry means the callee's
+    /// final value for that parameter is one of its *extra* return values
+    /// (see `Function`'s doc comment), to be copied back into `args[i]`'s
+    /// own (already-validated-mutable) binding.
+    Call { callable: TypedExprRef, args: Vec<Spanned<TypedExpr>>, mut_args: Vec<bool> },
 
     /// `target[index]` — list element access.
     Index { target: TypedExprRef, index: TypedExprRef },
@@ -105,12 +139,24 @@ pub enum TypedExprKind {
         enum_name: Option<String>,
     },
 
-    /// `base.field = value` — the struct "mutation" rebind-sugar: `base`
-    /// (a plain local, never a nested path — see `Grammar::assign`) is
-    /// rebound with `field` replaced by `value`. Result type is `Type::None`.
-    FieldAssign {
-        base:  String,
-        field: String,
+    /// `root(.field | [index])* = value` — a *place* assignment
+    /// (`MUTABILITY.md`): `root` must be a mutable binding
+    /// (`TypeChecker::lower_assign` checks this before constructing the
+    /// node), and `path` is always non-empty — a bare `name = value`
+    /// reaches `TypedExprKind::Assign` instead, never this. Result type is
+    /// `Type::None`.
+    ///
+    /// A path with no `Index` segment is the struct "mutation" rebind
+    /// sugar generalized to any depth (`o.i.v = 5`): codegen rebinds the
+    /// touched leaf `Variable`(s) directly, since a struct is a flat set
+    /// of named bindings. A path with exactly one `Index` segment writes
+    /// through a heap-allocated `FrogList` instead (`frog_list_set`).
+    /// `TypeChecker::lower_assign` rejects a path with more than one
+    /// `Index` — writing through nested list indices (`xs[i][j] = v`) —
+    /// as a v1 restriction, not a fundamental one.
+    PlaceAssign {
+        root:  String,
+        path:  Vec<PlaceSeg>,
         value: TypedExprRef,
     },
 

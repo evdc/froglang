@@ -82,7 +82,7 @@ func price_item(it: Item): Int | PricingError = {
 
 let items = [for i in 0..2000 do Item(sku=i, category=category_of(hash(i)), qty=1 + modn(hash(i + 7), 9), unit_price=100 + modn(hash(i + 13), 5000))]
 
-let total = 0
+mut total = 0
 for round in 0..2000 do {
     // Rotating the filter by `round` keeps a different two-thirds of the
     // catalogue in each batch, so the list can't be hoisted out of the loop.

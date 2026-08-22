@@ -8,7 +8,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::tokens::{Spanned, Token};
-use crate::frontend::typed_ast::{TypedExpr, TypedExprKind, TypedExprRef};
+use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
 use crate::runtime::{ffi, gc};
 use crate::runtime::gc::{FrogList, FrogVariant};
@@ -89,6 +89,13 @@ struct Ctx<'a> {
     /// Constant address of the owning `Codegen`'s `gc::ShadowTop` cell —
     /// see `setup_shadow_frame`, the only consumer.
     shadow_top_addr: i64,
+    /// This function's own `mut` parameters (name, type), in declaration
+    /// order — empty for `build_main_body`'s entry function, which never
+    /// has parameters. Consulted by every `return_`-emitting site
+    /// (`build_func_body`'s tail, and `compile_return`'s early exit) via
+    /// `mut_param_copyout` to append each one's final value after the
+    /// ordinary return — see `TypedExprKind::Function`'s doc comment.
+    mut_params:    Vec<(String, Type)>,
 }
 
 /// True iff a value of this type is a GC-managed heap pointer.
@@ -265,6 +272,24 @@ fn var_key(base: &str, leaf_path: &str) -> String {
     if leaf_path.is_empty() { base.to_string() } else { format!("{}.{}", base, leaf_path) }
 }
 
+/// Read back the current (possibly rebound, by a `PlaceAssign` or plain
+/// reassignment inside the body) value of each of `ctx.mut_params`'
+/// flattened `Variable`(s), in parameter order — the copy-out half of a
+/// `mut` parameter. Called at every `return_`-emitting site
+/// (`build_func_body`'s tail, `compile_return`'s early exit) to append
+/// after the ordinary return values, matching the extra `AbiParam`s
+/// `make_sig` appends to the signature in the same order.
+fn mut_param_copyout(bcx: &mut FunctionBuilder, vars: &HashMap<String, Variable>, ctx: &Ctx) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (name, ty) in &ctx.mut_params {
+        for (path, _) in struct_fields(ty, ctx.structs) {
+            let key = var_key(name, &path);
+            out.push(bcx.use_var(vars[&key]));
+        }
+    }
+    out
+}
+
 /// Number of heap-typed leaf fields in `ty` (0 for anything with none, 1 for
 /// a plain `Str`/`List`, N for a struct with N heap-typed leaves). Each one
 /// needs its own shadow-stack root — see call sites below.
@@ -302,7 +327,7 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
             }
         },
 
-        TypedExprKind::Call { callable, args } => {
+        TypedExprKind::Call { callable, args, mut_args } => {
             for_each_heap_producer(callable, structs, f);
             for arg in args { for_each_heap_producer(arg, structs, f); }
             // `print`'s codegen (`print_union`) reads whichever member of a
@@ -323,6 +348,13 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
             // A struct-typed return re-roots one heap-typed leaf at a time
             // (see the `Call` arm of `compile_expr_multi`) — count matches.
             for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
+            // Each `mut` argument's copy-out value (`Function`'s doc
+            // comment) crosses the ABI boundary as a fresh register value
+            // exactly like the call's own primary return does — same
+            // rooting need, one count per `mut` argument's own type.
+            for (arg, is_mut) in args.iter().zip(mut_args.iter()) {
+                if *is_mut { for _ in 0..heap_leaf_count(&arg.item.ty, structs) { f(); } }
+            }
         },
 
         TypedExprKind::Index { target, index } => {
@@ -411,7 +443,15 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
             }
         },
 
-        TypedExprKind::FieldAssign { value, .. } => for_each_heap_producer(value, structs, f),
+        // Mirrors `Index`'s own arm above: an `Index` path segment's inner
+        // expression is Int-typed itself, but evaluating it can still
+        // pass through heap-producing subexpressions on the way there.
+        TypedExprKind::PlaceAssign { path, value, .. } => {
+            for seg in path {
+                if let PlaceSeg::Index { index, .. } = seg { for_each_heap_producer(index, structs, f); }
+            }
+            for_each_heap_producer(value, structs, f);
+        },
 
         // A new heap object, just like `List`/`Slice`/`Range` — visits its
         // fields' own producers first, then itself.
@@ -1273,6 +1313,90 @@ fn compile_expr(
 /// `for_each_heap_producer`) is stored into `ctx`'s shadow-stack slot via
 /// `root_heap_value` immediately after being produced, so it stays visible to
 /// the GC's mark phase for the remainder of this function's execution.
+/// Split a `PlaceAssign` path into the dotted field path before any
+/// `Index` step (`""` if the path starts with the index), the `Index`
+/// step's lowered expression and resolved element type if present
+/// (`TypeChecker::lower_place_assign` guarantees at most one), and the
+/// dotted field path after it (`""` if there is none, or no index at all).
+fn split_place_path(path: &[PlaceSeg]) -> (String, Option<(&TypedExprRef, &Type)>, String) {
+    let mut prefix = Vec::new();
+    let mut index = None;
+    let mut suffix = Vec::new();
+    for seg in path {
+        match seg {
+            PlaceSeg::Field(f) => {
+                if index.is_none() { prefix.push(f.as_str()); } else { suffix.push(f.as_str()); }
+            },
+            PlaceSeg::Index { index: idx, elem_ty } => { index = Some((idx, elem_ty)); },
+        }
+    }
+    (prefix.join("."), index, suffix.join("."))
+}
+
+/// Codegen for `TypedExprKind::PlaceAssign` — see its doc comment for the
+/// two shapes this splits into.
+fn compile_place_assign(
+    root: &str,
+    path: &[PlaceSeg],
+    value: &Spanned<TypedExpr>,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) {
+    let (prefix, index, suffix) = split_place_path(path);
+    match index {
+        // A pure field path — the struct "mutation" rebind sugar,
+        // generalized to any depth (`o.i.v = 5`): overwrite just the
+        // touched leaf `Variable`(s), leaving every other field of `root`
+        // untouched. Works precisely because a struct is a flat set of
+        // named bindings, not one aggregate value — no
+        // read-modify-reconstruct needed, unlike a boxed representation.
+        None => {
+            let vals = compile_expr_multi(value, bcx, vars, ctx);
+            let leafs = struct_fields(&value.item.ty, ctx.structs);
+            for (v, (sub_path, lty)) in vals.iter().zip(leafs.iter()) {
+                let full_path = if sub_path.is_empty() { prefix.clone() } else { format!("{}.{}", prefix, sub_path) };
+                let key = var_key(root, &full_path);
+                let var = get_or_declare_var(bcx, vars, ctx, &key, lty);
+                bcx.def_var(var, *v);
+            }
+        },
+        // A path with exactly one `[index]` step writes through a
+        // heap-allocated `FrogList` instead: the list pointer itself is a
+        // flattened `Variable` (a `List`-typed leaf never recurses
+        // further in `struct_fields`, so `prefix`, even empty, names
+        // exactly one leaf — already declared when `root` was bound, so
+        // the type passed to `get_or_declare_var` here is never actually
+        // observed). Each of `value`'s own leaves lands at its offset
+        // within the *indexed element*'s own flattened layout: the whole
+        // element's layout if `suffix` is empty (`xs[0] = v`), or the
+        // sub-range under `suffix` if not (`xs[0].f = v`).
+        Some((idx_expr, elem_ty)) => {
+            let list_key = var_key(root, &prefix);
+            let list_ty = Type::List(Box::new(elem_ty.clone()));
+            let list_var = get_or_declare_var(bcx, vars, ctx, &list_key, &list_ty);
+            let list_val = bcx.use_var(list_var);
+            let idx_val = compile_expr(idx_expr, bcx, vars, ctx);
+
+            let (base_offset, _) = if suffix.is_empty() {
+                (0, struct_fields(elem_ty, ctx.structs).len())
+            } else {
+                dotted_leaf_range(elem_ty, &suffix, ctx.structs)
+            };
+
+            let vals = compile_expr_multi(value, bcx, vars, ctx);
+            let value_leafs = struct_fields(&value.item.ty, ctx.structs);
+            let set_id = ctx.func_ids["frog_list_set"];
+            for (i, (v, (_, lty))) in vals.iter().zip(value_leafs.iter()).enumerate() {
+                let raw = to_i64_repr(bcx, lty, *v);
+                let callee = ctx.module.declare_func_in_func(set_id, bcx.func);
+                let off_val = bcx.ins().iconst(types::I64, (base_offset + i) as i64);
+                bcx.ins().call(callee, &[list_val, idx_val, off_val, raw]);
+            }
+        },
+    }
+}
+
 fn compile_expr_multi(
     expr: &Spanned<TypedExpr>,
     bcx: &mut FunctionBuilder,
@@ -1336,7 +1460,7 @@ fn compile_expr_multi(
         TypedExprKind::Conditional { cond, true_branch, false_branch } =>
             compile_conditional(expr, cond, true_branch, false_branch, bcx, vars, ctx),
 
-        TypedExprKind::Call { callable, args } => compile_call(callable, args, bcx, vars, ctx),
+        TypedExprKind::Call { callable, args, mut_args } => compile_call(callable, args, mut_args, bcx, vars, ctx),
 
         TypedExprKind::Index { target, index } => {
             let list_val = compile_expr(target, bcx, vars, ctx);
@@ -1481,20 +1605,8 @@ fn compile_expr_multi(
             }
         },
 
-        TypedExprKind::FieldAssign { base, field, value } => {
-            // Overwrite just the touched leaf `Variable`(s) — every other
-            // field of `base` keeps its existing binding untouched. This
-            // works precisely because a struct is a flat set of named
-            // bindings, not one aggregate value: no read-modify-reconstruct
-            // of the whole struct is needed, unlike a boxed representation.
-            let vals = compile_expr_multi(value, bcx, vars, ctx);
-            let leafs = struct_fields(&value.item.ty, ctx.structs);
-            for (v, (sub_path, lty)) in vals.iter().zip(leafs.iter()) {
-                let full_path = if sub_path.is_empty() { field.clone() } else { format!("{}.{}", field, sub_path) };
-                let key = var_key(base, &full_path);
-                let var = get_or_declare_var(bcx, vars, ctx, &key, lty);
-                bcx.def_var(var, *v);
-            }
+        TypedExprKind::PlaceAssign { root, path, value } => {
+            compile_place_assign(root, path, value, bcx, vars, ctx);
             vec![bcx.ins().iconst(types::I64, 0)]
         },
 
@@ -1841,7 +1953,7 @@ fn compile_conditional(
     }
 }
 
-fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_args: &[bool], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     let func_name = match &callable.item.kind {
         TypedExprKind::Var(name) => name.clone(),
         _ => panic!("only named function calls supported in codegen"),
@@ -1957,7 +2069,19 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], bcx:
         bcx.seal_block(dead);
         return Vec::new();
     }
-    if return_ty == Type::None {
+    // Every `mut`-marked argument's final value follows the primary
+    // return, one contiguous group per argument in call order, sized by
+    // that argument's own flattened leaf count — `make_sig`/
+    // `build_func_body` on the callee side append exactly these leaves,
+    // in this order, after its own declared return (`Function`'s doc
+    // comment in `typed_ast.rs`). Split them off before handling the
+    // primary return so the three branches below don't need to know
+    // about `mut` arguments at all.
+    let all_results = bcx.inst_results(call).to_vec();
+    let primary_leaf_count = if return_ty == Type::None { 0 } else { struct_fields(&return_ty, ctx.structs).len() };
+    let (primary_raw, mut copyout_raw) = all_results.split_at(primary_leaf_count);
+
+    let primary_results = if return_ty == Type::None {
         vec![bcx.ins().iconst(types::I64, 0)]
     } else if is_multi_leaf_type(&return_ty) {
         // Each heap-producing leaf of a struct return, or a
@@ -1971,18 +2095,41 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], bcx:
         // caller has no static way to know which member the callee
         // actually returned — so `root_flat_leaves` roots it behind
         // a runtime tag comparison rather than unconditionally.
-        let results = bcx.inst_results(call).to_vec();
         let leaf_tys: Vec<Type> = struct_fields(&return_ty, ctx.structs)
             .into_iter().map(|(_, t)| t).collect();
-        root_flat_leaves(bcx, ctx, &results, &leaf_tys);
-        results
+        root_flat_leaves(bcx, ctx, primary_raw, &leaf_tys);
+        primary_raw.to_vec()
     } else {
-        let result = bcx.inst_results(call)[0];
+        let result = primary_raw[0];
         if is_heap_ty(&return_ty) {
             root_heap_value(bcx, ctx, result);
         }
         vec![result]
+    };
+
+    // Copy-out: root each `mut` argument's returned leaves exactly like
+    // the primary return above, then rebind them into the argument's own
+    // `Variable`(s) — `lower_call` only ever allows a bare identifier as
+    // a `mut` argument, so `var_key` needs nothing more than its name.
+    for (arg, is_mut) in args.iter().zip(mut_args.iter()) {
+        if !*is_mut { continue; }
+        let name = match &arg.item.kind {
+            TypedExprKind::Var(n) => n.clone(),
+            _ => unreachable!("TypeChecker::lower_call only allows a bare Var as a 'mut' argument"),
+        };
+        let leafs = struct_fields(&arg.item.ty, ctx.structs);
+        let (this_arg, rest) = copyout_raw.split_at(leafs.len());
+        copyout_raw = rest;
+        let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
+        root_flat_leaves(bcx, ctx, this_arg, &leaf_tys);
+        for (v, (path, lty)) in this_arg.iter().zip(leafs.iter()) {
+            let key = var_key(&name, path);
+            let var = get_or_declare_var(bcx, vars, ctx, &key, lty);
+            bcx.def_var(var, *v);
+        }
     }
+
+    primary_results
 }
 
 fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
@@ -2058,7 +2205,7 @@ fn compile_variant_init(fields: &[(String, TypedExprRef)], tag: u32, bcx: &mut F
 }
 
 fn compile_return(value: &Option<TypedExprRef>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
-    let results = match value {
+    let mut results = match value {
         Some(v) => compile_expr_multi(v, bcx, vars, ctx),
         None => Vec::new(),
     };
@@ -2066,6 +2213,10 @@ fn compile_return(value: &Option<TypedExprRef>, bcx: &mut FunctionBuilder, vars:
     // this is an *early* exit, so it must do the same thing
     // `build_func_body`'s own tail `return_` does, not skip it.
     teardown_shadow_frame(bcx, ctx.shadow_top_addr, ctx.heap_slot);
+    // And every path out must also carry each `mut` parameter's current
+    // value, exactly like the tail return does — an early `return` is
+    // just as much an exit as falling off the end of the body.
+    results.extend(mut_param_copyout(bcx, vars, ctx));
     bcx.ins().return_(&results);
     // Cranelift requires every block to end in exactly one
     // terminator, and `return_` is one — so whatever IR follows
@@ -2279,6 +2430,34 @@ fn field_slice_range(struct_ty: &Type, field: &str, structs: &StructDefs) -> (us
         offset += leaf_count;
     }
     panic!("field '{}' not found on struct {} in codegen", field, name);
+}
+
+/// The multi-level generalization of `field_slice_range`: the `(offset,
+/// len)` range, within `ty`'s own `struct_fields` flattening, occupied by
+/// the leaves under dotted path `dotted` (`"i.v"`, matching a nested
+/// struct field, not just an immediate one). Used by `PlaceAssign`
+/// codegen to find where a suffix field path (`xs[0].f = v`,
+/// `xs[0].i.v = v`) lands within the indexed element's own layout —
+/// `field_slice_range` itself isn't reusable there since it only compares
+/// against one struct's *immediate* declared field names, not a dotted
+/// path composed across several `.field` segments.
+fn dotted_leaf_range(ty: &Type, dotted: &str, structs: &StructDefs) -> (usize, usize) {
+    let leafs = struct_fields(ty, structs);
+    let mut start = None;
+    let mut count = 0;
+    for (i, (path, _)) in leafs.iter().enumerate() {
+        let matches = path == dotted || path.starts_with(&format!("{}.", dotted));
+        if matches {
+            if start.is_none() { start = Some(i); }
+            count += 1;
+        } else if start.is_some() {
+            break;
+        }
+    }
+    (
+        start.unwrap_or_else(|| panic!("dotted field path '{}' not found on {:?} in codegen", dotted, ty)),
+        count,
+    )
 }
 
 /// Shared codegen for `for var in iterable (if cond)? body`, used by both
@@ -2532,9 +2711,9 @@ impl Codegen {
     /// Cranelift signatures natively support multiple params/returns, so
     /// this is a direct extension of the pre-struct one-param-per-value
     /// signature shape (every non-struct type still contributes exactly one).
-    fn make_sig(&self, params: &[(String, Type)], return_type: &Type, structs: &StructDefs) -> cranelift_codegen::ir::Signature {
+    fn make_sig(&self, params: &[(String, Type, bool)], return_type: &Type, structs: &StructDefs) -> cranelift_codegen::ir::Signature {
         let mut sig = self.module.make_signature();
-        for (_, ty) in params {
+        for (_, ty, _) in params {
             for (_, lty) in struct_fields(ty, structs) {
                 sig.params.push(AbiParam::new(cl_type(&lty)));
             }
@@ -2542,6 +2721,18 @@ impl Codegen {
         if *return_type != Type::None {
             for (_, lty) in struct_fields(return_type, structs) {
                 sig.returns.push(AbiParam::new(cl_type(&lty)));
+            }
+        }
+        // Each `mut` parameter's final value is appended as extra return
+        // values, one per flattened leaf, in parameter order — the
+        // copy-in/copy-out half of a `mut` parameter (`MUTABILITY.md`).
+        // `compile_call` splits these off the call's results after the
+        // ordinary return, matching this order exactly.
+        for (_, ty, mutable) in params {
+            if *mutable {
+                for (_, lty) in struct_fields(ty, structs) {
+                    sig.returns.push(AbiParam::new(cl_type(&lty)));
+                }
             }
         }
         sig
@@ -2552,7 +2743,7 @@ impl Codegen {
         cl_ctx: &mut Context,
         module: &mut JITModule,
         func_ids: &HashMap<String, FuncId>,
-        params: &[(String, Type)],
+        params: &[(String, Type, bool)],
         return_type: &Type,
         body: &Spanned<TypedExpr>,
         string_arena: &mut Vec<Vec<u8>>,
@@ -2573,17 +2764,21 @@ impl Codegen {
         // it has flattened leaf fields — `make_sig` laid these out in the
         // exact same per-param `struct_fields` order.
         let mut cursor = 0usize;
-        for (name, ty) in params {
+        let mut mut_params: Vec<(String, Type)> = Vec::new();
+        for (name, ty, mutable) in params {
             for (path, lty) in struct_fields(ty, structs) {
                 let key = var_key(name, &path);
                 declare_and_def_var(&mut bcx, &mut vars, &mut var_counter, &key, &lty, entry_params[cursor]);
                 cursor += 1;
             }
+            if *mutable {
+                mut_params.push((name.clone(), ty.clone()));
+            }
         }
 
         let n = count_heap_slots(body, structs);
         let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
         teardown_shadow_frame(&mut bcx, shadow_top_addr, heap_slot);
 
@@ -2595,14 +2790,27 @@ impl Codegen {
             // verifies that block's own terminator against the function
             // signature even though nothing ever reaches it at runtime, so
             // it needs a value list of the right shape; the values
-            // themselves are never observed.
-            let results = if body.item.ty == Type::Never {
+            // themselves are never observed. Same reasoning for the
+            // appended `mut`-param placeholders below.
+            let mut results = if body.item.ty == Type::Never {
                 struct_fields(return_type, structs).iter()
                     .map(|(_, t)| placeholder_value(&mut bcx, cl_type(t)))
                     .collect()
             } else {
                 results
             };
+            if body.item.ty == Type::Never {
+                for (_, ty) in &ctx.mut_params {
+                    for (_, lty) in struct_fields(ty, structs) {
+                        results.push(placeholder_value(&mut bcx, cl_type(&lty)));
+                    }
+                }
+            } else {
+                results.extend(mut_param_copyout(&mut bcx, &vars, &ctx));
+            }
+            bcx.ins().return_(&results);
+        } else if !ctx.mut_params.is_empty() {
+            let results = mut_param_copyout(&mut bcx, &vars, &ctx);
             bcx.ins().return_(&results);
         } else {
             bcx.ins().return_(&[]);
@@ -2677,7 +2885,7 @@ impl Codegen {
 
         let n: usize = stmts.iter().map(|s| count_heap_slots(s, structs)).sum();
         let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params: Vec::new() };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;
@@ -2806,7 +3014,7 @@ impl Codegen {
         let shadow_top_addr = self.shadow_top() as i64;
 
         // ── Pass 2: Define all function bodies ───────────────────────────────
-        let func_defs: Vec<(String, FuncId, Vec<(String, Type)>, Type, Box<Spanned<TypedExpr>>)> =
+        let func_defs: Vec<(String, FuncId, Vec<(String, Type, bool)>, Type, Box<Spanned<TypedExpr>>)> =
             stmts.iter().filter_map(|stmt| {
                 if let TypedExprKind::Assign { name, value } = &stmt.item.kind {
                     if let TypedExprKind::Function { params, return_type, body } = &value.item.kind {

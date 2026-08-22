@@ -138,7 +138,7 @@ fn test_function_literal() {
     }
     match &r.kind {
         TypedExprKind::Function { params, return_type, .. } => {
-            assert_eq!(params, &[("x".to_string(), Type::Int)]);
+            assert_eq!(params, &[("x".to_string(), Type::Int, false)]);
             assert_eq!(*return_type, Type::Int);
         },
         _ => panic!("expected Function kind"),

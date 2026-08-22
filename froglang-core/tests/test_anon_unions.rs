@@ -114,7 +114,7 @@ fn test_scalar_union_member_survives_gc_pressure() {
          is Int(n) then n\n\
          is Oops(o) then -1\n\
          }\n\
-         let total = 0\n\
+         mut total = 0\n\
          for i in 0..3000 do {\n\
          let v: Int | Oops = i\n\
          total = total + classify(v)\n\
@@ -192,7 +192,7 @@ fn test_str_union_member_survives_gc_pressure() {
     // string or crash trying to follow a raw `Int` payload as a pointer.
     assert_eq!(compile_and_run(
         "let xs: List(Int | Str) = [for i in 0..8000 do (if i - (i / 2) * 2 == 0 then i else \"hello\")]\n\
-         let total = 0\n\
+         mut total = 0\n\
          for i in 0..8000 do (total = total + match xs[i] {\n\
          is Int(n) then n\n\
          is Str(s) then 0\n\
@@ -210,7 +210,7 @@ fn test_assigning_into_a_union_typed_struct_field_widens() {
     // `TypeTag`/`Narrow` to dereference `9` as a `FrogVariant*`.
     assert_eq!(compile_and_run(
         "data Cell(v: Int | Bool)\n\
-         let c = Cell(v=5)\n\
+         mut c = Cell(v=5)\n\
          c.v = 9\n\
          match c.v {\n\
          is Int(n) then n\n\
@@ -255,7 +255,7 @@ fn test_list_of_scalar_union_survives_gc_pressure() {
     assert_eq!(compile_and_run(
         "data Point(x: Int, y: Int)\n\
          let xs: List(Int | Point) = [for i in 0..6000 do (if i - (i / 2) * 2 == 0 then i else Point(x=i, y=i))]\n\
-         let total = 0\n\
+         mut total = 0\n\
          for i in 0..6000 do (total = total + match xs[i] {\n\
          is Int(n) then n\n\
          is Point(p) then p.x\n\
@@ -309,7 +309,7 @@ fn test_for_loop_over_scalar_union_list_allocating_in_the_body() {
         "data Point(x: Int, y: Int)\n\
          func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\
          let xs: List(Int | Point) = [4000000, 4000002, 4000004]\n\
-         let total = 0\n\
+         mut total = 0\n\
          for x in xs do (total = total + burn(1) + match x {\n\
          is Int(n) then n\n\
          is Point(p) then p.x\n\
@@ -328,7 +328,7 @@ fn test_indexing_a_scalar_union_list_allocating_between_reads() {
         "data Point(x: Int, y: Int)\n\
          func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\
          let xs: List(Int | Point) = [4000000, 4000002, 4000004]\n\
-         let total = 0\n\
+         mut total = 0\n\
          for i in 0..3 do (total = total + match xs[i] {\n\
          is Int(n) then n + burn(1)\n\
          is Point(p) then p.x + burn(1)\n\

@@ -139,6 +139,7 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
             },
             Expression::Try(inner) | Expression::Unwrap(inner) => walk(&inner.item, path),
             Expression::Catch { value, handler } => { walk(&value.item, path)?; walk(&handler.item, path) }
+            Expression::MutArg(name) => walk(&name.item, path),
             Expression::DataDecl(_) | Expression::Literal(_) => Ok(()),
         }
     }
@@ -688,6 +689,11 @@ fn rewrite(
             rewrite(&mut value.item, subst, qualified, shadow, track_let_shadow);
             rewrite(&mut handler.item, subst, qualified, shadow, track_let_shadow);
         }
+
+        // The marked name is an ordinary reference for renaming purposes
+        // — only *how* it's used at the call site is special, which
+        // `TypeChecker::lower_call` handles, not this rewrite.
+        Expression::MutArg(name) => rewrite(&mut name.item, subst, qualified, shadow, track_let_shadow),
     }
 }
 

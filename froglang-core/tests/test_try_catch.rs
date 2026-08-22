@@ -256,7 +256,7 @@ fn test_try_survives_gc_pressure() {
         "error ParseError(code: Int)\n\
          func parse(i: Int): Int | ParseError = if i - i / 7 * 7 == 0 then ParseError(code=i) else i\n\
          func run(i: Int): Int | ParseError = parse(i)? * 2\n\
-         let total = 0\n\
+         mut total = 0\n\
          for i in 0..3000 do {\n\
          total = total + match run(i) {\n\
          is Int(n) then n\n\

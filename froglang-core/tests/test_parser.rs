@@ -468,6 +468,7 @@ fn test_assignment() {
             Spanned::new(Expression::literal(Token::Identifier("a".to_string())), pos(0, 0), pos(0, 1)),
             None,
             Spanned::new(Expression::literal(Token::Int(5)), pos(0, 4), pos(0, 5)),
+            None,
         )
     );
 }
@@ -593,7 +594,8 @@ fn test_assignment_precedence() {
                     Spanned::new(Expression::literal(Token::Identifier("c".to_string())), pos(0, 8), pos(0, 9))
                 ),
                 pos(0, 4), pos(0, 9)
-            )
+            ),
+            None,
         )
     );
 
@@ -608,10 +610,12 @@ fn test_assignment_precedence() {
                 Expression::assign(
                     Spanned::new(Expression::literal(Token::Identifier("b".to_string())), pos(0, 4), pos(0, 5)),
                     None,
-                    Spanned::new(Expression::literal(Token::Identifier("c".to_string())), pos(0, 8), pos(0, 9))
+                    Spanned::new(Expression::literal(Token::Identifier("c".to_string())), pos(0, 8), pos(0, 9)),
+                    None,
                 ),
                 pos(0, 4), pos(0, 9)
-            )
+            ),
+            None,
         )
     );
 }
@@ -654,7 +658,7 @@ fn test_basic_arrow_function() {
     assert_eq!(
         Parser::new("x -> x + 1").expression(Precedence::Assign).unwrap().item,
         Expression::function(
-            vec![Parameter { name: "x".to_string(), ty: None }],
+            vec![Parameter { name: "x".to_string(), ty: None, mutable: false }],
             Expression::binary(
                 Token::Plus,
                 Expression::literal(Token::Identifier("x".to_string())).at((0, 5)..(0, 6)),
@@ -682,9 +686,9 @@ fn test_arrow_function_chaining() {
     assert_eq!(
         Parser::new("x -> y -> x + y").expression(Precedence::Assign).unwrap().item,
         Expression::function(
-            vec![Parameter { name: "x".to_string(), ty: None }],
+            vec![Parameter { name: "x".to_string(), ty: None, mutable: false }],
             Expression::function(
-                vec![Parameter { name: "y".to_string(), ty: None }],
+                vec![Parameter { name: "y".to_string(), ty: None, mutable: false }],
                 Expression::binary(
                     Token::Plus,
                     Expression::literal(Token::Identifier("x".to_string())).at((0, 10)..(0, 11)),
@@ -704,13 +708,14 @@ fn test_arrow_function_with_assignment() {
             Expression::literal(Token::Identifier("inc".to_string())).at((0, 0)..(0, 3)),
             None,
             Expression::function(
-               vec![Parameter { name: "x".to_string(), ty: None }],
+               vec![Parameter { name: "x".to_string(), ty: None, mutable: false }],
                 Expression::binary(
                     Token::Plus,
                     Expression::literal(Token::Identifier("x".to_string())).at((0, 11)..(0, 12)),
                     Expression::literal(Token::Int(1)).at((0, 15)..(0, 16))
                 ).at((0, 11)..(0, 16))
-            ).at((0, 6)..(0, 16))
+            ).at((0, 6)..(0, 16)),
+            None,
         )
     );
 }
@@ -793,7 +798,7 @@ fn test_arrow_function_returning_call() {
     assert_eq!(
         Parser::new("x -> f(x)").expression(Precedence::Assign).unwrap().item,
         Expression::function(
-            vec![Parameter { name: "x".to_string(), ty: None }],
+            vec![Parameter { name: "x".to_string(), ty: None, mutable: false }],
             Expression::call(
                 Expression::literal(Token::Identifier("f".to_string())).at((0, 5)..(0, 6)),
                 vec![Expression::literal(Token::Identifier("x".to_string())).at((0, 7)..(0, 8))]
@@ -809,7 +814,7 @@ fn test_immediately_invoked_arrow_expression() {
         Parser::new("(x -> x + 1)(1)").expression(Precedence::Assign).unwrap().item,
         Expression::call(
             Expression::function(
-                vec![Parameter { name: "x".to_string(), ty: None }],
+                vec![Parameter { name: "x".to_string(), ty: None, mutable: false }],
                 Expression::binary(
                     Token::Plus,
                     Expression::literal(Token::Identifier("x".to_string())).at((0, 6)..(0, 7)),

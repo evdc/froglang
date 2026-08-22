@@ -308,8 +308,17 @@ impl FrogState {
         // objects (`codegen::is_heap_ty`). It used to be missing, so the
         // result of an entry that produced a `data`-union value was left
         // unrooted for as long as `from_bits` needed it below.
-        if matches!(&result_ty, Type::Str | Type::List(_) | Type::Union(_)) {
-            self.heap.push_root(bits, true);
+        //
+        // Not a bare `matches!` on `result_ty`, though: `bits` is only ever
+        // *leaf 0* of the result's flattened value (`build_main_body`'s
+        // return is always a single i64), and for a two-slot union that
+        // leaf is the `$tag` `Int`, not a pointer — rooting it as one hands
+        // the collector an integer to dereference. Route through
+        // `heap_roots_in_leaves` (the same tag-aware check the bindings
+        // loop below uses) so it's skipped correctly.
+        let result_leaf0 = crate::codegen::struct_fields(&result_ty, self.tc.struct_defs());
+        for v in crate::codegen::heap_roots_in_leaves(&[bits], &result_leaf0[..1]) {
+            self.heap.push_root(v, true);
         }
         for (name, ty) in &self.env_types {
             if let Some(vals) = self.env.get(name) {

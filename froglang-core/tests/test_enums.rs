@@ -115,7 +115,7 @@ fn test_enum_unit_variants_in_list_program() {
 fn test_enum_variant_with_str_field_survives_gc() {
     assert_eq!(compile_and_run(
         "data Wrapper is Box(s: Str)\n\
-         let total = 0\n\
+         mut total = 0\n\
          for i in 0..3000 do { let w = Box(s=\"hello\")\ntotal = total + 1 }\n\
          total"
     ), 3000);
@@ -188,7 +188,7 @@ fn test_unit_variants_allocate_nothing() {
     let before = s.heap.bytes_allocated;
     s.eval(
         "data Color is Red | Green | Blue\n\
-         let n = 0\n\
+         mut n = 0\n\
          for i in 0..1000 do { let c = if i == 0 then Red else Green\n n = n + (if c is Red then 1 else 0) }\n\
          n"
     ).unwrap();
@@ -226,7 +226,7 @@ fn test_unboxed_variants_survive_collection_inside_a_list() {
     ).unwrap();
     s.heap.force_collect();
     let (value, _) = s.eval(
-        "let n = 0\n\
+        "mut n = 0\n\
          for o in opts do { n = n + match o {\nis None_ then 1\nis Some_(v) then v\n} }\n\
          n"
     ).unwrap();

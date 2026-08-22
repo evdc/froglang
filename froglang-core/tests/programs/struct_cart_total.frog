@@ -7,11 +7,11 @@ let catalog = [Product(name="Coffee", price=450), Product(name="Tea", price=350)
 
 let cart = [LineItem(product=catalog[0], qty=2), LineItem(product=catalog[2], qty=1)]
 
-let subtotal = 0
+mut subtotal = 0
 for item in cart do { subtotal = subtotal + line_total(item) }
 
 let bulk_lines = [for item in cart if item.qty > 1 do line_total(item)]
-let discount = 0
+mut discount = 0
 for line in bulk_lines do { discount = discount + line / 10 }
 
 subtotal - discount

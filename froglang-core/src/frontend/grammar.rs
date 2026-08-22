@@ -1,4 +1,4 @@
-use crate::frontend::{expression::{DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, MatchArm, MatchExpr, Parameter, Pattern, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
+use crate::frontend::{expression::{DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, MatchArm, MatchExpr, Mutability, Parameter, Pattern, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
 
 /// Result of parsing a type annotation. Parallel to `ParseResult`, but over
 /// the type grammar (`crate::frontend::type_expr`) rather than `Expression`.
@@ -49,10 +49,15 @@ impl Grammar {
         })
     }
     
-    pub fn let_binding(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
-        // parse a pattern - a name, optional colon&type, then an =, then an expr
-        // later(?) add destructuring assignment here
-        let name = parser.identifier()?;
+    /// `let name = expr` / `mut name = expr` — a fresh declaration. Which
+    /// keyword introduced this call decides the binding's `Mutability`
+    /// (`token.item` is `Token::Let` or `Token::Mut`; see `MUTABILITY.md`).
+    /// Continue parsing a declaration whose leading keyword (`token`) and
+    /// name have already been consumed: an optional `: Type`, `=`, then an
+    /// expression. Shared by `let_binding` (which always takes this path)
+    /// and `mut_prefix` (which takes it only once it's seen this *is* a
+    /// declaration, not a call-argument mutation marker).
+    fn finish_declaration(parser: &mut Parser, token: &Spanned<Token>, name: Spanned<Token>, mutability: Mutability) -> ParseResult {
         let ty = if parser.check(&Token::Colon) {
             parser.advance()?;
             Some(Self::type_expr(parser)?)
@@ -66,27 +71,64 @@ impl Grammar {
             item: Expression::assign(
                 name.map(Expression::literal),
                 ty,
-                expr)
+                expr,
+                Some(mutability))
         })
     }
 
-    pub fn assign(parser: &mut Parser, _token: Spanned<Token>, left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
-        // Valid targets: a bare identifier (`x = ...`), or a field access
-        // whose own target is a bare identifier (`alice.age = ...` — the
-        // struct rebind-sugar; see `TypedExprKind::FieldAssign`). Deeper
-        // paths (`a.b.c = ...`) and non-identifier bases (`foo().x = ...`)
-        // are rejected here — v1 restriction, not a fundamental limit.
-        let valid = match &left.item {
-            Expression::FieldAccess(fa) => fa.target.item.get_identifier().is_some(),
+    pub fn let_binding(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        // later(?) add destructuring assignment here
+        let name = parser.identifier()?;
+        Self::finish_declaration(parser, &token, name, Mutability::Immutable)
+    }
+
+    /// `mut name = expr` (a declaration) or `mut name` (marks an existing
+    /// mutable binding as the target of a `mut` parameter at a call site,
+    /// `bump(mut a)`) — see `MUTABILITY.md`. Disambiguated by what follows
+    /// the identifier: `:` or `=` continues exactly like `let_binding`;
+    /// anything else (`,`, `)`, a statement separator) means this is the
+    /// call-argument form, which accepts nothing but a bare identifier —
+    /// `mut a.b` or `mut f()` have no meaning there, so the identifier
+    /// parsed above is already the whole of it.
+    pub fn mut_prefix(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let name = parser.identifier()?;
+        if parser.check(&Token::Colon) || parser.check(&Token::Assign) {
+            return Self::finish_declaration(parser, &token, name, Mutability::Mutable);
+        }
+        let name_span = name.span;
+        Ok(Spanned {
+            span: token.span.merge(name_span),
+            item: Expression::mut_arg(name.map(Expression::literal)),
+        })
+    }
+
+    /// Valid targets: a bare identifier (`x = ...`), or a chain of `.field`
+    /// and `[index]` steps rooted at one (`a.b.c = ...`, `xs[0] = ...`,
+    /// `o.xs[0].f = ...`) — a *place*, in `MUTABILITY.md`'s terms. A
+    /// non-identifier root (`foo().x = ...`) is rejected here; how many
+    /// `[index]` steps a place may contain (today: at most one) is a
+    /// semantic rule enforced by `TypeChecker::lower_assign`, not a
+    /// syntactic one, so the parser accepts any depth and lets the checker
+    /// give the precise error.
+    fn is_assignable_place(expr: &Expression) -> bool {
+        match expr {
+            Expression::FieldAccess(fa) => Self::is_assignable_place(&fa.target.item),
+            Expression::Index(idx) => Self::is_assignable_place(&idx.target.item),
             other => other.get_identifier().is_some(),
-        };
-        if !valid {
+        }
+    }
+
+    pub fn assign(parser: &mut Parser, _token: Spanned<Token>, left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
+        if !Self::is_assignable_place(&left.item) {
             return Err(left.to(ParseError::InvalidAssignmentTarget));
         }
         let right = parser.expression(precedence)?;
         Ok(Spanned {
             span: left.span.merge(right.span),
-            item: Expression::assign(left, None, right)
+            // `decl: None` — this is a plain `target = value`, resolved
+            // by `TypeChecker::lower_assign` against an existing binding
+            // rather than introducing one.
+            item: Expression::assign(left, None, right, None)
         })
     }
 
@@ -164,6 +206,15 @@ impl Grammar {
 
         let mut params = Vec::new();
         while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
+            // `mut name: T` — see `MUTABILITY.md`. `mut` binds the
+            // parameter, not the type, matching a `mut`
+            // declaration one level up.
+            let mutable = if parser.check(&Token::Mut) {
+                parser.advance()?;
+                true
+            } else {
+                false
+            };
             let param_tok = parser.identifier()?;
             let param_name = match &param_tok.item {
                 Token::Identifier(s) => s.clone(),
@@ -175,7 +226,7 @@ impl Grammar {
             } else {
                 None
             };
-            params.push(Parameter { name: param_name, ty });
+            params.push(Parameter { name: param_name, ty, mutable });
             if parser.check(&Token::Comma) {
                 parser.advance()?;
             }
@@ -202,7 +253,9 @@ impl Grammar {
 
         Ok(Spanned {
             span: token.span.merge(body_span),
-            item: Expression::assign(name_expr, None, func_expr),
+            // A named `func` declaration binds like `let` — immutable, not
+            // reassignable — matching an ordinary `let f = x -> ...`.
+            item: Expression::assign(name_expr, None, func_expr, Some(Mutability::Immutable)),
         })
     }
 
@@ -265,7 +318,7 @@ impl Grammar {
                 return Err(left.to(ParseError::Other(msg)))
             }
         };
-        let params = params.iter().map(|name| Parameter { name: name.to_string(), ty: None }).collect();
+        let params = params.iter().map(|name| Parameter { name: name.to_string(), ty: None, mutable: false }).collect();
         let body = parser.expression(Precedence::Assign)?;
         Ok(Spanned { 
             span: left.span.merge(body.span), 

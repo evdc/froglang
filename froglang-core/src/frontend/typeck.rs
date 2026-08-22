@@ -4,12 +4,12 @@ use crate::frontend::{
     expression::{
         AnnotatedExpr, AssignExpr, BinaryExpr, CallExpr, ConditionalExpr, Expression,
         FieldAccessExpr, ForLoopExpr, FunctionExpr, IndexExpr, IsPatternExpr, LiteralExpr,
-        MatchArm, Pattern, RangeExpr, SliceExpr, UnaryExpr,
+        MatchArm, Mutability, Pattern, RangeExpr, SliceExpr, UnaryExpr,
     },
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::type_expr::TypeExpr;
-use crate::frontend::typed_ast::{TypedExpr, TypedExprKind, TypedExprRef};
+use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 use crate::utils::format_vec;
 
 /// Reserved name for the builtin `panic` alias that `!` desugars to.
@@ -265,6 +265,13 @@ pub type UnionDefs = HashMap<String, UnionDef>;
 /// nullary values carry no data); for an anonymous member, `bind_names` is
 /// the single name `check_type_pattern`/`Narrow` already bind the whole
 /// value to, and `whole_value` just reads it back.
+/// One step of an assignment target's path, before type-checking — see
+/// `TypeChecker::flatten_place`.
+enum RawPlaceSeg {
+    Field(String),
+    Index(Spanned<Expression>),
+}
+
 struct ErrorArmEntry {
     pattern_variant: String,
     ty: Type,
@@ -305,30 +312,64 @@ pub struct ScopeMark(usize);
 /// Writes are only logged while at least one scope is open (`depth > 0`).
 /// At the top level there is nothing to unwind to, so logging there would
 /// just grow forever in a long-lived REPL session.
+/// A bound name's type plus whether it accepts reassignment — see
+/// `MUTABILITY.md`. `mutable` is what `TypeChecker::lower_assign`'s
+/// assignment path (as opposed to its declaration path) checks.
+#[derive(Debug, Clone, PartialEq)]
+struct Binding {
+    ty:      Type,
+    mutable: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScopeStack {
-    bindings: HashMap<String, Type>,
-    log:      Vec<(String, Option<Type>)>,
+    bindings: HashMap<String, Binding>,
+    log:      Vec<(String, Option<Binding>)>,
     depth:    usize,
 }
 
 impl ScopeStack {
+    /// Seed the stack with immutable bindings (builtins, `add_ctx`
+    /// callers) — nothing outside `lower_assign`'s declaration path should
+    /// ever introduce a mutable one.
     fn new(bindings: HashMap<String, Type>) -> Self {
+        let bindings = bindings.into_iter()
+            .map(|(k, ty)| (k, Binding { ty, mutable: false }))
+            .collect();
         ScopeStack { bindings, log: Vec::new(), depth: 0 }
     }
 
     fn get(&self, name: &str) -> Option<&Type> {
-        self.bindings.get(name)
+        self.bindings.get(name).map(|b| &b.ty)
+    }
+
+    /// `None` if `name` isn't bound at all — distinct from `Some(false)`,
+    /// which is a real immutable binding. `lower_assign`'s assignment path
+    /// needs to tell "not declared" from "declared, not mutable" apart to
+    /// give the right error.
+    fn is_mutable(&self, name: &str) -> Option<bool> {
+        self.bindings.get(name).map(|b| b.mutable)
     }
 
     fn contains_key(&self, name: &str) -> bool {
         self.bindings.contains_key(name)
     }
 
-    /// Bind `name` in the innermost open scope, shadowing (and, once that
-    /// scope closes, restoring) whatever it held before.
+    /// Bind `name` immutably in the innermost open scope, shadowing (and,
+    /// once that scope closes, restoring) whatever it held before. Used
+    /// for every binding that isn't a user-facing `let`/`mut` declaration
+    /// — function parameters, loop/comprehension variables, match-arm and
+    /// `catch`-handler binds, struct-field synthetic names — all of which
+    /// are immutable by default (a `mut` function parameter, the one
+    /// exception, goes through `insert_mut` once implemented).
     fn insert(&mut self, name: String, ty: Type) {
-        let previous = self.bindings.insert(name.clone(), ty);
+        self.insert_mut(name, ty, false);
+    }
+
+    /// As `insert`, but the caller states the binding's mutability
+    /// explicitly — the declaration path in `lower_assign`.
+    fn insert_mut(&mut self, name: String, ty: Type, mutable: bool) {
+        let previous = self.bindings.insert(name.clone(), Binding { ty, mutable });
         if self.depth > 0 {
             self.log.push((name, previous));
         }
@@ -347,15 +388,15 @@ impl ScopeStack {
         while self.log.len() > mark.0 {
             let (name, previous) = self.log.pop().expect("log is longer than the mark");
             match previous {
-                Some(ty) => { self.bindings.insert(name, ty); },
-                None     => { self.bindings.remove(&name); },
+                Some(b) => { self.bindings.insert(name, b); },
+                None    => { self.bindings.remove(&name); },
             }
         }
         self.depth -= 1;
     }
 
     fn into_bindings(self) -> HashMap<String, Type> {
-        self.bindings
+        self.bindings.into_iter().map(|(k, b)| (k, b.ty)).collect()
     }
 }
 
@@ -397,6 +438,18 @@ pub struct TypeChecker {
     /// uses for a union member (`"Shape.Circle"`) or the bare name for a
     /// plain struct. Consulted only by `type_implements`.
     provides: HashMap<String, Vec<Trait>>,
+    /// Named function -> which of its parameters are `mut`
+    /// (`MUTABILITY.md`), in declaration order. `Type::Function` itself
+    /// carries no mutability — "a `mut` parameter does not escape" is the
+    /// whole point — so this is a side table, consulted only by
+    /// `lower_call` to validate a call site's `mut` markers against the
+    /// callee's actual declaration and to know how many extra copy-out
+    /// values the call produces. Populated twice per function: once from
+    /// the raw `Parameter.mutable` flags at pre-bind time (so a function
+    /// can call itself with `mut` arguments before its own body finishes
+    /// checking, mirroring how `func_ty` is pre-bound for recursion), and
+    /// again, authoritatively, once `lower_function` returns.
+    func_mut_params: HashMap<String, Vec<bool>>,
 }
 
 pub struct TypeCheckerCheckpoint {
@@ -409,15 +462,16 @@ pub struct TypeCheckerCheckpoint {
     variant_owners: HashMap<String, Vec<String>>,
     return_types: Vec<Type>,
     provides: HashMap<String, Vec<Trait>>,
+    func_mut_params: HashMap<String, Vec<bool>>,
 }
 
 impl TypeChecker {
     pub fn empty() -> Self {
-        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new() }
+        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new() }
+        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new() }
     }
 
     /// Check whether a concrete type implements the given trait. Only makes
@@ -485,7 +539,7 @@ impl TypeChecker {
     /// discarding — `x` still carries the union type onward to wherever it
     /// (recursively) needs to be handled, exactly like a tail value does.
     fn check_must_handle(&self, stmt: &Spanned<TypedExpr>) -> Result<(), Spanned<TypeError>> {
-        if matches!(stmt.item.kind, TypedExprKind::Assign { .. } | TypedExprKind::FieldAssign { .. }) {
+        if matches!(stmt.item.kind, TypedExprKind::Assign { .. } | TypedExprKind::PlaceAssign { .. }) {
             return Ok(());
         }
         let ty = &stmt.item.ty;
@@ -547,6 +601,7 @@ impl TypeChecker {
             variant_owners: self.variant_owners.clone(),
             return_types: self.return_types.clone(),
             provides: self.provides.clone(),
+            func_mut_params: self.func_mut_params.clone(),
         }
     }
 
@@ -560,6 +615,7 @@ impl TypeChecker {
         self.variant_owners = cp.variant_owners;
         self.return_types = cp.return_types;
         self.provides = cp.provides;
+        self.func_mut_params = cp.func_mut_params;
     }
 
     pub fn add_ctx(mut self, ctx: impl Iterator<Item=(String, Type)>) -> Self {
@@ -765,16 +821,20 @@ impl TypeChecker {
                     msg: format!("Wrong number of arguments, expected {}, got {}", params.len(), func.params.len())
                 }, span));
             }
-            let bindings: Vec<(String, Type)> = func.params.iter().zip(params.iter())
-                .map(|(p, pty)| (p.name.clone(), pty.clone()))
+            let bindings: Vec<(String, Type, bool)> = func.params.iter().zip(params.iter())
+                .map(|(p, pty)| (p.name.clone(), pty.clone(), p.mutable))
                 .collect();
             let return_type = (**result).clone();
             self.return_types.push(return_type.clone());
             // Pop before propagating: an error inside the body must not
             // leave a stale frame on `return_types`, or a later entry on
             // this same checker would accept a top-level `return`.
+            // A lambda parameter is always immutable in practice (the
+            // grammar has no `mut` marker for one), so a plain
+            // `with_context` — which always binds immutably — matches
+            // `bindings`' own `mutable` field here regardless.
             let body = self.with_context(
-                bindings.iter().cloned(),
+                bindings.iter().map(|(n, t, _)| (n.clone(), t.clone())),
                 |t| t.lower_expected(*func.body, &return_type),
             );
             self.return_types.pop();
@@ -847,6 +907,7 @@ impl TypeChecker {
                             Spanned::from(Expression::literal(Token::Identifier(fname.clone())), span),
                             None,
                             Spanned::from(Expression::literal(Token::Identifier(bind.clone())), span),
+                            None,
                         ),
                         span,
                     ));
@@ -987,6 +1048,7 @@ impl TypeChecker {
                                 Spanned::from(Expression::literal(Token::Identifier(bind.clone())), span),
                                 None,
                                 Spanned::from(e.whole_value, span),
+                                Some(Mutability::Immutable),
                             ),
                             span,
                         );
@@ -1625,13 +1687,6 @@ impl TypeChecker {
         }
     }
 
-    fn get(&self, name: &str, span: Span) -> TypeResult {
-        let ty = self.ctx.get(name).ok_or(
-            Spanned::from(TypeError { msg: format!("Unbound variable {}", name) }, span)
-        )?;
-        Ok(ty.clone())
-    }
-
     /// Run `closure` inside a fresh scope, then close it — so any binding
     /// made while it runs, whether by the closure itself or by anything it
     /// recurses into, is gone again on return.
@@ -1659,6 +1714,22 @@ impl TypeChecker {
     {
         self.in_scope(|t| {
             for (name, ty) in update_ctx { t.ctx.insert(name, ty); }
+            closure(t)
+        })
+    }
+
+    /// As `with_context`, but each binding states its own mutability —
+    /// needed where a rebind may shadow an existing `mut` name (flow
+    /// narrowing rebinding a match subject under its own name) alongside
+    /// ordinary always-immutable pattern binds in the same call.
+    fn with_context_mut<F, R>(
+        &mut self,
+        update_ctx: impl Iterator<Item = (String, Type, bool)>,
+        closure: F,
+    ) -> R where F: FnOnce(&mut Self) -> R,
+    {
+        self.in_scope(|t| {
+            for (name, ty, mutable) in update_ctx { t.ctx.insert_mut(name, ty, mutable); }
             closure(t)
         })
     }
@@ -1841,7 +1912,7 @@ impl TypeChecker {
 
             TypedExprKind::Function { body, .. } => self.validate_codegen_constraints(body),
 
-            TypedExprKind::Call { callable, args } => {
+            TypedExprKind::Call { callable, args, .. } => {
                 self.validate_codegen_constraints(callable)?;
                 for a in args { self.validate_codegen_constraints(a)?; }
                 // `print`'s argument is dispatched at runtime by
@@ -1911,7 +1982,14 @@ impl TypeChecker {
             },
 
             TypedExprKind::FieldAccess { target, .. } => self.validate_codegen_constraints(target),
-            TypedExprKind::FieldAssign { value, .. } => self.validate_codegen_constraints(value),
+            TypedExprKind::PlaceAssign { path, value, .. } => {
+                for seg in path {
+                    if let PlaceSeg::Index { index, .. } = seg {
+                        self.validate_codegen_constraints(index)?;
+                    }
+                }
+                self.validate_codegen_constraints(value)
+            },
 
             TypedExprKind::VariantInit { fields, .. } => {
                 for (_, v) in fields { self.validate_codegen_constraints(v)?; }
@@ -2098,6 +2176,16 @@ impl TypeChecker {
             Expression::Try(inner)           => self.lower_try(*inner, span),
             Expression::Unwrap(inner)        => self.lower_unwrap(*inner, span),
             Expression::Catch { value, handler } => self.lower_catch(*value, *handler, span),
+            // `mut name` is only meaningful as one of `lower_call`'s own
+            // arguments, which pattern-matches it before this dispatch is
+            // ever reached (mirroring how `Person(name="Alice")`'s
+            // `Assign`-shaped arguments are consumed by `lower_call`
+            // before it falls through to the ordinary call path). Any
+            // other position — `let x = mut y`, `1 + mut y`, a bare
+            // statement — reaches here and is rejected.
+            Expression::MutArg(_) => Err(Spanned::from(TypeError {
+                msg: "'mut' may only mark an argument at a call site, e.g. f(mut x)".to_string()
+            }, span)),
         }
     }
 
@@ -2234,76 +2322,210 @@ impl TypeChecker {
         }, span))
     }
 
+    /// One step of an assignment target's path, before type-checking —
+    /// the untyped-`Expression` counterpart of `typed_ast::PlaceSeg`.
+    /// `flatten_place` walks a target expression into a root name plus a
+    /// list of these, root-to-leaf.
+    fn flatten_place(target: Spanned<Expression>) -> (String, Vec<RawPlaceSeg>) {
+        let mut segs = Vec::new();
+        let mut cur = target;
+        loop {
+            match cur.item {
+                Expression::FieldAccess(fa) => {
+                    segs.push(RawPlaceSeg::Field(fa.field));
+                    cur = *fa.target;
+                },
+                Expression::Index(idx) => {
+                    segs.push(RawPlaceSeg::Index(*idx.index));
+                    cur = *idx.target;
+                },
+                other => {
+                    let name = other.get_identifier()
+                        .expect("Grammar::assign guarantees an identifier root")
+                        .to_string();
+                    segs.reverse();
+                    return (name, segs);
+                },
+            }
+        }
+    }
+
+    /// `root(.field | [index])* = value` — see `TypedExprKind::PlaceAssign`.
+    /// `target` is a `FieldAccess` or `Index` (checked by the caller);
+    /// `flatten_place` reduces it to `root` plus a root-to-leaf path,
+    /// which this walks segment by segment, tracking the current type
+    /// exactly as `lower_field_access`/`lower_index` do for a *read* of
+    /// the same path, and enforcing that `root` is mutable before
+    /// touching anything.
+    fn lower_place_assign(
+        &mut self,
+        target: Spanned<Expression>,
+        value: Spanned<Expression>,
+        span: Span,
+    ) -> Result<(TypedExprKind, Type), Spanned<TypeError>> {
+        let (root, raw_path) = Self::flatten_place(target);
+        match self.ctx.is_mutable(&root) {
+            None => return Err(Spanned::from(TypeError {
+                msg: format!("'{}' is not declared", root)
+            }, span)),
+            Some(false) => return Err(Spanned::from(TypeError {
+                msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to assign into it", root, root)
+            }, span)),
+            Some(true) => {},
+        }
+        let mut cur_ty = self.ctx.get(&root).expect("checked mutable above").clone();
+        let mut path = Vec::with_capacity(raw_path.len());
+        // At most one `[index]` step — writing through a *second* one
+        // (`xs[i][j] = v`, a list of lists) would need a heap store
+        // nested inside another heap store, which codegen doesn't
+        // implement yet. A v1 restriction, not a fundamental one — see
+        // `TypedExprKind::PlaceAssign`'s doc comment.
+        let mut seen_index = false;
+        for seg in raw_path {
+            match seg {
+                RawPlaceSeg::Field(fname) => {
+                    let resolved = self.lookup(&cur_ty);
+                    let Type::Struct(struct_name) = &resolved else {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Can't assign field '{}' on {}, expected a struct", fname, resolved)
+                        }, span));
+                    };
+                    let field_defs = self.struct_defs.get(struct_name).cloned().unwrap_or_default();
+                    let field_ty = field_defs.iter().find(|(n, _)| n == &fname)
+                        .map(|(_, t)| t.clone())
+                        .ok_or_else(|| Spanned::from(TypeError {
+                            msg: format!("Struct {} has no field '{}'", struct_name, fname)
+                        }, span))?;
+                    path.push(PlaceSeg::Field(fname));
+                    cur_ty = field_ty;
+                },
+                RawPlaceSeg::Index(idx_expr) => {
+                    if seen_index {
+                        return Err(Spanned::from(TypeError {
+                            msg: "assignment through more than one list index isn't supported yet".to_string()
+                        }, span));
+                    }
+                    seen_index = true;
+                    let resolved = self.lookup(&cur_ty);
+                    let elem_ty = match &resolved {
+                        Type::List(inner) => (**inner).clone(),
+                        _ => return Err(Spanned::from(TypeError {
+                            msg: format!("Can't index into {}, expected a List", resolved)
+                        }, span)),
+                    };
+                    let idx_span = idx_expr.span;
+                    let lowered_idx = self.check_and_lower(idx_expr)?;
+                    if !self.unify(&lowered_idx.item.ty, &Type::Int) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("List index must be Int, got {}", self.lookup(&lowered_idx.item.ty))
+                        }, idx_span));
+                    }
+                    path.push(PlaceSeg::Index { index: Box::new(lowered_idx), elem_ty: self.lookup(&elem_ty) });
+                    cur_ty = elem_ty;
+                },
+            }
+        }
+        let leaf_ty = self.lookup(&cur_ty);
+        // The assigned leaf is exactly as much a union-typed slot as a
+        // `StructInit` argument is, so it needs the same check-and-widen
+        // — without it, `c.v = 9` would overwrite a boxed `Int | Bool`
+        // field with the raw immediate `9`, and the next `TypeTag`/
+        // `Narrow` would dereference it as a `FrogVariant*`.
+        let value = self.lower_expected(value, &leaf_ty)?;
+        // A place assignment is a statement: codegen rebinds the touched
+        // leaf `Variable`(s) (a pure field path) or writes through the
+        // indexed list (a path with one `Index`), and yields one dummy
+        // value — `None` is both the documented result type and the only
+        // single-slot type that can't disagree with that.
+        Ok((TypedExprKind::PlaceAssign { root, path, value: Box::new(value) }, Type::None))
+    }
+
     fn lower_assign(&mut self, a: AssignExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
-        // `alice.age = 43` — rebind-sugar for struct "mutation".
-        // `Grammar::assign` only lets this parse when the
-        // FieldAccess's own target is a bare identifier, so
-        // `get_identifier` below is guaranteed to succeed.
-        let (kind, ty) = if let Expression::FieldAccess(fa) = a.target.item {
-            let base = fa.target.item.get_identifier()
-                .expect("parser only allows a bare identifier as a field-assign base")
-                .to_string();
-            let base_ty = self.get(&base, span)?;
-            let resolved_base = self.lookup(&base_ty);
-            let Type::Struct(struct_name) = &resolved_base else {
-                return Err(Spanned::from(TypeError {
-                    msg: format!("Can't assign field '{}' on {}, expected a struct", fa.field, resolved_base)
-                }, span));
-            };
-            let field_defs = self.struct_defs.get(struct_name).cloned().unwrap_or_default();
-            let field_ty = field_defs.iter().find(|(n, _)| n == &fa.field)
-                .map(|(_, t)| t.clone())
-                .ok_or_else(|| Spanned::from(TypeError {
-                    msg: format!("Struct {} has no field '{}'", struct_name, fa.field)
-                }, span))?;
-            // The assigned field is exactly as much a union-typed
-            // slot as a `StructInit` argument is, so it needs the
-            // same check-and-widen — without the widen, `c.v = 9`
-            // would overwrite a boxed `Int | Bool` field with the
-            // raw immediate `9` and the next `TypeTag`/`Narrow`
-            // would dereference it as a `FrogVariant*`. The declared
-            // field type comes from `struct_defs` (via the base's
-            // own type), never from `a.typ` — a field assignment
-            // carries no annotation of its own.
-            let value = self.lower_expected(*a.value, &field_ty)?;
-            // A field assignment is a statement: codegen rebinds the
-            // touched leaf `Variable`s and yields one dummy value,
-            // so `None` is both the documented result type and the
-            // only single-slot type that can't disagree with that.
-            (TypedExprKind::FieldAssign { base, field: fa.field, value: Box::new(value) }, Type::None)
+        // `a.b.c = ...` / `xs[0] = ...` / `o.xs[0].f = ...` — a place
+        // assignment. `Grammar::assign` only lets a `FieldAccess`/`Index`
+        // target reach here when its own root (chased through any number
+        // of further `.field`/`[index]` steps) is a bare identifier, so
+        // `lower_place_assign` never has to handle a non-identifier root.
+        let (kind, ty) = if matches!(a.target.item, Expression::FieldAccess(_) | Expression::Index(_)) {
+            self.lower_place_assign(*a.target, *a.value, span)?
         } else {
             let name = a.target.item.get_identifier()
                 .expect("assignment target must be identifier").to_string();
-            match &a.typ {
-                Some(ann) => {
-                    let annotated_ty = self.resolve_type_expr(ann)?;
-                    // Validate *and* lower the value against the
-                    // annotation, then bind the name at the
-                    // annotation type (not the value's own). For
-                    // function types that distinction matters: the
-                    // body's type is not the variable's type.
-                    let value = self.lower_expected(*a.value, &annotated_ty)?;
-                    self.ctx.insert(name.clone(), annotated_ty.clone());
-                    (TypedExprKind::Assign { name, value: Box::new(value) }, annotated_ty)
-                },
-                None => {
-                    // Pre-bind fully-annotated functions so the body
-                    // can reference the function by name (enabling
-                    // recursion).
-                    if let Expression::Function(func) = &a.value.item {
-                        if func.return_type.is_some() && func.params.iter().all(|p| p.ty.is_some()) {
-                            let param_tys: Result<Vec<Type>, _> = func.params.iter()
-                                .map(|p| self.resolve_type_expr(p.ty.as_ref().expect("all params annotated — checked above")))
-                                .collect();
-                            let ret_ty = self.resolve_type_expr(func.return_type.as_ref().expect("return type present — checked above"))?;
-                            let func_ty = Type::Function { params: param_tys?, result: Box::new(ret_ty) };
-                            self.ctx.insert(name.clone(), func_ty);
-                        }
+            match a.decl {
+                // `let name = ...` / `mut name = ...` — a fresh
+                // declaration, shadowing any binding of the same name
+                // already in scope. `mutability` decides whether the
+                // *new* binding accepts later reassignment; it says
+                // nothing about whatever it shadows.
+                Some(mutability) => {
+                    let mutable = mutability == Mutability::Mutable;
+                    match &a.typ {
+                        Some(ann) => {
+                            let annotated_ty = self.resolve_type_expr(ann)?;
+                            // Validate *and* lower the value against the
+                            // annotation, then bind the name at the
+                            // annotation type (not the value's own). For
+                            // function types that distinction matters: the
+                            // body's type is not the variable's type.
+                            let value = self.lower_expected(*a.value, &annotated_ty)?;
+                            self.ctx.insert_mut(name.clone(), annotated_ty.clone(), mutable);
+                            (TypedExprKind::Assign { name, value: Box::new(value) }, annotated_ty)
+                        },
+                        None => {
+                            // Pre-bind fully-annotated functions so the body
+                            // can reference the function by name (enabling
+                            // recursion). `func_mut_params` is pre-bound
+                            // alongside `func_ty` for the same reason: a
+                            // recursive call with a `mut` argument
+                            // (`lower_call`) needs it before this function's
+                            // own body finishes checking, not after.
+                            if let Expression::Function(func) = &a.value.item {
+                                if func.return_type.is_some() && func.params.iter().all(|p| p.ty.is_some()) {
+                                    let param_tys: Result<Vec<Type>, _> = func.params.iter()
+                                        .map(|p| self.resolve_type_expr(p.ty.as_ref().expect("all params annotated — checked above")))
+                                        .collect();
+                                    let ret_ty = self.resolve_type_expr(func.return_type.as_ref().expect("return type present — checked above"))?;
+                                    let func_ty = Type::Function { params: param_tys?, result: Box::new(ret_ty) };
+                                    self.ctx.insert_mut(name.clone(), func_ty, mutable);
+                                    self.func_mut_params.insert(name.clone(), func.params.iter().map(|p| p.mutable).collect());
+                                }
+                            }
+                            let value = self.check_and_lower(*a.value)?;
+                            let ty = self.lookup(&value.item.ty);
+                            self.ctx.insert_mut(name.clone(), ty.clone(), mutable);
+                            // Authoritative overwrite: covers the
+                            // not-fully-annotated case the pre-bind above
+                            // skips, and stays correct even when it ran.
+                            if let TypedExprKind::Function { params, .. } = &value.item.kind {
+                                self.func_mut_params.insert(name.clone(), params.iter().map(|(_, _, m)| *m).collect());
+                            }
+                            (TypedExprKind::Assign { name, value: Box::new(value) }, ty)
+                        },
                     }
-                    let value = self.check_and_lower(*a.value)?;
-                    let ty = self.lookup(&value.item.ty);
-                    self.ctx.insert(name.clone(), ty.clone());
-                    (TypedExprKind::Assign { name, value: Box::new(value) }, ty)
+                },
+                // `name = ...` with no `let`/`mut` — assignment to a
+                // binding declared earlier. Closes two holes: an
+                // undeclared name no longer silently declares one
+                // (`MUTABILITY.md`'s "implicit declaration"), and an
+                // immutable binding can no longer be silently retyped by
+                // reassignment. The grammar (`Grammar::assign`) never
+                // attaches a type annotation to this form, so the
+                // binding's own declared type is the only one in play —
+                // `lower_expected` both checks and (as any other slot
+                // does) widens the value into it.
+                None => {
+                    match self.ctx.is_mutable(&name) {
+                        None => return Err(Spanned::from(TypeError {
+                            msg: format!("'{}' is not declared — did you mean 'let {} = ...' or 'mut {} = ...'?", name, name, name)
+                        }, span)),
+                        Some(false) => return Err(Spanned::from(TypeError {
+                            msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to allow reassignment", name, name)
+                        }, span)),
+                        Some(true) => {},
+                    }
+                    let existing_ty = self.ctx.get(&name).expect("checked mutable above").clone();
+                    let value = self.lower_expected(*a.value, &existing_ty)?;
+                    (TypedExprKind::Assign { name, value: Box::new(value) }, existing_ty)
                 },
             }
         };
@@ -2311,13 +2533,13 @@ impl TypeChecker {
     }
 
     fn lower_function(&mut self, f: FunctionExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
-        let mut param_bindings: Vec<(String, Type)> = Vec::with_capacity(f.params.len());
+        let mut param_bindings: Vec<(String, Type, bool)> = Vec::with_capacity(f.params.len());
         for p in &f.params {
             let param_ty = match &p.ty {
                 Some(annotation) => self.resolve_type_expr(annotation)?,
                 None => self.fresh_var(),
             };
-            param_bindings.push((p.name.clone(), param_ty));
+            param_bindings.push((p.name.clone(), param_ty, p.mutable));
         }
 
         // `return`'s type rule needs to know what it's returning
@@ -2338,7 +2560,14 @@ impl TypeChecker {
         // the type down into a list literal
         // (`func f(): List(Str) = []`); without one it's
         // synthesized and unified with the `return`s below.
-        let body = self.with_context(param_bindings.iter().cloned(), |t| {
+        let body = self.in_scope(|t| {
+            // Unlike `with_context`, each parameter binds with its own
+            // declared mutability (`mut p: T` binds mutably; an ordinary
+            // parameter, like any other non-`let`/`mut` binding, is
+            // immutable) rather than uniformly immutable.
+            for (name, ty, mutable) in param_bindings.iter().cloned() {
+                t.ctx.insert_mut(name, ty, mutable);
+            }
             t.return_types.push(return_slot.clone());
             let result = match &declared_ret {
                 Some(ret_ty) => t.lower_expected(*f.body, ret_ty),
@@ -2368,11 +2597,11 @@ impl TypeChecker {
             }, span));
         };
 
-        let params: Vec<(String, Type)> = param_bindings.into_iter()
-            .map(|(n, t)| { let t = self.lookup(&t); (n, t) })
+        let params: Vec<(String, Type, bool)> = param_bindings.into_iter()
+            .map(|(n, t, mutable)| { let t = self.lookup(&t); (n, t, mutable) })
             .collect();
         let ty = Type::Function {
-            params: params.iter().map(|(_, t)| t.clone()).collect(),
+            params: params.iter().map(|(_, t, _)| t.clone()).collect(),
             result: Box::new(return_type.clone()),
         };
         Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Function { params, return_type, body: Box::new(body) } }, span))
@@ -2380,6 +2609,12 @@ impl TypeChecker {
 
     fn lower_call(&mut self, c: CallExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let callee_span = c.callable.span;
+        // Captured before `c.callable` is consumed below — only a call
+        // through a bare name can have `mut` arguments at all (`mut`
+        // "does not escape" a named `func` declaration, `MUTABILITY.md`),
+        // so this is what the generic call branch looks
+        // `func_mut_params` up by.
+        let callee_name = c.callable.item.get_identifier().map(|s| s.to_string());
 
         // Struct construction: `Person(name="Alice", age=42)` looks
         // like an ordinary call syntactically (there's no dedicated
@@ -2435,7 +2670,7 @@ impl TypeChecker {
             // (join with other branches, dead-code trapping, etc.)
             // instead of falsely claiming `None`.
             let ty = if arg.item.ty == Type::Never { Type::Never } else { Type::None };
-            (TypedExprKind::Call { callable: Box::new(callable), args: vec![arg] }, ty)
+            (TypedExprKind::Call { callable: Box::new(callable), args: vec![arg], mut_args: vec![false] }, ty)
         } else {
             let callable = self.check_and_lower(*c.callable)?;
             let func_type = self.lookup(&callable.item.ty);
@@ -2463,10 +2698,56 @@ impl TypeChecker {
                     msg: format!("Wrong number of arguments, expected {}, got {}", params.len(), c.args.len())
                 }, callee_span));
             }
+            // The callee's declared `mut` parameters, if it's a plain
+            // name resolving to one — `None` means either an indirect
+            // call or a callee with no `mut` parameters, both of which
+            // reject *any* `mut`-marked argument identically below.
+            let declared_mut = callee_name.as_ref().and_then(|n| self.func_mut_params.get(n).cloned());
+
             let mut args = Vec::with_capacity(c.args.len());
-            for (arg, param) in c.args.into_iter().zip(params.iter()) {
+            let mut mut_args = Vec::with_capacity(c.args.len());
+            // Every argument that's a bare identifier reference, mut or
+            // not — used below to reject a `mut` argument's root
+            // reappearing as any other argument in the same call
+            // (`swap(mut a, mut a)`, `merge(mut xs, xs)`), the exclusivity
+            // rule that's cheap here only because nothing else aliases.
+            let mut all_roots: Vec<(String, Span)> = Vec::new();
+            for (i, (arg, param)) in c.args.into_iter().zip(params.iter()).enumerate() {
                 let arg_span = arg.span;
-                let lowered = self.check_and_lower(arg)?;
+                let (is_mut, inner) = match arg.item {
+                    Expression::MutArg(inner) => (true, *inner),
+                    other => (false, Spanned::from(other, arg_span)),
+                };
+                if let Some(root) = inner.item.get_identifier() {
+                    all_roots.push((root.to_string(), arg_span));
+                }
+                if is_mut {
+                    let root = inner.item.get_identifier().map(|s| s.to_string()).ok_or_else(|| Spanned::from(TypeError {
+                        msg: "'mut' argument must be a plain mutable binding, not an expression".to_string()
+                    }, arg_span))?;
+                    match self.ctx.is_mutable(&root) {
+                        None => return Err(Spanned::from(TypeError {
+                            msg: format!("'{}' is not declared", root)
+                        }, arg_span)),
+                        Some(false) => return Err(Spanned::from(TypeError {
+                            msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to pass it as a 'mut' argument", root, root)
+                        }, arg_span)),
+                        Some(true) => {},
+                    }
+                }
+                match declared_mut.as_ref().map(|d| d[i]) {
+                    Some(true) if !is_mut => return Err(Spanned::from(TypeError {
+                        msg: format!("argument {} must be marked 'mut' — the callee's parameter is 'mut'", i + 1)
+                    }, arg_span)),
+                    Some(false) if is_mut => return Err(Spanned::from(TypeError {
+                        msg: format!("argument {} is marked 'mut', but the callee's parameter isn't", i + 1)
+                    }, arg_span)),
+                    None if is_mut => return Err(Spanned::from(TypeError {
+                        msg: "'mut' arguments are only valid in a direct call to a 'func' declaration".to_string()
+                    }, arg_span)),
+                    _ => {},
+                }
+                let lowered = self.check_and_lower(inner)?;
                 let resolved_argt  = self.lookup(&lowered.item.ty);
                 let resolved_param = self.lookup(param);
                 // Allow implicit widening coercions at call sites (e.g. Int→Float).
@@ -2476,9 +2757,23 @@ impl TypeChecker {
                     }, arg_span));
                 }
                 args.push(self.lower_widen(lowered, param)?);
+                mut_args.push(is_mut);
+            }
+            // Exclusivity: a `mut`-marked root may not also be any other
+            // argument's root in this same call.
+            for (i, is_mut) in mut_args.iter().enumerate() {
+                if !is_mut { continue; }
+                let (root, _) = &all_roots[i];
+                let aliases = all_roots.iter().enumerate()
+                    .any(|(j, (n, _))| j != i && n == root);
+                if aliases {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("'{}' can't be passed 'mut' and also appear as another argument in the same call", root)
+                    }, all_roots[i].1));
+                }
             }
             let ty = self.lookup(&result);
-            (TypedExprKind::Call { callable: Box::new(callable), args }, ty)
+            (TypedExprKind::Call { callable: Box::new(callable), args, mut_args }, ty)
         };
         Ok(Spanned::from(TypedExpr { ty, kind }, span))
     }
@@ -2971,7 +3266,7 @@ impl TypeChecker {
                         TypedExpr { ty: fty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
                         span,
                     ));
-                    bindings.push((bind.clone(), fty.clone()));
+                    bindings.push((bind.clone(), fty.clone(), false));
                 }
             } else if let Some(name) = &narrow_target {
                 // Flow narrowing (ERRORS.md Phase 6): rebind the subject's
@@ -3010,7 +3305,11 @@ impl TypeChecker {
                     TypedExpr { ty: narrowed_ty.clone(), kind: TypedExprKind::Assign { name: name.clone(), value: Box::new(value) } },
                     span,
                 ));
-                bindings.push((name.clone(), narrowed_ty));
+                // Preserve the subject's own mutability across the rebind
+                // — narrowing shouldn't turn a `mut` binding immutable for
+                // the arm that's using it.
+                let mutable = self.ctx.is_mutable(name).unwrap_or(false);
+                bindings.push((name.clone(), narrowed_ty, mutable));
             }
 
             // A guard's binds must be extracted (the `prelude`) *before*
@@ -3026,7 +3325,7 @@ impl TypeChecker {
             // only. The immediately-invoked closure that used to guarantee
             // the restore happened even on an early `?` is now `in_scope`'s
             // job.
-            let (guard, body) = self.with_context(
+            let (guard, body) = self.with_context_mut(
                 bindings.iter().cloned(),
                 |t| -> Result<_, Spanned<TypeError>> {
                     let body = t.check_and_lower(*arm.body)?;
@@ -3186,7 +3485,8 @@ impl TypeChecker {
             // already-bound bare-identifier subject narrows that name
             // instead (ERRORS.md Phase 6's flow narrowing) — `Narrow`
             // already yields the whole member value either way.
-            let bind_name = arm.pattern.binds.first().cloned().or_else(|| narrow_target.clone());
+            let explicit_bind = arm.pattern.binds.first().cloned();
+            let bind_name = explicit_bind.clone().or_else(|| narrow_target.clone());
             if let Some(bind) = bind_name {
                 if bind != "_" {
                     let value = Spanned::from(
@@ -3199,7 +3499,13 @@ impl TypeChecker {
                         TypedExpr { ty: member_ty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
                         span,
                     ));
-                    bindings.push((bind.clone(), member_ty.clone()));
+                    // An explicit pattern bind is always a fresh, immutable
+                    // name; the bindless fallback rebinds the subject's own
+                    // name and must preserve whatever mutability it already
+                    // had, or e.g. `if x is Str then { x = 0 }` on a `mut x`
+                    // would wrongly reject the reassignment.
+                    let mutable = if explicit_bind.is_some() { false } else { self.ctx.is_mutable(&bind).unwrap_or(false) };
+                    bindings.push((bind.clone(), member_ty.clone(), mutable));
                 }
             }
 
@@ -3207,7 +3513,7 @@ impl TypeChecker {
             // only. The immediately-invoked closure that used to guarantee
             // the restore happened even on an early `?` is now `in_scope`'s
             // job.
-            let (guard, body) = self.with_context(
+            let (guard, body) = self.with_context_mut(
                 bindings.iter().cloned(),
                 |t| -> Result<_, Spanned<TypeError>> {
                     let body = t.check_and_lower(*arm.body)?;

@@ -427,7 +427,7 @@ fn test_comprehension_in_let() {
 #[test]
 fn test_for_loop_accumulator_pattern() {
     let result = compile_and_run(
-        "let total = 0\nfor x in [1, 2, 3, 4, 5] do { total = total + x }\ntotal"
+        "mut total = 0\nfor x in [1, 2, 3, 4, 5] do { total = total + x }\ntotal"
     );
     assert_eq!(result, 15);
 }
@@ -437,7 +437,7 @@ fn test_for_loop_accumulator_pattern() {
 #[test]
 fn test_reassignment_inside_if_else_branches() {
     let result = compile_and_run(
-        "let x = 1\nif true then { x = 99 } else { x = 0 }\nx"
+        "mut x = 1\nif true then { x = 99 } else { x = 0 }\nx"
     );
     assert_eq!(result, 99);
 }
@@ -493,14 +493,14 @@ fn test_struct_declaration_order_independent() {
 #[test]
 fn test_struct_value_semantics_alias_not_affected_by_rebind() {
     assert_eq!(compile_and_run(
-        "data Person(name: Str, age: Int)\nlet a = Person(name=\"Alice\", age=42)\nlet b = a\nb.age = 99\na.age"
+        "data Person(name: Str, age: Int)\nlet a = Person(name=\"Alice\", age=42)\nmut b = a\nb.age = 99\na.age"
     ), 42);
 }
 
 #[test]
 fn test_struct_rebind_sugar_updates_only_target_field() {
     assert_eq!(compile_and_run(
-        "data Person(name: Str, age: Int)\nlet a = Person(name=\"Alice\", age=42)\na.age = 99\na.age"
+        "data Person(name: Str, age: Int)\nmut a = Person(name=\"Alice\", age=42)\na.age = 99\na.age"
     ), 99);
 }
 
@@ -548,8 +548,11 @@ fn test_struct_typed_function_param_and_return() {
 
 #[test]
 fn test_struct_typed_function_does_not_mutate_caller_arg() {
+    // `p` (the parameter) is immutable until `mut` parameters exist
+    // (MUTABILITY.md stage 4); `mut q = p` takes an explicit local mutable
+    // copy, and mutating it still never affects the caller's argument.
     assert_eq!(compile_and_run(
-        "data Person(name: Str, age: Int)\nfunc birthday(p: Person): Person = { p.age = p.age + 1\np }\nlet a = Person(name=\"Alice\", age=42)\nlet b = birthday(a)\na.age"
+        "data Person(name: Str, age: Int)\nfunc birthday(p: Person): Person = { mut q = p\nq.age = q.age + 1\nq }\nlet a = Person(name=\"Alice\", age=42)\nlet b = birthday(a)\na.age"
     ), 42);
 }
 
@@ -563,7 +566,7 @@ fn test_list_of_structs_index() {
 #[test]
 fn test_list_of_structs_iteration_sum() {
     assert_eq!(compile_and_run(
-        "data Person(name: Str, age: Int)\nlet people = [Person(name=\"A\", age=1), Person(name=\"B\", age=2), Person(name=\"C\", age=3)]\nlet total = 0\nfor p in people do { total = total + p.age }\ntotal"
+        "data Person(name: Str, age: Int)\nlet people = [Person(name=\"A\", age=1), Person(name=\"B\", age=2), Person(name=\"C\", age=3)]\nmut total = 0\nfor p in people do { total = total + p.age }\ntotal"
     ), 6);
 }
 

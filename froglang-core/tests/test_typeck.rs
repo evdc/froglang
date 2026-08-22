@@ -1,5 +1,5 @@
 use std::{fmt::Debug, vec};
-use froglang_core::frontend::{expression::{Expression, Parameter}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr, typeck::{Trait, Type, TypeChecker}};
+use froglang_core::frontend::{expression::{Expression, Mutability, Parameter}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr, typeck::{Trait, Type, TypeChecker}};
 use froglang_core::frontend::parser::Parser;
 
 // Helper function to create a spanned item
@@ -12,7 +12,7 @@ fn spanned<T: Debug>(item: T) -> Spanned<T> {
 
 // Helper function to create lambda exprs
 fn lambda(params: Vec<&str>, result: Expression) -> Spanned<Expression> {
-    let params = params.iter().map(|p| Parameter { name: p.to_string(), ty: None }).collect();
+    let params = params.iter().map(|p| Parameter { name: p.to_string(), ty: None, mutable: false }).collect();
     spanned(Expression::function(params, spanned(result)))
 }
 
@@ -448,8 +448,8 @@ fn test_deeply_nested_functions() {
 fn test_assignment() {
     let mut t = TypeChecker::new();
 
-    // x = 1; x + 2
-    let assign = spanned(Expression::assign(ident("x"), None, int(1)));
+    // let x = 1; x + 2
+    let assign = spanned(Expression::assign(ident("x"), None, int(1), Some(Mutability::Immutable)));
     let add = spanned(Expression::binary(Token::Plus, ident("x"), int(2)));
 
     // Should be an error if we infer `x + 2` without seeing the variable binding first
@@ -484,9 +484,9 @@ fn test_logical_ops() {
 #[test]
 fn test_block_type_inference() {
     let mut t = TypeChecker::new();
-    // { x = 1; x + 2 } :: Int (block type = type of last expression)
+    // { let x = 1; x + 2 } :: Int (block type = type of last expression)
     let block = spanned(Expression::Block(vec![
-        spanned(Expression::assign(ident("x"), None, int(1))),
+        spanned(Expression::assign(ident("x"), None, int(1), Some(Mutability::Immutable))),
         spanned(Expression::binary(Token::Plus, ident("x"), int(2))),
     ]));
     assert_eq!(t.infer(&block).unwrap(), Type::Int);
@@ -642,12 +642,12 @@ fn test_assignment_with_type_annotation() {
     let mut t = TypeChecker::new();
     // let x: Int = 5
     let ann_type = spanned(TypeExpr::Name("Int".to_string()));
-    let assign = spanned(Expression::assign(ident("x"), Some(ann_type), int(5)));
+    let assign = spanned(Expression::assign(ident("x"), Some(ann_type), int(5), Some(Mutability::Immutable)));
     assert_eq!(t.infer(&assign).unwrap(), Type::Int);
     // Type mismatch: let x: Bool = 5 should fail
     let mut t2 = TypeChecker::new();
     let ann_type2 = spanned(TypeExpr::Name("Bool".to_string()));
-    let assign2 = spanned(Expression::assign(ident("x"), Some(ann_type2), int(5)));
+    let assign2 = spanned(Expression::assign(ident("x"), Some(ann_type2), int(5), Some(Mutability::Immutable)));
     assert!(t2.infer(&assign2).is_err());
 }
 

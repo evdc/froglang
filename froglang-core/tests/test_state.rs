@@ -238,7 +238,7 @@ func total(c: Chain): Int = match c {
     let (v, _) = s
         .eval(
             r#"
-let checksum = 0
+mut checksum = 0
 for round in 0..300 do {
     let garbage = build(120, Nil)
     checksum = checksum + total(garbage) + total(spine)

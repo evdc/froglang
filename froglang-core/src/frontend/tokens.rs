@@ -59,6 +59,14 @@ pub enum Token {
     #[prefix(Grammar::let_binding, Precedence::Assign)]
     Let,
 
+    /// `mut name = expr` — a fresh, reassignable declaration — or `mut
+    /// name` marking a call argument as the target of a `mut` parameter
+    /// (`bump(mut a)`). `Grammar::mut_prefix` disambiguates by what
+    /// follows the identifier — see `MUTABILITY.md`.
+    #[lex("mut")]
+    #[prefix(Grammar::mut_prefix, Precedence::Assign)]
+    Mut,
+
     #[infix(Grammar::assign, Precedence::Assign)]
     #[lex("=")]
     Assign,

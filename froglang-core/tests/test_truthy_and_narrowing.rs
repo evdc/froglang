@@ -64,7 +64,7 @@ fn test_truthy_and_or_not_short_circuit_with_non_bool_operands() {
 
 #[test]
 fn test_truthy_for_loop_guard() {
-    let src = "let xs = [0, 1, 0, 2, 3]\nlet total = 0\nfor x in xs if x do { total = total + x }\ntotal";
+    let src = "let xs = [0, 1, 0, 2, 3]\nmut total = 0\nfor x in xs if x do { total = total + x }\ntotal";
     assert_eq!(compile_and_run(src), 6);
 }
 

@@ -394,11 +394,121 @@ is visible in the type name, rather than diffused through the collection types.
    lowering; the flattened-local path stays as it is; a write through exactly one list index goes
    through `frog_list_set`. Compound assignment (`+=` etc.) deferred — new lexer tokens, no
    existing precedent to extend, and orthogonal to the places mechanism itself.
-4. **`mut` parameters** with the call-site marker and the single-root exclusivity check.
+4. **`mut` parameters** ✅ with the call-site marker and the single-root exclusivity check, via
+   copy-in/copy-out extra Cranelift return values.
 5. **Closure capture by value** — decided now, implemented when closures are.
-6. **Move on last use**, benchmarked against `orders`, *then* container mutation (`push`, `set`,
-   and `Dict`'s mutating operations) on top of it.
+6. **Move on last use** — split into three pieces; the analysis landed, the two consumers did not.
+   See below.
+   *Then* container mutation (`push`, `set`, and `Dict`'s mutating operations) on top of it.
 7. **COW via the `shared` header bit**, if and only if the benchmarks still want it.
+
+### Stage 6 in detail
+
+Split into a liveness analysis (frontend, name-level) and two consumers, per the plan the
+analysis itself sketched.
+
+- **Node identity + the analysis.** ✅ `TypedExpr` gained a `NodeId`, stamped by a post-lowering
+  renumbering pass (`liveness::number_nodes`) rather than at construction, since lowering clones
+  subtrees (a guarded match arm's `tail`, a `catch` handler inlined per `Error` member) and a
+  construction-time id would let clones share one. `liveness::analyze_body`/`analyze_entry` is a
+  backward, name-level dataflow pass — no CFG exists on the froglang side, so it's a structured
+  fold mirroring `compile_expr_multi`'s own evaluation order arm for arm, with a bounded fixpoint
+  over the one back-edge in the language (`for`-loop bodies). Output is `Ownership::{Copy, Move}`
+  per `Var` node id plus `dead_after(stmt)` per statement boundary, both side tables keyed by
+  `NodeId` rather than new AST variants.
+- **GC root minimization.** ❌ **Attempted and reverted — do not retry this shape.** Inspection
+  showed the existing per-producer shadow-slot walk was already leaf-type- and allocation-precise
+  (`apply` in `benches/orders.frog` needed zero slots *before* this work, contrary to this doc's
+  own prediction), so the apparent waste was that `Conditional`'s two branches summed their slot
+  needs instead of sharing them, even though exactly one branch ever runs. Sharing them
+  (`max_heap_slots` combining by `max`, `compile_conditional` resetting `ctx.heap_cursor` before
+  the false branch) cut `discount_for`'s frame from 5 slots to 1 and touched every construct, since
+  `match`/`?`/`!`/`catch` all desugar to nested `Conditional`. `orders`' wall-clock didn't move —
+  it's allocation/GC-bound, not frame-setup-bound.
+
+  It was also **unsound**, and the `FROG_GC_STRESS=1` sweep that "verified" it simply had no test
+  of the failing shape. Mutual exclusion holds within one execution, not across a loop back-edge: a
+  value produced in one branch and assigned to a binding declared outside the loop is rooted only
+  in that shared slot, and the next iteration taking the other branch overwrites it while the value
+  is still live. Reverted; `tests/test_gc_roots.rs` now covers it.
+
+  The general invariant the whole scheme rests on: **a shadow slot may be overwritten only where
+  its current occupant is dead.** Without reuse that holds vacuously, which is why the pre-existing
+  code was correct without ever arguing for it. Any sharing has to discharge it with real live
+  ranges — share iff non-interfering — not with a structural mutual-exclusion argument.
+
+  Chasing that also turned up a **pre-existing hole of the same shape, still open**: loop bodies
+  reuse their slots across the back-edge, so a producer inside a loop overwrites its own slot on
+  the next iteration. Since `let s = <producer>` gives `s` no root of its own — it borrows the
+  producer's — a binding fed from inside a loop and read after it loses its root. See the ignored
+  test in `tests/test_gc_roots.rs`. This is not fixable by removing a reuse (the back-edge reuse is
+  inherent); it needs the "binding roots" half of the split this bullet originally sketched and
+  then skipped. Which makes that split load-bearing for *correctness*, not just for frame size —
+  it should be re-planned as such, together with the third bullet below, which independently
+  concluded it needs the same thing.
+- **Move on last use as a semantic consumer.** Not done, and not safe to bolt on to the current
+  slot scheme. Root slots are owned by *producer site*, not by *binding name* — `let x = y` binds
+  `x` to whatever slot already roots `y` (a plain `Var` read costs zero new slots), so multiple
+  names can share one slot through aliasing. Clearing "x's slot" at x's last use, on top of that,
+  would in that case clear a slot `y` might still need. Acting on `Move` safely needs slots owned
+  per binding name instead — updated at every def of that name, so aliasing between names is
+  moot — which is a bigger change than this pass makes, not a follow-on to it. What *is* done:
+  `Ownership`/`dead_after` are computed for every function body and REPL entry, and a
+  `FROG_DUMP_LIVENESS=1` env var prints every `Var` occurrence's mark to stderr — the only way to
+  inspect the analysis today, and what a future semantic consumer (copy elision, `mut` container
+  operations) should be checked against.
+
+### Stage 6a: shadow-slot allocation — RETIRED, see RUNTIME.md
+
+**Do not implement this section.** It is kept for the reasoning, which still holds; its
+conclusion does not. Cranelift 0.113 already exposes user stack maps
+(`declare_value_needs_stack_map`, spilling and liveness over its own real CFG, non-moving
+collectors explicitly supported), which subsumes the entire allocation problem below — there
+are no slots to allocate. The blocker was that stack-map liveness is *use-driven*, so a
+union's `(tag, payload)` pair cannot be declared while its payload's pointer-ness is dynamic;
+`RUNTIME.md` resolves that with a tagged-pointer representation and retires this plan. The
+open loop back-edge hole is closed there too.
+
+The original sketch follows.
+
+---
+
+Three separate conclusions above all land on the same missing piece — the reverted branch sharing
+needs live ranges to be sound, the open loop back-edge hole needs binding-owned roots, and move-on-
+last-use needs binding-owned roots. So build that piece once, as a real allocation pass, rather
+than three times as local patches.
+
+**The shape.** Replace the two hand-synced walks (`max_heap_slots`' counting walk and
+`compile_expr_multi`'s `ctx.heap_cursor` bump) with one pass that computes live ranges for heap
+roots and assigns slot indices, and hands codegen a `NodeId -> slot` map plus the frame size.
+Sharing then falls out of non-interference rather than a per-construct argument.
+
+1. **Roots are owned per binding, not per producer.** A heap-typed binding gets a slot written at
+   every def of that name and held for its live range. That closes the loop back-edge hole (`best`
+   has a root that does not depend on a producer inside the loop not re-running) and makes
+   aliasing between names moot, which is exactly what the third bullet above says `Move` needs.
+2. **Temporaries get producer→last-use ranges.** A use ends at consumption into a binding, into an
+   ABI call, or into an already-rooted heap object — past that the parent's root covers it
+   transitively. Slots for temporaries whose ranges don't overlap can coincide, which recovers the
+   `Conditional` win *and* beats it: the cursor could never share across sequential statements or
+   sibling calls, and this can.
+3. **Back-edges need no special case.** `analyze_loop`'s bounded fixpoint already extends live
+   ranges across the one back-edge in the language, so a value that escapes a loop interferes with
+   everything in the body and gets its own slot by construction.
+4. **Frame size is max simultaneous live roots**, not producer count — and it comes out of the same
+   pass that assigns the indices, so the "must stay in exact lockstep" hazard that `Ctx.heap_max`
+   and `max_heap_slots` both warn about stops being a hazard. That coupling is what let the
+   reverted change look verified while being wrong; it is worth removing on its own merits.
+
+**Prerequisite.** `liveness.rs` is name-level today. Slot allocation needs node-level ranges for
+temporaries too. `NodeId`s and the fixpoint are already there, so this extends the pass rather than
+replacing it.
+
+**How to know it's right.** The invariant is checkable: at every overwrite of a slot, the previous
+occupant is dead. That is worth asserting in a debug build directly, rather than inferring it from
+a passing stress sweep — the sweep is only as good as the shapes the suite happens to contain, as
+the revert above demonstrated. Grow `tests/test_gc_roots.rs` with the escape shapes first
+(including un-ignoring the loop one), then measure `discount_for`'s frame again.
 
 Stages 1–4 are frontend work with no runtime component and can land before generics. Stage 6 is
 the one with a dependency in both directions: it needs the liveness analysis, and container

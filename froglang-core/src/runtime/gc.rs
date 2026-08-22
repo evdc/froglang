@@ -209,6 +209,20 @@ pub struct GcHeap {
     /// nursery: `bytes_allocated` still counts only *live* bytes, so the
     /// collection threshold is unaffected.
     free_lists:      Vec<*mut u8>,
+    /// When set (from the `FROG_GC_STRESS` env var, read once in `new()`),
+    /// `maybe_collect` sweeps on *every* allocation instead of waiting for
+    /// `gc_threshold`. A shadow-stack slot-sizing or -reuse bug (e.g. a
+    /// `compile_conditional` branch whose `root_heap_value` calls don't
+    /// agree with what `max_heap_slots` predicted) only under-roots a value
+    /// that is genuinely still live at the moment a collection actually
+    /// runs — with the normal 1 MB threshold, most test programs never
+    /// collect at all, so such a bug can sit undetected. Forcing a
+    /// collection at every allocation point turns that into a
+    /// close-to-immediate, reproducible failure instead of an intermittent
+    /// one. Never enabled by default — it makes every allocation as
+    /// expensive as a full sweep, which is only acceptable for a test run
+    /// explicitly opting in.
+    stress:          bool,
     /// Reusable mark-phase worklist. Kept on the heap rather than allocated
     /// per `mark` call: `mark` is invoked once per root, so a fresh `Vec`
     /// each time is a `malloc`/`free` pair per root per collection.
@@ -286,6 +300,7 @@ impl GcHeap {
             roots:           Vec::new(),
             shadow_top:      std::ptr::null(),
             free_lists:      vec![std::ptr::null_mut(); MAX_FREE_WORDS + 1],
+            stress:          std::env::var_os("FROG_GC_STRESS").is_some(),
             mark_worklist:   Vec::new(),
         }
     }
@@ -315,7 +330,7 @@ impl GcHeap {
     }
 
     pub fn maybe_collect(&mut self) {
-        if self.bytes_allocated > self.gc_threshold {
+        if self.stress || self.bytes_allocated > self.gc_threshold {
             self.collect();
         }
     }

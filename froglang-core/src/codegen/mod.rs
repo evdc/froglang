@@ -7,6 +7,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
+use crate::frontend::liveness;
 use crate::frontend::tokens::{Spanned, Token};
 use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
@@ -49,13 +50,14 @@ struct Ctx<'a> {
     heap_slot:     Option<StackSlot>,
     heap_cursor:   usize,
     /// Slots `setup_shadow_frame` actually allocated — i.e. what
-    /// `count_heap_slots` predicted. Only used to assert that the
-    /// `for_each_heap_producer` walk stays in sync with the
-    /// `root_heap_value` calls `compile_expr_multi` really makes: a
-    /// producer the walk fails to count makes `root_heap_value` store
-    /// past the end of the slot *and* leaves that root outside the `len`
-    /// handed to `frog_frame_push`, so the GC never scans it — a silent,
-    /// intermittent memory bug rather than a test failure.
+    /// `max_heap_slots` predicted. Only used to assert that the
+    /// `max_heap_slots` walk stays in sync with the `root_heap_value`
+    /// calls `compile_expr_multi` really makes: a producer the walk fails
+    /// to count makes
+    /// `root_heap_value` store past the end of the slot *and* leaves that
+    /// root outside the `len` handed to `frog_frame_push`, so the GC never
+    /// scans it — a silent, intermittent memory bug rather than a test
+    /// failure.
     heap_max:      usize,
     /// Next unused `Variable` index for mutable-local codegen (see
     /// `get_or_declare_var`). Each function-body compile starts a fresh
@@ -297,138 +299,152 @@ fn heap_leaf_count(ty: &Type, structs: &StructDefs) -> usize {
     struct_fields(ty, structs).iter().filter(|(_, t)| is_heap_ty(t)).count()
 }
 
-/// Walk `expr` in exactly the recursion pattern `compile_expr` uses (including
-/// skipping over nested `Function` bodies, which are compiled separately) and
-/// invoke `f` once for every subexpression that allocates a new heap pointer
-/// (once per heap-typed leaf field, for a struct-typed one).
-fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &mut impl FnMut()) {
+/// Peak number of shadow-stack slots `expr`'s compiled function needs —
+/// what `setup_shadow_frame`'s `n` is sized from. Walks `expr` in exactly
+/// the recursion pattern `compile_expr` uses (including skipping over
+/// nested `Function` bodies, which are compiled separately, and never
+/// visiting `Var` — reading an existing binding doesn't produce a fresh
+/// pointer needing its own root) and charges one slot for every
+/// subexpression that allocates a new heap pointer, or that reads a
+/// heap-typed value out of memory the way `Index`/`FieldAccess`-on-a-union/
+/// `VariantField`/`Narrow` do (once per heap-typed leaf, for a struct- or
+/// union-typed one).
+///
+/// Every node charges by *sum*, including `Conditional`, whose two
+/// branches each get their own slot range even though only one of them
+/// ever runs at a time. Combining them by `max` (and resetting
+/// `ctx.heap_cursor` in `compile_conditional` to make the sharing real)
+/// was tried and reverted: mutual exclusion within one execution does not
+/// imply the reclaimed slots' occupants are dead, so a branch-produced
+/// value that escapes into an outer `mut` binding loses its only root the
+/// next time a loop back-edge re-runs the reset. See `compile_conditional`
+/// for the full argument. Sharing slots at all needs live ranges, not a
+/// structural mutual-exclusion argument — MUTABILITY.md stage 6.
+///
+/// So no slot is ever reused: one per producer site, held for the whole
+/// function. This function and `compile_expr_multi`'s `root_heap_value`
+/// calls must still stay in exact lockstep — the hazard `Ctx.heap_max`'s
+/// own doc comment describes.
+fn max_heap_slots(expr: &Spanned<TypedExpr>, structs: &StructDefs) -> usize {
     match &expr.item.kind {
         TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_)
-        | TypedExprKind::BoolLit(_) | TypedExprKind::Var(_) => {},
+        | TypedExprKind::BoolLit(_) | TypedExprKind::Var(_) => 0,
 
-        TypedExprKind::StrLit(_) => f(),
+        TypedExprKind::StrLit(_) => 1,
 
-        TypedExprKind::Unary { expr: inner, .. } => for_each_heap_producer(inner, structs, f),
+        TypedExprKind::Unary { expr: inner, .. } => max_heap_slots(inner, structs),
 
         TypedExprKind::Binary { op, left, right } => {
-            for_each_heap_producer(left, structs, f);
-            for_each_heap_producer(right, structs, f);
+            let mut n = max_heap_slots(left, structs) + max_heap_slots(right, structs);
             // Only Str + Str (concat) allocates; Str == / != Str yields Bool.
-            if *op == Token::Plus && left.item.ty == Type::Str {
-                f();
-            }
+            if *op == Token::Plus && left.item.ty == Type::Str { n += 1; }
+            n
         },
 
+        // Sums like every other arm — the branches do not share slots.
+        // See this function's own doc comment.
         TypedExprKind::Conditional { cond, true_branch, false_branch } => {
-            for_each_heap_producer(cond, structs, f);
-            for_each_heap_producer(true_branch, structs, f);
-            if let Some(fb) = false_branch {
-                for_each_heap_producer(fb, structs, f);
-            }
+            let t = max_heap_slots(true_branch, structs);
+            let f = false_branch.as_ref().map_or(0, |fb| max_heap_slots(fb, structs));
+            max_heap_slots(cond, structs) + t + f
         },
 
         TypedExprKind::Call { callable, args, mut_args } => {
-            for_each_heap_producer(callable, structs, f);
-            for arg in args { for_each_heap_producer(arg, structs, f); }
+            let mut n = max_heap_slots(callable, structs);
+            for arg in args { n += max_heap_slots(arg, structs); }
             // `print`'s codegen (`print_union`) reads whichever member of a
             // union-typed argument matched at runtime via
             // `read_variant_slots`, rooting one slot per heap-typed leaf of
-            // that member. Which member is a runtime fact, so — mirroring
-            // how `Conditional` below counts both branches even though only
-            // one runs — conservatively reserve for every member.
+            // that member. Which member is a runtime fact, so —
+            // conservatively — reserve for every member.
             if let (TypedExprKind::Var(name), [arg, ..]) = (&callable.item.kind, args.as_slice()) {
                 if name == "print" {
                     if let Type::Union(members) = &arg.item.ty {
-                        for m in members {
-                            for _ in 0..heap_leaf_count(m, structs) { f(); }
-                        }
+                        for m in members { n += heap_leaf_count(m, structs); }
                     }
                 }
             }
             // A struct-typed return re-roots one heap-typed leaf at a time
             // (see the `Call` arm of `compile_expr_multi`) — count matches.
-            for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
+            n += heap_leaf_count(&expr.item.ty, structs);
             // Each `mut` argument's copy-out value (`Function`'s doc
             // comment) crosses the ABI boundary as a fresh register value
             // exactly like the call's own primary return does — same
             // rooting need, one count per `mut` argument's own type.
             for (arg, is_mut) in args.iter().zip(mut_args.iter()) {
-                if *is_mut { for _ in 0..heap_leaf_count(&arg.item.ty, structs) { f(); } }
+                if *is_mut { n += heap_leaf_count(&arg.item.ty, structs); }
             }
+            n
         },
 
         TypedExprKind::Index { target, index } => {
-            for_each_heap_producer(target, structs, f);
-            for_each_heap_producer(index, structs, f);
             // A heap-typed element read out of a list isn't a fresh
             // allocation, but it needs its own shadow-stack root all the
             // same: once read, it's only reachable from the containing
             // list, which may itself go unrooted (e.g. a temporary list
             // literal) before this value is done being used.
-            for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
+            max_heap_slots(target, structs) + max_heap_slots(index, structs) + heap_leaf_count(&expr.item.ty, structs)
         },
 
         TypedExprKind::Slice { target, start, end } => {
-            for_each_heap_producer(target, structs, f);
-            if let Some(s) = start { for_each_heap_producer(s, structs, f); }
-            if let Some(e) = end { for_each_heap_producer(e, structs, f); }
             // Unlike Index, a slice always allocates a brand-new list.
-            f();
+            let mut n = max_heap_slots(target, structs) + 1;
+            if let Some(s) = start { n += max_heap_slots(s, structs); }
+            if let Some(e) = end { n += max_heap_slots(e, structs); }
+            n
         },
 
-        TypedExprKind::Range { start, end } => {
-            for_each_heap_producer(start, structs, f);
-            for_each_heap_producer(end, structs, f);
-            f(); // always allocates the materialized list
-        },
+        // Always allocates the materialized list.
+        TypedExprKind::Range { start, end } => max_heap_slots(start, structs) + max_heap_slots(end, structs) + 1,
 
         TypedExprKind::Assign { value, .. } => {
             // Mirrors compile_expr's Assign arm, which never visits a
             // Function value (it's compiled separately as a top-level fn).
-            if !matches!(value.item.kind, TypedExprKind::Function { .. }) {
-                for_each_heap_producer(value, structs, f);
-            }
+            if matches!(value.item.kind, TypedExprKind::Function { .. }) { 0 } else { max_heap_slots(value, structs) }
         },
 
-        TypedExprKind::Function { .. } => {},
+        TypedExprKind::Function { .. } => 0,
 
-        TypedExprKind::List(elems) => {
-            for e in elems { for_each_heap_producer(e, structs, f); }
-            f();
-        },
+        TypedExprKind::List(elems) => elems.iter().map(|e| max_heap_slots(e, structs)).sum::<usize>() + 1,
 
-        TypedExprKind::Block(stmts) => {
-            for s in stmts { for_each_heap_producer(s, structs, f); }
-        },
+        TypedExprKind::Block(stmts) => stmts.iter().map(|s| max_heap_slots(s, structs)).sum(),
 
         TypedExprKind::ForLoop { iterable, cond, body, .. } => {
-            for_each_heap_producer(iterable, structs, f);
             // Reading a heap-typed element out of the list each iteration
             // needs its own root, same reasoning as `Index` above — see
             // `compile_for_loop`'s `root_heap_value(bcx, ctx, elem)` call.
-            for _ in 0..elem_heap_leaf_count(iterable, structs) { f(); }
-            if let Some(c) = cond { for_each_heap_producer(c, structs, f); }
-            for_each_heap_producer(body, structs, f);
+            // Slots are reserved once, not per iteration — the loop body
+            // reuses the same slot range every pass, since a producer site
+            // inside the body re-runs and overwrites its own slot.
+            //
+            // KNOWN UNSOUND, pre-existing: that overwrite has the same
+            // defect as the reverted `Conditional` sharing (see
+            // `compile_conditional`). A binding that outlives the loop has
+            // no root of its own — `let s = <producer>` binds `s` to the
+            // *producer's* slot — so `best = s` inside the body leaves
+            // `best`'s value rooted only until iteration k+1 re-runs that
+            // producer. See `tests/test_gc_roots.rs`. The fix is roots
+            // owned per binding, not per producer site: MUTABILITY.md
+            // stage 6.
+            let mut n = max_heap_slots(iterable, structs) + elem_heap_leaf_count(iterable, structs);
+            if let Some(c) = cond { n += max_heap_slots(c, structs); }
+            n + max_heap_slots(body, structs)
         },
 
         TypedExprKind::Comprehension { iterable, cond, body, .. } => {
             // The result list is allocated (and rooted) before the loop
             // starts — see `compile_expr`'s `Comprehension` arm.
-            f();
-            for_each_heap_producer(iterable, structs, f);
-            for _ in 0..elem_heap_leaf_count(iterable, structs) { f(); }
-            if let Some(c) = cond { for_each_heap_producer(c, structs, f); }
-            for_each_heap_producer(body, structs, f);
+            let mut n = 1 + max_heap_slots(iterable, structs) + elem_heap_leaf_count(iterable, structs);
+            if let Some(c) = cond { n += max_heap_slots(c, structs); }
+            n + max_heap_slots(body, structs)
         },
 
         // A struct value is never itself a single heap pointer — it's
         // flattened into its leaf fields (see `struct_fields`), each rooted
         // individually wherever it's actually produced. So unlike `List`,
-        // `StructInit` calls `f()` for its *fields'* producers only, never
-        // for itself.
-        TypedExprKind::StructInit { fields, .. } => {
-            for (_, v) in fields { for_each_heap_producer(v, structs, f); }
-        },
+        // `StructInit` charges for its *fields'* producers only, never for
+        // itself.
+        TypedExprKind::StructInit { fields, .. } => fields.iter().map(|(_, v)| max_heap_slots(v, structs)).sum(),
 
         // Reading a field off an already-bound struct isn't itself a new
         // heap-value producer (its leaf is a `Variable`, already rooted
@@ -437,50 +453,45 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         // in heap memory, so *reading* one is a fresh `Value` each time,
         // same as a list-element read (`Index`, above) — needs its own root.
         TypedExprKind::FieldAccess { target, enum_name, .. } => {
-            for_each_heap_producer(target, structs, f);
-            if enum_name.is_some() {
-                for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
-            }
+            max_heap_slots(target, structs) + if enum_name.is_some() { heap_leaf_count(&expr.item.ty, structs) } else { 0 }
         },
 
         // Mirrors `Index`'s own arm above: an `Index` path segment's inner
         // expression is Int-typed itself, but evaluating it can still
         // pass through heap-producing subexpressions on the way there.
         TypedExprKind::PlaceAssign { path, value, .. } => {
+            let mut n = 0;
             for seg in path {
-                if let PlaceSeg::Index { index, .. } = seg { for_each_heap_producer(index, structs, f); }
+                if let PlaceSeg::Index { index, .. } = seg { n += max_heap_slots(index, structs); }
             }
-            for_each_heap_producer(value, structs, f);
+            n + max_heap_slots(value, structs)
         },
 
-        // A new heap object, just like `List`/`Slice`/`Range` — visits its
+        // A new heap object, just like `List`/`Slice`/`Range` — charges its
         // fields' own producers first, then itself.
         TypedExprKind::VariantInit { fields, .. } => {
-            for (_, v) in fields { for_each_heap_producer(v, structs, f); }
+            let mut n: usize = fields.iter().map(|(_, v)| max_heap_slots(v, structs)).sum();
             // A payload-less variant compiles to an immediate, not an
             // allocation, so it produces nothing to root — see the matching
             // arm in `compile_expr_multi`.
-            if !fields.is_empty() { f(); }
+            if !fields.is_empty() { n += 1; }
+            n
         },
 
         // A runtime tag test — no allocation; only `target`'s own
         // producers (if any) matter.
-        TypedExprKind::IsVariant { target, .. } => for_each_heap_producer(target, structs, f),
+        TypedExprKind::IsVariant { target, .. } => max_heap_slots(target, structs),
 
         // Reading a variant's own field is a fresh heap read, exactly like
         // the enum arm of `FieldAccess` above.
-        TypedExprKind::VariantField { target, .. } => {
-            for_each_heap_producer(target, structs, f);
-            for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
-        },
+        TypedExprKind::VariantField { target, .. } =>
+            max_heap_slots(target, structs) + heap_leaf_count(&expr.item.ty, structs),
 
         // `return` itself allocates nothing — whatever `value` produces is
         // already accounted for by recursing into it.
-        TypedExprKind::Return(value) => {
-            if let Some(v) = value { for_each_heap_producer(v, structs, f); }
-        },
+        TypedExprKind::Return(value) => value.as_ref().map_or(0, |v| max_heap_slots(v, structs)),
 
-        TypedExprKind::NoneLit => {},
+        TypedExprKind::NoneLit => 0,
 
         // Boxes `value` into a new heap cell — unless `value`'s type is
         // `None`, which is already the immediate `1` and needs no
@@ -489,36 +500,35 @@ fn for_each_heap_producer(expr: &Spanned<TypedExpr>, structs: &StructDefs, f: &m
         // own type is a bare scalar/`None` — that rides in the payload
         // register directly, no `frog_alloc_variant` call either.
         TypedExprKind::Widen { value, .. } => {
-            for_each_heap_producer(value, structs, f);
+            let mut n = max_heap_slots(value, structs);
             let is_two_slot = matches!(&expr.item.ty, Type::Union(members) if is_two_slot_union(members));
             let needs_box = if is_two_slot {
                 !matches!(value.item.ty, Type::Int | Type::Float | Type::Bool | Type::None)
             } else {
                 value.item.ty != Type::None
             };
-            if needs_box { f(); }
+            if needs_box { n += 1; }
+            n
         },
 
         // Unboxes a payload slot: no fresh allocation, but the unboxed
         // pointer is a fresh heap *read* that `compile_expr_multi` roots
         // via `read_variant_slots` — one slot per heap-typed leaf of the
         // narrowed type, exactly like `VariantField` above.
-        TypedExprKind::Narrow { value, .. } => {
-            for_each_heap_producer(value, structs, f);
-            for _ in 0..heap_leaf_count(&expr.item.ty, structs) { f(); }
-        },
+        TypedExprKind::Narrow { value, .. } =>
+            max_heap_slots(value, structs) + heap_leaf_count(&expr.item.ty, structs),
 
         // A runtime tag test on an anonymous union — no allocation, exactly
         // like `IsVariant`.
-        TypedExprKind::TypeTag { target, .. } => for_each_heap_producer(target, structs, f),
+        TypedExprKind::TypeTag { target, .. } => max_heap_slots(target, structs),
 
         // A `Bool`-producing test on `value` — no allocation of its own,
         // just whatever `value` itself produces.
-        TypedExprKind::Truthy(value) => for_each_heap_producer(value, structs, f),
+        TypedExprKind::Truthy(value) => max_heap_slots(value, structs),
 
         // A numeric promotion produces no heap value of its own — only its
         // operand can.
-        TypedExprKind::Coerce(value) => for_each_heap_producer(value, structs, f),
+        TypedExprKind::Coerce(value) => max_heap_slots(value, structs),
     }
 }
 
@@ -531,14 +541,6 @@ fn elem_heap_leaf_count(iterable: &Spanned<TypedExpr>, structs: &StructDefs) -> 
         Type::List(inner) => heap_leaf_count(inner, structs),
         _ => 0,
     }
-}
-
-/// Count the heap-pointer-producing subexpressions in `expr` — the number of
-/// shadow-stack slots its compiled function needs.
-fn count_heap_slots(expr: &Spanned<TypedExpr>, structs: &StructDefs) -> usize {
-    let mut n = 0usize;
-    for_each_heap_producer(expr, structs, &mut || n += 1);
-    n
 }
 
 /// Store a freshly-produced heap pointer into the next shadow-stack slot, if
@@ -1813,13 +1815,27 @@ fn compile_conditional(
     if expr.item.ty == Type::Never {
         bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
 
+        // NOTE: the two branches do *not* share shadow-stack slots, even
+        // though only one of them ever runs. Sharing them (resetting
+        // `ctx.heap_cursor` before `false_branch`) is unsound: a slot is
+        // the only root a value held in an SSA register / Cranelift
+        // `Variable` has, so overwriting a slot is only legal at a point
+        // where its current occupant is *dead*. A value produced in one
+        // branch can escape the conditional (assigned to an outer `mut`
+        // binding), and a loop back-edge can then re-execute the reset
+        // while it is still live — iteration k's root gets clobbered by
+        // iteration k+1 taking the other branch, and the GC frees a value
+        // the program still holds. Slots are therefore never reused: each
+        // producer site owns one for the whole function, which meets the
+        // invariant vacuously. Recovering the sharing needs real live
+        // ranges (share iff non-interfering), not a mutual-exclusion
+        // argument — see MUTABILITY.md stage 6.
         bcx.switch_to_block(true_bb);
         bcx.seal_block(true_bb);
         compile_expr_multi(true_branch, bcx, vars, ctx);
         if true_branch.item.ty != Type::Never {
             bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code"));
         }
-
         bcx.switch_to_block(false_bb);
         bcx.seal_block(false_bb);
         match false_branch {
@@ -1831,7 +1847,6 @@ fn compile_conditional(
             }
             None => { bcx.ins().trap(TrapCode::user(2).expect("2 is a valid user trap code")); }
         }
-
         // Every path above already ended in a terminator (a nested
         // `Never` conditional's own trap, `return_`, or the `trap`
         // just emitted) — this conditional itself is `Never`-typed,
@@ -1861,6 +1876,8 @@ fn compile_conditional(
 
         bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
 
+        // See the `Type::Never` branch above for why the branches must
+        // not share shadow-stack slots.
         bcx.switch_to_block(true_bb);
         bcx.seal_block(true_bb);
         // `compile_expr_multi`, not `compile_expr` — a `Never`-typed
@@ -1881,7 +1898,6 @@ fn compile_conditional(
                 bcx.ins().jump(merge_bb, &[]);
             }
         }
-
         bcx.switch_to_block(false_bb);
         bcx.seal_block(false_bb);
         if let Some(fb) = false_branch {
@@ -1900,7 +1916,6 @@ fn compile_conditional(
         } else {
             bcx.ins().jump(merge_bb, &[]);
         }
-
         bcx.switch_to_block(merge_bb);
         bcx.seal_block(merge_bb);
 
@@ -1923,6 +1938,8 @@ fn compile_conditional(
 
         bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
 
+        // See the `Type::Never` branch above for why the branches must
+        // not share shadow-stack slots.
         bcx.switch_to_block(true_bb);
         bcx.seal_block(true_bb);
         let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
@@ -1931,7 +1948,6 @@ fn compile_conditional(
         if true_branch.item.ty != Type::Never {
             bcx.ins().jump(merge_bb, &tv);
         }
-
         bcx.switch_to_block(false_bb);
         bcx.seal_block(false_bb);
         match false_branch {
@@ -1946,7 +1962,6 @@ fn compile_conditional(
                 bcx.ins().jump(merge_bb, &fv);
             }
         };
-
         bcx.switch_to_block(merge_bb);
         bcx.seal_block(merge_bb);
         bcx.block_params(merge_bb).to_vec()
@@ -2739,6 +2754,7 @@ impl Codegen {
     }
 
     fn build_func_body(
+        name: &str,
         builder_ctx: &mut FunctionBuilderContext,
         cl_ctx: &mut Context,
         module: &mut JITModule,
@@ -2776,7 +2792,16 @@ impl Codegen {
             }
         }
 
-        let n = count_heap_slots(body, structs);
+        if std::env::var_os("FROG_DUMP_LIVENESS").is_some() {
+            // A `mut` param's own copy-out (`mut_param_copyout`, consulted
+            // at every `return_`) is the only thing this body's `Ownership`
+            // marks must stay sound against — see `liveness::analyze_body`.
+            let exit_live: liveness::NameSet = mut_params.iter().map(|(n, _)| n.clone()).collect();
+            let body_liveness = liveness::analyze_body(body, &exit_live);
+            liveness::dump_body(name, body, &body_liveness);
+        }
+
+        let n = max_heap_slots(body, structs);
         let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
         let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
@@ -2883,7 +2908,28 @@ impl Codegen {
         let mut last_val = bcx.ins().iconst(types::I64, 0);
         let mut last_ty = &Type::Int;
 
-        let n: usize = stmts.iter().map(|s| count_heap_slots(s, structs)).sum();
+        if std::env::var_os("FROG_DUMP_LIVENESS").is_some() {
+            // Every prior entry's binding (`env_types`, since `FrogState::eval`
+            // re-roots all of `env` after every entry regardless of whether
+            // this one touches it — see `liveness::analyze_entry`'s doc
+            // comment) plus this entry's own top-level bindings: both end up
+            // in `env`/`bindings` by the time this entry finishes, so both
+            // must be treated as live through to the end. Over-including a
+            // name that turns out `Never`-typed (skipped from the real
+            // `bindings` list below) only costs precision, never soundness.
+            let mut exit_live: liveness::NameSet = env_types.keys().cloned().collect();
+            for s in stmts {
+                if let TypedExprKind::Assign { name, value } = &s.item.kind {
+                    if !matches!(value.item.kind, TypedExprKind::Function { .. }) {
+                        exit_live.insert(name.clone());
+                    }
+                }
+            }
+            let entry_liveness = liveness::analyze_entry(stmts, &exit_live);
+            liveness::dump_entry("<entry>", stmts, &entry_liveness);
+        }
+
+        let n: usize = stmts.iter().map(|s| max_heap_slots(s, structs)).sum();
         let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
         let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params: Vec::new() };
 
@@ -3030,7 +3076,7 @@ impl Codegen {
                 None
             }).collect();
 
-        for (_, func_id, params, return_type, body) in &func_defs {
+        for (dbgname, func_id, params, return_type, body) in &func_defs {
             let sig = self.make_sig(params, &return_type, structs);
             let mut ctx = self.module.make_context();
             ctx.func.signature = sig;
@@ -3040,6 +3086,7 @@ impl Codegen {
             // function, O(n^2) per entry) is fine: `func_ids` is read-only
             // for the whole of Pass 2, only ever written during Pass 1 above.
             Self::build_func_body(
+                dbgname,
                 &mut self.builder_ctx,
                 &mut ctx,
                 &mut self.module,
@@ -3104,7 +3151,8 @@ pub fn compile_and_run(src: &str) -> i64 {
 
     let ast = Parser::parse(src).expect("parse error");
     let mut tc = TypeChecker::new();
-    let typed = tc.check_and_lower(ast).expect("type error");
+    let mut typed = tc.check_and_lower(ast).expect("type error");
+    crate::frontend::liveness::number_nodes(&mut typed);
 
     let mut codegen = Codegen::new();
     let mut string_arena: Vec<Vec<u8>> = Vec::new();

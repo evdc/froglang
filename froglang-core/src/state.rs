@@ -225,13 +225,17 @@ impl FrogState {
         let ast = Spanned::from(Expression::Block(stmts), span);
 
         let cp = self.tc.checkpoint();
-        let typed = match self.tc.check_and_lower_entry(ast) {
+        let mut typed = match self.tc.check_and_lower_entry(ast) {
             Ok(t) => t,
             Err(e) => {
                 self.tc.restore(cp);
                 return Err(FrogError::Type(e.to_string()));
             }
         };
+        // Stamp every node with a fresh id before any post-lowering pass
+        // touches the tree — see `liveness::number_nodes`'s doc comment for
+        // why this must run once, after lowering, rather than during it.
+        crate::frontend::liveness::number_nodes(&mut typed);
         if let Err(e) = self.tc.validate_codegen_constraints(&typed) {
             self.tc.restore(cp);
             return Err(FrogError::Type(e.to_string()));

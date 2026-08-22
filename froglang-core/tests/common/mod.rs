@@ -75,6 +75,31 @@ pub fn run_raw(src: &str) -> RunOutput {
     }
 }
 
+/// Run `src` with `FROG_GC_STRESS=1` and return its stdout, asserting it
+/// exited successfully.
+///
+/// `GcHeap::new` reads that variable once per process, so forcing a
+/// collection on every allocation is only reachable from a subprocess —
+/// which is what makes this a separate helper rather than a flag on an
+/// in-process `compile_and_run`. Without it most programs never collect at
+/// all (the normal threshold is 1 MB), so a missing or clobbered GC root
+/// stays invisible.
+pub fn run_gc_stress(src: &str) -> String {
+    let scratch = ScratchFile::new(src);
+    let output = Command::new(env!("CARGO_BIN_EXE_froglang-core"))
+        .args(["run", scratch.path.to_str().expect("scratch path is valid UTF-8")])
+        .env("FROG_GC_STRESS", "1")
+        .output()
+        .expect("failed to run froglang-core binary");
+    assert!(
+        output.status.success(),
+        "program was expected to succeed but exited with {:?}\n--- stderr ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// Run `src` and return its stdout, asserting it exited successfully.
 pub fn run(src: &str) -> String {
     let out = run_raw(src);

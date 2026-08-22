@@ -3,7 +3,7 @@
 - Enums / variants, common fields, matching expressions (e.g. via `if x is Circle(r) then ...`) — done: `data X is A | B(...)`, `match`, `is`, boxed+tagged GC representation, exhaustiveness checking
   - follow-ups: structural `==` on enums, named/nested pattern binds, multi-line leading-`|` variant lists
   - done: payload-less variants are unboxed to an immediate tag (`(tag << 1) | 1`, low bit distinguishes them from 8-aligned pointers — see gc.rs "Immediate (unboxed) values")
-- Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value (~4M mallocs); after inlining heap access and un-boxing shadow frames it is at 182ms vs 31ms for the same program in Rust, and `malloc`/`free`/`memset` plus the mark phase are ~half of what's left. Secondary: pool/free-list the fixed-size GC blocks, and make shadow frames cheaper than an FFI push/pop + zeroing per call.
+- Perf: unbox variants *with* payloads — **designed, see RUNTIME.md** (tagged-pointer union repr, which also unblocks Cranelift stack maps and retires the shadow stack) — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value (~4M mallocs); after inlining heap access and un-boxing shadow frames it is at 182ms vs 31ms for the same program in Rust, and `malloc`/`free`/`memset` plus the mark phase are ~half of what's left. Secondary: pool/free-list the fixed-size GC blocks, and make shadow frames cheaper than an FFI push/pop + zeroing per call.
 - Error handling, errors as values + early-return sugar, etc — builds on enums (Result/Option as compiler-known enums)
 - Traits/interfaces, explicit-style
     - Resolve duality between `provides` and trait impls. Explicit `impl Trait for Type` `Type implements Trait {}` blocks?
@@ -26,6 +26,9 @@ We need to improve performance of unions/errors. In the `orders.frog` benchmark,
   back out — a full box-then-unbox round trip on a path that never actually holds an error, ~4M extra allocations on top of the Discount boxing the README already calls out.
 
 Notes
+- The union-representation question below is answered in RUNTIME.md: neither two-slot nor
+  always-boxed, but a tagged pointer carrying the member tag in the low 3 bits of the pointer
+  slot. Measurements and the encoding-collision rules are there.
 - We switched from a two-slot (tag, payload) repr to a one-slot (always-boxed) repr - why?
     - We found the "global type id" isn't required anywhere else
     - Perhaps to save a slot?

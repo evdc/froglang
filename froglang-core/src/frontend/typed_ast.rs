@@ -4,13 +4,35 @@ use crate::frontend::typeck::Type;
 /// Convenience alias, parallel to `ExprRef` in the untyped AST.
 pub type TypedExprRef = Box<Spanned<TypedExpr>>;
 
+/// Identifies one occurrence of a `TypedExpr` node, for analyses (liveness)
+/// that need to key results to a specific position in the tree rather than
+/// to its structural shape. `0` means "unnumbered" — every node starts here
+/// at construction time, since lowering clones subtrees (a guarded match
+/// arm's `tail`, a `catch` handler inlined per error member) and assigning
+/// real ids during construction would let clones share one id. Real ids are
+/// assigned afterward, in one pass, by `liveness::number_nodes`; nothing
+/// may look one up before that pass has run.
+pub type NodeId = u32;
+
 /// Semantic content of a type-checked node.
 /// Wrap in `Spanned<TypedExpr>` for a located value.
 /// All `TypeVar`s reachable from `ty` are fully resolved by `check_and_lower`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TypedExpr {
+    /// See `NodeId`'s doc comment. Deliberately excluded from `PartialEq`
+    /// below — tests compare lowered trees structurally (`tests/test_lower.rs`,
+    /// `tests/test_typeck.rs`), and two structurally identical nodes built
+    /// independently (e.g. in a test's expected value) have no reason to
+    /// share an id.
+    pub id:   NodeId,
     pub ty:   Type,
     pub kind: TypedExprKind,
+}
+
+impl PartialEq for TypedExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty && self.kind == other.kind
+    }
 }
 
 /// One step of a `PlaceAssign` path — see its doc comment.

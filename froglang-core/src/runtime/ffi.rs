@@ -513,22 +513,35 @@ mod tests {
 
     #[test]
     fn test_frog_str_eq() {
+        // Root each string immediately, unlike a call through generated
+        // code (which the shadow stack protects automatically) — these
+        // tests call the FFI entry points directly, so nothing else roots
+        // `pa`/`pb`/`pc`, and under `FROG_GC_STRESS` every further
+        // allocation collects for real: an unrooted earlier string is
+        // exactly the "no observer" case the collector is entitled to
+        // sweep.
         let a = b"abc";
         let b = b"abc";
         let c = b"xyz";
         let pa = frog_alloc_str(a.as_ptr() as i64, a.len() as i64);
+        with_heap(|heap| heap.push_root(pa, true));
         let pb = frog_alloc_str(b.as_ptr() as i64, b.len() as i64);
+        with_heap(|heap| heap.push_root(pb, true));
         let pc = frog_alloc_str(c.as_ptr() as i64, c.len() as i64);
+        with_heap(|heap| heap.push_root(pc, true));
         assert_eq!(frog_str_eq(pa, pb), 1);
         assert_eq!(frog_str_eq(pa, pc), 0);
     }
 
     #[test]
     fn test_frog_str_cmp() {
+        // See `test_frog_str_eq`'s comment on why these are rooted by hand.
         let a = b"abc";
         let b = b"abd";
         let pa = frog_alloc_str(a.as_ptr() as i64, a.len() as i64);
+        with_heap(|heap| heap.push_root(pa, true));
         let pb = frog_alloc_str(b.as_ptr() as i64, b.len() as i64);
+        with_heap(|heap| heap.push_root(pb, true));
         assert_eq!(frog_str_cmp(pa, pb), -1);
         assert_eq!(frog_str_cmp(pb, pa), 1);
         assert_eq!(frog_str_cmp(pa, pa), 0);

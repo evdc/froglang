@@ -527,7 +527,7 @@ impl TypeChecker {
     /// doesn't reject anything.
     fn coerce_truthy(&mut self, e: Spanned<TypedExpr>, span: Span) -> Spanned<TypedExpr> {
         if e.item.ty == Type::Bool { return e; }
-        Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Truthy(Box::new(e)) }, span)
+        Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Truthy(Box::new(e)) }, span)
     }
 
     /// A statement-position value may not silently discard a possible
@@ -758,7 +758,7 @@ impl TypeChecker {
         if widens_to(&from, target) {
             let span = lowered.span;
             return Ok(Spanned::from(
-                TypedExpr { ty: target.clone(), kind: TypedExprKind::Coerce(Box::new(lowered)) },
+                TypedExpr { id: 0, ty: target.clone(), kind: TypedExprKind::Coerce(Box::new(lowered)) },
                 span,
             ));
         }
@@ -771,7 +771,7 @@ impl TypeChecker {
             }, span));
         }
         Ok(Spanned::from(
-            TypedExpr { ty: target.clone(), kind: TypedExprKind::Widen { value: Box::new(lowered), tag: tag as u32 } },
+            TypedExpr { id: 0, ty: target.clone(), kind: TypedExprKind::Widen { value: Box::new(lowered), tag: tag as u32 } },
             span,
         ))
     }
@@ -840,7 +840,7 @@ impl TypeChecker {
             self.return_types.pop();
             let body = body?;
             return Ok(Spanned::from(
-                TypedExpr {
+                TypedExpr { id: 0,
                     ty: expected.clone(),
                     kind: TypedExprKind::Function { params: bindings, return_type, body: Box::new(body) },
                 },
@@ -856,7 +856,7 @@ impl TypeChecker {
                     items.push(self.lower_expected(e, &elem_ty)?);
                 }
                 Ok(Spanned::from(
-                    TypedExpr { ty: Type::List(Box::new(elem_ty)), kind: TypedExprKind::List(items) },
+                    TypedExpr { id: 0, ty: Type::List(Box::new(elem_ty)), kind: TypedExprKind::List(items) },
                     span,
                 ))
             },
@@ -1873,7 +1873,7 @@ impl TypeChecker {
                         self.check_must_handle(t)?;
                     }
                 }
-                Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Block(lowered) }, span))
+                Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Block(lowered) }, span))
             },
             other => self.check_and_lower(Spanned::from(other, span)),
         }
@@ -2165,7 +2165,7 @@ impl TypeChecker {
             Expression::ForLoop(fl)          => self.lower_for_loop_expr(fl, span),
             Expression::Comprehension(inner) => self.lower_comprehension(inner, span),
             // Handled entirely by `hoist_data_decls` — never reaches codegen.
-            Expression::DataDecl(_) => Ok(Spanned::from(TypedExpr { ty: Type::None, kind: TypedExprKind::IntLit(0) }, span)),
+            Expression::DataDecl(_) => Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::IntLit(0) }, span)),
             Expression::FieldAccess(fa)      => self.lower_field_access(fa, span),
             Expression::Match(m)             => self.lower_match(m.subject, m.arms, m.default, span),
             Expression::IsPattern(ip)        => self.lower_is_pattern(ip, span),
@@ -2216,7 +2216,7 @@ impl TypeChecker {
             },
             _ => unreachable!("unexpected literal token"),
         };
-        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
     }
 
     fn lower_unary(&mut self, u: UnaryExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2228,7 +2228,7 @@ impl TypeChecker {
         let inner = self.check_and_lower(*u.expr)?;
         let ty = self.builtin_op_type(op, &[(inner.item.ty.clone(), inner.span)], span)?;
         let inner = if u.op == Token::Not { self.coerce_truthy(inner, span) } else { inner };
-        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Unary { op: u.op, expr: Box::new(inner) } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Unary { op: u.op, expr: Box::new(inner) } }, span))
     }
 
     fn lower_binary(&mut self, b: BinaryExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2253,7 +2253,7 @@ impl TypeChecker {
         } else {
             TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
         };
-        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
     }
 
     fn lower_conditional(&mut self, c: ConditionalExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2312,7 +2312,7 @@ impl TypeChecker {
             Some(fb) => Some(Box::new(self.lower_widen(fb, &result_ty)?)),
             None => None,
         };
-        Ok(Spanned::from(TypedExpr {
+        Ok(Spanned::from(TypedExpr { id: 0,
             ty: result_ty,
             kind: TypedExprKind::Conditional {
                 cond:         Box::new(cond),
@@ -2529,7 +2529,7 @@ impl TypeChecker {
                 },
             }
         };
-        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
     }
 
     fn lower_function(&mut self, f: FunctionExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2604,7 +2604,7 @@ impl TypeChecker {
             params: params.iter().map(|(_, t, _)| t.clone()).collect(),
             result: Box::new(return_type.clone()),
         };
-        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Function { params, return_type, body: Box::new(body) } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Function { params, return_type, body: Box::new(body) } }, span))
     }
 
     fn lower_call(&mut self, c: CallExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2775,7 +2775,7 @@ impl TypeChecker {
             let ty = self.lookup(&result);
             (TypedExprKind::Call { callable: Box::new(callable), args, mut_args }, ty)
         };
-        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
     }
 
     fn lower_tuple(&mut self, elems: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2806,7 +2806,7 @@ impl TypeChecker {
             let elem_ty = self.lookup(&first_ty.expect("elems is non-empty"));
             (TypedExprKind::List(items), Type::List(Box::new(elem_ty)))
         };
-        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
     }
 
     // A block is its own lexical scope: bindings made by a `let`
@@ -2841,7 +2841,7 @@ impl TypeChecker {
             }
         }
         let ty = lowered.last().map(|t| t.item.ty.clone()).unwrap_or(Type::None);
-        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Block(lowered) }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Block(lowered) }, span))
     }
 
     // The annotation is absorbed into this node's own type: lower
@@ -2850,7 +2850,7 @@ impl TypeChecker {
     fn lower_annotated(&mut self, a: AnnotatedExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let annotated_ty = self.resolve_type_expr(&a.ty)?;
         let lowered = self.lower_expected(*a.expr, &annotated_ty)?;
-        Ok(Spanned::from(TypedExpr { ty: lowered.item.ty, kind: lowered.item.kind }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty: lowered.item.ty, kind: lowered.item.kind }, span))
     }
 
     fn lower_index(&mut self, idx: IndexExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2883,7 +2883,7 @@ impl TypeChecker {
         }
 
         let ty = self.lookup(&elem_ty);
-        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Index { target: Box::new(target), index: Box::new(index) } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Index { target: Box::new(target), index: Box::new(index) } }, span))
     }
 
     fn lower_slice(&mut self, s: SliceExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2928,7 +2928,7 @@ impl TypeChecker {
         let start = bounds.pop().expect("two bounds pushed");
 
         let ty = self.lookup(&list_ty);
-        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Slice { target: Box::new(target), start, end } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Slice { target: Box::new(target), start, end } }, span))
     }
 
     fn lower_range(&mut self, r: RangeExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2946,7 +2946,7 @@ impl TypeChecker {
                 msg: format!("Range end must be Int, got {}", self.lookup(&end.item.ty))
             }, end_span));
         }
-        Ok(Spanned::from(TypedExpr {
+        Ok(Spanned::from(TypedExpr { id: 0,
             ty: Type::List(Box::new(Type::Int)),
             kind: TypedExprKind::Range { start: Box::new(start), end: Box::new(end) },
         }, span))
@@ -2957,7 +2957,7 @@ impl TypeChecker {
         // Each iteration discards the body's value exactly like a
         // non-tail Block statement does — same must-handle rule.
         self.check_must_handle(&body)?;
-        Ok(Spanned::from(TypedExpr { ty: Type::None, kind: TypedExprKind::ForLoop { var, iterable, cond, body } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::ForLoop { var, iterable, cond, body } }, span))
     }
 
     fn lower_comprehension(&mut self, inner: Box<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2970,7 +2970,7 @@ impl TypeChecker {
         // does not apply here — unlike a plain ForLoop.
         let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
         let ty = Type::List(Box::new(self.lookup(&body.item.ty)));
-        Ok(Spanned::from(TypedExpr { ty, kind: TypedExprKind::Comprehension { var, iterable, cond, body } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Comprehension { var, iterable, cond, body } }, span))
     }
 
     fn lower_field_access(&mut self, fa: FieldAccessExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -3013,7 +3013,7 @@ impl TypeChecker {
                 msg: format!("Can't access field '{}' on {}, expected a struct or union", fa.field, resolved)
             }, target_span));
         };
-        Ok(Spanned::from(TypedExpr { ty, kind }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
     }
 
     // Standalone (non-if-condition) `subject is Variant`/`subject is
@@ -3048,7 +3048,7 @@ impl TypeChecker {
                 msg: "pattern bindings with 'is' are only allowed as the entire condition of an 'if'".to_string()
             }, span));
         }
-        Ok(Spanned::from(TypedExpr { ty: Type::Bool, kind }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind }, span))
     }
 
     // `return`, or `return value`. Always typed `Never` — see
@@ -3094,7 +3094,7 @@ impl TypeChecker {
                 None
             },
         };
-        Ok(Spanned::from(TypedExpr { ty: Type::Never, kind: TypedExprKind::Return(value) }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Never, kind: TypedExprKind::Return(value) }, span))
     }
 
     /// Shared lowering for `for var in iterable (if cond)? body`, used by
@@ -3225,7 +3225,7 @@ impl TypeChecker {
         // `TypeVar` that merely points at it.
         let subject_ty = resolved_subject.clone();
         let subject_assign = Spanned::from(
-            TypedExpr { ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject) } },
+            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject) } },
             span,
         );
 
@@ -3241,11 +3241,11 @@ impl TypeChecker {
             let variant_fields = def.variants[idx].1.clone();
 
             let subject_var = Spanned::from(
-                TypedExpr { ty: subject_ty.clone(), kind: TypedExprKind::Var(subject_name.clone()) },
+                TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Var(subject_name.clone()) },
                 span,
             );
             let base_cond = Spanned::from(
-                TypedExpr { ty: Type::Bool, kind: TypedExprKind::IsVariant {
+                TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::IsVariant {
                     target: Box::new(subject_var.clone()), enum_name: enum_name.clone(), variant: arm.pattern.variant.clone(), tag: idx as u32,
                 } },
                 span,
@@ -3257,13 +3257,13 @@ impl TypeChecker {
                 for (bind, (fname, fty)) in arm.pattern.binds.iter().zip(variant_fields.iter()) {
                     if bind == "_" { continue; }
                     let value = Spanned::from(
-                        TypedExpr { ty: fty.clone(), kind: TypedExprKind::VariantField {
+                        TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::VariantField {
                             target: Box::new(subject_var.clone()), enum_name: enum_name.clone(), variant: arm.pattern.variant.clone(), field: fname.clone(),
                         } },
                         span,
                     );
                     prelude.push(Spanned::from(
-                        TypedExpr { ty: fty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
+                        TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
                         span,
                     ));
                     bindings.push((bind.clone(), fty.clone(), false));
@@ -3281,7 +3281,7 @@ impl TypeChecker {
                 let qualified = format!("{}.{}", enum_name, arm.pattern.variant);
                 let common_fields = def.common.iter().map(|(fname, fty)| {
                     (fname.clone(), Box::new(Spanned::from(
-                        TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess {
+                        TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::FieldAccess {
                             target: Box::new(subject_var.clone()), field: fname.clone(), enum_name: Some(enum_name.clone()),
                         } },
                         span,
@@ -3289,7 +3289,7 @@ impl TypeChecker {
                 });
                 let own_fields = variant_fields.iter().map(|(fname, fty)| {
                     (fname.clone(), Box::new(Spanned::from(
-                        TypedExpr { ty: fty.clone(), kind: TypedExprKind::VariantField {
+                        TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::VariantField {
                             target: Box::new(subject_var.clone()), enum_name: enum_name.clone(), variant: arm.pattern.variant.clone(), field: fname.clone(),
                         } },
                         span,
@@ -3298,11 +3298,11 @@ impl TypeChecker {
                 let narrowed_fields: Vec<(String, TypedExprRef)> = common_fields.chain(own_fields).collect();
                 let narrowed_ty = Type::Struct(qualified.clone());
                 let value = Spanned::from(
-                    TypedExpr { ty: narrowed_ty.clone(), kind: TypedExprKind::StructInit { name: qualified, fields: narrowed_fields } },
+                    TypedExpr { id: 0, ty: narrowed_ty.clone(), kind: TypedExprKind::StructInit { name: qualified, fields: narrowed_fields } },
                     span,
                 );
                 prelude.push(Spanned::from(
-                    TypedExpr { ty: narrowed_ty.clone(), kind: TypedExprKind::Assign { name: name.clone(), value: Box::new(value) } },
+                    TypedExpr { id: 0, ty: narrowed_ty.clone(), kind: TypedExprKind::Assign { name: name.clone(), value: Box::new(value) } },
                     span,
                 ));
                 // Preserve the subject's own mutability across the rebind
@@ -3369,7 +3369,7 @@ impl TypeChecker {
                         None => None,
                     };
                     Spanned::from(
-                        TypedExpr { ty: result_ty, kind: TypedExprKind::Conditional {
+                        TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
                             cond: Box::new(g), true_branch: Box::new(body), false_branch,
                         } },
                         span,
@@ -3383,7 +3383,7 @@ impl TypeChecker {
                 let inner_ty = true_inner.item.ty.clone();
                 let mut stmts = prelude;
                 stmts.push(true_inner);
-                Spanned::from(TypedExpr { ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
+                Spanned::from(TypedExpr { id: 0, ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
             };
 
             let true_ty = true_branch.item.ty.clone();
@@ -3400,7 +3400,7 @@ impl TypeChecker {
             };
 
             tail = Some(Spanned::from(
-                TypedExpr { ty: result_ty, kind: TypedExprKind::Conditional {
+                TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
                     cond: Box::new(base_cond), true_branch: Box::new(true_branch), false_branch,
                 } },
                 span,
@@ -3409,7 +3409,7 @@ impl TypeChecker {
 
         let chain = tail.expect("an empty match with no arms and no default was already rejected as non-exhaustive");
         let chain_ty = chain.item.ty.clone();
-        Ok(Spanned::from(TypedExpr { ty: chain_ty, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty: chain_ty, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span))
     }
 
     /// `lower_match_lowered`'s counterpart for an *anonymous* union subject
@@ -3454,7 +3454,7 @@ impl TypeChecker {
         // See the matching note in `lower_match_lowered`.
         let subject_ty = Type::Union(members.clone());
         let subject_assign = Spanned::from(
-            TypedExpr { ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject) } },
+            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject) } },
             span,
         );
 
@@ -3469,11 +3469,11 @@ impl TypeChecker {
             let (idx, member_ty) = self.check_type_pattern(&arm.pattern, &members, arm.body.span)?;
 
             let subject_var = Spanned::from(
-                TypedExpr { ty: subject_ty.clone(), kind: TypedExprKind::Var(subject_name.clone()) },
+                TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Var(subject_name.clone()) },
                 span,
             );
             let base_cond = Spanned::from(
-                TypedExpr { ty: Type::Bool, kind: TypedExprKind::TypeTag {
+                TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::TypeTag {
                     target: Box::new(subject_var.clone()), tag: idx as u32,
                 } },
                 span,
@@ -3490,13 +3490,13 @@ impl TypeChecker {
             if let Some(bind) = bind_name {
                 if bind != "_" {
                     let value = Spanned::from(
-                        TypedExpr { ty: member_ty.clone(), kind: TypedExprKind::Narrow {
+                        TypedExpr { id: 0, ty: member_ty.clone(), kind: TypedExprKind::Narrow {
                             value: Box::new(subject_var.clone()), tag: idx as u32,
                         } },
                         span,
                     );
                     prelude.push(Spanned::from(
-                        TypedExpr { ty: member_ty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
+                        TypedExpr { id: 0, ty: member_ty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
                         span,
                     ));
                     // An explicit pattern bind is always a fresh, immutable
@@ -3546,7 +3546,7 @@ impl TypeChecker {
                         None => None,
                     };
                     Spanned::from(
-                        TypedExpr { ty: result_ty, kind: TypedExprKind::Conditional {
+                        TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
                             cond: Box::new(g), true_branch: Box::new(body), false_branch,
                         } },
                         span,
@@ -3560,7 +3560,7 @@ impl TypeChecker {
                 let inner_ty = true_inner.item.ty.clone();
                 let mut stmts = prelude;
                 stmts.push(true_inner);
-                Spanned::from(TypedExpr { ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
+                Spanned::from(TypedExpr { id: 0, ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
             };
 
             let true_ty = true_branch.item.ty.clone();
@@ -3574,7 +3574,7 @@ impl TypeChecker {
             };
 
             tail = Some(Spanned::from(
-                TypedExpr { ty: result_ty, kind: TypedExprKind::Conditional {
+                TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
                     cond: Box::new(base_cond), true_branch: Box::new(true_branch), false_branch,
                 } },
                 span,
@@ -3583,7 +3583,7 @@ impl TypeChecker {
 
         let chain = tail.expect("an empty match with no arms and no default was already rejected as non-exhaustive");
         let chain_ty = chain.item.ty.clone();
-        Ok(Spanned::from(TypedExpr { ty: chain_ty, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty: chain_ty, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span))
     }
 
     /// Desugar `left == right` / `left != right` (both already lowered,
@@ -3597,14 +3597,14 @@ impl TypeChecker {
         let left_ty = left.item.ty.clone();
         let right_ty = right.item.ty.clone();
 
-        let l_assign = Spanned::from(TypedExpr { ty: left_ty.clone(), kind: TypedExprKind::Assign { name: l_name.clone(), value: Box::new(left) } }, span);
-        let r_assign = Spanned::from(TypedExpr { ty: right_ty.clone(), kind: TypedExprKind::Assign { name: r_name.clone(), value: Box::new(right) } }, span);
-        let l_var = Spanned::from(TypedExpr { ty: left_ty, kind: TypedExprKind::Var(l_name) }, span);
-        let r_var = Spanned::from(TypedExpr { ty: right_ty, kind: TypedExprKind::Var(r_name) }, span);
+        let l_assign = Spanned::from(TypedExpr { id: 0, ty: left_ty.clone(), kind: TypedExprKind::Assign { name: l_name.clone(), value: Box::new(left) } }, span);
+        let r_assign = Spanned::from(TypedExpr { id: 0, ty: right_ty.clone(), kind: TypedExprKind::Assign { name: r_name.clone(), value: Box::new(right) } }, span);
+        let l_var = Spanned::from(TypedExpr { id: 0, ty: left_ty, kind: TypedExprKind::Var(l_name) }, span);
+        let r_var = Spanned::from(TypedExpr { id: 0, ty: right_ty, kind: TypedExprKind::Var(r_name) }, span);
 
         let eq_expr = self.build_struct_eq(name, l_var, r_var, span);
         let result = if op == Token::NotEq {
-            Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Unary { op: Token::Not, expr: Box::new(eq_expr) } }, span)
+            Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Unary { op: Token::Not, expr: Box::new(eq_expr) } }, span)
         } else {
             eq_expr
         };
@@ -3620,18 +3620,18 @@ impl TypeChecker {
         let fields = self.struct_defs.get(name).cloned().unwrap_or_default();
         let mut chain: Option<Spanned<TypedExpr>> = None;
         for (fname, fty) in &fields {
-            let lf = Spanned::from(TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(l.clone()), field: fname.clone(), enum_name: None } }, span);
-            let rf = Spanned::from(TypedExpr { ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(r.clone()), field: fname.clone(), enum_name: None } }, span);
+            let lf = Spanned::from(TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(l.clone()), field: fname.clone(), enum_name: None } }, span);
+            let rf = Spanned::from(TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(r.clone()), field: fname.clone(), enum_name: None } }, span);
             let sub = match fty {
                 Type::Struct(inner) => self.build_struct_eq(inner, lf, rf, span),
-                _ => Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::EqEq, left: Box::new(lf), right: Box::new(rf) } }, span),
+                _ => Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::EqEq, left: Box::new(lf), right: Box::new(rf) } }, span),
             };
             chain = Some(match chain {
                 None => sub,
-                Some(prev) => Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::And, left: Box::new(prev), right: Box::new(sub) } }, span),
+                Some(prev) => Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::And, left: Box::new(prev), right: Box::new(sub) } }, span),
             });
         }
-        chain.unwrap_or_else(|| Spanned::from(TypedExpr { ty: Type::Bool, kind: TypedExprKind::BoolLit(true) }, span))
+        chain.unwrap_or_else(|| Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::BoolLit(true) }, span))
     }
 
     /// Resolve a parsed type annotation (`crate::frontend::type_expr`) into a

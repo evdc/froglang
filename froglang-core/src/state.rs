@@ -308,30 +308,32 @@ impl FrogState {
         // rebound — stayed alive for the process's lifetime.
         self.heap.clear_roots();
         // `Type::Union` belongs here alongside `Str`/`List`: a union value
-        // is a GC-boxed `FrogVariant` exactly like the other two are heap
-        // objects (`codegen::is_heap_ty`). It used to be missing, so the
-        // result of an entry that produced a `data`-union value was left
-        // unrooted for as long as `from_bits` needed it below.
+        // is a GC-visible word (`codegen::is_heap_ty`) exactly like the
+        // other two. It used to be missing, so the result of an entry that
+        // produced a `data`-union value was left unrooted for as long as
+        // `from_bits` needed it below.
         //
         // Not a bare `matches!` on `result_ty`, though: `bits` is only ever
         // *leaf 0* of the result's flattened value (`build_main_body`'s
-        // return is always a single i64), and for a two-slot union that
-        // leaf is the `$tag` `Int`, not a pointer — rooting it as one hands
-        // the collector an integer to dereference. Route through
-        // `heap_roots_in_leaves` (the same tag-aware check the bindings
-        // loop below uses) so it's skipped correctly.
+        // return is always a single i64), and whether that leaf is a
+        // scannable column is a property of the column, not of the whole
+        // type — route through `heap_roots_in_leaves` so it is decided the
+        // same way the bindings loop below decides it.
+        //
+        // `get(..1)` rather than `[..1]`: a zero-leaf result type (`Type::None`
+        // flattens to one leaf, but a struct with no fields flattens to none)
+        // would otherwise panic on the slice.
         let result_leaf0 = crate::codegen::struct_fields(&result_ty, self.tc.struct_defs());
-        for v in crate::codegen::heap_roots_in_leaves(&[bits], &result_leaf0[..1]) {
+        for v in crate::codegen::heap_roots_in_leaves(&[bits], result_leaf0.get(..1).unwrap_or_default()) {
             self.heap.push_root(v, true);
         }
         for (name, ty) in &self.env_types {
             if let Some(vals) = self.env.get(name) {
                 let leafs = crate::codegen::struct_fields(ty, self.tc.struct_defs());
-                // Not a plain per-leaf `matches!` on the type: a two-slot
-                // union's payload leaf is only *sometimes* a pointer, and
-                // rooting it when its tag says otherwise would hand the
-                // collector an integer to dereference. See
-                // `codegen::heap_roots_in_leaves`.
+                // Not a plain per-leaf `matches!` on the type: which
+                // flattened leaves are GC-scannable columns is
+                // `struct_fields`'s business, not something to re-derive
+                // here. See `codegen::heap_roots_in_leaves`.
                 for v in crate::codegen::heap_roots_in_leaves(vals, &leafs) {
                     self.heap.push_root(v, true);
                 }

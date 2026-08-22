@@ -59,10 +59,12 @@ pub enum TypedExprKind {
     FloatLit(f64),
     BoolLit(bool),
     StrLit(String),
-    /// The `none` literal — the singleton `Type::None` value. Compiles to
-    /// the immediate `1` (same encoding as a nullary union member's tag
-    /// `0` — see `gc::immediate_variant` — chosen for consistency, not
-    /// because `None` is "variant 0" of anything).
+    /// The `none` literal — the singleton `Type::None` value. Standing on
+    /// its own it compiles to `gc::IMMEDIATE_NONE`, a word in the reserved
+    /// `111` class that the collector never follows. As a *member* of a
+    /// union it is not that at all: an inline union represents it as its
+    /// member tag, a boxed one as `gc::immediate_variant` of its tag — see
+    /// `TypedExprKind::Widen`.
     NoneLit,
     /// Variable reference — name resolved from environment.
     Var(String),
@@ -227,11 +229,13 @@ pub enum TypedExprKind {
     /// union's own construction already produces its widened type
     /// directly, via `VariantInit`, so never needs this node). `tag` is
     /// `value`'s type's index in the union's own sorted member list
-    /// (`Type::normalize`'s canonical order). Boxes `value` the same way
-    /// `VariantInit` boxes a non-nullary member's fields — see
-    /// `codegen::box_into_variant` — except when `value.item.ty` is
-    /// `Type::None`, which is the immediate `1` already and needs no
-    /// allocation at all.
+    /// (`Type::normalize`'s canonical order). For an inline union
+    /// (`codegen::union_is_inline`) this allocates nothing: `value`'s own
+    /// leaves are written into the union's columns and the tag rides in
+    /// slot 0. For a boxed one it boxes `value` the same way `VariantInit`
+    /// boxes a non-nullary member's fields — see
+    /// `codegen::box_into_variant` — except for a `Type::None` value, which
+    /// is an immediate and needs no allocation either.
     Widen {
         value: TypedExprRef,
         tag:   u32,

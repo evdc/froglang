@@ -1,8 +1,12 @@
 # froglang runtime & codegen model
 
-Status: proposal. Nothing here is implemented. Written 2026-08-22 after two GC-rooting
-use-after-frees traced to the same structural cause; the measurements below are real, the
-design is not yet.
+Status: **Part 1 implemented** (2026-08-22, commit following this document's own). Parts 2
+and 3 are still proposals. Written after two GC-rooting use-after-frees traced to the same
+structural cause; the measurements below are real.
+
+Where the implementation diverges from what was proposed, this document says so inline under
+"As built" — the proposal text is left standing rather than rewritten, so the reasoning that
+produced it stays legible next to what it actually cost.
 
 This covers three coupled decisions — how union values are represented, how the GC finds its
 roots, and what codegen compiles *from*. They are written up together because each one's
@@ -186,6 +190,35 @@ Worked examples against types in the tree today:
 `TypeChecker::check_scalar_union_consistency` along with the one-scalar-union-shape-per-aggregate
 restriction it enforces. `gc_masks` collapses back to a plain `ptr_mask`.
 
+### As built
+
+Three deviations, all conservative.
+
+**Self-referential unions box entirely, rather than unboxing the node and boxing its
+children.** The proposal's `Tree` row wants a value's representation to depend on *where* it
+sits — inline as a local, boxed as a `Node`'s field — which needs a box/unbox conversion at
+every field read and write. Representation is instead a function of the type alone
+(`union_is_inline`): a union reachable from itself, directly or through a struct field, keeps
+today's one-slot boxed form. That is exactly its current behaviour, so it is a missed win
+rather than a regression, and it is what makes `union_layout`'s recursion terminate without a
+visited set threaded through every caller. `Tree` and a struct-mediated cycle are both tested
+(`tests/test_union_repr.rs`).
+
+**The tag sometimes needs a column of its own** — the second open question below, answered.
+Overlaying the tag on a member's first pointer leaf is only safe when that word has three spare
+low bits, which a `Str`/`List` pointer does and a *union* leaf does not: an inline union's slot
+0 already carries its own tag, and a boxed union's word may be an immediate. `UnionLayout`
+detects that case (`overlay_safe`) and gives the tag a dedicated leading column, one slot wider
+and still statically scannable. Every union in the tree today overlays; the dedicated case is
+reached only by a union nested directly inside a union member.
+
+**The tag is always slot 0**, whether it shares that word with a pointer or owns it. Reading it
+is `w & 7` either way, with no per-union branch at the read site, and the scannable columns stay
+a contiguous prefix.
+
+Measured on `benches/orders.frog`: **90 ms → 60 ms** (same result value), from `Discount`,
+`Category` and `Int | PricingError` no longer allocating.
+
 ## Part 2 — GC roots: Cranelift stack maps
 
 ### Why
@@ -292,16 +325,17 @@ Stage 6a of `MUTABILITY.md` is retired by step 2 and should not be implemented.
 
 ## Open questions
 
-- **Where does the tag live when a union has both pointer and scalar leaves in different
-  members?** The proposal hosts it in the first pointer slot unconditionally, which means a
-  member with no pointer fields writes its tag there and leaves the scalar column live. Confirm
-  no reader assumes the scalar column is meaningful for such a member.
-- **Nested unions.** `Type::normalize` flattens `Int | (Str | Bool)`, so a union member is never
-  itself a union — but a union member that is a *struct containing* a union still nests. Confirm
-  the layout recursion terminates and that inner tags don't need distinguishing from outer ones.
-- **Does the 6-member ceiling bite anywhere real?** Nothing in the tree exceeds four. A wide
-  error union assembled by `?` conversion across modules is the plausible counterexample; the
-  boxed fallback must be reachable and tested, not merely present.
+- ~~**Where does the tag live when a union has both pointer and scalar leaves in different
+  members?**~~ Answered: the first pointer column, whose remaining bits stay zero for a member
+  with no pointer fields. No reader consults a scalar column it did not write —
+  `member_slot_map` drives both `pack_union_member` and `unpack_union_member` from the same
+  partition.
+- ~~**Nested unions.**~~ Answered, and it cost a slot: see "As built". A union leaf is not
+  overlay-safe, so a union nested inside a union member forces `dedicated_tag`. Recursion
+  terminates because a self-referential union boxes.
+- ~~**Does the 6-member ceiling bite anywhere real?**~~ Nothing in the tree exceeds four, so
+  the ceiling does not bite — but the fallback is now reachable and tested rather than merely
+  present (`a_seven_member_union_falls_back_to_boxing`).
 - **Is `preserve_frame_pointers` enough on aarch64** to walk out of the runtime and across JIT
   frames reliably, or is an explicit frame list needed?
 - **The list-stride overhead gap** (7.5 ns/elem against Rust's 2.6) is unexplained and larger

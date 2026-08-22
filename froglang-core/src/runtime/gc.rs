@@ -13,6 +13,7 @@ macro_rules! gc_trace {
 // ── Object kinds ─────────────────────────────────────────────────────────────
 
 #[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ObjKind { Str = 0, List = 1, Variant = 2 }
 
 // ── GC header (prefix for every heap object) ─────────────────────────────────
@@ -55,21 +56,12 @@ pub struct FrogList {
     pub len:      u32,
     pub cap:      u32,
     pub stride:   u32,
-    pub ptr_mask: u64,
     /// Bit `i` set means slot `i` within each element block is a
-    /// *conditional* pointer: a heap pointer iff the element's slot `i-1`
-    /// (its tag — always the immediately preceding leaf, see
-    /// `struct_fields`'s two-slot `Union` arm) holds one of `boxed_tags`'s
-    /// bits. Exists because a scalar-carrying union (`Int | Str`) uses an
-    /// unboxed `{tag, payload}` pair when it's a local/param/return (no
-    /// allocation needed), but `ptr_mask` alone can't express "this slot is
-    /// a pointer only sometimes" — see `codegen::gc_masks`, the one place
-    /// that computes this. At most one distinct such union shape is
-    /// supported per list (`TypeChecker::check_scalar_union_consistency`
-    /// rejects more before codegen ever sees them), so one `boxed_tags` set
-    /// is enough regardless of how many `cond_mask` bits are set.
-    pub cond_mask:  u64,
-    pub boxed_tags: u64,
+    /// scannable column: the collector reads it and applies the uniform
+    /// `is_heap_ptr`/`heap_ptr` rule (see "Word encoding" above). Columns
+    /// that hold raw scalars are left clear, since a raw `Int` has no tag
+    /// bits and could otherwise be mistaken for an address.
+    pub ptr_mask: u64,
     pub data:     *mut i64,
 }
 
@@ -91,47 +83,82 @@ pub struct FrogVariant {
     pub tag:      u32,
     pub nslots:   u32,
     pub ptr_mask: u64,
-    /// See `FrogList::cond_mask`'s doc comment — the identical mechanism,
-    /// applied to a boxed union/struct's own payload slots instead of a
-    /// list's per-element slots.
-    pub cond_mask:  u64,
-    pub boxed_tags: u64,
     _data: [i64; 0],  // zero-sized marker; slots live at (ptr + size_of::<FrogVariant>())
 }
 
-// ── Immediate (unboxed) values ────────────────────────────────────────────────
+// ── Word encoding ─────────────────────────────────────────────────────────────
 //
-// A payload-less enum variant — no fields of its own and no common fields on
-// its enum, e.g. `Red` in `data Color is Red | Green | Blue`, or `NoDiscount`
-// in an enum whose other variants do carry fields — needs no heap object at
-// all: the tag *is* the whole value.  Codegen emits such a value as the
-// immediate `(tag << 1) | 1` instead of calling `frog_alloc_variant`
-// (see `TypedExprKind::VariantInit` in codegen/mod.rs).
+// Every GC-visible word in the system — a shadow-stack root, a list element
+// slot, a boxed variant's payload slot, a value crossing the FFI — uses one
+// encoding, so the collector needs no per-slot type information and no
+// per-slot metadata beyond "is this column scannable at all" (`ptr_mask`).
 //
-// The low bit is what tells the two apart: every heap object comes from
-// `alloc`, so its address is at least 8-byte aligned and has the low bit
-// clear.  An enum-typed slot therefore holds either a real pointer or an
-// odd immediate, and everything that follows enum-typed words — the mark
-// phase's roots, shadow-stack slots, list element slots, and variant payload
-// slots — must ask `is_heap_ptr` first rather than dereferencing blind.
+// `alloc_bytes` lays every heap object out with `Layout::from_size_align(_, 8)`,
+// so every object address has its low 3 bits clear. Those 3 bits carry a tag:
+//
+//   low 3 bits | meaning
+//   -----------+--------------------------------------------------------------
+//   000        | a plain pointer, or 0 for null/absent — `Str`, `List`, a boxed
+//              | union
+//   001..110   | an *inline* union's tag slot: the member tag in the low bits,
+//              | and (when that member's first field is a plain pointer, see
+//              | `codegen::UnionLayout`) the pointer itself in `w & !7`. A
+//              | member with no pointer field leaves the pointer part zero, so
+//              | its word is just the small tag `1..=6`, which masks to `0` and
+//              | is correctly not followed.
+//   111        | not a pointer: the upper 61 bits are data. This is a *boxed*
+//              | union's payload-less member (`immediate_variant`) and the unit
+//              | value `Type::None` (`IMMEDIATE_NONE`).
+//
+// The collector's whole rule is `is_heap_ptr` + `heap_ptr` below: two ALU ops,
+// no branch on slot kind, no tag lookup. That uniformity is what makes precise
+// roots possible at all — see RUNTIME.md.
+//
+// Member tags run `1..=6`: `0` is reserved so a plain non-union pointer is
+// indistinguishable from an untagged one, and `7` is reserved for immediates.
+// A union with more than `codegen::MAX_INLINE_UNION_MEMBERS` members (or one
+// that is self-referential) falls back to the boxed one-slot representation
+// instead of being laid out inline.
 
-/// Is `v` a pointer the GC may follow, rather than 0 (an empty slot) or an
-/// unboxed immediate (low bit set — see above)?
+/// Low bits of a word reserved for a tag.
+pub const TAG_MASK: i64 = 7;
+
+/// The reserved tag class meaning "these bits are data, not an address".
+pub const TAG_IMMEDIATE: i64 = 7;
+
+/// The unit value `Type::None` when it stands on its own rather than as a
+/// member of some union (where it is just that union's member tag). Tag
+/// data zero in the immediate class.
+pub const IMMEDIATE_NONE: i64 = TAG_IMMEDIATE;
+
+/// Is `w` a pointer the GC may follow? False for `0` (an empty slot), for an
+/// immediate (`111`), and for a tag-only inline-union word (`1..=6`, whose
+/// pointer part is zero).
 #[inline]
-pub fn is_heap_ptr(v: i64) -> bool {
-    v != 0 && v & 1 == 0
+pub fn is_heap_ptr(w: i64) -> bool {
+    w & TAG_MASK != TAG_IMMEDIATE && (w & !TAG_MASK) != 0
 }
 
-/// Encode variant index `tag` as an unboxed enum value.
+/// The object `w` points at, with any tag bits stripped. Only meaningful
+/// when `is_heap_ptr(w)`.
+#[inline]
+pub fn heap_ptr(w: i64) -> *mut GcHeader {
+    (w & !TAG_MASK) as *mut GcHeader
+}
+
+/// Encode variant index `tag` as a *boxed* union's unboxed immediate — the
+/// representation a payload-less member of a union too wide (or too
+/// self-referential) to lay out inline gets. An inline union's payload-less
+/// member is not an immediate at all: it is simply its member tag.
 #[inline]
 pub fn immediate_variant(tag: u32) -> i64 {
-    ((tag as i64) << 1) | 1
+    ((tag as i64) << 3) | TAG_IMMEDIATE
 }
 
 /// Decode an unboxed enum value produced by `immediate_variant`.
 #[inline]
 pub fn immediate_variant_tag(v: i64) -> i64 {
-    v >> 1
+    v >> 3
 }
 
 // ── Shadow stack ──────────────────────────────────────────────────────────────
@@ -353,7 +380,7 @@ impl GcHeap {
         gc_trace!("marking {} roots", roots.len());
         for (value, is_ptr) in roots {
             if is_ptr && is_heap_ptr(value) {
-                unsafe { Self::mark_from(&mut self.mark_worklist, value as *mut GcHeader); }
+                unsafe { Self::mark_from(&mut self.mark_worklist, heap_ptr(value)); }
             }
         }
 
@@ -373,7 +400,7 @@ impl GcHeap {
                 for i in 0..len {
                     let v = *slots.add(i);
                     if is_heap_ptr(v) {
-                        Self::mark_from(&mut self.mark_worklist, v as *mut GcHeader);
+                        Self::mark_from(&mut self.mark_worklist, heap_ptr(v));
                     }
                 }
                 frame = (*frame).prev;
@@ -405,6 +432,21 @@ impl GcHeap {
         debug_assert!(worklist.is_empty());
         worklist.push(obj);
         while let Some(obj) = worklist.pop() {
+            // Cheap O(1) screen on the uniform word encoding: anything the
+            // collector reaches must be a real object, so its `kind` byte
+            // must be a valid `ObjKind` discriminant. A word that was
+            // written under the wrong encoding — a raw `Int` in a scanned
+            // column, a tag OR'd onto a word that already had one — almost
+            // always lands here rather than silently corrupting the heap.
+            // See gc.rs's "Word encoding": this is the assertion RUNTIME.md
+            // asks for, at the point of *consumption* (one place) rather
+            // than at every point of production.
+            debug_assert!(
+                std::ptr::read(&(*obj).kind) as u8 <= ObjKind::Variant as u8,
+                "GC followed {:p}, which is not a heap object — a word reached the collector \
+                 under the wrong encoding (see gc.rs's \"Word encoding\")",
+                obj,
+            );
             if (*obj).marked { continue; }
             (*obj).marked = true;
             gc_trace!("mark  {:p} ({})", obj,
@@ -413,28 +455,16 @@ impl GcHeap {
                 ObjKind::List => {
                     let list = obj as *mut FrogList;
                     let mask = (*list).ptr_mask;
-                    let cond_mask = (*list).cond_mask;
-                    let boxed_tags = (*list).boxed_tags;
-                    if mask != 0 || cond_mask != 0 {
+                    if mask != 0 {
                         let stride = ((*list).stride as usize).max(1);
                         let elem_len = (*list).len as usize / stride;
                         for i in 0..elem_len {
                             let base = i * stride;
                             for bit in 0..stride {
-                                let unconditional = mask & (1u64 << bit) != 0;
-                                // A conditional slot's own pointer-ness
-                                // depends on its tag, the immediately
-                                // preceding slot (see `cond_mask`'s doc
-                                // comment) — always in-bounds, since the
-                                // tag leaf is never the first of a field.
-                                let conditional = cond_mask & (1u64 << bit) != 0
-                                    && bit > 0
-                                    && boxed_tags & (1u64 << *(*list).data.add(base + bit - 1)) != 0;
-                                if unconditional || conditional {
-                                    let elem = *(*list).data.add(base + bit);
-                                    if is_heap_ptr(elem) {
-                                        worklist.push(elem as *mut GcHeader);
-                                    }
+                                if mask & (1u64 << bit) == 0 { continue; }
+                                let w = *(*list).data.add(base + bit);
+                                if is_heap_ptr(w) {
+                                    worklist.push(heap_ptr(w));
                                 }
                             }
                         }
@@ -443,21 +473,14 @@ impl GcHeap {
                 ObjKind::Variant => {
                     let variant = obj as *mut FrogVariant;
                     let mask = (*variant).ptr_mask;
-                    let cond_mask = (*variant).cond_mask;
-                    let boxed_tags = (*variant).boxed_tags;
-                    if mask != 0 || cond_mask != 0 {
+                    if mask != 0 {
                         let nslots = (*variant).nslots as usize;
                         let data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
                         for i in 0..nslots {
-                            let unconditional = mask & (1u64 << i) != 0;
-                            let conditional = cond_mask & (1u64 << i) != 0
-                                && i > 0
-                                && boxed_tags & (1u64 << *data.add(i - 1)) != 0;
-                            if unconditional || conditional {
-                                let elem = *data.add(i);
-                                if is_heap_ptr(elem) {
-                                    worklist.push(elem as *mut GcHeader);
-                                }
+                            if mask & (1u64 << i) == 0 { continue; }
+                            let w = *data.add(i);
+                            if is_heap_ptr(w) {
+                                worklist.push(heap_ptr(w));
                             }
                         }
                     }
@@ -561,7 +584,7 @@ impl GcHeap {
     /// type). `ptr_mask` marks which of the `stride` per-element slot
     /// offsets are heap pointers — see `FrogList`'s doc comment.
     /// The data buffer is separately allocated (not a GC object).
-    pub fn alloc_list(&mut self, cap: usize, stride: usize, ptr_mask: u64, cond_mask: u64, boxed_tags: u64) -> *mut FrogList {
+    pub fn alloc_list(&mut self, cap: usize, stride: usize, ptr_mask: u64) -> *mut FrogList {
         let stride = stride.max(1);
         let actual_elem_cap = cap.max(1);
         let slot_cap = actual_elem_cap * stride;
@@ -581,8 +604,6 @@ impl GcHeap {
             (*ptr).cap        = slot_cap as u32;
             (*ptr).stride     = stride as u32;
             (*ptr).ptr_mask   = ptr_mask;
-            (*ptr).cond_mask  = cond_mask;
-            (*ptr).boxed_tags = boxed_tags;
             (*ptr).data       = data;
         }
 
@@ -599,7 +620,7 @@ impl GcHeap {
     /// garbage through an as-yet-unwritten slot — mirrors why
     /// `setup_shadow_frame` zeroes shadow-stack slots). `ptr_mask` marks which
     /// slots are heap pointers, exactly like `alloc_list`'s.
-    pub fn alloc_variant(&mut self, tag: u32, nslots: usize, ptr_mask: u64, cond_mask: u64, boxed_tags: u64) -> *mut FrogVariant {
+    pub fn alloc_variant(&mut self, tag: u32, nslots: usize, ptr_mask: u64) -> *mut FrogVariant {
         let struct_size = std::mem::size_of::<FrogVariant>();
         let data_size = nslots * std::mem::size_of::<i64>();
         let total = words_for(struct_size + data_size) * 8;
@@ -613,8 +634,6 @@ impl GcHeap {
             (*ptr).tag        = tag;
             (*ptr).nslots     = nslots as u32;
             (*ptr).ptr_mask   = ptr_mask;
-            (*ptr).cond_mask  = cond_mask;
-            (*ptr).boxed_tags = boxed_tags;
             // Zero the payload. `write_bytes` compiles to a `memset`
             // *call* even for one or two slots, which is the common case
             // here and showed up in `benches/orders.frog`'s profile costing

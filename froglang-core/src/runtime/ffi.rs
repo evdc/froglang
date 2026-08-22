@@ -211,10 +211,10 @@ pub extern "C" fn frog_list_print(list: i64, kind: i64) {
 // ── List operations ───────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn frog_alloc_list(cap: i64, stride: i64, ptr_mask: i64, cond_mask: i64, boxed_tags: i64) -> i64 {
+pub extern "C" fn frog_alloc_list(cap: i64, stride: i64, ptr_mask: i64) -> i64 {
     with_heap(|heap| {
         heap.maybe_collect();
-        heap.alloc_list(cap as usize, stride as usize, ptr_mask as u64, cond_mask as u64, boxed_tags as u64) as i64
+        heap.alloc_list(cap as usize, stride as usize, ptr_mask as u64) as i64
     })
 }
 
@@ -340,9 +340,7 @@ fn clamp_bound(idx: i64, len: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
     let list_ptr = list as *const FrogList;
-    let (stride, ptr_mask, cond_mask, boxed_tags) = unsafe {
-        ((*list_ptr).stride as i64, (*list_ptr).ptr_mask, (*list_ptr).cond_mask, (*list_ptr).boxed_tags)
-    };
+    let (stride, ptr_mask) = unsafe { ((*list_ptr).stride as i64, (*list_ptr).ptr_mask) };
     let stride = stride.max(1);
     let elem_len = unsafe { (*list_ptr).len as i64 } / stride;
 
@@ -354,7 +352,7 @@ pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
 
     with_heap(|heap| {
         heap.maybe_collect();
-        let new_list = heap.alloc_list(slice_elems.max(1), stride as usize, ptr_mask, cond_mask, boxed_tags);
+        let new_list = heap.alloc_list(slice_elems.max(1), stride as usize, ptr_mask);
         unsafe {
             (*new_list).len = slice_slots as u32;
             if slice_slots > 0 {
@@ -412,7 +410,7 @@ pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
 
     with_heap(|heap| {
         heap.maybe_collect();
-        let list = heap.alloc_list(len.max(1), 1, 0, 0, 0);
+        let list = heap.alloc_list(len.max(1), 1, 0);
         unsafe {
             (*list).len = len as u32;
             for i in 0..len {
@@ -432,16 +430,16 @@ pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
 /// start zeroed; the caller (codegen's `VariantInit`) fills them in with
 /// `frog_variant_set` right after this returns.
 #[no_mangle]
-pub extern "C" fn frog_alloc_variant(tag: i64, nslots: i64, ptr_mask: i64, cond_mask: i64, boxed_tags: i64) -> i64 {
+pub extern "C" fn frog_alloc_variant(tag: i64, nslots: i64, ptr_mask: i64) -> i64 {
     with_heap(|heap| {
         heap.maybe_collect();
-        heap.alloc_variant(tag as u32, nslots as usize, ptr_mask as u64, cond_mask as u64, boxed_tags as u64) as i64
+        heap.alloc_variant(tag as u32, nslots as usize, ptr_mask as u64) as i64
     })
 }
 
-/// A payload-less variant is unboxed — the value carries its own tag and
-/// there is nothing to dereference. See gc.rs's "Immediate (unboxed)
-/// values" section for the encoding.
+/// A payload-less member of a *boxed* union is an immediate — the value
+/// carries its own tag and there is nothing to dereference. See gc.rs's
+/// "Word encoding" section.
 #[no_mangle]
 pub extern "C" fn frog_variant_tag(variant: i64) -> i64 {
     if !super::gc::is_heap_ptr(variant) {
@@ -549,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_frog_list_push_and_get() {
-        let list = frog_alloc_list(2, 1, 0, 0, 0);
+        let list = frog_alloc_list(2, 1, 0);
         frog_list_push(list, 10);
         frog_list_push(list, 20);
         frog_list_push(list, 30);  // triggers realloc

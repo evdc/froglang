@@ -737,14 +737,12 @@ impl TypeChecker {
     /// list can assign the same member a different local tag than its
     /// original union did, which would silently misread an existing boxed
     /// value's tag under the new numbering. Every other member type is
-    /// supported: scalars (`Int`/`Float`/`Bool`) and `None` ride unboxed
-    /// (see `is_two_slot_union`); everything else — plain structs, and now
-    /// `Str`/`List` too — is boxed into a `FrogVariant` exactly like a
-    /// nominal union's non-nullary member already is (`box_into_variant`),
-    /// trading one extra allocation and indirection (the `FrogStr`/
-    /// `FrogList` is already its own heap object; boxing wraps a pointer to
-    /// it) for reusing that machinery unchanged rather than teaching the
-    /// GC to discriminate a union member by the pointee's own `ObjKind`.
+    /// supported: a union that `codegen::union_is_inline` accepts carries
+    /// every member's fields in its own flattened columns and allocates
+    /// nothing at all, and one it rejects (more than
+    /// `codegen::MAX_INLINE_UNION_MEMBERS` members, or self-referential) is
+    /// boxed into a `FrogVariant` exactly like a nominal union's non-nullary
+    /// member already is (`box_into_variant`).
     fn lower_widen(&self, lowered: Spanned<TypedExpr>, target: &Type) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let from = lowered.item.ty.clone();
         if from == *target || from == Type::Never {
@@ -1882,8 +1880,8 @@ impl TypeChecker {
     /// Post-lowering validation: reject constructs the type checker accepts
     /// but codegen can't yet compile, as a spanned `TypeError` rather than a
     /// codegen-time `panic!` recovered by `catch_unwind` (see
-    /// `codegen::mod`'s `assert_no_two_slot_union_leaf` and `print_union`'s
-    /// recursion guard, whose conditions this mirrors exactly). Both are
+    /// `print_union`'s recursion guard, whose condition this mirrors
+    /// exactly). It is
     /// decidable from the fully-resolved typed AST alone, so this walks it
     /// once after `check_and_lower_entry`/`check_and_lower` produce it —
     /// deliberately *not* folded into the single-pass lowering walk itself,
@@ -1948,11 +1946,6 @@ impl TypeChecker {
 
             TypedExprKind::List(elems) => {
                 for e in elems { self.validate_codegen_constraints(e)?; }
-                if let Type::List(inner) = &expr.item.ty {
-                    let mut leafs = Vec::new();
-                    self.flatten_leaf_types(inner, &mut leafs);
-                    self.check_scalar_union_consistency(&leafs, expr.span, "a list element type")?;
-                }
                 Ok(())
             },
 
@@ -1970,10 +1963,7 @@ impl TypeChecker {
             TypedExprKind::Comprehension { iterable, cond, body, .. } => {
                 self.validate_codegen_constraints(iterable)?;
                 if let Some(c) = cond { self.validate_codegen_constraints(c)?; }
-                self.validate_codegen_constraints(body)?;
-                let mut leafs = Vec::new();
-                self.flatten_leaf_types(&body.item.ty, &mut leafs);
-                self.check_scalar_union_consistency(&leafs, body.span, "a list element type")
+                self.validate_codegen_constraints(body)
             },
 
             TypedExprKind::StructInit { fields, .. } => {
@@ -1993,15 +1983,7 @@ impl TypeChecker {
 
             TypedExprKind::VariantInit { fields, .. } => {
                 for (_, v) in fields { self.validate_codegen_constraints(v)?; }
-                // Checked across *all* fields together, not one at a time:
-                // `codegen::box_into_variant` boxes every field's flattened
-                // leaves into one `FrogVariant`, sharing one `boxed_tags`
-                // set for the whole thing (see `gc_masks`) — so it's the
-                // combination that has to stay consistent, not each field
-                // in isolation.
-                let mut leafs = Vec::new();
-                for (_, v) in fields { self.flatten_leaf_types(&v.item.ty, &mut leafs); }
-                self.check_scalar_union_consistency(&leafs, expr.span, "a boxed union/struct field")
+                Ok(())
             },
 
             TypedExprKind::IsVariant { target, .. } => self.validate_codegen_constraints(target),
@@ -2012,66 +1994,13 @@ impl TypeChecker {
                 Ok(())
             },
 
-            TypedExprKind::Widen { value, .. } => {
-                self.validate_codegen_constraints(value)?;
-                let mut leafs = Vec::new();
-                self.flatten_leaf_types(&value.item.ty, &mut leafs);
-                self.check_scalar_union_consistency(&leafs, value.span, "a boxed union/struct field")
-            },
+            TypedExprKind::Widen { value, .. } => self.validate_codegen_constraints(value),
 
             TypedExprKind::Narrow { value, .. } => self.validate_codegen_constraints(value),
             TypedExprKind::TypeTag { target, .. } => self.validate_codegen_constraints(target),
             TypedExprKind::Truthy(value) => self.validate_codegen_constraints(value),
             TypedExprKind::Coerce(value) => self.validate_codegen_constraints(value),
         }
-    }
-
-    /// Flatten `ty` into its leaf types, recursing into struct fields the
-    /// same way `codegen::struct_fields` does — leaf *types* only, no field
-    /// names, no special-casing of a two-slot union leaf (unlike
-    /// `struct_fields` itself), since `check_scalar_union_consistency` just
-    /// needs to see every union type reachable, whatever slot count it
-    /// ends up using.
-    fn flatten_leaf_types(&self, ty: &Type, out: &mut Vec<Type>) {
-        match ty {
-            Type::Struct(name) => {
-                if let Some(fields) = self.struct_defs.get(name) {
-                    for (_, fty) in fields { self.flatten_leaf_types(fty, out); }
-                }
-            },
-            _ => out.push(ty.clone()),
-        }
-    }
-
-    /// Reject more than one *distinct* scalar-carrying union shape (a
-    /// `Type::Union` with an `Int`/`Float`/`Bool` member — see
-    /// `codegen::is_two_slot_union` — which rides as an unboxed `{tag,
-    /// payload}` pair rather than allocating) among `leafs`. One such shape
-    /// embedded in a GC-scanned aggregate (a list's elements, or a boxed
-    /// union/struct's fields) is fine: codegen tracks a single
-    /// `(cond_mask, boxed_tags)` pair per aggregate to make the payload
-    /// slot's pointer-ness conditional on its sibling tag slot (see
-    /// `codegen::gc_masks`, and `FrogList`/`FrogVariant`'s own doc comments
-    /// in `runtime/gc.rs`) — but two *different* scalar-carrying unions
-    /// can't share that one slot's bookkeeping.
-    fn check_scalar_union_consistency(&self, leafs: &[Type], span: Span, context: &str) -> Result<(), Spanned<TypeError>> {
-        let mut seen: Option<&Vec<Type>> = None;
-        for t in leafs {
-            let Type::Union(members) = t else { continue };
-            if !members.iter().any(|m| matches!(m, Type::Int | Type::Float | Type::Bool)) { continue; }
-            match seen {
-                None => seen = Some(members),
-                Some(prev) if prev == members => {},
-                Some(_) => return Err(Spanned::from(TypeError {
-                    msg: format!(
-                        "unsupported: two different scalar-carrying union types can't yet appear together in {} \
-                         — only one such union shape (e.g. `Int | Str`) is supported per list/struct/variant.",
-                        context
-                    )
-                }, span)),
-            }
-        }
-        Ok(())
     }
 
     /// Statically predict whether `codegen::print_union` would recurse into

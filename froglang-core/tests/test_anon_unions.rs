@@ -219,18 +219,16 @@ fn test_assigning_into_a_union_typed_struct_field_widens() {
     ), 9);
 }
 
-// ── a scalar-carrying union as a list element (`cond_mask`) ────────────────────
+// ── a scalar-carrying union as a list element ─────────────────────────────────
 //
-// A `List(Int | Point)` element uses the same unboxed `{tag, payload}` pair
-// a local `Int | Point` binding does (no allocation for the `Int` case) —
-// but `ptr_mask`, the list's static per-slot "is this a pointer" bitmask,
-// can't express "the payload slot is a pointer only when the tag says so".
-// `FrogList`/`FrogVariant` gained a `cond_mask` + `boxed_tags` pair for
-// exactly this (see `codegen::gc_masks` and `GcHeap::mark` in
-// `runtime/gc.rs`) — these tests exercise it end to end, including under
-// real GC pressure, where a wrong `cond_mask` would either free a still-live
-// boxed member (read-after-free) or follow a raw `Int` payload as if it
-// were a pointer (a crash or worse).
+// A `List(Int | Point)` element is laid out inline (`codegen::UnionLayout`):
+// a tagged pointer column plus a scalar column, no allocation for the `Int`
+// case. Both columns' pointer-ness is static — the scalar column is never
+// scanned, and the pointer column is scanned unconditionally, with the
+// uniform `gc::is_heap_ptr` rule screening a tag-only word out. These tests
+// exercise it end to end, including under real GC pressure, where getting
+// the columns wrong would either free a still-live boxed member
+// (read-after-free) or follow a raw `Int` payload as if it were a pointer.
 
 #[test]
 fn test_list_of_scalar_and_struct_union_round_trips() {
@@ -265,32 +263,32 @@ fn test_list_of_scalar_union_survives_gc_pressure() {
 }
 
 #[test]
-fn test_two_distinct_scalar_unions_in_one_struct_rejected() {
-    // `codegen::gc_masks` tracks one shared `boxed_tags` set per
-    // GC-scanned aggregate — two *different* scalar-carrying union shapes
-    // in the same struct can't both be represented by it, so
-    // `TypeChecker::check_scalar_union_consistency` rejects the combination
-    // (only reachable once the struct itself is embedded in an aggregate,
-    // e.g. a list — a plain top-level binding never boxes anything).
+fn test_two_distinct_scalar_unions_in_one_struct() {
+    // This combination used to be a *type error*: the old two-slot union
+    // representation described a payload slot's pointer-ness with one
+    // shared `(cond_mask, boxed_tags)` pair per GC-scanned aggregate, which
+    // two different scalar-carrying union shapes in the same struct could
+    // not both use, and `TypeChecker::check_scalar_union_consistency`
+    // rejected them rather than miscompile.
     //
-    // This check runs in `TypeChecker::validate_codegen_constraints`, a
-    // post-lowering pass wired into `FrogState::eval` (not the ordinary
-    // `check_and_lower` the `type_error` helper above calls), so it's
-    // exercised through `FrogState` directly.
-    use froglang_core::state::{FrogState, FrogError};
+    // Under `codegen::UnionLayout` each union owns its own columns and each
+    // column's pointer-ness is static, so there is nothing shared left to
+    // conflict — the restriction, the check, and the error message are all
+    // gone. Exercised through a list (which is where the aggregate scanning
+    // actually happens) and under `FrogState`, since that is what runs
+    // `validate_codegen_constraints`.
+    use froglang_core::state::FrogState;
     let mut s = FrogState::new();
     let result = s.eval(
         "data Point(x: Int, y: Int)\n\
          data Line(a: Point, b: Point)\n\
-         data Bad(m: Int | Point, n: Float | Line)\n\
-         let items: List(Bad) = [Bad(m=1, n=2.0)]\n\
-         items"
+         data Both(m: Int | Point, n: Float | Line)\n\
+         let items: List(Both) = [Both(m=1, n=2.0), Both(m=Point(x=3, y=4), n=5.0)]\n\
+         match items[1].m { is Int(k) then k\nis Point(p) then p.x + p.y\n }"
     );
     match result {
-        Err(FrogError::Type(msg)) => {
-            assert!(msg.contains("two different scalar-carrying union types"), "unexpected error: {}", msg);
-        },
-        other => panic!("expected a type error, got {:?}", other),
+        Ok((v, _)) => assert_eq!(v.display_str(), "7"),
+        other => panic!("expected 7, got {:?}", other),
     }
 }
 

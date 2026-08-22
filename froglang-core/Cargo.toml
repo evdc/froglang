@@ -17,11 +17,11 @@ gc_trace = []
 [dependencies]
 froglang-macros = { path = "../froglang-macros" }
 rustyline = "17.0.1"
-cranelift-codegen  = "0.113"
-cranelift-frontend = "0.113"
-cranelift-module   = "0.113"
-cranelift-jit      = "0.113"
-cranelift-native   = "0.113"
+cranelift-codegen  = "0.135"
+cranelift-frontend = "0.135"
+cranelift-module   = "0.135"
+cranelift-jit      = "0.135"
+cranelift-native   = "0.135"
 
 [[bin]]
 name = "froglang-core"

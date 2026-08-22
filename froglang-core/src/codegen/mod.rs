@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::mem::{offset_of, size_of};
 
-use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, TrapCode, Value};
+use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, BlockArg, InstBuilder, MachMemFlags, MemFlagsData, StackSlot, StackSlotData, StackSlotKind, TrapCode, Value};
 use cranelift_codegen::{settings, settings::Configurable, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -59,11 +59,6 @@ struct Ctx<'a> {
     /// scans it — a silent, intermittent memory bug rather than a test
     /// failure.
     heap_max:      usize,
-    /// Next unused `Variable` index for mutable-local codegen (see
-    /// `get_or_declare_var`). Each function-body compile starts a fresh
-    /// counter (0-based) — `Variable` indices only need to be unique within
-    /// a single `FunctionBuilder`, not globally.
-    var_counter:   u32,
     /// Field layout for every registered struct, from `TypeChecker::struct_defs`.
     /// Structs are represented unboxed: a struct-typed value is never one
     /// SSA `Value`, it's flattened into as many `Value`s as it has leaf
@@ -337,7 +332,7 @@ fn pack_union_member(
     let mut slots: Vec<Option<Value>> = vec![None; layout.width()];
     for (i, (slot, shares_tag)) in map.iter().enumerate() {
         let mut w = to_i64_repr(bcx, &leaf_tys[i], leaf_vals[i]);
-        if *shares_tag { w = bcx.ins().bor_imm(w, tag as i64); }
+        if *shares_tag { w = bcx.ins().bor_imm_s(w, tag as i64); }
         slots[*slot] = Some(w);
     }
     // Slot 0 always carries the tag. It is already written when this
@@ -370,7 +365,7 @@ fn unpack_union_member(
     let mut out = Vec::with_capacity(leaf_tys.len());
     for (i, (slot, shares_tag)) in map.iter().enumerate() {
         let mut w = slots[*slot];
-        if *shares_tag { w = bcx.ins().band_imm(w, !gc::TAG_MASK); }
+        if *shares_tag { w = bcx.ins().band_imm_s(w, !gc::TAG_MASK); }
         out.push(from_i64_repr(bcx, &leaf_tys[i], w));
     }
     out
@@ -380,8 +375,8 @@ fn unpack_union_member(
 /// normalized index `index`" — one `and` and one compare against a constant,
 /// with no load and no branch on representation.
 fn emit_inline_tag_test(bcx: &mut FunctionBuilder, slots: &[Value], index: usize) -> Value {
-    let tag_bits = bcx.ins().band_imm(slots[0], gc::TAG_MASK);
-    bcx.ins().icmp_imm(IntCC::Equal, tag_bits, member_tag(index) as i64)
+    let tag_bits = bcx.ins().band_imm_s(slots[0], gc::TAG_MASK);
+    bcx.ins().icmp_imm_s(IntCC::Equal, tag_bits, member_tag(index) as i64)
 }
 
 /// The normalized-member index of nominal union `enum_name`'s variant
@@ -796,7 +791,7 @@ fn root_heap_value(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) {
             ctx.heap_cursor, ctx.heap_max,
         );
         let offset = SHADOW_SLOTS_OFFSET + (ctx.heap_cursor * 8) as i32;
-        bcx.ins().stack_store(val, slot, offset);
+        bcx.ins().stack_store(types::I64, val, slot, offset);
         ctx.heap_cursor += 1;
     }
 }
@@ -831,14 +826,14 @@ fn root_flat_leaves(bcx: &mut FunctionBuilder, ctx: &mut Ctx, vals: &[Value], le
 /// Flags for accesses to a live GC object: the pointer came from `alloc`, so
 /// it is non-null and 8-byte aligned, and every offset here is derived from
 /// the object's declared layout, so nothing can trap.
-fn heap_mem() -> MemFlags { MemFlags::trusted() }
+fn heap_mem() -> MachMemFlags { MachMemFlags::trusted() }
 
 /// Address of raw slot `slot` in `list`'s flat data buffer. Reloads `data`
 /// on each use rather than hoisting it, since a push can reallocate the
 /// buffer out from under a cached copy.
 fn list_slot_addr(bcx: &mut FunctionBuilder, list: Value, slot: Value) -> Value {
     let data = bcx.ins().load(types::I64, heap_mem(), list, offset_of!(FrogList, data) as i32);
-    let byte_off = bcx.ins().imul_imm(slot, 8);
+    let byte_off = bcx.ins().imul_imm_s(slot, 8);
     bcx.ins().iadd(data, byte_off)
 }
 
@@ -847,7 +842,7 @@ fn list_slot_addr(bcx: &mut FunctionBuilder, list: Value, slot: Value) -> Value 
 fn list_stride(bcx: &mut FunctionBuilder, list: Value) -> Value {
     let raw = bcx.ins().load(types::I32, heap_mem(), list, offset_of!(FrogList, stride) as i32);
     let s = bcx.ins().uextend(types::I64, raw);
-    let is_zero = bcx.ins().icmp_imm(IntCC::Equal, s, 0);
+    let is_zero = bcx.ins().icmp_imm_s(IntCC::Equal, s, 0);
     let one = bcx.ins().iconst(types::I64, 1);
     bcx.ins().select(is_zero, one, s)
 }
@@ -876,7 +871,7 @@ fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, val: Va
     let len64 = bcx.ins().uextend(types::I64, len);
     let addr = list_slot_addr(bcx, list, len64);
     bcx.ins().store(heap_mem(), val, addr, 0);
-    let next_len = bcx.ins().iadd_imm(len, 1);
+    let next_len = bcx.ins().iadd_imm_s(len, 1);
     bcx.ins().store(heap_mem(), next_len, list, offset_of!(FrogList, len) as i32);
     bcx.ins().jump(done_bb, &[]);
 
@@ -934,28 +929,28 @@ fn emit_is_variant(bcx: &mut FunctionBuilder, val: Value, def: &UnionDef, tag: u
 ///     load is guarded by the low-bit test.
 fn emit_tag_test(bcx: &mut FunctionBuilder, val: Value, target_is_immediate: bool, any_immediate: bool, tag: u32) -> Value {
     if target_is_immediate {
-        return bcx.ins().icmp_imm(IntCC::Equal, val, gc::immediate_variant(tag));
+        return bcx.ins().icmp_imm_s(IntCC::Equal, val, gc::immediate_variant(tag));
     }
 
     if !any_immediate {
         let actual = bcx.ins().load(types::I32, heap_mem(), val, offset_of!(FrogVariant, tag) as i32);
-        return bcx.ins().icmp_imm(IntCC::Equal, actual, tag as i64);
+        return bcx.ins().icmp_imm_s(IntCC::Equal, actual, tag as i64);
     }
 
     let boxed_bb = bcx.create_block();
     let done_bb  = bcx.create_block();
     bcx.append_block_param(done_bb, types::I8);
 
-    let tag_bits = bcx.ins().band_imm(val, gc::TAG_MASK);
-    let is_immediate = bcx.ins().icmp_imm(IntCC::Equal, tag_bits, gc::TAG_IMMEDIATE);
+    let tag_bits = bcx.ins().band_imm_s(val, gc::TAG_MASK);
+    let is_immediate = bcx.ins().icmp_imm_s(IntCC::Equal, tag_bits, gc::TAG_IMMEDIATE);
     let no = bcx.ins().iconst(types::I8, 0);
-    bcx.ins().brif(is_immediate, done_bb, &[no], boxed_bb, &[]);
+    bcx.ins().brif(is_immediate, done_bb, &[BlockArg::from(no)], boxed_bb, &[]);
 
     bcx.switch_to_block(boxed_bb);
     bcx.seal_block(boxed_bb);
     let actual = bcx.ins().load(types::I32, heap_mem(), val, offset_of!(FrogVariant, tag) as i32);
-    let matched = bcx.ins().icmp_imm(IntCC::Equal, actual, tag as i64);
-    bcx.ins().jump(done_bb, &[matched]);
+    let matched = bcx.ins().icmp_imm_s(IntCC::Equal, actual, tag as i64);
+    bcx.ins().jump(done_bb, &[BlockArg::from(matched)]);
 
     bcx.switch_to_block(done_bb);
     bcx.seal_block(done_bb);
@@ -1043,12 +1038,12 @@ fn setup_shadow_frame(
     if n <= INLINE_ZERO_SLOTS {
         let zero = bcx.ins().iconst(types::I64, 0);
         for i in 0..n {
-            bcx.ins().stack_store(zero, slot, SHADOW_SLOTS_OFFSET + (i * 8) as i32);
+            bcx.ins().stack_store(types::I64, zero, slot, SHADOW_SLOTS_OFFSET + (i * 8) as i32);
         }
     } else {
         let slots = bcx.ins().stack_addr(types::I64, slot, SHADOW_SLOTS_OFFSET);
         let config = module.target_config();
-        bcx.emit_small_memset(config, slots, 0, (n * 8) as u64, 8, heap_mem());
+        bcx.emit_small_memset(config, slots, 0, (n * 8) as u64, 8, MemFlagsData::from(heap_mem()));
     }
 
     // *top_cell = frame — publish only now that the frame is fully
@@ -1070,7 +1065,7 @@ fn teardown_shadow_frame(
     // Reload `prev` from the frame rather than reusing the entry block's
     // value: this runs from whichever block holds the `return`, and a
     // reload is valid in all of them.
-    let prev = bcx.ins().stack_load(types::I64, slot, 0);
+    let prev = bcx.ins().stack_load(types::I64, types::I64, slot, 0);
     let top_cell = bcx.ins().iconst(types::I64, shadow_top_addr);
     bcx.ins().store(heap_mem(), prev, top_cell, 0);
 }
@@ -1088,35 +1083,28 @@ fn teardown_shadow_frame(
 fn get_or_declare_var(
     bcx: &mut FunctionBuilder,
     vars: &mut HashMap<String, Variable>,
-    ctx: &mut Ctx,
     name: &str,
     ty: &Type,
 ) -> Variable {
     if let Some(&v) = vars.get(name) {
         return v;
     }
-    let v = Variable::from_u32(ctx.var_counter);
-    ctx.var_counter += 1;
-    bcx.declare_var(v, cl_type(ty));
+    let v = bcx.declare_var(cl_type(ty));
     vars.insert(name.to_string(), v);
     v
 }
 
-/// Declare-and-bind a name's `Variable` using a plain counter rather than a
-/// `Ctx` — used for function-parameter and pre-seeded-REPL-binding setup,
-/// which both run before `Ctx` is constructed (see `build_func_body`,
-/// `build_main_body`).
+/// Declare-and-bind a name's `Variable` without a `Ctx` — used for
+/// function-parameter and pre-seeded-REPL-binding setup, which both run
+/// before `Ctx` is constructed (see `build_func_body`, `build_main_body`).
 fn declare_and_def_var(
     bcx: &mut FunctionBuilder,
     vars: &mut HashMap<String, Variable>,
-    counter: &mut u32,
     name: &str,
     ty: &Type,
     val: Value,
 ) {
-    let v = Variable::from_u32(*counter);
-    *counter += 1;
-    bcx.declare_var(v, cl_type(ty));
+    let v = bcx.declare_var(cl_type(ty));
     vars.insert(name.to_string(), v);
     bcx.def_var(v, val);
 }
@@ -1128,6 +1116,13 @@ fn cl_type(ty: &Type) -> types::Type {
         Type::Float => types::F64,
         _           => types::I64,
     }
+}
+
+/// Wrap SSA values as block arguments. Cranelift 0.135 distinguishes a
+/// `BlockArg` (which may also be an exception-table payload) from a plain
+/// `Value`; every argument froglang passes is an ordinary value.
+fn block_args(vals: &[Value]) -> Vec<BlockArg> {
+    vals.iter().copied().map(BlockArg::from).collect()
 }
 
 /// A zero of Cranelift type `t`, for a value slot that is never actually
@@ -1173,7 +1168,7 @@ fn coerce_value(val: Value, from_ty: &Type, to_ty: &Type, bcx: &mut FunctionBuil
 /// and Int/Str/List(_) are already i64-shaped (the latter two are pointers).
 fn to_i64_repr(bcx: &mut FunctionBuilder, ty: &Type, val: Value) -> Value {
     match ty {
-        Type::Float => bcx.ins().bitcast(types::I64, MemFlags::new(), val),
+        Type::Float => bcx.ins().bitcast(types::I64, MachMemFlags::new(), val),
         Type::Bool  => bcx.ins().uextend(types::I64, val),
         _           => val,
     }
@@ -1184,7 +1179,7 @@ fn to_i64_repr(bcx: &mut FunctionBuilder, ty: &Type, val: Value) -> Value {
 /// Cranelift representation.
 fn from_i64_repr(bcx: &mut FunctionBuilder, ty: &Type, val: Value) -> Value {
     match ty {
-        Type::Float => bcx.ins().bitcast(types::F64, MemFlags::new(), val),
+        Type::Float => bcx.ins().bitcast(types::F64, MachMemFlags::new(), val),
         Type::Bool  => bcx.ins().ireduce(types::I8, val),
         _           => val,
     }
@@ -1220,9 +1215,9 @@ fn declare_rt(
 /// Emitting this leaves the builder positioned in a fresh "ok" block, so the
 /// caller's following `sdiv` lands after the guard.
 fn emit_int_div_guard(bcx: &mut FunctionBuilder, ctx: &mut Ctx, lv: Value, rv: Value) {
-    let is_zero = bcx.ins().icmp_imm(IntCC::Equal, rv, 0);
-    let is_neg1 = bcx.ins().icmp_imm(IntCC::Equal, rv, -1);
-    let is_min  = bcx.ins().icmp_imm(IntCC::Equal, lv, i64::MIN);
+    let is_zero = bcx.ins().icmp_imm_s(IntCC::Equal, rv, 0);
+    let is_neg1 = bcx.ins().icmp_imm_s(IntCC::Equal, rv, -1);
+    let is_min  = bcx.ins().icmp_imm_s(IntCC::Equal, lv, i64::MIN);
     let is_ovf  = bcx.ins().band(is_neg1, is_min);
     let is_bad  = bcx.ins().bor(is_zero, is_ovf);
 
@@ -1551,7 +1546,7 @@ fn compile_place_assign(
             for (v, (sub_path, lty)) in vals.iter().zip(leafs.iter()) {
                 let full_path = if sub_path.is_empty() { prefix.clone() } else { format!("{}.{}", prefix, sub_path) };
                 let key = var_key(root, &full_path);
-                let var = get_or_declare_var(bcx, vars, ctx, &key, lty);
+                let var = get_or_declare_var(bcx, vars, &key, lty);
                 bcx.def_var(var, *v);
             }
         },
@@ -1568,7 +1563,7 @@ fn compile_place_assign(
         Some((idx_expr, elem_ty)) => {
             let list_key = var_key(root, &prefix);
             let list_ty = Type::List(Box::new(elem_ty.clone()));
-            let list_var = get_or_declare_var(bcx, vars, ctx, &list_key, &list_ty);
+            let list_var = get_or_declare_var(bcx, vars, &list_key, &list_ty);
             let list_val = bcx.use_var(list_var);
             let idx_val = compile_expr(idx_expr, bcx, vars, ctx);
 
@@ -1721,7 +1716,7 @@ fn compile_expr_multi(
                 let leafs = struct_fields(&value.item.ty, ctx.structs);
                 for (v, (path, lty)) in vals.iter().zip(leafs.iter()) {
                     let key = var_key(name, path);
-                    let var = get_or_declare_var(bcx, vars, ctx, &key, lty);
+                    let var = get_or_declare_var(bcx, vars, &key, lty);
                     bcx.def_var(var, *v);
                 }
                 vals
@@ -1954,17 +1949,17 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
         if *op == Token::And {
             // `false and right` == false, without evaluating `right`.
             let zero = bcx.ins().iconst(types::I8, 0);
-            bcx.ins().brif(lv, rhs_bb, &[], merge_bb, &[zero]);
+            bcx.ins().brif(lv, rhs_bb, &[], merge_bb, &[BlockArg::from(zero)]);
         } else {
             // `true or right` == true, without evaluating `right`.
             let one = bcx.ins().iconst(types::I8, 1);
-            bcx.ins().brif(lv, merge_bb, &[one], rhs_bb, &[]);
+            bcx.ins().brif(lv, merge_bb, &[BlockArg::from(one)], rhs_bb, &[]);
         }
 
         bcx.switch_to_block(rhs_bb);
         bcx.seal_block(rhs_bb);
         let rv = compile_expr(right, bcx, vars, ctx);
-        bcx.ins().jump(merge_bb, &[rv]);
+        bcx.ins().jump(merge_bb, &[BlockArg::from(rv)]);
 
         bcx.switch_to_block(merge_bb);
         bcx.seal_block(merge_bb);
@@ -2118,7 +2113,7 @@ fn compile_conditional(
         if true_branch.item.ty != Type::Never {
             if has_value {
                 let tv = ensure_width(tv[0], &true_branch.item.ty, result_ty, bcx);
-                bcx.ins().jump(merge_bb, &[tv]);
+                bcx.ins().jump(merge_bb, &[BlockArg::from(tv)]);
             } else {
                 bcx.ins().jump(merge_bb, &[]);
             }
@@ -2130,14 +2125,14 @@ fn compile_conditional(
             if fb.item.ty != Type::Never {
                 if has_value {
                     let fv = ensure_width(fv[0], &fb.item.ty, result_ty, bcx);
-                    bcx.ins().jump(merge_bb, &[fv]);
+                    bcx.ins().jump(merge_bb, &[BlockArg::from(fv)]);
                 } else {
                     bcx.ins().jump(merge_bb, &[]);
                 }
             }
         } else if has_value {
             let fv = bcx.ins().iconst(result_ty, 0);
-            bcx.ins().jump(merge_bb, &[fv]);
+            bcx.ins().jump(merge_bb, &[BlockArg::from(fv)]);
         } else {
             bcx.ins().jump(merge_bb, &[]);
         }
@@ -2171,7 +2166,7 @@ fn compile_conditional(
         // See the scalar path above for why a `Never`-typed branch
         // must not also jump — it already terminated itself.
         if true_branch.item.ty != Type::Never {
-            bcx.ins().jump(merge_bb, &tv);
+            bcx.ins().jump(merge_bb, &block_args(&tv));
         }
         bcx.switch_to_block(false_bb);
         bcx.seal_block(false_bb);
@@ -2179,12 +2174,12 @@ fn compile_conditional(
             Some(fb) => {
                 let fv = compile_expr_multi(fb, bcx, vars, ctx);
                 if fb.item.ty != Type::Never {
-                    bcx.ins().jump(merge_bb, &fv);
+                    bcx.ins().jump(merge_bb, &block_args(&fv));
                 }
             }
             None => {
                 let fv: Vec<Value> = param_tys.iter().map(|&t| placeholder_value(bcx, t)).collect();
-                bcx.ins().jump(merge_bb, &fv);
+                bcx.ins().jump(merge_bb, &block_args(&fv));
             }
         };
         bcx.switch_to_block(merge_bb);
@@ -2363,7 +2358,7 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         root_flat_leaves(bcx, ctx, this_arg, &leaf_tys);
         for (v, (path, lty)) in this_arg.iter().zip(leafs.iter()) {
             let key = var_key(&name, path);
-            let var = get_or_declare_var(bcx, vars, ctx, &key, lty);
+            let var = get_or_declare_var(bcx, vars, &key, lty);
             bcx.def_var(var, *v);
         }
     }
@@ -2733,7 +2728,7 @@ fn compile_for_loop(
     bcx.append_block_param(header_bb, types::I64);
 
     let zero = bcx.ins().iconst(types::I64, 0);
-    bcx.ins().jump(header_bb, &[zero]);
+    bcx.ins().jump(header_bb, &[BlockArg::from(zero)]);
 
     // `header_bb` has a second predecessor — the back-edge jump emitted at
     // the end of this function — so it can't be sealed until that jump
@@ -2758,7 +2753,7 @@ fn compile_for_loop(
     let base_slot = bcx.ins().imul(i, stride_val);
     let mut elem_vals = Vec::with_capacity(elem_leafs.len());
     for (leaf_idx, (_, lty)) in elem_leafs.iter().enumerate() {
-        let slot = bcx.ins().iadd_imm(base_slot, leaf_idx as i64);
+        let slot = bcx.ins().iadd_imm_s(base_slot, leaf_idx as i64);
         let addr = list_slot_addr(bcx, list_val, slot);
         let raw = bcx.ins().load(types::I64, heap_mem(), addr, 0);
         elem_vals.push(from_i64_repr(bcx, lty, raw));
@@ -2770,7 +2765,7 @@ fn compile_for_loop(
     root_flat_leaves(bcx, ctx, &elem_vals, &elem_leaf_tys);
     for ((leaf_path, lty), elem_val) in elem_leafs.iter().zip(elem_vals) {
         let key = var_key(var, leaf_path);
-        let var_id = get_or_declare_var(bcx, vars, ctx, &key, lty);
+        let var_id = get_or_declare_var(bcx, vars, &key, lty);
         bcx.def_var(var_id, elem_val);
     }
 
@@ -2784,8 +2779,8 @@ fn compile_for_loop(
 
         bcx.switch_to_block(skip_bb);
         bcx.seal_block(skip_bb);
-        let i_next = bcx.ins().iadd_imm(i, 1);
-        bcx.ins().jump(header_bb, &[i_next]);
+        let i_next = bcx.ins().iadd_imm_s(i, 1);
+        bcx.ins().jump(header_bb, &[BlockArg::from(i_next)]);
 
         bcx.switch_to_block(do_bb);
         bcx.seal_block(do_bb);
@@ -2800,8 +2795,8 @@ fn compile_for_loop(
         }
     }
 
-    let i_next = bcx.ins().iadd_imm(i, 1);
-    bcx.ins().jump(header_bb, &[i_next]);
+    let i_next = bcx.ins().iadd_imm_s(i, 1);
+    bcx.ins().jump(header_bb, &[BlockArg::from(i_next)]);
     bcx.seal_block(header_bb);
 
     bcx.switch_to_block(exit_bb);
@@ -2986,6 +2981,7 @@ impl Codegen {
         unions: &UnionDefs,
         shadow_top_addr: i64,
     ) {
+        let target_config = module.target_config();
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
         let entry = bcx.create_block();
         bcx.append_block_params_for_function_params(entry);
@@ -2993,7 +2989,6 @@ impl Codegen {
         bcx.seal_block(entry);
 
         let mut vars: HashMap<String, Variable> = HashMap::new();
-        let mut var_counter: u32 = 0;
         let entry_params: Vec<Value> = bcx.block_params(entry).to_vec();
         // A struct-typed param consumes as many consecutive entry params as
         // it has flattened leaf fields — `make_sig` laid these out in the
@@ -3003,7 +2998,7 @@ impl Codegen {
         for (name, ty, mutable) in params {
             for (path, lty) in struct_fields(ty, structs) {
                 let key = var_key(name, &path);
-                declare_and_def_var(&mut bcx, &mut vars, &mut var_counter, &key, &lty, entry_params[cursor]);
+                declare_and_def_var(&mut bcx, &mut vars, &key, &lty, entry_params[cursor]);
                 cursor += 1;
             }
             if *mutable {
@@ -3022,7 +3017,7 @@ impl Codegen {
 
         let n = max_heap_slots(body, structs);
         let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
         teardown_shadow_frame(&mut bcx, shadow_top_addr, heap_slot);
 
@@ -3061,7 +3056,7 @@ impl Codegen {
         }
 
         bcx.seal_all_blocks();
-        bcx.finalize();
+        bcx.finalize(target_config);
     }
 
     /// Build the `__frog_main[_N]` body. The function takes one `i64` pointer
@@ -3099,6 +3094,7 @@ impl Codegen {
         unions: &UnionDefs,
         shadow_top_addr: i64,
     ) -> Vec<(String, Type)> {
+        let target_config = module.target_config();
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
         let entry = bcx.create_block();
         bcx.append_block_params_for_function_params(entry);
@@ -3107,7 +3103,6 @@ impl Codegen {
         let out_ptr = bcx.block_params(entry)[0];
 
         let mut vars: HashMap<String, Variable> = HashMap::new();
-        let mut var_counter: u32 = 0;
 
         // Pre-seed vars from prior REPL entries as iconst values — one per
         // flattened leaf field, matching how `FrogState::eval` decoded them.
@@ -3121,7 +3116,7 @@ impl Codegen {
                     _           => bcx.ins().iconst(types::I64, leaf_bits),
                 };
                 let key = var_key(name, path);
-                declare_and_def_var(&mut bcx, &mut vars, &mut var_counter, &key, lty, val);
+                declare_and_def_var(&mut bcx, &mut vars, &key, lty, val);
             }
         }
         let mut last_val = bcx.ins().iconst(types::I64, 0);
@@ -3150,7 +3145,7 @@ impl Codegen {
 
         let n: usize = stmts.iter().map(|s| max_heap_slots(s, structs)).sum();
         let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, var_counter, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params: Vec::new() };
+        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params: Vec::new() };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;
@@ -3176,7 +3171,7 @@ impl Codegen {
                     // enough to read or write its `out_ptr` slot.
                     for (path, lty) in struct_fields(&value.item.ty, structs) {
                         let key = var_key(name, &path);
-                        let var = get_or_declare_var(&mut bcx, &mut vars, &mut ctx, &key, &lty);
+                        let var = get_or_declare_var(&mut bcx, &mut vars, &key, &lty);
                         let zero = placeholder_value(&mut bcx, cl_type(&lty));
                         bcx.def_var(var, zero);
                     }
@@ -3197,7 +3192,7 @@ impl Codegen {
                 for (v, (_, lty)) in vals.iter().zip(leafs.iter()) {
                     let repr = to_i64_repr(&mut bcx, lty, *v);
                     let offset = (slot_cursor * 8) as i32;
-                    bcx.ins().store(MemFlags::new(), repr, out_ptr, offset);
+                    bcx.ins().store(MachMemFlags::new(), repr, out_ptr, offset);
                     slot_cursor += 1;
                 }
                 bindings.push((name.clone(), last_ty.clone()));
@@ -3224,7 +3219,7 @@ impl Codegen {
 
         bcx.ins().return_(&[last_val]);
         bcx.seal_all_blocks();
-        bcx.finalize();
+        bcx.finalize(target_config);
 
         bindings
     }

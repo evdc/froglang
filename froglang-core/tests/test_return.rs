@@ -3,7 +3,7 @@
 // `return` is the language's first early-exit construct: before this, a
 // function body was a single expression whose tail value was the result,
 // and codegen emitted exactly one `return_` per function. `return` needed
-// real multi-exit codegen (teardown the shadow frame, `return_`, then keep
+// real multi-exit codegen (`return_`, then keep
 // building into a fresh block for whatever source follows) and a bottom
 // type (`Never`) so `if c then return 1 else 2` types as plain `Int` rather
 // than some union of "the branch that never produces a value" with `Int`.
@@ -182,10 +182,9 @@ fn test_early_returned_heap_value_survives_a_collection_triggered_before_it() {
     // Every `Str`/`List` allocation checks the GC threshold (`maybe_collect`
     // in `runtime::ffi`), so enough throwaway string allocations inside the
     // loop below force a real, non-forced collection to happen *before* the
-    // early `return` executes. If the early-return codegen path (the new
-    // `TypedExprKind::Return` arm) failed to keep the shadow frame's
-    // accounting in sync with what it actually roots — see
-    // `for_each_heap_producer`'s `Return` arm — the string built on the
+    // early `return` executes. If the early-return codegen path (the
+    // `TypedExprKind::Return` arm in `codegen::compile_expr_multi`) failed
+    // to declare its result to Cranelift as a GC root — the string built on the
     // final iteration and returned here would already be collected garbage
     // by the time `print` reads it back, and this would print corrupted
     // bytes or crash rather than the exact string constructed.

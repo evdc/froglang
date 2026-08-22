@@ -1,7 +1,7 @@
 use std::alloc::Layout;
 use std::io::Write;
 
-use super::gc::{FrogList, FrogStr, FrogVariant, GcHeap, GC_HEAP, ACTIVE_HEAP};
+use super::gc::{FrogList, FrogStr, FrogVariant, GcHeap, RuntimeRoots, GC_HEAP, ACTIVE_HEAP};
 
 /// Call `f` with a mutable reference to the active GcHeap.
 /// Uses the `FrogState`-owned heap if one is executing on this thread,
@@ -25,6 +25,7 @@ where
 
 #[no_mangle]
 pub extern "C" fn frog_alloc_str(data: i64, len: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
     with_heap(|heap| {
         heap.maybe_collect();
         heap.alloc_str(data as *const u8, len as usize) as i64
@@ -38,6 +39,8 @@ pub extern "C" fn frog_str_len(s: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn frog_str_concat(a: i64, b: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
+    let _roots = RuntimeRoots::hold(&[a, b]);
     let a_ptr = a as *const FrogStr;
     let b_ptr = b as *const FrogStr;
     let struct_size = std::mem::size_of::<FrogStr>();
@@ -212,6 +215,7 @@ pub extern "C" fn frog_list_print(list: i64, kind: i64) {
 
 #[no_mangle]
 pub extern "C" fn frog_alloc_list(cap: i64, stride: i64, ptr_mask: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
     with_heap(|heap| {
         heap.maybe_collect();
         heap.alloc_list(cap as usize, stride as usize, ptr_mask as u64) as i64
@@ -339,6 +343,11 @@ fn clamp_bound(idx: i64, len: i64) -> i64 {
 /// `list[:end]` / `list[start:]` / `list[:]`) — see codegen's `Slice` arm.
 #[no_mangle]
 pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
+    // `list` is read again after the allocation below, which can collect —
+    // and the caller's stack map does not cover it, since from the JIT's
+    // point of view the value died at this call. See `gc::RuntimeRoots`.
+    let _roots = RuntimeRoots::hold(&[list]);
     let list_ptr = list as *const FrogList;
     let (stride, ptr_mask) = unsafe { ((*list_ptr).stride as i64, (*list_ptr).ptr_mask) };
     let stride = stride.max(1);
@@ -406,6 +415,7 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
 /// "never errors, just clamps" convention rather than `frog_list_get`'s.
 #[no_mangle]
 pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
     let len = if end > start { (end - start) as usize } else { 0 };
 
     with_heap(|heap| {
@@ -431,6 +441,7 @@ pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
 /// `frog_variant_set` right after this returns.
 #[no_mangle]
 pub extern "C" fn frog_alloc_variant(tag: i64, nslots: i64, ptr_mask: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
     with_heap(|heap| {
         heap.maybe_collect();
         heap.alloc_variant(tag as u32, nslots as usize, ptr_mask as u64) as i64
@@ -478,15 +489,18 @@ pub extern "C" fn frog_gc_dump() {
     super::gc::gc_dump();
 }
 
-// ── Shadow stack (GC roots for JIT-local heap pointers) ───────────────────────
+// ── GC roots for JIT-local heap pointers ──────────────────────────────────────
 //
 // Deliberately absent: there is no `frog_frame_push`/`frog_frame_pop` FFI
-// pair any more. A shadow-stack frame is now a `gc::ShadowFrame` embedded
-// in the JIT function's own native stack frame, linked and unlinked by four
-// inline loads/stores that `setup_shadow_frame`/`teardown_shadow_frame`
-// (codegen/mod.rs) emit directly — no call, no thread-local lookup, no
-// `memset` libcall. See `gc::ShadowFrame` for the layout and
-// `gc::GcHeap::set_shadow_top` for how the collector finds the chain.
+// pair, and no runtime function here maintains a root of its own for a
+// value it merely passes through. Roots for JIT-produced values are
+// Cranelift's stack maps (RUNTIME.md Part 2, `gc.rs`'s "Precise roots") —
+// `Codegen` declares every GC-scannable SSA value as it is produced, and the
+// collector walks the native stack directly rather than any structure this
+// module maintains. The one thing a runtime function does still have to get
+// right is `gc::RuntimeRoots`, just below `with_heap`: an argument it still
+// needs *after* a call that can collect is not otherwise rooted, since from
+// the JIT's point of view that argument died at the call.
 
 #[cfg(test)]
 mod tests {
@@ -511,8 +525,7 @@ mod tests {
 
     #[test]
     fn test_frog_str_eq() {
-        // Root each string immediately, unlike a call through generated
-        // code (which the shadow stack protects automatically) — these
+        // Root each string immediately — these
         // tests call the FFI entry points directly, so nothing else roots
         // `pa`/`pb`/`pc`, and under `FROG_GC_STRESS` every further
         // allocation collects for real: an unrooted earlier string is

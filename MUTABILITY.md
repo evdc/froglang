@@ -397,8 +397,9 @@ is visible in the type name, rather than diffused through the collection types.
 4. **`mut` parameters** ✅ with the call-site marker and the single-root exclusivity check, via
    copy-in/copy-out extra Cranelift return values.
 5. **Closure capture by value** — decided now, implemented when closures are.
-6. **Move on last use** — split into three pieces; the analysis landed, the two consumers did not.
-   See below.
+6. **Move on last use** — split into three pieces; the analysis landed, the GC-rooting consumer
+   is moot (Cranelift's stack maps own that now — RUNTIME.md Part 2), the semantic consumer
+   (move-elision for a plain value) did not land. See below.
    *Then* container mutation (`push`, `set`, and `Dict`'s mutating operations) on top of it.
 7. **COW via the `shared` header bit**, if and only if the benchmarks still want it.
 
@@ -458,16 +459,17 @@ analysis itself sketched.
   inspect the analysis today, and what a future semantic consumer (copy elision, `mut` container
   operations) should be checked against.
 
-### Stage 6a: shadow-slot allocation — RETIRED, see RUNTIME.md
+### Stage 6a: shadow-slot allocation — RETIRED, superseded by RUNTIME.md Part 2 (implemented)
 
 **Do not implement this section.** It is kept for the reasoning, which still holds; its
-conclusion does not. Cranelift 0.113 already exposes user stack maps
-(`declare_value_needs_stack_map`, spilling and liveness over its own real CFG, non-moving
-collectors explicitly supported), which subsumes the entire allocation problem below — there
-are no slots to allocate. The blocker was that stack-map liveness is *use-driven*, so a
-union's `(tag, payload)` pair cannot be declared while its payload's pointer-ness is dynamic;
-`RUNTIME.md` resolves that with a tagged-pointer representation and retires this plan. The
-open loop back-edge hole is closed there too.
+conclusion does not. GC roots are now Cranelift's own user stack maps (RUNTIME.md Part 2 —
+implemented, not just designed), which subsumed the entire allocation problem below before it
+was ever built: there are no slots to allocate. The blocker had been that stack-map liveness is
+*use-driven*, so a union's `(tag, payload)` pair could not be declared while its payload's
+pointer-ness was dynamic; RUNTIME.md Part 1's tagged-pointer representation resolved that. The
+open loop back-edge hole this section's reasoning identified is closed too — see
+`tests/test_gc_roots.rs::loop_body_producer_does_not_clobber_an_escaping_binding`, which was
+`#[ignore]`d until Part 2 landed and now passes.
 
 The original sketch follows.
 

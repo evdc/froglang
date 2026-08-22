@@ -1,8 +1,8 @@
 # froglang runtime & codegen model
 
-Status: **Part 1 implemented** (2026-08-22, commit following this document's own). Parts 2
-and 3 are still proposals. Written after two GC-rooting use-after-frees traced to the same
-structural cause; the measurements below are real.
+Status: **Parts 1 and 2 implemented** (2026-08-22). Part 3 is still a proposal. Written after
+two GC-rooting use-after-frees traced to the same structural cause; the measurements below are
+real.
 
 Where the implementation diverges from what was proposed, this document says so inline under
 "As built" — the proposal text is left standing rather than rewritten, so the reasoning that
@@ -258,19 +258,72 @@ ever tested with `is`, never narrowed) its absence from the map is correct, not 
 
 ### Mechanics
 
-1. Cranelift emits stack maps keyed by return address. Enable `preserve_frame_pointers` and walk
-   the native stack at collection time, which begins inside the allocator — itself called from
-   JIT code, so the walk starts at the allocator's caller.
-2. Maintain a sorted table of `(code_start, code_len, stack_maps)` across all JIT'd functions to
-   resolve a return address to its map.
-3. Roots come out as spill-slot offsets. Read each word, apply the uniform `is_heap_ptr`/
-   `heap_ptr` rule from Part 1. No per-root type metadata is needed, which is the whole payoff
-   of a single encoding.
+1. Cranelift emits stack maps keyed by return address. `preserve_frame_pointers` is enabled on
+   the JIT side and `-C force-frame-pointers=yes` on the Rust side (`.cargo/config.toml`), and the
+   walk starts inside the runtime FFI function the mutator called into — `caller_frame_pointer!`
+   reads that function's own frame pointer, and `JitFrameGuard` (`gc.rs`) publishes it for the
+   duration of the call, restoring the previous one on the way out so re-entrant calls (printing
+   a union runs JIT-compiled formatting) nest correctly.
+2. `gc::JitCode` is a sorted table of `(start, len, maps)` across all JIT'd functions, built once
+   each function's address is known (`finalize_definitions`) and resolving a return address to its
+   map in `O(log n)`.
+3. Roots come out as SP-relative byte offsets. Read each word, apply the uniform `is_heap_ptr`/
+   `heap_ptr` rule from Part 1. No per-root type metadata is needed, which is the whole payoff of
+   a single encoding.
+
+### As built
+
+The plan above is what's implemented, with two additions the plan didn't anticipate.
+
+**A prerequisite: cranelift-frontend 0.113 → 0.135.** `declare_var_needs_stack_map` only
+propagated through `use_var`/`def_var` in 0.113, not through block parameters the SSA builder
+inserts purely to route a variable's value between blocks that never mention it. A value could
+sit in exactly such a parameter across a safepoint and be silently absent from that safepoint's
+map — the same missed-root class stack maps were meant to remove, just relocated. Confirmed with
+a standalone probe before touching any froglang code; `tests/test_cranelift_stack_maps.rs` pins
+the property against a regression. 0.135 moved the tracking into the SSA builder itself, which is
+the fix, plus an unrelated but required migration (`MemFlags` is now an interned entity index,
+block arguments are `BlockArg` not `Value`, `stack_load`/`store` take a pointer type, `*_imm`
+builders want an explicit sign/zero-extend variant).
+
+**A residual conservative region: `gc::RuntimeRoots` and `gc::push_scanned_span`.** Stack maps are
+precise for JIT frames, but two places still need help:
+
+- A runtime FFI function (`ffi.rs`) that receives a GC pointer as an argument and can itself
+  trigger a collection, but still needs that argument afterward, is not otherwise rooted — from
+  the JIT caller's point of view the argument died *at* the call, so it is correctly absent from
+  the caller's own map. `RuntimeRoots::hold` pushes explicit roots for the duration of such a
+  function's body; the rule is stated once as "any runtime function meeting both conditions holds
+  its pointer arguments for its whole body" rather than reasoned about per call site, since that
+  reasoning is exactly what produces a use-after-free the next time such a function is edited.
+- `__frog_main`'s `out_ptr` buffer (and the one-shot `compile_and_run` path's equivalent) is
+  filled with top-level bindings as they're created, but `FrogState::eval` only turns it into
+  explicit roots *after* the call returns. A binding whose last JIT-side use has already passed —
+  built early, read back only through `out_ptr` after `eval` returns — is reachable only through
+  that buffer in between. Found by a real crash (`struct_cart_total.frog`, reduced to
+  `tests/test_gc_roots.rs::top_level_binding_survives_a_collection_triggered_before_eval_returns`):
+  the shadow stack hid this by keeping every root alive for the whole function; precise roots
+  correctly stopped doing that and nothing scanned the buffer instead. `push_scanned_span`
+  registers the buffer's GC-scannable slots (from `gc_slots_of_bindings`) for the duration of the
+  call, conservatively scanning that one buffer rather than relying on a JIT-side root for a value
+  the JIT side is, correctly, already done with.
+
+Both are narrow, deliberate exceptions to "every root comes from a Cranelift stack map" — confined
+to the two places precise roots cannot reach by construction (a value crossing into Rust code with
+no map of its own; a value crossing out through a buffer the caller owns), not a reversion to
+conservative scanning generally.
+
+Measured on `benches/orders.frog`: unchanged at 60 ms — Part 2 is about correctness and about
+retiring hand-written machinery, not about this benchmark's time, which Part 1 already fixed.
+`FROG_GC_STRESS=1` (a collection on every allocation) passes across the whole suite, including the
+previously-`#[ignore]`d `test_gc_roots::loop_body_producer_does_not_clobber_an_escaping_binding` —
+un-ignored, since binding-owned roots were exactly what it needed and Cranelift's live-range
+analysis gives every `Variable` its own.
 
 `gc::ShadowFrame`, `ShadowTop`, `setup_shadow_frame`, `teardown_shadow_frame`,
 `root_heap_value`, `root_flat_leaves`, `max_heap_slots`, `Ctx.heap_slot/heap_cursor/heap_max`
-all go away. So does `MUTABILITY.md`'s proposed stage 6a slot allocator — **do not build it**;
-this subsumes it entirely.
+are gone. So is `MUTABILITY.md`'s proposed stage 6a slot allocator — it was never built; this
+subsumed it before it needed to be.
 
 If a moving collector is ever wanted, spilled slots would need rewriting with the tag preserved.
 Noted, not designed.
@@ -310,15 +363,12 @@ ever be.
 
 ## Sequencing
 
-1. **Tagged-pointer union representation.** Self-contained, independently measurable, deletes
-   existing special-case machinery, and solves `roadmap.md`'s top perf item by unboxing
-   payload-carrying variants. Must land as one commit for the encoding — see the migration
-   invariant above.
-2. **Stack maps.** Mechanical once every root is statically a pointer and genuinely used. Delete
-   the shadow stack; un-ignore
-   `test_gc_roots::loop_body_producer_does_not_clobber_an_escaping_binding`.
-3. **Fix the open frontend findings** (`all_roots` indexing, `func_mut_params` scoping,
-   `state.rs:324`'s zero-leaf slice) — unrelated, small, still open.
+1. ~~**Tagged-pointer union representation.**~~ Done — see Part 1's "As built".
+2. ~~**Stack maps.**~~ Done — see Part 2's "As built". Needed an unplanned Cranelift upgrade and
+   an unplanned conservative region (`RuntimeRoots`/`push_scanned_span`) for the two places
+   precise roots cannot reach by construction.
+3. ~~**Fix the open frontend findings**~~ (`all_roots` indexing, `func_mut_params` scoping,
+   `state.rs:324`'s zero-leaf slice) — done, in the commit between Parts 1 and 2.
 4. **The IR**, when effects, concurrency, or refinement types arrive. Not speculatively.
 
 Stage 6a of `MUTABILITY.md` is retired by step 2 and should not be implemented.
@@ -336,7 +386,8 @@ Stage 6a of `MUTABILITY.md` is retired by step 2 and should not be implemented.
 - ~~**Does the 6-member ceiling bite anywhere real?**~~ Nothing in the tree exceeds four, so
   the ceiling does not bite — but the fallback is now reachable and tested rather than merely
   present (`a_seven_member_union_falls_back_to_boxing`).
-- **Is `preserve_frame_pointers` enough on aarch64** to walk out of the runtime and across JIT
-  frames reliably, or is an explicit frame list needed?
+- ~~**Is `preserve_frame_pointers` enough on aarch64**~~ Answered: yes, paired with
+  `-C force-frame-pointers=yes` on the Rust side, which the JIT-only flag doesn't cover. No
+  explicit frame list needed.
 - **The list-stride overhead gap** (7.5 ns/elem against Rust's 2.6) is unexplained and larger
   than any representation choice here. Worth profiling before optimizing width further.

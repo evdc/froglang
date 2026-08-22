@@ -255,13 +255,12 @@ pub fn analyze_entry(stmts: &[Spanned<TypedExpr>], exit_live: &NameSet) -> Liven
 /// `codegen::build_func_body`/`build_main_body`, since walking the whole
 /// tree a second time only to throw the result away isn't free. This is
 /// currently the *only* consumer of `Ownership`: nothing in codegen acts on
-/// a `Move` mark yet (see this module's own doc comment for why — briefly,
-/// today's shadow-stack slots are owned by *producer site*, not by
-/// *binding name*, and a plain `let x = y` binds `x` to whatever slot
-/// already roots `y` with no slot of its own; clearing "x's slot" at x's
-/// last use would, in that case, clear a slot `y` might still need. Acting
-/// on `Move` safely needs slots to be owned per binding name instead, which
-/// is a bigger change than this pass makes.) So this dump is the only way
+/// a `Move` mark yet — GC roots are now Cranelift's own stack maps
+/// (RUNTIME.md Part 2), tied to each `Variable`'s real live range, so the
+/// per-binding-slot problem this analysis was designed against no longer
+/// exists on the GC side. A future consumer (move-on-last-use for a
+/// non-GC resource, or a mid-level IR) still has to define its own
+/// ownership discipline; nothing here presumes one. So this dump is the only way
 /// to inspect the analysis today, and it's what a future semantic consumer
 /// (copy elision, `mut` container operations) should be checked against.
 pub fn dump_body(name: &str, body: &Spanned<TypedExpr>, liveness: &Liveness) {

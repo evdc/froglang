@@ -294,15 +294,16 @@ fn test_two_distinct_scalar_unions_in_one_struct() {
 
 #[test]
 fn test_for_loop_over_scalar_union_list_allocating_in_the_body() {
-    // Regression: `compile_for_loop` used to root each element leaf on
-    // `is_heap_ty(leaf)` alone, which is `true` for a two-slot union — so
-    // the *scalar* payload of an `Int` element (a raw integer, not a
-    // pointer) was pushed onto the shadow stack as a live root. The
-    // collector dereferences every non-zero root unchecked, so any
-    // collection triggered from inside the loop body dereferenced 4000004
-    // as a heap object. Rooting now goes through the tag-aware
-    // `root_flat_leaves`; `burn` allocates hard enough to force real
-    // collections while the loop variable is live.
+    // Regression, from the era of the old two-slot union representation:
+    // `compile_for_loop` used to root each element leaf on `is_heap_ty(leaf)`
+    // alone, which was `true` for a two-slot union's payload — so the
+    // *scalar* payload of an `Int` element (a raw integer, not a pointer)
+    // got rooted as if it were one. The collector dereferenced every
+    // non-zero root unchecked, so any collection triggered from inside the
+    // loop body dereferenced 4000004 as a heap object. `codegen::UnionLayout`
+    // now makes a scalar column statically un-scannable, so there's nothing
+    // left for this class of bug to trip over; `burn` allocates hard enough
+    // to force real collections while the loop variable is live.
     assert_eq!(compile_and_run(
         "data Point(x: Int, y: Int)\n\
          func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\

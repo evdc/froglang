@@ -1,4 +1,4 @@
-//! Shadow-stack rooting under a forced collection on every allocation.
+//! GC rooting under a forced collection on every allocation.
 //!
 //! Every test here runs its program twice over — once normally, where the
 //! 1 MB collection threshold means no GC ever runs and any rooting bug is
@@ -8,12 +8,16 @@
 //! stress-mode output that is truncated, empty, or holding some other
 //! string's bytes.
 //!
-//! The shape all of these probe is a *heap value that escapes the
-//! construct that produced it*. Shadow-stack slots are owned by producer
-//! site rather than by binding (see `codegen::max_heap_slots`), so
-//! `let s = <producer>` gives `s` no root of its own — it borrows the
-//! producer's. Anything that then overwrites that slot while the binding
-//! is still live drops the value on the floor.
+//! The first two tests here predate RUNTIME.md Part 2 and probe the shadow
+//! stack's structural defect: a root slot was owned by *producer site*, not
+//! by binding, so `let s = <producer>` gave `s` no root of its own — it
+//! borrowed the producer's, and anything that later overwrote that slot
+//! while `s` was still live dropped the value on the floor. Cranelift's
+//! stack maps (which now provide GC roots — see `gc.rs`, "Precise roots")
+//! tie a root to the `Variable`'s own live range instead, so both now pass;
+//! they stay as regression tests for the class of bug, not as documentation
+//! of a known hole. The third test guards Part 2's own migration defect —
+//! see its own doc comment.
 
 mod common;
 use common::{run, run_gc_stress};
@@ -50,13 +54,14 @@ print(go(6))
 /// producer is in a loop body and re-runs, overwriting its own slot, while
 /// the binding it fed outlives the loop.
 ///
-/// KNOWN FAILING, pre-existing and unrelated to the `Conditional` revert —
-/// loop bodies have always reused their slots across the back-edge. Fixing
-/// it needs roots owned per binding rather than per producer site
-/// (MUTABILITY.md stage 6); until then this documents the hole rather than
-/// guarding it. Prints `keep` instead of `keepAA` under stress.
+/// Used to be KNOWN FAILING under the shadow-stack representation — a loop
+/// body has always reused its slot across the back-edge, and fixing it
+/// needed roots owned per binding rather than per producer site. RUNTIME.md
+/// Part 2 (Cranelift stack maps) gives every binding exactly that: a
+/// `Variable`'s root tracks its own live range, not some producer site's.
+/// Prints `keepAA` correctly now — see RUNTIME.md's "Sequencing" for the
+/// un-ignore this test used to carry.
 #[test]
-#[ignore = "known unsound: loop back-edge overwrites a root the escaping binding still needs"]
 fn loop_body_producer_does_not_clobber_an_escaping_binding() {
     let src = r#"
 func go(): Str = {
@@ -74,4 +79,21 @@ print(go())
 "#;
     assert_eq!(run(src).lines().last(), Some("keepAA"));
     assert_eq!(run_gc_stress(src).lines().last(), Some("keepAA"));
+}
+
+// ── the top-level out_ptr buffer is itself a root, not just a source of roots ──
+
+#[test]
+fn top_level_binding_survives_a_collection_triggered_before_eval_returns() {
+    let src = r#"
+data Product(name: Str, price: Int)
+data LineItem(product: Product, qty: Int)
+func line_total(item: LineItem): Int = item.product.price * item.qty
+let catalog = [Product(name="Coffee", price=450), Product(name="Tea", price=350)]
+let cart = [LineItem(product=catalog[0], qty=2), LineItem(product=catalog[1], qty=1)]
+let bulk_lines = [for item in cart do line_total(item)]
+print(bulk_lines[0])
+"#;
+    assert_eq!(run(src).lines().last(), Some("900"));
+    assert_eq!(run_gc_stress(src).lines().last(), Some("900"));
 }

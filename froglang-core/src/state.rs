@@ -175,17 +175,17 @@ impl FrogState {
 
     /// Set `ACTIVE_HEAP` to this state's heap, call `func_ptr` with the
     /// out-buffer pointer, then clear it.
-    fn call_jit(&mut self, func_ptr: fn(i64) -> i64, out_ptr: i64) -> i64 {
-        // The compiled code links its shadow-stack frames into the head
-        // cell owned by `self.codegen`; point the heap at that cell so a
-        // collection triggered from inside `func_ptr` can walk them. Set
-        // here rather than once at construction because `Codegen`'s cell
-        // address is only meaningful for code *it* compiled, and a
-        // `FrogState` may be moved after `new`.
-        self.heap.set_shadow_top(self.codegen.shadow_top());
+    fn call_jit(&mut self, func_ptr: fn(i64) -> i64, out_ptr: i64, out_gc_slots: Vec<usize>) -> i64 {
+        // `func_ptr` writes each top-level binding into `out_ptr` as soon as
+        // it is created, and the roots below are only rebuilt after this
+        // returns — so for the length of the call that buffer is the only
+        // thing keeping some of those values reachable. See
+        // `GcHeap::push_scanned_span`.
+        self.heap.push_scanned_span(out_ptr as *const i64, out_gc_slots);
         ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut GcHeap));
         let result = func_ptr(out_ptr);
         ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
+        self.heap.pop_scanned_span();
         result
     }
 
@@ -289,7 +289,8 @@ impl FrogState {
             .sum();
         let mut out_buf: Vec<i64> = vec![0i64; total_slots];
         let out_ptr = out_buf.as_mut_ptr() as i64;
-        let bits = self.call_jit(func_ptr, out_ptr);
+        let out_gc_slots = crate::codegen::gc_slots_of_bindings(&bindings, self.tc.struct_defs());
+        let bits = self.call_jit(func_ptr, out_ptr, out_gc_slots);
 
         let mut cursor = 0usize;
         for (name, ty) in &bindings {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::mem::{offset_of, size_of};
 
-use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, BlockArg, InstBuilder, MachMemFlags, MemFlagsData, StackSlot, StackSlotData, StackSlotKind, TrapCode, Value};
+use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, BlockArg, InstBuilder, MachMemFlags, TrapCode, Value};
 use cranelift_codegen::{settings, settings::Configurable, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -18,47 +18,22 @@ pub struct Codegen {
     pub module: JITModule,
     func_ids: HashMap<String, FuncId>,
     builder_ctx: FunctionBuilderContext,
-    /// The one shadow-stack head cell this `Codegen`'s generated functions
-    /// link themselves into. Boxed because `setup_shadow_frame` bakes its
-    /// address into the machine code as a constant, so it must not move
-    /// when the `Codegen` itself does. See `gc::ShadowTop`.
-    shadow_top: Box<gc::ShadowTop>,
-}
-
-impl Codegen {
-    /// Address of this `Codegen`'s shadow-stack head cell. Hand this to
-    /// `GcHeap::set_shadow_top` before running any function compiled here,
-    /// or the collector will not see the JIT's roots.
-    pub fn shadow_top(&self) -> *const gc::ShadowTop {
-        &*self.shadow_top as *const gc::ShadowTop
-    }
 }
 
 /// Per-function-compilation context threaded through `compile_expr`.
 ///
-/// `heap_slot`/`heap_cursor` implement a conservative shadow stack: every
-/// syntactic subexpression that *produces* a new heap pointer (string
-/// allocation, string concat, list allocation, or a call returning
-/// `Str`/`List`) is stored into a dedicated stack-slot cell immediately after
-/// it is computed, so the GC's mark phase can find it even though it's only
-/// live in an SSA register. Functions with no heap-typed subexpressions get
-/// `heap_slot: None` and pay no runtime cost.
+/// GC roots are Cranelift's business now, not this module's: every value
+/// whose static type is a GC-scannable column (`is_heap_ty`) is handed to
+/// `declare_gc_value`/`declare_gc_var`, Cranelift computes which of them are
+/// live at each safepoint, and the collector reads them off the native stack
+/// (`gc.rs`, "Precise roots"). What used to live here — a shadow-frame stack
+/// slot, a bump cursor into it, and a predicted slot count that had to stay
+/// in exact lockstep with the codegen walk — is gone along with the two
+/// use-after-frees that lockstep requirement produced. See RUNTIME.md Part 2.
 struct Ctx<'a> {
     func_ids:      &'a HashMap<String, FuncId>,
     module:        &'a mut JITModule,
     string_arena:  &'a mut Vec<Vec<u8>>,
-    heap_slot:     Option<StackSlot>,
-    heap_cursor:   usize,
-    /// Slots `setup_shadow_frame` actually allocated — i.e. what
-    /// `max_heap_slots` predicted. Only used to assert that the
-    /// `max_heap_slots` walk stays in sync with the `root_heap_value`
-    /// calls `compile_expr_multi` really makes: a producer the walk fails
-    /// to count makes
-    /// `root_heap_value` store past the end of the slot *and* leaves that
-    /// root outside the `len` handed to `frog_frame_push`, so the GC never
-    /// scans it — a silent, intermittent memory bug rather than a test
-    /// failure.
-    heap_max:      usize,
     /// Field layout for every registered struct, from `TypeChecker::struct_defs`.
     /// Structs are represented unboxed: a struct-typed value is never one
     /// SSA `Value`, it's flattened into as many `Value`s as it has leaf
@@ -80,12 +55,9 @@ struct Ctx<'a> {
     /// `data Node is Add(lhs: Node, ...) | ...` representable at all), so
     /// printing one recursively re-derives the same union type at codegen
     /// time with no static bound on depth — `print_union` uses this stack
-    /// to detect that recursion and fail clearly instead of blowing the
-    /// (necessarily finite) shadow-stack slot count.
+    /// to detect that recursion and fail clearly instead of emitting an
+    /// unbounded branch tree.
     printing_unions: Vec<String>,
-    /// Constant address of the owning `Codegen`'s `gc::ShadowTop` cell —
-    /// see `setup_shadow_frame`, the only consumer.
-    shadow_top_addr: i64,
     /// This function's own `mut` parameters (name, type), in declaration
     /// order — empty for `build_main_body`'s entry function, which never
     /// has parameters. Consulted by every `return_`-emitting site
@@ -208,6 +180,14 @@ fn overlay_safe(leaf_ty: &Type) -> bool {
 pub struct UnionLayout {
     /// Number of pointer columns.
     pub ptrs: usize,
+    /// The widest member's pointer-leaf count — `ptrs` before the forced
+    /// minimum of one that hosting the tag imposes. `0` means *no* member
+    /// ever puts a pointer in this union at all, so its tag column holds
+    /// nothing but a small tag: not scannable, and not worth spilling
+    /// around safepoints. `data Discount is NoDiscount | Percent(pct: Int)
+    /// | ...` is the case that matters — it is a union by type and pure
+    /// scalars by content.
+    pub ptrs_used: usize,
     /// Number of scalar columns.
     pub scalars: usize,
     /// True when the tag has a column to itself (see above).
@@ -236,6 +216,15 @@ impl UnionLayout {
     /// pointer back out needs the tag bits masked off.
     pub fn tag_shares_slot0(&self) -> bool {
         !self.dedicated_tag
+    }
+    /// Can slot `i` ever hold a heap pointer? False for the scalar columns,
+    /// and false for the tag column whenever the tag has it to itself — a
+    /// word that only ever holds `1..=6` is not worth scanning, and (much
+    /// more expensively) not worth spilling and reloading around every
+    /// safepoint the way a real root is.
+    pub fn slot_is_scannable(&self, i: usize) -> bool {
+        if i >= self.ptr_end() { return false; }
+        if self.dedicated_tag { i >= 1 } else { self.ptrs_used > 0 }
     }
 }
 
@@ -274,12 +263,13 @@ pub fn union_layout(members: &[Type], structs: &StructDefs) -> UnionLayout {
             if !overlay_safe(first) { dedicated_tag = true; }
         }
     }
+    let ptrs_used = ptrs;
     if !dedicated_tag {
         // Slot 0 doubles as pointer column 0, so there is always at least
         // one pointer column to host the tag.
         ptrs = ptrs.max(1);
     }
-    UnionLayout { ptrs, scalars, dedicated_tag }
+    UnionLayout { ptrs, ptrs_used, scalars, dedicated_tag }
 }
 
 /// For each of `member`'s leaves, in declaration order, the slot it occupies
@@ -332,7 +322,15 @@ fn pack_union_member(
     let mut slots: Vec<Option<Value>> = vec![None; layout.width()];
     for (i, (slot, shares_tag)) in map.iter().enumerate() {
         let mut w = to_i64_repr(bcx, &leaf_tys[i], leaf_vals[i]);
-        if *shares_tag { w = bcx.ins().bor_imm_s(w, tag as i64); }
+        if *shares_tag {
+            // OR-ing the tag in produces a *new* SSA value that is still a
+            // pointer to the same object, and the un-tagged one may die
+            // immediately — so the tagged word needs declaring in its own
+            // right. `gc::is_heap_ptr` masks the tag off, so the collector
+            // reads it correctly.
+            w = bcx.ins().bor_imm_s(w, tag as i64);
+            declare_gc_ptr(bcx, w);
+        }
         slots[*slot] = Some(w);
     }
     // Slot 0 always carries the tag. It is already written when this
@@ -365,7 +363,13 @@ fn unpack_union_member(
     let mut out = Vec::with_capacity(leaf_tys.len());
     for (i, (slot, shares_tag)) in map.iter().enumerate() {
         let mut w = slots[*slot];
-        if *shares_tag { w = bcx.ins().band_imm_s(w, !gc::TAG_MASK); }
+        if *shares_tag {
+            // Masking the tag off produces a new SSA value naming the same
+            // object; the tagged word it came from may die immediately, so
+            // this one is declared too (see `pack_union_member`).
+            w = bcx.ins().band_imm_s(w, !gc::TAG_MASK);
+            declare_gc_ptr(bcx, w);
+        }
         out.push(from_i64_repr(bcx, &leaf_tys[i], w));
     }
     out
@@ -458,7 +462,13 @@ pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
         Type::Union(members) if union_is_inline(members, structs) => {
             let l = union_layout(members, structs);
             let mut out = Vec::with_capacity(l.width());
-            for i in 0..l.ptr_end() { out.push((format!("$p{}", i), ty.clone())); }
+            for i in 0..l.ptr_end() {
+                // A column no member ever puts a pointer in is labelled a
+                // plain `Int`, so nothing downstream scans it, roots it, or
+                // spills it — see `UnionLayout::slot_is_scannable`.
+                let col = if l.slot_is_scannable(i) { ty.clone() } else { Type::Int };
+                out.push((format!("$p{}", i), col));
+            }
             for i in 0..l.scalars  { out.push((format!("$s{}", i), Type::Int)); }
             out
         },
@@ -491,6 +501,26 @@ pub fn heap_roots_in_leaves(vals: &[i64], leaf_tys: &[(String, Type)]) -> Vec<i6
     out
 }
 
+/// Which slots of the `out_ptr` buffer `__frog_main` writes its top-level
+/// bindings into are GC-scannable columns.
+///
+/// `bindings` is the list `compile_entry` returns, laid out back to back,
+/// each occupying `struct_fields(ty).len()` slots. Only the scannable
+/// columns are listed: the rest hold raw scalars, which carry no tag bits
+/// and must never be handed to the collector. See
+/// `gc::GcHeap::push_scanned_span` for why the buffer is scanned at all.
+pub fn gc_slots_of_bindings(bindings: &[(String, Type)], structs: &StructDefs) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for (_, ty) in bindings {
+        for (_, leaf_ty) in struct_fields(ty, structs) {
+            if is_heap_ty(&leaf_ty) { out.push(cursor); }
+            cursor += 1;
+        }
+    }
+    out
+}
+
 /// Build the `vars` map key for leaf `leaf_path` (from `struct_fields`) of
 /// the binding named `base`. For a scalar binding (`leaf_path == ""`) this
 /// is just `base` — identical to every key used before structs existed.
@@ -516,298 +546,49 @@ fn mut_param_copyout(bcx: &mut FunctionBuilder, vars: &HashMap<String, Variable>
     out
 }
 
-/// Number of heap-typed leaf fields in `ty` (0 for anything with none, 1 for
-/// a plain `Str`/`List`, N for a struct with N heap-typed leaves). Each one
-/// needs its own shadow-stack root — see call sites below.
-fn heap_leaf_count(ty: &Type, structs: &StructDefs) -> usize {
-    struct_fields(ty, structs).iter().filter(|(_, t)| is_heap_ty(t)).count()
-}
-
-/// Peak number of shadow-stack slots `expr`'s compiled function needs —
-/// what `setup_shadow_frame`'s `n` is sized from. Walks `expr` in exactly
-/// the recursion pattern `compile_expr` uses (including skipping over
-/// nested `Function` bodies, which are compiled separately, and never
-/// visiting `Var` — reading an existing binding doesn't produce a fresh
-/// pointer needing its own root) and charges one slot for every
-/// subexpression that allocates a new heap pointer, or that reads a
-/// heap-typed value out of memory the way `Index`/`FieldAccess`-on-a-union/
-/// `VariantField`/`Narrow` do (once per heap-typed leaf, for a struct- or
-/// union-typed one).
+/// Tell Cranelift that `val` must appear in stack maps: it is a word the
+/// collector will read and hand to `gc::is_heap_ptr`, so it must be spilled
+/// to a known offset around every safepoint it is live across.
 ///
-/// Every node charges by *sum*, including `Conditional`, whose two
-/// branches each get their own slot range even though only one of them
-/// ever runs at a time. Combining them by `max` (and resetting
-/// `ctx.heap_cursor` in `compile_conditional` to make the sharing real)
-/// was tried and reverted: mutual exclusion within one execution does not
-/// imply the reclaimed slots' occupants are dead, so a branch-produced
-/// value that escapes into an outer `mut` binding loses its only root the
-/// next time a loop back-edge re-runs the reset. See `compile_conditional`
-/// for the full argument. Sharing slots at all needs live ranges, not a
-/// structural mutual-exclusion argument — MUTABILITY.md stage 6.
+/// The invariant this maintains is simply **every SSA value whose static
+/// type is a GC-scannable column is declared**. Cranelift decides the rest:
+/// which of them are live where, which spill slot each gets, and which
+/// safepoints record which. A value that is genuinely dead after its
+/// definition is correctly absent from every map; a value we fail to declare
+/// is a missed root, which is why this is stated as a whole-program rule
+/// rather than a judgement made site by site.
+fn declare_gc_value(bcx: &mut FunctionBuilder, ty: &Type, val: Value) {
+    if is_heap_ty(ty) {
+        declare_gc_ptr(bcx, val);
+    }
+}
+
+/// `declare_gc_value` for a value already known to be a GC-visible word —
+/// a fresh allocation, or a leaf whose column type the caller has already
+/// checked.
+fn declare_gc_ptr(bcx: &mut FunctionBuilder, val: Value) {
+    bcx.declare_value_needs_stack_map(val);
+}
+
+/// `declare_gc_value` for a whole flattened value: `vals` aligned 1:1 with
+/// `leaf_tys` (`struct_fields`'s output types).
+fn declare_gc_leaves(bcx: &mut FunctionBuilder, vals: &[Value], leaf_tys: &[Type]) {
+    for (v, t) in vals.iter().zip(leaf_tys.iter()) {
+        declare_gc_value(bcx, t, *v);
+    }
+}
+
+/// `declare_gc_value` for a `Variable`, which propagates to every value
+/// `use_var`/`def_var` ever produces for it *and* to the block parameters
+/// Cranelift's SSA construction inserts to route it between blocks — that
+/// last part is why froglang needs cranelift >= 0.135, see
+/// `tests/test_cranelift_stack_maps.rs`.
 ///
-/// So no slot is ever reused: one per producer site, held for the whole
-/// function. This function and `compile_expr_multi`'s `root_heap_value`
-/// calls must still stay in exact lockstep — the hazard `Ctx.heap_max`'s
-/// own doc comment describes.
-fn max_heap_slots(expr: &Spanned<TypedExpr>, structs: &StructDefs) -> usize {
-    match &expr.item.kind {
-        TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_)
-        | TypedExprKind::BoolLit(_) | TypedExprKind::Var(_) => 0,
-
-        TypedExprKind::StrLit(_) => 1,
-
-        TypedExprKind::Unary { expr: inner, .. } => max_heap_slots(inner, structs),
-
-        TypedExprKind::Binary { op, left, right } => {
-            let mut n = max_heap_slots(left, structs) + max_heap_slots(right, structs);
-            // Only Str + Str (concat) allocates; Str == / != Str yields Bool.
-            if *op == Token::Plus && left.item.ty == Type::Str { n += 1; }
-            n
-        },
-
-        // Sums like every other arm — the branches do not share slots.
-        // See this function's own doc comment.
-        TypedExprKind::Conditional { cond, true_branch, false_branch } => {
-            let t = max_heap_slots(true_branch, structs);
-            let f = false_branch.as_ref().map_or(0, |fb| max_heap_slots(fb, structs));
-            max_heap_slots(cond, structs) + t + f
-        },
-
-        TypedExprKind::Call { callable, args, mut_args } => {
-            let mut n = max_heap_slots(callable, structs);
-            for arg in args { n += max_heap_slots(arg, structs); }
-            // `print`'s codegen (`print_union`) reads whichever member of a
-            // union-typed argument matched at runtime via
-            // `read_variant_slots`, rooting one slot per heap-typed leaf of
-            // that member. Which member is a runtime fact, so —
-            // conservatively — reserve for every member.
-            if let (TypedExprKind::Var(name), [arg, ..]) = (&callable.item.kind, args.as_slice()) {
-                if name == "print" {
-                    if let Type::Union(members) = &arg.item.ty {
-                        // Only a *boxed* union's members are read out of
-                        // heap memory; an inline one is unpacked from
-                        // registers and roots nothing (see `Narrow`).
-                        if !union_is_inline(members, structs) {
-                            for m in members { n += heap_leaf_count(m, structs); }
-                        }
-                    }
-                }
-            }
-            // A struct-typed return re-roots one heap-typed leaf at a time
-            // (see the `Call` arm of `compile_expr_multi`) — count matches.
-            n += heap_leaf_count(&expr.item.ty, structs);
-            // Each `mut` argument's copy-out value (`Function`'s doc
-            // comment) crosses the ABI boundary as a fresh register value
-            // exactly like the call's own primary return does — same
-            // rooting need, one count per `mut` argument's own type.
-            for (arg, is_mut) in args.iter().zip(mut_args.iter()) {
-                if *is_mut { n += heap_leaf_count(&arg.item.ty, structs); }
-            }
-            n
-        },
-
-        TypedExprKind::Index { target, index } => {
-            // A heap-typed element read out of a list isn't a fresh
-            // allocation, but it needs its own shadow-stack root all the
-            // same: once read, it's only reachable from the containing
-            // list, which may itself go unrooted (e.g. a temporary list
-            // literal) before this value is done being used.
-            max_heap_slots(target, structs) + max_heap_slots(index, structs) + heap_leaf_count(&expr.item.ty, structs)
-        },
-
-        TypedExprKind::Slice { target, start, end } => {
-            // Unlike Index, a slice always allocates a brand-new list.
-            let mut n = max_heap_slots(target, structs) + 1;
-            if let Some(s) = start { n += max_heap_slots(s, structs); }
-            if let Some(e) = end { n += max_heap_slots(e, structs); }
-            n
-        },
-
-        // Always allocates the materialized list.
-        TypedExprKind::Range { start, end } => max_heap_slots(start, structs) + max_heap_slots(end, structs) + 1,
-
-        TypedExprKind::Assign { value, .. } => {
-            // Mirrors compile_expr's Assign arm, which never visits a
-            // Function value (it's compiled separately as a top-level fn).
-            if matches!(value.item.kind, TypedExprKind::Function { .. }) { 0 } else { max_heap_slots(value, structs) }
-        },
-
-        TypedExprKind::Function { .. } => 0,
-
-        TypedExprKind::List(elems) => elems.iter().map(|e| max_heap_slots(e, structs)).sum::<usize>() + 1,
-
-        TypedExprKind::Block(stmts) => stmts.iter().map(|s| max_heap_slots(s, structs)).sum(),
-
-        TypedExprKind::ForLoop { iterable, cond, body, .. } => {
-            // Reading a heap-typed element out of the list each iteration
-            // needs its own root, same reasoning as `Index` above — see
-            // `compile_for_loop`'s `root_heap_value(bcx, ctx, elem)` call.
-            // Slots are reserved once, not per iteration — the loop body
-            // reuses the same slot range every pass, since a producer site
-            // inside the body re-runs and overwrites its own slot.
-            //
-            // KNOWN UNSOUND, pre-existing: that overwrite has the same
-            // defect as the reverted `Conditional` sharing (see
-            // `compile_conditional`). A binding that outlives the loop has
-            // no root of its own — `let s = <producer>` binds `s` to the
-            // *producer's* slot — so `best = s` inside the body leaves
-            // `best`'s value rooted only until iteration k+1 re-runs that
-            // producer. See `tests/test_gc_roots.rs`. The fix is roots
-            // owned per binding, not per producer site: MUTABILITY.md
-            // stage 6.
-            let mut n = max_heap_slots(iterable, structs) + elem_heap_leaf_count(iterable, structs);
-            if let Some(c) = cond { n += max_heap_slots(c, structs); }
-            n + max_heap_slots(body, structs)
-        },
-
-        TypedExprKind::Comprehension { iterable, cond, body, .. } => {
-            // The result list is allocated (and rooted) before the loop
-            // starts — see `compile_expr`'s `Comprehension` arm.
-            let mut n = 1 + max_heap_slots(iterable, structs) + elem_heap_leaf_count(iterable, structs);
-            if let Some(c) = cond { n += max_heap_slots(c, structs); }
-            n + max_heap_slots(body, structs)
-        },
-
-        // A struct value is never itself a single heap pointer — it's
-        // flattened into its leaf fields (see `struct_fields`), each rooted
-        // individually wherever it's actually produced. So unlike `List`,
-        // `StructInit` charges for its *fields'* producers only, never for
-        // itself.
-        TypedExprKind::StructInit { fields, .. } => fields.iter().map(|(_, v)| max_heap_slots(v, structs)).sum(),
-
-        // Reading a field off an already-bound struct isn't itself a new
-        // heap-value producer (its leaf is a `Variable`, already rooted
-        // wherever it was produced) — only `target` might be (e.g.
-        // `f().name`). A union-typed target is different: its fields live
-        // in heap memory, so *reading* one is a fresh `Value` each time,
-        // same as a list-element read (`Index`, above) — needs its own root.
-        TypedExprKind::FieldAccess { target, enum_name, .. } => {
-            let boxed_union = enum_name.is_some()
-                && !matches!(&target.item.ty, Type::Union(members) if union_is_inline(members, structs));
-            max_heap_slots(target, structs)
-                + if boxed_union { heap_leaf_count(&expr.item.ty, structs) } else { 0 }
-        },
-
-        // Mirrors `Index`'s own arm above: an `Index` path segment's inner
-        // expression is Int-typed itself, but evaluating it can still
-        // pass through heap-producing subexpressions on the way there.
-        TypedExprKind::PlaceAssign { path, value, .. } => {
-            let mut n = 0;
-            for seg in path {
-                if let PlaceSeg::Index { index, .. } = seg { n += max_heap_slots(index, structs); }
-            }
-            n + max_heap_slots(value, structs)
-        },
-
-        // A new heap object, just like `List`/`Slice`/`Range` — charges its
-        // fields' own producers first, then itself.
-        TypedExprKind::VariantInit { fields, .. } => {
-            let mut n: usize = fields.iter().map(|(_, v)| max_heap_slots(v, structs)).sum();
-            // An inline union allocates nothing (see `Widen`), and even a
-            // boxed union's payload-less variant compiles to an immediate
-            // rather than an allocation — see the matching arm in
-            // `compile_expr_multi`.
-            let inline = matches!(&expr.item.ty, Type::Union(members) if union_is_inline(members, structs));
-            if !inline && !fields.is_empty() { n += 1; }
-            n
-        },
-
-        // A runtime tag test — no allocation; only `target`'s own
-        // producers (if any) matter.
-        TypedExprKind::IsVariant { target, .. } => max_heap_slots(target, structs),
-
-        // Reading a variant's own field out of a *boxed* union is a fresh
-        // heap read, exactly like the enum arm of `FieldAccess` above. Out
-        // of an inline one it is a register mask — see `Narrow`.
-        TypedExprKind::VariantField { target, .. } => {
-            let inline = matches!(&target.item.ty, Type::Union(members) if union_is_inline(members, structs));
-            max_heap_slots(target, structs)
-                + if inline { 0 } else { heap_leaf_count(&expr.item.ty, structs) }
-        },
-
-        // `return` itself allocates nothing — whatever `value` produces is
-        // already accounted for by recursing into it.
-        TypedExprKind::Return(value) => value.as_ref().map_or(0, |v| max_heap_slots(v, structs)),
-
-        TypedExprKind::NoneLit => 0,
-
-        // An inline union (`union_is_inline`) allocates nothing at all —
-        // `compile_widen` writes the value's own leaves into the union's
-        // columns, and each of those leaves was already rooted at its own
-        // producer site, so no new root is needed either. A boxed union
-        // still boxes, except for a payload-less member, which is an
-        // immediate.
-        TypedExprKind::Widen { value, .. } => {
-            let mut n = max_heap_slots(value, structs);
-            let inline = matches!(&expr.item.ty, Type::Union(members) if union_is_inline(members, structs));
-            if !inline && value.item.ty != Type::None { n += 1; }
-            n
-        },
-
-        // Reading a member back out of an inline union is register
-        // arithmetic — a mask, no memory access — and whatever a pointer
-        // column names stays reachable through the union's own root, so
-        // nothing new is produced. A boxed union's payload is a genuine
-        // heap read that `read_variant_slots` roots, one slot per heap-typed
-        // leaf, exactly like `VariantField`.
-        TypedExprKind::Narrow { value, .. } => {
-            let inline = matches!(&value.item.ty, Type::Union(members) if union_is_inline(members, structs));
-            max_heap_slots(value, structs)
-                + if inline { 0 } else { heap_leaf_count(&expr.item.ty, structs) }
-        },
-
-        // A runtime tag test on an anonymous union — no allocation, exactly
-        // like `IsVariant`.
-        TypedExprKind::TypeTag { target, .. } => max_heap_slots(target, structs),
-
-        // A `Bool`-producing test on `value` — no allocation of its own,
-        // just whatever `value` itself produces.
-        TypedExprKind::Truthy(value) => max_heap_slots(value, structs),
-
-        // A numeric promotion produces no heap value of its own — only its
-        // operand can.
-        TypedExprKind::Coerce(value) => max_heap_slots(value, structs),
-    }
-}
-
-/// Number of heap-typed leaf fields in `iterable`'s element type
-/// (`iterable.item.ty` is always `List(elem)` after type checking) — 0 for
-/// a scalar element, 1 for a plain `Str`/`List` element, N for a struct
-/// element with N heap-typed leaves.
-fn elem_heap_leaf_count(iterable: &Spanned<TypedExpr>, structs: &StructDefs) -> usize {
-    match &iterable.item.ty {
-        Type::List(inner) => heap_leaf_count(inner, structs),
-        _ => 0,
-    }
-}
-
-/// Store a freshly-produced heap pointer into the next shadow-stack slot, if
-/// this function has one (no-op for functions with no heap-typed values).
-fn root_heap_value(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) {
-    if let Some(slot) = ctx.heap_slot {
-        debug_assert!(
-            ctx.heap_cursor < ctx.heap_max,
-            "shadow frame overflow: slot {} of {} — `for_each_heap_producer` undercounts this expression's heap producers",
-            ctx.heap_cursor, ctx.heap_max,
-        );
-        let offset = SHADOW_SLOTS_OFFSET + (ctx.heap_cursor * 8) as i32;
-        bcx.ins().stack_store(types::I64, val, slot, offset);
-        ctx.heap_cursor += 1;
-    }
-}
-
-/// Root every GC-scannable leaf in `vals` (aligned 1:1 with `leaf_tys`,
-/// e.g. `struct_fields`'s output types). Under the uniform word encoding
-/// (gc.rs) this is a straight filter on the column type — the collector
-/// screens each word with `is_heap_ptr` itself, so a tag-only inline-union
-/// word or an immediate roots harmlessly. The old conditional variant
-/// (`root_two_slot_payload`, which had to `select` on a sibling tag) is
-/// gone with the representation that needed it.
-fn root_flat_leaves(bcx: &mut FunctionBuilder, ctx: &mut Ctx, vals: &[Value], leaf_tys: &[Type]) {
-    for (i, lty) in leaf_tys.iter().enumerate() {
-        if is_heap_ty(lty) {
-            root_heap_value(bcx, ctx, vals[i]);
-        }
+/// Must be called before the variable's first definition; Cranelift asserts
+/// this, since an earlier definition would be silently omitted.
+fn declare_gc_var(bcx: &mut FunctionBuilder, ty: &Type, var: Variable) {
+    if is_heap_ty(ty) {
+        bcx.declare_var_needs_stack_map(var);
     }
 }
 
@@ -975,99 +756,13 @@ fn box_into_variant(tag: u32, flat_vals: &[Value], flat_types: &[Type], bcx: &mu
     // Root the new object itself before populating it — matches the
     // traversal order `for_each_heap_producer` uses for both callers
     // (fields'/value's own producers first, then `f()` for this box).
-    root_heap_value(bcx, ctx, ptr);
+    declare_gc_ptr(bcx, ptr);
 
     for (i, (v, t)) in flat_vals.iter().zip(flat_types.iter()).enumerate() {
         let wire = to_i64_repr(bcx, t, *v);
         bcx.ins().store(heap_mem(), wire, ptr, variant_slot_offset(i));
     }
     ptr
-}
-
-/// Byte offset of a shadow frame's first root slot — the `gc::ShadowFrame`
-/// header (`prev`, `len`) sits in front of them, in the same stack
-/// allocation. `root_heap_value` adds `8 * cursor` to this.
-const SHADOW_SLOTS_OFFSET: i32 = std::mem::size_of::<gc::ShadowFrame>() as i32;
-
-/// If `n > 0`, allocate a stack region holding a `gc::ShadowFrame` header
-/// followed by `n` root slots, and link it onto the front of the shadow
-/// stack. Returns `None` — and emits no IR at all — for functions with no
-/// heap-typed subexpressions.
-///
-/// This is all inline: a load of the head cell, two header stores, the
-/// zeroing of the slots, and a store back to the head cell. It used to be a
-/// `frog_frame_push` call, which cost an out-of-line call, a thread-local
-/// lookup to find the active heap, a `Vec` push, and a `memset` libcall —
-/// together the largest single entry in `benches/orders.frog`'s profile.
-/// `shadow_top_addr` is the (constant, `is_pic == false`) address of the
-/// owning `Codegen`'s `gc::ShadowTop` cell.
-fn setup_shadow_frame(
-    bcx: &mut FunctionBuilder,
-    module: &mut JITModule,
-    shadow_top_addr: i64,
-    n: usize,
-) -> Option<StackSlot> {
-    if n == 0 { return None; }
-    let header = SHADOW_SLOTS_OFFSET as u32;
-    let slot = bcx.create_sized_stack_slot(StackSlotData::new(
-        StackSlotKind::ExplicitSlot,
-        header + (n * 8) as u32,
-        3, // 8-byte aligned (align_shift = log2(8))
-    ));
-    let frame = bcx.ins().stack_addr(types::I64, slot, 0);
-    let top_cell = bcx.ins().iconst(types::I64, shadow_top_addr);
-
-    // frame.prev = *top_cell; frame.len = n;
-    let prev = bcx.ins().load(types::I64, heap_mem(), top_cell, 0);
-    bcx.ins().store(heap_mem(), prev, frame, 0);
-    let len_val = bcx.ins().iconst(types::I64, n as i64);
-    bcx.ins().store(heap_mem(), len_val, frame, 8);
-
-    // Zero the root slots: an unwritten slot otherwise holds stack garbage
-    // that the mark phase would follow as a pointer.
-    //
-    // Emitted as plain stores rather than via `emit_small_memset`, whose
-    // own inline-vs-libcall threshold is only a few stores — small enough
-    // that an ordinary hot function's frame became a `memset` call per
-    // invocation, which is exactly what removing `frog_frame_push` was
-    // meant to avoid. Past `INLINE_ZERO_SLOTS` the store count would start
-    // to cost more in code size than the call does in time, and a frame
-    // that wide belongs to a big top-level body entered once, not to a
-    // function in a loop.
-    const INLINE_ZERO_SLOTS: usize = 16;
-    if n <= INLINE_ZERO_SLOTS {
-        let zero = bcx.ins().iconst(types::I64, 0);
-        for i in 0..n {
-            bcx.ins().stack_store(types::I64, zero, slot, SHADOW_SLOTS_OFFSET + (i * 8) as i32);
-        }
-    } else {
-        let slots = bcx.ins().stack_addr(types::I64, slot, SHADOW_SLOTS_OFFSET);
-        let config = module.target_config();
-        bcx.emit_small_memset(config, slots, 0, (n * 8) as u64, 8, MemFlagsData::from(heap_mem()));
-    }
-
-    // *top_cell = frame — publish only now that the frame is fully
-    // initialised, so a collection triggered from anywhere after this point
-    // sees zeroed slots rather than garbage.
-    bcx.ins().store(heap_mem(), frame, top_cell, 0);
-    Some(slot)
-}
-
-/// Unlink the frame `setup_shadow_frame` pushed, if any, by restoring the
-/// head cell to this frame's `prev`. Must run on every path out of the
-/// function, before `return_`.
-fn teardown_shadow_frame(
-    bcx: &mut FunctionBuilder,
-    shadow_top_addr: i64,
-    slot: Option<StackSlot>,
-) {
-    let Some(slot) = slot else { return };
-    // Reload `prev` from the frame rather than reusing the entry block's
-    // value: this runs from whichever block holds the `return`, and a
-    // reload is valid in all of them.
-    let prev = bcx.ins().stack_load(types::I64, types::I64, slot, 0);
-    let top_cell = bcx.ins().iconst(types::I64, shadow_top_addr);
-    bcx.ins().store(heap_mem(), prev, top_cell, 0);
 }
 
 /// Look up `name`'s Cranelift `Variable`, declaring a fresh one (with `ty`'s
@@ -1090,6 +785,9 @@ fn get_or_declare_var(
         return v;
     }
     let v = bcx.declare_var(cl_type(ty));
+    // Before the first `def_var`, which Cranelift requires — an earlier
+    // definition would be silently left out of every stack map.
+    declare_gc_var(bcx, ty, v);
     vars.insert(name.to_string(), v);
     v
 }
@@ -1105,6 +803,7 @@ fn declare_and_def_var(
     val: Value,
 ) {
     let v = bcx.declare_var(cl_type(ty));
+    declare_gc_var(bcx, ty, v);
     vars.insert(name.to_string(), v);
     bcx.def_var(v, val);
 }
@@ -1347,9 +1046,8 @@ fn print_union(members: &[Type], arg_vals: &[Value], bcx: &mut FunctionBuilder, 
     // which only rejects an *unboxed* cycle). Printing recurses through
     // `print_union_member` → `print_value` back into `print_union` for that
     // same field type, so a genuinely recursive union would need unbounded
-    // branch trees at codegen time — reject it clearly instead of either
-    // hanging the compiler or (since shadow-stack slots are necessarily
-    // finite) blowing `root_heap_value`'s slot count.
+    // branch trees at codegen time — reject it clearly instead of
+    // hanging the compiler.
     let shape = format!("{:?}", members);
     if ctx.printing_unions.contains(&shape) {
         panic!(
@@ -1498,10 +1196,10 @@ fn compile_expr(
 /// executes; `frog_alloc_str` copies bytes immediately, so the arena only
 /// needs to outlive the call to the compiled function.
 ///
-/// Every subexpression that allocates a new heap pointer (see
-/// `for_each_heap_producer`) is stored into `ctx`'s shadow-stack slot via
-/// `root_heap_value` immediately after being produced, so it stays visible to
-/// the GC's mark phase for the remainder of this function's execution.
+/// Every SSA value whose static type is GC-scannable is declared to
+/// Cranelift (`declare_gc_value`/`declare_gc_var`) at or near the point it
+/// is produced, so it stays visible to a collection triggered anywhere it
+/// remains live — see `gc.rs`'s "Precise roots".
 /// Split a `PlaceAssign` path into the dotted field path before any
 /// `Index` step (`""` if the path starts with the index), the `Index`
 /// step's lowered expression and resolved element type if present
@@ -1612,7 +1310,7 @@ fn compile_expr_multi(
             let callee  = ctx.module.declare_func_in_func(func_id, bcx.func);
             let call    = bcx.ins().call(callee, &[data_val, len_val]);
             let result  = bcx.inst_results(call)[0];
-            root_heap_value(bcx, ctx, result);
+            declare_gc_ptr(bcx, result);
             vec![result]
         },
 
@@ -1670,7 +1368,7 @@ fn compile_expr_multi(
             // Which leaves are GC-scannable is a property of the column
             // (`is_heap_ty`), so `root_flat_leaves` needs nothing else.
             let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
-            root_flat_leaves(bcx, ctx, &results, &leaf_tys);
+            declare_gc_leaves(bcx, &results, &leaf_tys);
             results
         },
 
@@ -1692,7 +1390,7 @@ fn compile_expr_multi(
             let callee = ctx.module.declare_func_in_func(id, bcx.func);
             let call   = bcx.ins().call(callee, &[list_val, start_val, end_val]);
             let result = bcx.inst_results(call)[0];
-            root_heap_value(bcx, ctx, result);
+            declare_gc_ptr(bcx, result);
             vec![result]
         },
 
@@ -1704,7 +1402,7 @@ fn compile_expr_multi(
             let callee = ctx.module.declare_func_in_func(id, bcx.func);
             let call   = bcx.ins().call(callee, &[start_val, end_val]);
             let result = bcx.inst_results(call)[0];
-            root_heap_value(bcx, ctx, result);
+            declare_gc_ptr(bcx, result);
             vec![result]
         },
 
@@ -1758,7 +1456,7 @@ fn compile_expr_multi(
             // Root the result list before the loop runs at all: it must
             // already be reachable by the time the first pushed element
             // (or the iterable itself) can trigger a collection.
-            root_heap_value(bcx, ctx, result_list);
+            declare_gc_ptr(bcx, result_list);
 
             compile_for_loop(var, iterable, cond, body, Some(result_list), bcx, vars, ctx);
             vec![result_list]
@@ -1901,7 +1599,7 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
                 let callee = ctx.module.declare_func_in_func(id, bcx.func);
                 let call   = bcx.ins().call(callee, &[lv, rv]);
                 let result = bcx.inst_results(call)[0];
-                root_heap_value(bcx, ctx, result);
+                declare_gc_ptr(bcx, result);
                 result
             },
             Token::EqEq | Token::NotEq => {
@@ -2035,15 +1733,16 @@ fn compile_conditional(
     if expr.item.ty == Type::Never {
         bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
 
-        // NOTE: the two branches do *not* share shadow-stack slots, even
-        // though only one of them ever runs. Sharing them (resetting
-        // `ctx.heap_cursor` before `false_branch`) is unsound: a slot is
-        // the only root a value held in an SSA register / Cranelift
-        // `Variable` has, so overwriting a slot is only legal at a point
-        // where its current occupant is *dead*. A value produced in one
-        // branch can escape the conditional (assigned to an outer `mut`
-        // binding), and a loop back-edge can then re-execute the reset
-        // while it is still live — iteration k's root gets clobbered by
+        // NOTE, historical: an earlier shadow-stack representation gave
+        // both branches of a `Conditional` overlapping root-slot ranges on
+        // the argument that only one of them ever runs. That was unsound —
+        // a value produced in one branch can escape (assigned to an outer
+        // `mut` binding), and a loop back-edge can re-run the conditional
+        // while it is still live. Cranelift's stack maps make the question
+        // moot: root liveness is now real live-range analysis, not a
+        // structural mutual-exclusion argument, so nothing here shares or
+        // needs to share anything. See RUNTIME.md Part 2 and, for the bug
+        // this replaced,
         // iteration k+1 taking the other branch, and the GC frees a value
         // the program still holds. Slots are therefore never reused: each
         // producer site owns one for the whole function, which meets the
@@ -2071,7 +1770,7 @@ fn compile_conditional(
         // `Never` conditional's own trap, `return_`, or the `trap`
         // just emitted) — this conditional itself is `Never`-typed,
         // so it might be the tail of its enclosing function body
-        // (`build_func_body`'s own tail `return_`/`teardown_shadow_frame`
+        // (`build_func_body`'s own tail `return_`
         // would otherwise try to append to an already-filled
         // block), or nested inside a `Block`/another `Conditional`
         // that keeps building after it. Either way it needs a
@@ -2096,8 +1795,6 @@ fn compile_conditional(
 
         bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
 
-        // See the `Type::Never` branch above for why the branches must
-        // not share shadow-stack slots.
         bcx.switch_to_block(true_bb);
         bcx.seal_block(true_bb);
         // `compile_expr_multi`, not `compile_expr` — a `Never`-typed
@@ -2140,7 +1837,13 @@ fn compile_conditional(
         bcx.seal_block(merge_bb);
 
         if has_value {
-            vec![bcx.block_params(merge_bb)[0]]
+            // A fresh SSA value carrying whichever branch's result arrived;
+            // the branch values that fed it are dead here, so if this is a
+            // GC-scannable column it needs declaring in its own right (see
+            // `declare_gc_value`'s whole-program rule).
+            let merged = bcx.block_params(merge_bb)[0];
+            declare_gc_value(bcx, &expr.item.ty, merged);
+            vec![merged]
         } else {
             vec![bcx.ins().iconst(types::I64, 0)]
         }
@@ -2158,8 +1861,6 @@ fn compile_conditional(
 
         bcx.ins().brif(cond_val, true_bb, &[], false_bb, &[]);
 
-        // See the `Type::Never` branch above for why the branches must
-        // not share shadow-stack slots.
         bcx.switch_to_block(true_bb);
         bcx.seal_block(true_bb);
         let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
@@ -2184,7 +1885,14 @@ fn compile_conditional(
         };
         bcx.switch_to_block(merge_bb);
         bcx.seal_block(merge_bb);
-        bcx.block_params(merge_bb).to_vec()
+        // The merge parameters are fresh SSA values carrying whichever
+        // branch's leaves arrived, so each GC-scannable column among them
+        // needs declaring in its own right — the branch values that fed
+        // them are dead here (see `declare_gc_value`'s whole-program rule).
+        let merged = bcx.block_params(merge_bb).to_vec();
+        let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
+        declare_gc_leaves(bcx, &merged, &leaf_tys);
+        merged
     }
 }
 
@@ -2321,22 +2029,20 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
     } else if is_multi_leaf_type(&return_ty, ctx.structs) {
         // Each GC-scannable leaf of a struct return, or of an
         // inline union return, crosses the ABI boundary as a bare
-        // register value — the callee's own shadow frame (which
-        // rooted it during its own execution) is already popped by
-        // the time we get here, so it must be re-rooted into *this*
-        // function's frame immediately, exactly like the scalar
-        // Str/List case below. Which leaves those are is static
+        // register value, a fresh SSA value on this side of the call
+        // that needs declaring in its own right, exactly like the
+        // scalar Str/List case below. Which leaves those are is static
         // (`is_heap_ty` on the column), and the collector screens
         // each word with `gc::is_heap_ptr` itself, so a tag-only
         // inline-union word roots harmlessly.
         let leaf_tys: Vec<Type> = struct_fields(&return_ty, ctx.structs)
             .into_iter().map(|(_, t)| t).collect();
-        root_flat_leaves(bcx, ctx, primary_raw, &leaf_tys);
+        declare_gc_leaves(bcx, primary_raw, &leaf_tys);
         primary_raw.to_vec()
     } else {
         let result = primary_raw[0];
         if is_heap_ty(&return_ty) {
-            root_heap_value(bcx, ctx, result);
+            declare_gc_ptr(bcx, result);
         }
         vec![result]
     };
@@ -2355,7 +2061,7 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         let (this_arg, rest) = copyout_raw.split_at(leafs.len());
         copyout_raw = rest;
         let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
-        root_flat_leaves(bcx, ctx, this_arg, &leaf_tys);
+        declare_gc_leaves(bcx, this_arg, &leaf_tys);
         for (v, (path, lty)) in this_arg.iter().zip(leafs.iter()) {
             let key = var_key(&name, path);
             let var = get_or_declare_var(bcx, vars, &key, lty);
@@ -2387,7 +2093,7 @@ fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut Func
     // Root the list itself *before* compiling its elements: an
     // element expression (e.g. a Str) can allocate and trigger a
     // collection, and the list must already be reachable by then.
-    root_heap_value(bcx, ctx, list_ptr);
+    declare_gc_ptr(bcx, list_ptr);
 
     for elem in elems {
         // A struct element compiles to `leafs.len()` values, pushed
@@ -2458,11 +2164,9 @@ fn compile_return(value: &Option<TypedExprRef>, bcx: &mut FunctionBuilder, vars:
         Some(v) => compile_expr_multi(v, bcx, vars, ctx),
         None => Vec::new(),
     };
-    // Every path out of the function pops the shadow frame first —
-    // this is an *early* exit, so it must do the same thing
-    // `build_func_body`'s own tail `return_` does, not skip it.
-    teardown_shadow_frame(bcx, ctx.shadow_top_addr, ctx.heap_slot);
-    // And every path out must also carry each `mut` parameter's current
+    // This is an *early* exit, so it must do the same thing
+    // `build_func_body`'s own tail `return_` does, not skip it: carry
+    // each `mut` parameter's current
     // value, exactly like the tail return does — an early `return` is
     // just as much an exit as falling off the end of the body.
     results.extend(mut_param_copyout(bcx, vars, ctx));
@@ -2590,11 +2294,10 @@ fn compile_truthy(value: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &
 
 /// Read `leaf_types.len()` consecutive payload slots starting at `offset`
 /// out of the `FrogVariant` at `ptr`, converting each back from its
-/// `i64`-wire representation and — for a heap-typed leaf — rooting the
-/// freshly-read pointer (it's only reachable via `ptr`, which may itself
-/// go unrooted before this value is done being used, exactly like a
-/// list-element read — see `for_each_heap_producer`).
-fn read_variant_slots(ptr: Value, offset: usize, leaf_types: &[Type], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Vec<Value> {
+/// `i64`-wire representation and declaring each GC-scannable one to
+/// Cranelift — a freshly-loaded pointer is a new SSA value, and `ptr`
+/// itself may die before it does.
+fn read_variant_slots(ptr: Value, offset: usize, leaf_types: &[Type], bcx: &mut FunctionBuilder, _ctx: &mut Ctx) -> Vec<Value> {
     let mut out = Vec::with_capacity(leaf_types.len());
     for (i, lty) in leaf_types.iter().enumerate() {
         // Only a variant that has payload slots to read is ever boxed, so
@@ -2602,7 +2305,7 @@ fn read_variant_slots(ptr: Value, offset: usize, leaf_types: &[Type], bcx: &mut 
         let raw = bcx.ins().load(types::I64, heap_mem(), ptr, variant_slot_offset(offset + i));
         out.push(from_i64_repr(bcx, lty, raw));
     }
-    root_flat_leaves(bcx, ctx, &out, leaf_types);
+    declare_gc_leaves(bcx, &out, leaf_types);
     out
 }
 
@@ -2762,7 +2465,7 @@ fn compile_for_loop(
     // collect, so there's no window to lose one in. Which leaves are
     // GC-scannable is a property of the column (`is_heap_ty`).
     let elem_leaf_tys: Vec<Type> = elem_leafs.iter().map(|(_, t)| t.clone()).collect();
-    root_flat_leaves(bcx, ctx, &elem_vals, &elem_leaf_tys);
+    declare_gc_leaves(bcx, &elem_vals, &elem_leaf_tys);
     for ((leaf_path, lty), elem_val) in elem_leafs.iter().zip(elem_vals) {
         let key = var_key(var, leaf_path);
         let var_id = get_or_declare_var(bcx, vars, &key, lty);
@@ -2834,6 +2537,12 @@ impl Codegen {
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("is_pic", "false").expect("is_pic setting");
+        // The collector finds its roots by walking the native stack frame
+        // by frame (`gc.rs`, "Precise roots"), which needs every JIT frame
+        // to actually have a frame pointer. Without this, Cranelift is free
+        // to use the frame-pointer register as a general one and the chain
+        // ends at the first function that does.
+        flag_builder.set("preserve_frame_pointers", "true").expect("preserve_frame_pointers setting");
         let flags = settings::Flags::new(flag_builder);
         let isa = cranelift_native::builder()
             .expect("host machine not supported by Cranelift")
@@ -2931,7 +2640,6 @@ impl Codegen {
             module,
             func_ids,
             builder_ctx: FunctionBuilderContext::new(),
-            shadow_top: Box::new(gc::ShadowTop::new()),
         }
     }
 
@@ -2979,7 +2687,6 @@ impl Codegen {
         string_arena: &mut Vec<Vec<u8>>,
         structs: &StructDefs,
         unions: &UnionDefs,
-        shadow_top_addr: i64,
     ) {
         let target_config = module.target_config();
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
@@ -3015,11 +2722,8 @@ impl Codegen {
             liveness::dump_body(name, body, &body_liveness);
         }
 
-        let n = max_heap_slots(body, structs);
-        let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params };
+        let mut ctx = Ctx { func_ids, module, string_arena, structs, unions, printing_unions: Vec::new(), mut_params };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
-        teardown_shadow_frame(&mut bcx, shadow_top_addr, heap_slot);
 
         if *return_type != Type::None {
             // If the body's own type is `Never`, it already returned
@@ -3092,7 +2796,6 @@ impl Codegen {
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
         unions: &UnionDefs,
-        shadow_top_addr: i64,
     ) -> Vec<(String, Type)> {
         let target_config = module.target_config();
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
@@ -3143,9 +2846,7 @@ impl Codegen {
             liveness::dump_entry("<entry>", stmts, &entry_liveness);
         }
 
-        let n: usize = stmts.iter().map(|s| max_heap_slots(s, structs)).sum();
-        let heap_slot = setup_shadow_frame(&mut bcx, module, shadow_top_addr, n);
-        let mut ctx = Ctx { func_ids, module, string_arena, heap_slot, heap_cursor: 0, heap_max: n, structs, unions, printing_unions: Vec::new(), shadow_top_addr, mut_params: Vec::new() };
+        let mut ctx = Ctx { func_ids, module, string_arena, structs, unions, printing_unions: Vec::new(), mut_params: Vec::new() };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;
@@ -3209,7 +2910,6 @@ impl Codegen {
             last_ty = &stmt.item.ty;
         }
 
-        teardown_shadow_frame(&mut bcx, shadow_top_addr, heap_slot);
 
         // __frog_main[_N] always returns a single i64 (see this function's
         // doc comment — a struct-typed final result only reports its first
@@ -3267,11 +2967,10 @@ impl Codegen {
             }
         }
 
-        // Every function compiled below links its shadow frame into *this*
-        // `Codegen`'s head cell, whose address is a constant in the emitted
-        // code (`setup_shadow_frame`). Read it once, before the `&mut self`
-        // borrows below.
-        let shadow_top_addr = self.shadow_top() as i64;
+        // Stack maps come off each `Context` right after `define_function`,
+        // but a function has no address until `finalize_definitions` below,
+        // so they are held here and filed once at the end.
+        let mut pending_maps: Vec<(FuncId, gc::JitFunctionMaps)> = Vec::new();
 
         // ── Pass 2: Define all function bodies ───────────────────────────────
         let func_defs: Vec<(String, FuncId, Vec<(String, Type, bool)>, Type, Box<Spanned<TypedExpr>>)> =
@@ -3311,12 +3010,12 @@ impl Codegen {
                 string_arena,
                 structs,
                 unions,
-                shadow_top_addr,
             );
 
             self.module
                 .define_function(*func_id, &mut ctx)
                 .unwrap_or_else(|e| panic!("define_function failed: {}", e));
+            pending_maps.push((*func_id, take_stack_maps(&ctx)));
             self.module.clear_context(&mut ctx);
         }
 
@@ -3343,18 +3042,52 @@ impl Codegen {
             env_types,
             structs,
             unions,
-            shadow_top_addr,
         );
 
         self.module
             .define_function(main_id, &mut ctx)
             .unwrap_or_else(|e| panic!("define {} failed: {}", entry_name, e));
+        pending_maps.push((main_id, take_stack_maps(&ctx)));
         self.module.clear_context(&mut ctx);
 
         self.module.finalize_definitions().expect("finalize_definitions failed");
 
+        // Only now do these functions have addresses, so only now can their
+        // stack maps be filed by return address — see `gc::JitCode`.
+        for (func_id, maps) in pending_maps {
+            if maps.maps.is_empty() { continue; }
+            let start = self.module.get_finalized_function(func_id) as usize;
+            gc::JIT_CODE.with(|c| c.borrow_mut().register(gc::JitFunctionMaps { start, ..maps }));
+        }
+
         (main_id, bindings)
     }
+}
+
+/// Pull one just-compiled function's user stack maps out of its `Context`,
+/// in the shape `gc::JitCode` wants: return-address offsets and SP-relative
+/// byte offsets, with no Cranelift types left in them.
+///
+/// `start` is left as `0` — the function has no address until
+/// `Module::finalize_definitions` has run, and the caller fills it in then.
+///
+/// Cranelift emits these already sorted by return address (it asserts as
+/// much when pushing them), which `JitCode::lookup`'s binary search relies
+/// on; the assert below is what makes that reliance explicit rather than
+/// assumed.
+fn take_stack_maps(ctx: &Context) -> gc::JitFunctionMaps {
+    let compiled = ctx.compiled_code().expect("function was just defined, so it is compiled");
+    let maps: Vec<(u32, Vec<u32>)> = compiled
+        .buffer
+        .user_stack_maps()
+        .iter()
+        .map(|(return_addr, _span, map)| (*return_addr, map.entries().map(|(_ty, off)| off).collect()))
+        .collect();
+    debug_assert!(
+        maps.windows(2).all(|w| w[0].0 < w[1].0),
+        "cranelift emitted stack maps out of return-address order, which `JitCode::lookup` binary-searches",
+    );
+    gc::JitFunctionMaps { start: 0, len: compiled.code_info().total_size as usize, maps }
 }
 
 /// Parse, type-check, compile, and run a froglang source string.
@@ -3374,12 +3107,6 @@ pub fn compile_and_run(src: &str) -> i64 {
         typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),
     );
 
-    // No `FrogState` here, so nothing has set `ACTIVE_HEAP`: the generated
-    // code allocates against the thread-local `GC_HEAP`, and that heap is
-    // the one that has to know where this `Codegen`'s shadow frames live.
-    let shadow_top = codegen.shadow_top();
-    gc::GC_HEAP.with(|h| h.borrow_mut().set_shadow_top(shadow_top));
-
     let ptr = codegen.module.get_finalized_function(main_id);
     let f: fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
     // Each binding occupies `struct_fields(ty, structs).len()` i64 slots in
@@ -3389,6 +3116,14 @@ pub fn compile_and_run(src: &str) -> i64 {
         .map(|(_, ty)| struct_fields(ty, tc.struct_defs()).len())
         .sum();
     let mut out_buf: Vec<i64> = vec![0i64; total_slots];
-    f(out_buf.as_mut_ptr() as i64)
+    // Same protocol `FrogState::call_jit` follows: `f` writes each top-level
+    // binding into this buffer as it goes, so the collector must scan it for
+    // the duration of the call — see `gc::GcHeap::push_scanned_span`.
+    let out_gc_slots = gc_slots_of_bindings(&bindings, tc.struct_defs());
+    let out_ptr = out_buf.as_mut_ptr();
+    gc::GC_HEAP.with(|h| h.borrow_mut().push_scanned_span(out_ptr, out_gc_slots));
+    let result = f(out_ptr as i64);
+    gc::GC_HEAP.with(|h| h.borrow_mut().pop_scanned_span());
+    result
     // string_arena and out_buf dropped here, after f() returns
 }

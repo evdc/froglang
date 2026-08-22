@@ -1,0 +1,13 @@
+[build]
+# The collector walks the native stack frame by frame to find its roots
+# (froglang-core/src/runtime/gc.rs, "Precise roots"). The walk starts inside
+# a runtime FFI function, so *that* function must have a frame pointer for
+# `caller_frame_pointer!` to read and for its saved return address to be
+# where the chain expects. The JIT side is covered by Cranelift's
+# `preserve_frame_pointers`; this covers the Rust side.
+#
+# Not merely a debugging nicety here: without it the chain can start at the
+# wrong frame, and the collector then reads a stack map against a stack
+# pointer that does not belong to it — silently, and only when a collection
+# happens to land in the wrong place.
+rustflags = ["-C", "force-frame-pointers=yes"]

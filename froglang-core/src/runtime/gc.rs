@@ -88,7 +88,7 @@ pub struct FrogVariant {
 
 // ── Word encoding ─────────────────────────────────────────────────────────────
 //
-// Every GC-visible word in the system — a shadow-stack root, a list element
+// Every GC-visible word in the system — a Cranelift-tracked root, a list element
 // slot, a boxed variant's payload slot, a value crossing the FFI — uses one
 // encoding, so the collector needs no per-slot type information and no
 // per-slot metadata beyond "is this column scannable at all" (`ptr_mask`).
@@ -161,49 +161,199 @@ pub fn immediate_variant_tag(v: i64) -> i64 {
     v >> 3
 }
 
-// ── Shadow stack ──────────────────────────────────────────────────────────────
+// ── Precise roots: Cranelift stack maps ──────────────────────────────────────
 //
-// Codegen roots every heap pointer produced inside a JIT-compiled function by
-// storing it into a dedicated stack slot immediately after it's computed
-// (`root_heap_value` in codegen/mod.rs). Each function pushes one `ShadowFrame`
-// describing that slot's memory at entry and pops it before returning, so the
-// frames form a linked list that mirrors the native call stack. The mark phase
-// walks every frame and treats every non-zero slot as a live root — this is
-// conservative (a value can outlive its last use within one call) but never
-// under-roots, since a value stays reachable until the frame that stored it
-// returns.
+// Every GC-managed value a JIT-compiled function holds is declared to
+// Cranelift (`declare_var_needs_stack_map` / `declare_value_needs_stack_map`
+// in codegen/mod.rs). Cranelift spills those values around every safepoint —
+// which is every call — and emits, per safepoint, the SP-relative byte
+// offsets at which they sit. Collection therefore means walking the native
+// stack and reading the words each frame's map names.
+//
+// This replaces a hand-written shadow stack: one root slot per producer
+// site, stored on production and held for the whole call. That was both
+// slower (a frame push, pop and zeroing per call — ~30% of `orders.frog`)
+// and unsound in two ways we found and one we probably had not, because its
+// slot-reuse rules were a structural argument about control flow rather than
+// a live-range analysis. Cranelift's is the analysis its register allocator
+// already depends on. See RUNTIME.md Part 2.
+//
+// The walk needs three things, in this order:
+//
+// 1. The frame pointer of the runtime function the mutator called into.
+//    `caller_frame_pointer!` reads it at each collecting FFI entry point and
+//    `set_jit_frame` hands it to the collector. From a frame pointer `f`,
+//    `*(f + 8)` is the return address into the caller and `*f` is the
+//    caller's own frame pointer — the standard chain, which requires frame
+//    pointers to actually be present (see `.cargo/config.toml`, and
+//    `preserve_frame_pointers` for the JIT side).
+//
+// 2. A return address resolved to the function that contains it, and to that
+//    function's map for exactly that address. `JitCode` is that table.
+//
+// 3. That frame's stack pointer, to which the map's offsets are relative.
+//    A callee's frame pointer sits directly below the two words its prologue
+//    pushed (saved FP and return address on aarch64; return address pushed
+//    by `call` plus saved RBP on x86-64), so the caller's stack pointer at
+//    the call site is `callee_fp + 16` on both.
 
-/// One JIT function's shadow-stack frame, living *inside* that function's
-/// own native stack frame: a `prev` link to the caller's frame, this
-/// frame's root-slot count, then `len` `i64` root slots laid out inline
-/// immediately after (offset `size_of::<ShadowFrame>()`).
-///
-/// Codegen emits the push and the pop as a handful of plain loads and
-/// stores in the prologue/epilogue (`setup_shadow_frame` /
-/// `teardown_shadow_frame` in codegen/mod.rs). This used to be a
-/// `Vec<ShadowFrame>` entry pushed by an out-of-line `frog_frame_push`
-/// call, and that call — plus the thread-local lookup it needed to find
-/// the heap, plus the `memset` libcall it made to zero the slots — was the
-/// single largest cost in the `orders` benchmark's profile, ahead of both
-/// `malloc`/`free` and the collector itself.
-#[repr(C)]
-pub struct ShadowFrame {
-    pub prev: *mut ShadowFrame,
-    pub len:  usize,
+/// Bytes between a callee's frame pointer and its caller's stack pointer at
+/// the call site: the saved frame pointer and the return address.
+const FRAME_LINK_BYTES: usize = 16;
+
+/// Read the frame pointer of the function this expands inside. Must be used
+/// directly in a function the mutator calls, not in a helper it calls — the
+/// whole point is *which* frame it names.
+#[macro_export]
+macro_rules! caller_frame_pointer {
+    () => {{
+        let fp: usize;
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        compile_error!("froglang's GC stack walk needs a frame-pointer read for this architecture");
+        fp
+    }};
 }
 
-/// The "innermost live frame" cell that the JIT prologue/epilogue update.
-/// Its address is baked into the generated machine code as a constant, so
-/// the cell must never move: `Codegen` owns exactly one in a `Box` and
-/// hands `GcHeap` a pointer to it before any JIT code runs (see
-/// `FrogState::call_jit`). One cell per `Codegen` — not a process global —
-/// keeps `FrogState`s on different threads independent, as they have
-/// always been.
-#[repr(transparent)]
-pub struct ShadowTop(pub *mut ShadowFrame);
+/// Publishes the calling function's frame pointer as the place the next
+/// collection should start walking from, and puts the previous one back on
+/// the way out.
+///
+/// Must be created with the `jit_frame_guard!` macro, never by calling
+/// `new` directly: the frame pointer has to be read *in* the function the
+/// mutator called, which is what the macro guarantees and a plain call
+/// would quietly get wrong.
+///
+/// The save-and-restore matters because froglang code re-enters the runtime
+/// (printing a union runs JIT-compiled formatting, which allocates), so
+/// these nest. Leaving an inner frame published after it returned would have
+/// the collector walk a dead frame.
+pub struct JitFrameGuard {
+    previous: usize,
+}
 
-impl ShadowTop {
-    pub fn new() -> Self { ShadowTop(std::ptr::null_mut()) }
+impl JitFrameGuard {
+    /// Use `jit_frame_guard!()` instead.
+    #[inline]
+    pub fn new(fp: usize) -> Self {
+        JitFrameGuard { previous: with_active_heap(|h| h.set_jit_frame(fp)) }
+    }
+}
+
+impl Drop for JitFrameGuard {
+    #[inline]
+    fn drop(&mut self) {
+        with_active_heap(|h| h.set_jit_frame(self.previous));
+    }
+}
+
+/// Publish this function's frame pointer for the duration of the returned
+/// guard. See `JitFrameGuard`.
+#[macro_export]
+macro_rules! jit_frame_guard {
+    () => {
+        $crate::runtime::gc::JitFrameGuard::new($crate::caller_frame_pointer!())
+    };
+}
+
+/// Roots GC pointers a runtime function received as arguments, for as long
+/// as that function still needs them.
+///
+/// Cranelift's stack maps are *precise*: a value that is used by a call and
+/// dead afterwards is not recorded at that call, because from the mutator's
+/// point of view nothing can reach it again. That is exactly right for JIT
+/// frames and exactly wrong for the runtime function on the other side of
+/// the call, which is Rust code with no stack map of its own. So a runtime
+/// function that can trigger a collection and still needs an argument
+/// afterwards must say so.
+///
+/// The rule, applied at the entry points rather than case by case: **if a
+/// runtime function takes a GC pointer and can collect, it holds its
+/// pointer arguments for its whole body.** Reasoning per-function about
+/// whether the last use happens before or after the collection is how this
+/// becomes a use-after-free the next time one of them is edited.
+pub struct RuntimeRoots {
+    held: usize,
+}
+
+impl RuntimeRoots {
+    /// Root `values` until the returned guard drops.
+    #[inline]
+    pub fn hold(values: &[i64]) -> Self {
+        with_active_heap(|h| {
+            for &v in values {
+                h.push_root(v, true);
+            }
+        });
+        RuntimeRoots { held: values.len() }
+    }
+}
+
+impl Drop for RuntimeRoots {
+    #[inline]
+    fn drop(&mut self) {
+        with_active_heap(|h| h.pop_roots(self.held));
+    }
+}
+
+/// One JIT-compiled function's stack maps, in the form the collector wants:
+/// no Cranelift types, just addresses and offsets.
+pub struct JitFunctionMaps {
+    /// Where this function's machine code starts, once finalized.
+    pub start: usize,
+    /// How many bytes of it there are.
+    pub len: usize,
+    /// `(return-address offset from `start`, SP-relative byte offsets of the
+    /// live GC-managed values at that safepoint)`, sorted by the first
+    /// element — Cranelift emits them in that order and the lookup below
+    /// binary-searches on it.
+    pub maps: Vec<(u32, Vec<u32>)>,
+}
+
+/// Every JIT-compiled function's maps, sorted by `start` so a return address
+/// resolves in `O(log n)`.
+///
+/// A process-wide table rather than one per `Codegen`: a return address is
+/// unique across the process, and the collector reaching a frame it cannot
+/// resolve has no way to tell "not froglang code" from "the wrong table".
+pub struct JitCode {
+    functions: Vec<JitFunctionMaps>,
+}
+
+impl JitCode {
+    const fn new() -> Self {
+        JitCode { functions: Vec::new() }
+    }
+
+    /// Register one finalized function. Called once per compiled function,
+    /// after `Module::finalize_definitions` has fixed its address.
+    pub fn register(&mut self, f: JitFunctionMaps) {
+        let at = self.functions.partition_point(|g| g.start < f.start);
+        self.functions.insert(at, f);
+    }
+
+    /// The live-value offsets at `return_addr`, if it is a safepoint in a
+    /// function this table knows.
+    ///
+    /// `None` covers three different things and deliberately does not
+    /// distinguish them: a frame belonging to the Rust runtime or to libc,
+    /// a JIT frame stopped somewhere that is not a safepoint (impossible
+    /// while a collection is running, since a collection only starts from a
+    /// call), and an address in a function compiled without any GC values
+    /// at all.
+    pub fn lookup(&self, return_addr: usize) -> Option<&[u32]> {
+        let at = self.functions.partition_point(|g| g.start <= return_addr);
+        let f = self.functions.get(at.checked_sub(1)?)?;
+        if return_addr >= f.start + f.len {
+            return None;
+        }
+        let offset = (return_addr - f.start) as u32;
+        let i = f.maps.binary_search_by_key(&offset, |(o, _)| *o).ok()?;
+        Some(&f.maps[i].1)
+    }
 }
 
 // ── GcHeap ───────────────────────────────────────────────────────────────────
@@ -213,12 +363,19 @@ pub struct GcHeap {
     pub bytes_allocated: usize,
     gc_threshold:    usize,
     roots:           Vec<(i64, bool)>,  // (value, is_ptr)
-    /// Head of the JIT shadow stack: a pointer to the `ShadowTop` cell the
-    /// generated code writes, whose `.0` is the innermost live
-    /// `ShadowFrame`. Null until `set_shadow_top` is called, which is the
-    /// state for a heap that no JIT code has ever run against (an embedding
-    /// that only uses `alloc_*` directly, and every unit test in this file).
-    shadow_top:      *const ShadowTop,
+    /// Caller-owned buffers that JIT code writes GC pointers into, which
+    /// the collector must therefore scan — see `push_scanned_span`.
+    scanned_spans:   Vec<(usize, Vec<usize>)>,
+    /// Frame pointer of the runtime function the mutator most recently
+    /// called into — where the native stack walk starts. `0` when no JIT
+    /// code is on the stack, which is the state for an embedding that only
+    /// uses `alloc_*` directly, and for every unit test in this file; the
+    /// walk is then skipped entirely and only the explicit `roots` apply.
+    ///
+    /// Set by every collecting FFI entry point (see `caller_frame_pointer!`)
+    /// and cleared when that entry point returns, so a collection triggered
+    /// from outside JIT code never walks a stale frame.
+    jit_frame:       usize,
     /// Recycled blocks from swept objects, bucketed by size in 8-byte
     /// words: `free_lists[w]` heads an intrusive singly-linked list of
     /// blocks of exactly `w * 8` bytes (the `next` link lives in the
@@ -238,12 +395,12 @@ pub struct GcHeap {
     free_lists:      Vec<*mut u8>,
     /// When set (from the `FROG_GC_STRESS` env var, read once in `new()`),
     /// `maybe_collect` sweeps on *every* allocation instead of waiting for
-    /// `gc_threshold`. A shadow-stack slot-sizing or -reuse bug (e.g. a
-    /// `compile_conditional` branch whose `root_heap_value` calls don't
-    /// agree with what `max_heap_slots` predicted) only under-roots a value
-    /// that is genuinely still live at the moment a collection actually
-    /// runs — with the normal 1 MB threshold, most test programs never
-    /// collect at all, so such a bug can sit undetected. Forcing a
+    /// `gc_threshold`. A missed-declaration rooting bug (a GC-scannable SSA
+    /// value that reaches `declare_gc_value`/`declare_gc_var` too late, or
+    /// not at all) only under-roots a value that is genuinely still live at
+    /// the moment a collection actually runs — with the normal 1 MB
+    /// threshold, most test programs never collect at all, so such a bug
+    /// can sit undetected. Forcing a
     /// collection at every allocation point turns that into a
     /// close-to-immediate, reproducible failure instead of an intermittent
     /// one. Never enabled by default — it makes every allocation as
@@ -258,6 +415,10 @@ pub struct GcHeap {
 
 thread_local! {
     pub static GC_HEAP: RefCell<GcHeap> = RefCell::new(GcHeap::new());
+    /// Every JIT-compiled function's stack maps — see `JitCode`. Populated
+    /// by `Codegen` as it finalizes each function, read by the collector's
+    /// native stack walk.
+    pub static JIT_CODE: RefCell<JitCode> = RefCell::new(JitCode::new());
     /// Pointer to the GcHeap of the FrogState currently executing on this thread.
     /// Null when no froglang code is running (falls back to GC_HEAP).
     pub static ACTIVE_HEAP: Cell<*mut GcHeap> = Cell::new(std::ptr::null_mut());
@@ -325,7 +486,8 @@ impl GcHeap {
             bytes_allocated: 0,
             gc_threshold:    1024 * 1024,  // 1 MB initial threshold
             roots:           Vec::new(),
-            shadow_top:      std::ptr::null(),
+            scanned_spans:   Vec::new(),
+            jit_frame:       0,
             free_lists:      vec![std::ptr::null_mut(); MAX_FREE_WORDS + 1],
             stress:          std::env::var_os("FROG_GC_STRESS").is_some(),
             mark_worklist:   Vec::new(),
@@ -334,6 +496,14 @@ impl GcHeap {
 
     pub fn push_root(&mut self, value: i64, is_ptr: bool) {
         self.roots.push((value, is_ptr));
+    }
+
+    /// Drop the `n` most recently pushed explicit roots. Paired with
+    /// `push_root` by `RuntimeRoots`, which is strictly nested, so a
+    /// truncate from the end is the right discipline.
+    pub fn pop_roots(&mut self, n: usize) {
+        let keep = self.roots.len().saturating_sub(n);
+        self.roots.truncate(keep);
     }
 
     /// Discard every explicit root pushed via `push_root`. Callers that
@@ -345,15 +515,47 @@ impl GcHeap {
         self.roots.clear();
     }
 
-    /// Point this heap at the `ShadowTop` cell the JIT code it is about to
-    /// run updates, so `collect` can walk that code's frames. `top` must
-    /// outlive every collection this heap performs — `Codegen` owns it in a
-    /// `Box` for exactly that reason.
+    /// Register a caller-owned `i64` buffer at `base` whose slots at
+    /// `slots` hold GC pointers, so the collector scans it for the duration
+    /// of the JIT call that fills it.
     ///
-    /// Frames themselves are pushed and popped entirely by generated code;
-    /// the runtime never sees an individual push or pop.
-    pub fn set_shadow_top(&mut self, top: *const ShadowTop) {
-        self.shadow_top = top;
+    /// `__frog_main` writes each top-level binding into such a buffer the
+    /// moment the binding is created, and `FrogState::eval` only turns that
+    /// buffer into explicit roots *after* the call returns. In between, a
+    /// binding whose last JIT-side use has passed is reachable only through
+    /// this buffer — Cranelift is right that the mutator is done with it,
+    /// and the collector would be right to sweep it, and the result is a
+    /// dangling pointer in `env`. This is a narrow, deliberate exception to
+    /// "precise roots" — the buffer is conservatively scanned in full for
+    /// the duration of one call, the same trade the old shadow stack made
+    /// everywhere, just now confined to the one place Cranelift's own
+    /// analysis cannot reach.
+    ///
+    /// Only the listed slots are read: an unlisted one holds a raw `Int` or
+    /// `Float`, which has no tag bits and must never be mistaken for an
+    /// address. Slots not yet written hold `0`, which is not a pointer.
+    pub fn push_scanned_span(&mut self, base: *const i64, slots: Vec<usize>) {
+        self.scanned_spans.push((base as usize, slots));
+    }
+
+    /// Drop the most recently registered span. The buffer must still be
+    /// alive at this point; these nest with the call that owns them.
+    pub fn pop_scanned_span(&mut self) {
+        self.scanned_spans.pop();
+    }
+
+    /// Record the frame pointer the next collection should walk from — the
+    /// frame of the runtime function the mutator just called into. See the
+    /// "Precise roots" section above for what the walk does with it.
+    ///
+    /// Returns the previous value, which the caller must restore on the way
+    /// out: froglang code can re-enter the runtime (a `print` of a union
+    /// walks back into JIT-compiled formatting), and leaving a stale inner
+    /// frame behind would make the collector walk a frame that has already
+    /// returned.
+    #[inline]
+    pub fn set_jit_frame(&mut self, fp: usize) -> usize {
+        std::mem::replace(&mut self.jit_frame, fp)
     }
 
     pub fn maybe_collect(&mut self) {
@@ -384,30 +586,53 @@ impl GcHeap {
             }
         }
 
-        // ...plus every live JIT shadow-stack frame, walked from the
-        // innermost outwards along the `prev` chain the generated
-        // prologues built.
-        let mut _nframes = 0usize;
-        let mut frame = if self.shadow_top.is_null() {
-            std::ptr::null_mut()
-        } else {
-            unsafe { (*self.shadow_top).0 }
-        };
-        while !frame.is_null() {
-            unsafe {
-                let len = (*frame).len;
-                let slots = (frame as *mut u8).add(std::mem::size_of::<ShadowFrame>()) as *const i64;
-                for i in 0..len {
-                    let v = *slots.add(i);
-                    if is_heap_ptr(v) {
-                        Self::mark_from(&mut self.mark_worklist, heap_ptr(v));
-                    }
+        // ...plus any caller-owned buffer the running JIT call is filling
+        // with GC pointers (`push_scanned_span`).
+        let spans = std::mem::take(&mut self.scanned_spans);
+        for (base, slots) in &spans {
+            for &i in slots {
+                let w = unsafe { *((*base as *const i64).add(i)) };
+                if is_heap_ptr(w) {
+                    unsafe { Self::mark_from(&mut self.mark_worklist, heap_ptr(w)) };
                 }
-                frame = (*frame).prev;
             }
-            _nframes += 1;
         }
-        gc_trace!("marked {} shadow frame(s)", _nframes);
+        self.scanned_spans = spans;
+
+        // ...plus every GC-managed value live in a JIT frame on the native
+        // stack. `jit_frame` is the frame pointer of the runtime function
+        // the mutator called into, so the first iteration below already
+        // describes the innermost JIT frame: its return address is the
+        // safepoint we are stopped at, and its stack pointer is just above
+        // the two words that frame link occupies.
+        let mut _nframes = 0usize;
+        let mut fp = self.jit_frame;
+        while fp != 0 {
+            let (ret, caller_fp) = unsafe {
+                (*((fp + 8) as *const usize), *(fp as *const usize))
+            };
+            let sp = fp + FRAME_LINK_BYTES;
+            JIT_CODE.with(|c| {
+                if let Some(offsets) = c.borrow().lookup(ret) {
+                    for &off in offsets {
+                        let w = unsafe { *((sp + off as usize) as *const i64) };
+                        if is_heap_ptr(w) {
+                            unsafe { Self::mark_from(&mut self.mark_worklist, heap_ptr(w)) };
+                        }
+                    }
+                    _nframes += 1;
+                }
+            });
+            // Stop at the first frame that is not above the current one:
+            // the chain runs from inner to outer, so a frame pointer that
+            // does not increase means we have walked off the end of it (or
+            // into a frame built without one) and must not keep following.
+            if caller_fp <= fp {
+                break;
+            }
+            fp = caller_fp;
+        }
+        gc_trace!("marked {} JIT frame(s)", _nframes);
 
         // Sweep phase
         let before = self.bytes_allocated;
@@ -421,8 +646,9 @@ impl GcHeap {
     }
 
     /// Mark `obj` and everything transitively reachable from it. Iterative
-    /// (explicit worklist) rather than recursive, since the shadow stack
-    /// makes deep object graphs reachable from ordinary programs.
+    /// (explicit worklist) rather than recursive, since ordinary programs
+    /// build deep object graphs (a long list, a recursive `Tree`) that a
+    /// stack-recursive mark could overflow on.
     ///
     /// `worklist` is supplied by the caller (`GcHeap::mark_worklist`) and
     /// left empty on return, so a collection with many roots reuses one
@@ -617,8 +843,7 @@ impl GcHeap {
     /// Allocate a GC-managed `FrogVariant` with `nslots` `i64` payload
     /// slots, zero-initialized (so a collection triggered while a
     /// still-being-populated field is being computed never follows
-    /// garbage through an as-yet-unwritten slot — mirrors why
-    /// `setup_shadow_frame` zeroes shadow-stack slots). `ptr_mask` marks which
+    /// garbage through an as-yet-unwritten slot). `ptr_mask` marks which
     /// slots are heap pointers, exactly like `alloc_list`'s.
     pub fn alloc_variant(&mut self, tag: u32, nslots: usize, ptr_mask: u64) -> *mut FrogVariant {
         let struct_size = std::mem::size_of::<FrogVariant>();
@@ -718,6 +943,20 @@ impl GcHeap {
 
 pub fn push_root(value: i64, is_ptr: bool) {
     GC_HEAP.with(|h| h.borrow_mut().push_root(value, is_ptr));
+}
+
+/// Run `f` against whichever heap is current — the `FrogState`-owned one if
+/// froglang code is executing on this thread, else the thread-local
+/// fallback. The same choice `ffi::with_heap` makes, duplicated here
+/// because `JitFrameGuard` lives on this side of the module boundary.
+#[inline]
+pub fn with_active_heap<R>(f: impl FnOnce(&mut GcHeap) -> R) -> R {
+    let ptr = ACTIVE_HEAP.with(|h| h.get());
+    if ptr.is_null() {
+        GC_HEAP.with(|h| f(&mut *h.borrow_mut()))
+    } else {
+        unsafe { f(&mut *ptr) }
+    }
 }
 
 pub fn gc_collect() {

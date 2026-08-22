@@ -219,8 +219,8 @@ pub enum TypedExprKind {
 
     /// `return`, or `return value`. This node's own `.ty` (on the enclosing
     /// `TypedExpr`) is always `Type::Never` — see
-    /// `TypeChecker::return_types`. Compiles to an unconditional exit: pop
-    /// the shadow frame, then `return_`.
+    /// `TypeChecker::return_types`. Compiles to an unconditional exit:
+    /// `return_`, carrying each `mut` parameter's current value.
     Return(Option<TypedExprRef>),
 
     /// Coerce `value` (a strict, narrower member type) up into this node's

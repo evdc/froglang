@@ -190,14 +190,13 @@ fn test_let_in_conditional_branch_visible_within_branch_and_state_recovers() {
 }
 
 /// End-to-end stress for the two GC mechanisms a program exercises on every
-/// heap-touching call: the intrusive shadow-frame chain that codegen links
-/// into `Codegen`'s `ShadowTop` cell, and the size-class free lists
-/// `GcHeap::sweep` recycles blocks onto.
+/// heap-touching call: Cranelift's stack-map roots (RUNTIME.md Part 2,
+/// `gc.rs`'s "Precise roots"), and the size-class free lists `GcHeap::sweep`
+/// recycles blocks onto.
 ///
-/// Both replaced simpler-but-slower designs (an out-of-line
-/// `frog_frame_push` maintaining a `Vec<ShadowFrame>`, and a straight
-/// `alloc`/`dealloc` per object). Their failure mode is not a wrong answer
-/// in the small — every existing test still passes against a shadow chain
+/// Both replaced simpler-but-slower designs (a hand-written shadow stack,
+/// and a straight `alloc`/`dealloc` per object). Their failure mode is not
+/// a wrong answer in the small — every existing test still passes against a
 /// that drops a frame, or a free list that hands out a block still reachable
 /// from somewhere — but corruption that only appears once collections
 /// actually fire *while* a deep call stack holds heap values in registers.

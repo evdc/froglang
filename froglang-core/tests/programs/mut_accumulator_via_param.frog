@@ -1,0 +1,21 @@
+data Student(name: Str, score: Int)
+data Stats(count: Int, total: Int, highest: Int)
+
+// Same computation as struct_grade_stats.frog, but `record` writes into the
+// caller's `stats` in place via a `mut` parameter instead of returning a
+// fresh copy for the caller to rebind — MUTABILITY.md stage 4, not
+// expressible before `mut` parameters existed.
+func record(mut stats: Stats, score: Int): None = {
+    stats.highest = if score > stats.highest then score else stats.highest
+    stats.count = stats.count + 1
+    stats.total = stats.total + score
+}
+
+let students = [Student(name="Alice", score=92), Student(name="Bob", score=58), Student(name="Cara", score=77), Student(name="Dev", score=41), Student(name="Eve", score=88)]
+
+let passing = [for s in students if s.score >= 60 do s]
+
+mut stats = Stats(count=0, total=0, highest=0)
+for s in passing do { record(mut stats, s.score) }
+
+stats.total / stats.count

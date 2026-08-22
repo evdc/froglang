@@ -50,6 +50,17 @@
 //! path in `?`/`catch` once doubled its wall time even though the error
 //! branch was never taken, and nothing in the suite would have localised
 //! that to error handling rather than to structs, lists or the GC.
+//!
+//! `structs`/`structs_mut_param` and `lists`/`list_mut_index` are the same
+//! pairing applied to MUTABILITY.md: each pair runs the identical
+//! computation once the old return-and-rebind way and once through the
+//! `mut`-parameter / place-assignment machinery that stage added. Neither
+//! pair should show a *regression* — `mut` write-back is currently
+//! copy-in/copy-out at the ABI boundary, no cheaper than returning a fresh
+//! value — but their ratio is the baseline to compare against once
+//! move-on-last-use or in-place `mut` writes (MUTABILITY.md §4) land: it
+//! should shrink toward 1 as copies the compiler can prove are unobserved
+//! stop happening.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::hint::black_box;
@@ -126,7 +137,7 @@ func price_item(it: Item): Int | PricingError = {
 }
 
 let items = [for i in 0..400 do Item(sku=i, category=category_of(hash(i)), qty=1 + modn(hash(i + 7), 9), unit_price=100 + modn(hash(i + 13), 5000))]
-let total = 0
+mut total = 0
 for round in 0..100 do {
     let batch = [for it in items if modn(it.sku + round, 3) != 0 do it]
     for it in batch do { total = total + (price_item(it) catch 0) }
@@ -140,7 +151,7 @@ total
 /// counterpart to `fib`, which never touches the heap at all.
 const ALLOC: &str = "\
 func label(i: Int): Str = \"item-\" + \"x\"
-let sink = 0
+mut sink = 0
 for i in 0..20000 do {
     let s = label(i)
     let xs = [i, i + 1, i + 2]
@@ -160,14 +171,46 @@ data Vec3(x: Int, y: Int, z: Int)
 data Body(pos: Vec3, vel: Vec3, mass: Int)
 func advance(p: Vec3, v: Vec3): Vec3 = Vec3(x=p.x + v.x, y=p.y + v.y, z=p.z + v.z)
 func step(b: Body): Body = {
-    b.pos = advance(b.pos, b.vel)
-    b
+    mut r = b
+    r.pos = advance(r.pos, r.vel)
+    r
 }
 func energy(b: Body): Int = b.mass * (b.vel.x * b.vel.x + b.vel.y * b.vel.y + b.vel.z * b.vel.z)
-let b = Body(pos=Vec3(x=0, y=0, z=0), vel=Vec3(x=1, y=2, z=3), mass=7)
-let total = 0
+mut b = Body(pos=Vec3(x=0, y=0, z=0), vel=Vec3(x=1, y=2, z=3), mass=7)
+mut total = 0
 for i in 0..500000 do {
     b = step(b)
+    total = total + energy(b)
+}
+total + b.pos.x
+";
+
+/// `STRUCTS`'s copy-elision baseline pair (MUTABILITY.md stage 4): the
+/// identical `Body`-advancing computation, but `step` writes into the
+/// caller's `b` through a `mut` parameter instead of returning a fresh
+/// `Body` for the caller to rebind. `advance` is inlined into `step` rather
+/// than called separately, because a `mut` argument must be a plain
+/// binding — `b.pos` isn't one, so there's no way to hand the nested field
+/// to a second `mut`-taking function. Semantically this differs from
+/// `STRUCTS` only in *how* the write happens; today `mut` parameters are
+/// copy-in/copy-out at the ABI boundary (`compile_call`'s "copy-out" pass in
+/// codegen/mod.rs), so this should currently track `STRUCTS` closely. The
+/// gap between them is exactly what move-on-last-use / in-place `mut`
+/// writes (MUTABILITY.md §4, tier 2) should close — watch this ratio move
+/// toward 1 as that lands.
+const STRUCTS_MUT_PARAM: &str = "\
+data Vec3(x: Int, y: Int, z: Int)
+data Body(pos: Vec3, vel: Vec3, mass: Int)
+func step(mut b: Body): None = {
+    b.pos.x = b.pos.x + b.vel.x
+    b.pos.y = b.pos.y + b.vel.y
+    b.pos.z = b.pos.z + b.vel.z
+}
+func energy(b: Body): Int = b.mass * (b.vel.x * b.vel.x + b.vel.y * b.vel.y + b.vel.z * b.vel.z)
+mut b = Body(pos=Vec3(x=0, y=0, z=0), vel=Vec3(x=1, y=2, z=3), mass=7)
+mut total = 0
+for i in 0..500000 do {
+    step(mut b)
     total = total + energy(b)
 }
 total + b.pos.x
@@ -185,7 +228,7 @@ func digit(d: Int): Str =
     else if d == 3 then \"3\" else if d == 4 then \"4\" else if d == 5 then \"5\"
     else if d == 6 then \"6\" else if d == 7 then \"7\" else if d == 8 then \"8\" else \"9\"
 func render(n: Int): Str = digit(modn(n / 100, 10)) + digit(modn(n / 10, 10)) + digit(modn(n, 10))
-let hits = 0
+mut hits = 0
 for i in 0..8000 do {
     let key = \"id-\" + render(i) + \"/\" + render(i + 1)
     if key == \"id-000/001\" then hits = hits + 1 else hits = hits
@@ -200,12 +243,34 @@ hits
 /// them with.
 const LISTS: &str = "\
 func modn(x: Int, n: Int): Int = x - (x / n) * n
-let total = 0
+mut total = 0
 for round in 0..500 do {
     let xs = [for i in 0..1500 do i * 3 + round]
-    let s = 0
+    mut s = 0
     for j in 0..1500 do { s = s + xs[modn(j * 7 + round, 1500)] }
     total = total + modn(s, 1000003)
+}
+total
+";
+
+/// `LISTS`'s mutability counterpart: one list allocated once, then mutated
+/// in place through index assignment (`xs[j] = ...`) every round instead of
+/// rebuilt fresh via a comprehension. List index assignment (`PlaceAssign`
+/// with one `[index]` step, MUTABILITY.md stage 3) didn't exist before this
+/// round of changes — "no user-facing list mutation exists" per that doc's
+/// table — so there's no pre-mutability baseline to compare against; this
+/// establishes one for the write path itself (`frog_list_set`, called once
+/// per leaf field per write) ahead of any future inlining of it the way
+/// list *reads* were already inlined (see README, "Inline heap access").
+/// Any gap against `LISTS`'s per-element cost that isn't explained by
+/// skipping the comprehension's own allocation is that path's overhead.
+const LIST_MUT_INDEX: &str = "\
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+mut xs = [for i in 0..1500 do i]
+mut total = 0
+for round in 0..500 do {
+    for j in 0..1500 do { xs[j] = modn(xs[j] + round * 7 + 1, 1000003) }
+    total = total + xs[modn(round * 13, 1500)]
 }
 total
 ";
@@ -224,7 +289,7 @@ func sum(t: Tree): Int = match t {
     is Leaf then 0
     is Node(v, l, r) then v + sum(l) + sum(r)
 }
-let total = 0
+mut total = 0
 for i in 0..40 do { total = total + sum(build(12, i)) }
 total
 ";
@@ -244,7 +309,7 @@ func total(t: Node): Int = match t {
     is Cell(v, rest) then v + total(rest)
 }
 let live = chain(4000, Empty)
-let sink = 0
+mut sink = 0
 for i in 0..400 do {
     let garbage = chain(200, Empty)
     sink = sink + total(garbage)
@@ -259,7 +324,7 @@ const INFALLIBLE: &str = "\
 func modn(x: Int, n: Int): Int = x - (x / n) * n
 func scale(x: Int): Int = if x < 0 then 0 else x * 3 + 1
 func pipeline(x: Int): Int = scale(scale(x))
-let total = 0
+mut total = 0
 for i in 0..800000 do { total = total + modn(pipeline(i), 1000003) }
 total
 ";
@@ -282,7 +347,7 @@ func pipeline(x: Int): Int | Bad = {
     let a = scale(x)?
     scale(a)
 }
-let total = 0
+mut total = 0
 for i in 0..800000 do { total = total + modn(pipeline(i) catch 0, 1000003) }
 total
 ";
@@ -328,15 +393,21 @@ z
 
 /// Every runnable workload, in the order both groups report them.
 /// `infallible` sits immediately before `fallible` so their ratio — the
-/// cost of `?`/`catch` — is two adjacent lines in the output.
-fn runnable() -> [(&'static str, &'static str); 10] {
+/// cost of `?`/`catch` — is two adjacent lines in the output. Likewise
+/// `structs`/`structs_mut_param` and `lists`/`list_mut_index` are adjacent
+/// pairs: same computation, return-and-rebind vs `mut`-parameter/place
+/// write-back, so their ratio is the copy-elision headroom MUTABILITY.md
+/// §4 describes.
+fn runnable() -> [(&'static str, &'static str); 12] {
     [
         ("fib", FIB),
         ("structs", STRUCTS),
+        ("structs_mut_param", STRUCTS_MUT_PARAM),
         ("alloc", ALLOC),
         ("gc_pressure", GC_PRESSURE),
         ("strings", STRINGS),
         ("lists", LISTS),
+        ("list_mut_index", LIST_MUT_INDEX),
         ("tree", TREE),
         ("infallible", INFALLIBLE),
         ("fallible", FALLIBLE),

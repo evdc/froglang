@@ -647,3 +647,50 @@ fn test_struct_grade_stats() {
 fn test_struct_shapes_by_origin() {
     assert_eq!(compile_and_run(&prog("struct_shapes_by_origin.frog")), 15);
 }
+
+// ── mutability programs from tests/programs/ (MUTABILITY.md stages 3-4: ────
+// places and `mut` parameters — each of these was a parse error or a type
+// error before that work landed) ────────────────────────────────────────────
+
+/// Same computation as `struct_grade_stats.frog`, but `record` writes back
+/// into the caller's `stats` through a `mut` parameter instead of returning
+/// a fresh copy for the caller to rebind. average = 257/3 = 85.
+#[test]
+fn test_mut_accumulator_via_param() {
+    assert_eq!(compile_and_run(&prog("mut_accumulator_via_param.frog")), 85);
+}
+
+/// Assignment through a path three struct levels deep (`scene.bg.origin.x`)
+/// — `o.i.v = 5` was a parse error before places existed.
+#[test]
+fn test_mut_nested_field_path() {
+    assert_eq!(compile_and_run(&prog("mut_nested_field_path.frog")), 178);
+}
+
+/// List index assignment, both on a scalar list and on a list of structs
+/// through a nested field (`cells[i].age = ...`) — no user-facing list
+/// mutation existed before places.
+#[test]
+fn test_mut_list_index_assign() {
+    assert_eq!(compile_and_run(&prog("mut_list_index_assign.frog")), 197);
+}
+
+/// Two `mut` parameters writing back into two distinct caller bindings from
+/// the same call — callee mutation of a caller's argument didn't exist at
+/// all before `mut` parameters. x and y swap: (9, 3) -> 9*10+3 = 93.
+#[test]
+fn test_mut_swap_via_params() {
+    assert_eq!(compile_and_run(&prog("mut_swap_via_params.frog")), 93);
+}
+
+/// The exclusivity rule: a `mut`-marked root can't also appear as another
+/// argument in the same call.
+#[test]
+fn test_mut_exclusivity_rejects_aliased_root() {
+    let ast = froglang_core::frontend::parser::Parser::parse(
+        "func f(mut a: Int, b: Int): None = { a = b\nnone }\nmut x = 1\nf(mut x, x)\n1"
+    ).expect("parse error");
+    let mut tc = froglang_core::frontend::typeck::TypeChecker::new();
+    let err = tc.check_and_lower(ast).expect_err("aliased mut root should be rejected");
+    assert!(format!("{:?}", err).contains("can't be passed 'mut'"), "unexpected error: {:?}", err);
+}

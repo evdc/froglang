@@ -1,0 +1,13 @@
+data Point(x: Int, y: Int)
+data Rect(origin: Point, w: Int, h: Int)
+data Scene(bg: Rect, cursor: Point)
+
+// `o.i.v = 5` was a parse error before places (MUTABILITY.md stage 3) — a
+// path through more than one level of struct nesting.
+mut scene = Scene(bg=Rect(origin=Point(x=0, y=0), w=100, h=50), cursor=Point(x=5, y=5))
+
+scene.bg.origin.x = 10
+scene.bg.origin.y = scene.bg.origin.y + 3
+scene.cursor.x = scene.cursor.x * 2
+
+scene.bg.origin.x + scene.bg.origin.y + scene.bg.w + scene.bg.h + scene.cursor.x + scene.cursor.y

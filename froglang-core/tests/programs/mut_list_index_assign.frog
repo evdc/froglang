@@ -1,0 +1,20 @@
+data Cell(alive: Bool, age: Int)
+
+// `xs[0] = v` was a parse error before places (MUTABILITY.md stage 3) —
+// "no user-facing list mutation exists" per the table at the top of that
+// doc. Exercises a scalar list and a list of structs, the latter writing
+// through one index into a nested field (`cells[i].age = ...`).
+mut xs = [1, 2, 3, 4, 5]
+xs[0] = 100
+xs[4] = xs[4] + 50
+
+mut cells = [Cell(alive=true, age=0), Cell(alive=false, age=0), Cell(alive=true, age=0)]
+for i in 0..3 do { cells[i].age = cells[i].age + 1 }
+cells[1].alive = true
+
+mut total = 0
+for x in xs do { total = total + x }
+mut cell_total = 0
+for c in cells do { cell_total = cell_total + c.age + if c.alive then 10 else 0 }
+
+total + cell_total

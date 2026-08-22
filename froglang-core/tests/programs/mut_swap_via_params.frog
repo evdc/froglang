@@ -1,0 +1,15 @@
+// Two `mut` parameters writing back into two distinct caller bindings in
+// the same call — previously unwritable, since callee mutation of an
+// argument didn't exist at all before MUTABILITY.md stage 4.
+func swap(mut a: Int, mut b: Int): None = {
+    let tmp = a
+    a = b
+    b = tmp
+    none
+}
+
+mut x = 3
+mut y = 9
+swap(mut x, mut y)
+
+x * 10 + y

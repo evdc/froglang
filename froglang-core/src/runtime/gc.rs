@@ -883,6 +883,106 @@ impl GcHeap {
         ptr
     }
 
+    /// Deep-clone the heap object at `obj`, returning a pointer with no
+    /// aliasing to the original — the runtime primitive value semantics for
+    /// `List` needs (MUTABILITY.md tier 1: "copy on write-through-a-non-unique
+    /// root"). Dispatches on `ObjKind`, exactly like `mark_from`, rather than
+    /// on any new per-object metadata:
+    ///
+    /// - `Str` is returned unchanged. It's immutable, so aliasing it is
+    ///   unobservable — the same reasoning MUTABILITY.md gives for why
+    ///   immutable types never copy at all.
+    /// - `List` gets a fresh buffer (same `stride`/`ptr_mask`/length) with the
+    ///   raw slots copied, then every `ptr_mask`-set slot in every element
+    ///   block is recursively cloned, re-OR'ing the original tag bits
+    ///   (`TAG_MASK`) onto the clone — an element's pointer column is *not*
+    ///   always a plain untagged pointer: a `List(Tagged)` where `Tagged` is
+    ///   an inline union has element leaves labelled `Type::Union` by
+    ///   `struct_fields`, and that column's word is the union's own
+    ///   tagged-pointer encoding (RUNTIME.md Part 1), same as a struct field
+    ///   or a variant payload slot of that type.
+    /// - `Variant` gets a fresh payload the same way, tag bits preserved
+    ///   identically.
+    ///
+    /// **Assumes the object graph is acyclic** — plain structural recursion,
+    /// no visited-set. This holds today because a self-referential union
+    /// always boxes as a single opaque node rather than being expressed as a
+    /// cycle of clonable values, and there is no other way to build a cycle
+    /// from surface syntax (MUTABILITY.md's "Graphs get arenas": cyclic or
+    /// shared-observer structures are explicitly out of scope for value
+    /// semantics, and must be arena-plus-index instead). A future `Ref(T)` or
+    /// handle type would need to revisit this.
+    ///
+    /// **GC-safety**: every allocation this makes can itself trigger a
+    /// collection. The object being cloned is assumed already rooted by the
+    /// caller for the whole call (see `ffi::frog_clone`'s `RuntimeRoots`) —
+    /// that keeps every *original* descendant alive, since a collection
+    /// simply marks the whole reachable graph from it. But a freshly
+    /// allocated *destination* object is reachable from nothing until its
+    /// parent stores its pointer, so each recursion level roots its own new
+    /// object for the duration of that level (`push_root`/`pop_roots`,
+    /// popped only after every child has been written into it) rather than
+    /// relying on `RuntimeRoots` from within `GcHeap` itself.
+    pub unsafe fn clone_obj(&mut self, obj: *mut GcHeader) -> *mut GcHeader {
+        match (*obj).kind {
+            ObjKind::Str => obj,
+            ObjKind::List => {
+                let src = obj as *mut FrogList;
+                let stride = ((*src).stride as usize).max(1);
+                let len = (*src).len as usize;
+                let mask = (*src).ptr_mask;
+                let elem_cap = (len / stride).max(1);
+                let new_list = self.alloc_list(elem_cap, stride, mask);
+                self.push_root(new_list as i64, true);
+                if len > 0 {
+                    std::ptr::copy_nonoverlapping((*src).data, (*new_list).data, len);
+                }
+                (*new_list).len = len as u32;
+                if mask != 0 {
+                    let elem_len = len / stride;
+                    for i in 0..elem_len {
+                        let base = i * stride;
+                        for bit in 0..stride {
+                            if mask & (1u64 << bit) == 0 { continue; }
+                            let w = *(*new_list).data.add(base + bit);
+                            if is_heap_ptr(w) {
+                                let cloned = self.clone_obj(heap_ptr(w));
+                                *(*new_list).data.add(base + bit) = (cloned as i64) | (w & TAG_MASK);
+                            }
+                        }
+                    }
+                }
+                self.pop_roots(1);
+                new_list as *mut GcHeader
+            }
+            ObjKind::Variant => {
+                let src = obj as *mut FrogVariant;
+                let tag = (*src).tag;
+                let nslots = (*src).nslots as usize;
+                let mask = (*src).ptr_mask;
+                let new_variant = self.alloc_variant(tag, nslots, mask);
+                self.push_root(new_variant as i64, true);
+                let src_data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
+                let dst_data = (new_variant as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
+                if nslots > 0 {
+                    std::ptr::copy_nonoverlapping(src_data, dst_data, nslots);
+                }
+                if mask != 0 {
+                    for i in 0..nslots {
+                        if mask & (1u64 << i) == 0 { continue; }
+                        let w = *dst_data.add(i);
+                        if is_heap_ptr(w) {
+                            let cloned = self.clone_obj(heap_ptr(w));
+                            *dst_data.add(i) = (cloned as i64) | (w & TAG_MASK);
+                        }
+                    }
+                }
+                self.pop_roots(1);
+                new_variant as *mut GcHeader
+            }
+        }
+    }
+
     /// Print every live object in this heap to stderr.
     pub fn dump(&self) {
         let struct_size = std::mem::size_of::<FrogStr>();

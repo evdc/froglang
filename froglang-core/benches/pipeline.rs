@@ -275,6 +275,47 @@ for round in 0..500 do {
 total
 ";
 
+/// `LISTS`'s `push` counterpart: the same 1500-element-per-round shape, but
+/// built by `push`ing into a `mut` binding one element at a time instead of
+/// a comprehension. `push`'s own receiver is always `Move`-classified
+/// (`liveness.rs`'s `Call`/`mut_args` handling — see codegen's `Ctx::liveness`
+/// doc comment), so this should cost about what `LISTS`' comprehension build
+/// costs, not that plus a per-`push` clone: MUTABILITY.md stage 6's elision
+/// claim, made measurable.
+const LIST_PUSH_LOOP: &str = "\
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+mut total = 0
+for round in 0..500 do {
+    mut xs = []
+    for i in 0..1500 do push(mut xs, i * 3 + round)
+    mut s = 0
+    for j in 0..1500 do { s = s + xs[modn(j * 7 + round, 1500)] }
+    total = total + modn(s, 1000003)
+}
+total
+";
+
+/// `LIST_PUSH_LOOP` with one genuine alias per round: `ys` binds the fully
+/// built list, `xs` is read again afterward, so that bind must clone —
+/// exactly the correctness half of the same story. Should show one
+/// measurable, once-per-round clone cost on top of `LIST_PUSH_LOOP`, not a
+/// per-element one; if it doesn't show up at all, the clone is being wrongly
+/// elided, not correctly avoided.
+const LIST_PUSH_ALIASED: &str = "\
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+mut total = 0
+for round in 0..500 do {
+    mut xs = []
+    for i in 0..1500 do push(mut xs, i * 3 + round)
+    mut ys = xs
+    push(mut ys, 999999)
+    mut s = 0
+    for j in 0..1500 do { s = s + xs[modn(j * 7 + round, 1500)] }
+    total = total + modn(s + ys[1500], 1000003)
+}
+total
+";
+
 /// Recursive boxed unions: build a complete binary `Tree` and walk it with
 /// `match`. Unlike a struct, a union value is always a heap-boxed
 /// `FrogVariant`, so this measures variant allocation, tag dispatch and
@@ -398,7 +439,7 @@ z
 /// pairs: same computation, return-and-rebind vs `mut`-parameter/place
 /// write-back, so their ratio is the copy-elision headroom MUTABILITY.md
 /// §4 describes.
-fn runnable() -> [(&'static str, &'static str); 12] {
+fn runnable() -> [(&'static str, &'static str); 14] {
     [
         ("fib", FIB),
         ("structs", STRUCTS),
@@ -408,6 +449,8 @@ fn runnable() -> [(&'static str, &'static str); 12] {
         ("strings", STRINGS),
         ("lists", LISTS),
         ("list_mut_index", LIST_MUT_INDEX),
+        ("list_push_loop", LIST_PUSH_LOOP),
+        ("list_push_aliased", LIST_PUSH_ALIASED),
         ("tree", TREE),
         ("infallible", INFALLIBLE),
         ("fallible", FALLIBLE),

@@ -373,6 +373,38 @@ pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
     })
 }
 
+/// Deep-clone the heap value `w` — the runtime primitive codegen's
+/// `Ownership::Copy`-gated clone-on-read (see `codegen::compile_expr_multi`'s
+/// `Var` arm) calls whenever a binding's value is duplicated and might still
+/// be observed elsewhere. `w` may be `0` (an empty/absent slot) or a
+/// non-pointer immediate, in which case it's returned unchanged — only an
+/// actual heap pointer (`is_heap_ptr`) is cloned.
+///
+/// `w` itself may carry tag bits (an inline union's tagged pointer word, not
+/// just a plain `List`/`Str` pointer — `is_heap_ty` covers `Type::Union` too,
+/// so this is called on those leaves as well). The clone must carry the same
+/// tag, or a union value would silently forget which member it was — the
+/// same reasoning `GcHeap::clone_obj`'s `Variant` case already applies to a
+/// tagged pointer nested *inside* a payload, just one level further out.
+#[no_mangle]
+pub extern "C" fn frog_clone(w: i64) -> i64 {
+    if !super::gc::is_heap_ptr(w) {
+        return w;
+    }
+    let _jit_frame = crate::jit_frame_guard!();
+    // `w` is read (recursively) throughout `clone_obj`, which allocates and
+    // can therefore collect — and the caller's stack map does not cover it,
+    // since from the JIT's point of view the value died at this call. See
+    // `gc::RuntimeRoots`, and `GcHeap::clone_obj`'s own doc comment for how
+    // the objects it allocates along the way are separately kept alive.
+    let _roots = RuntimeRoots::hold(&[w]);
+    with_heap(|heap| {
+        heap.maybe_collect();
+        let cloned = unsafe { heap.clone_obj(super::gc::heap_ptr(w)) };
+        (cloned as i64) | (w & super::gc::TAG_MASK)
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
     with_heap(|heap| {

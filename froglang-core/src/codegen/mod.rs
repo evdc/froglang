@@ -65,6 +65,14 @@ struct Ctx<'a> {
     /// `mut_param_copyout` to append each one's final value after the
     /// ordinary return — see `TypedExprKind::Function`'s doc comment.
     mut_params:    Vec<(String, Type)>,
+    /// This function/entry's move-vs-copy analysis (`liveness::analyze_body`/
+    /// `analyze_entry`), consulted by `compile_expr_multi`'s `TypedExprKind::Var`
+    /// arm: a `Copy`-classified read of a GC-pointer-bearing binding is cloned
+    /// (`frog_clone`) before use, so no two live bindings can ever alias the
+    /// same `List`/union payload — see MUTABILITY.md stage 6 and RUNTIME.md.
+    /// `Move` means this is the name's last use, so the raw pointer is used
+    /// as-is, same as before this existed.
+    liveness:      liveness::Liveness,
 }
 
 /// True iff a slot of this type is a GC-scannable column — a word the
@@ -590,6 +598,94 @@ fn declare_gc_var(bcx: &mut FunctionBuilder, ty: &Type, var: Variable) {
     if is_heap_ty(ty) {
         bcx.declare_var_needs_stack_map(var);
     }
+}
+
+/// The raw funnel for reading a binding named `name`: one `use_var` per
+/// flattened leaf, no cloning. Factored out of `compile_expr_multi`'s `Var`
+/// arm so `compile_expr_multi_transient` can call it directly and bypass
+/// that arm's cloning — see its doc comment for why.
+#[inline]
+fn read_var_raw(name: &str, ty: &Type, bcx: &mut FunctionBuilder, vars: &HashMap<String, Variable>, structs: &StructDefs) -> Vec<Value> {
+    struct_fields(ty, structs).iter().map(|(path, _)| {
+        let key = var_key(name, path);
+        let var = *vars.get(&key)
+            .unwrap_or_else(|| panic!("unbound variable in codegen: {}", key));
+        bcx.use_var(var)
+    }).collect()
+}
+
+/// MUTABILITY.md stage 6 / RUNTIME.md: clone `vals` (the just-compiled
+/// value of `expr`) if `expr` is itself a `Var` read of **exactly**
+/// `Type::List(_)` and `Ownership::Copy` (see `Ctx::liveness`) — otherwise
+/// return it unchanged. Called from the `Var` arm of `compile_expr_multi` —
+/// every *non*-transient consumer of a binding's value (a bind, a call
+/// argument, a return, a struct/list/variant literal's field or element, a
+/// `Widen`, a `Block`'s tail, a `Conditional` branch...) reaches it that way
+/// automatically, since they all read the binding through an ordinary
+/// `compile_expr`/`compile_expr_multi` call on a `Var` node.
+///
+/// **Why exactly `List`, not "any GC-pointer-bearing type"**: cloning exists
+/// to protect against a mutation becoming visible through an alias, and
+/// `push`/index-assignment are the only mutations that exist — both require
+/// a *bare* `mut`-rooted `List` binding (`is_push`/`flatten_place`'s root
+/// check in typeck.rs), never a struct field or a union payload. A struct or
+/// union value can only ever be *rebound* (a new value replacing the whole
+/// thing), never mutated in place, so aliasing one is unobservable no matter
+/// how many bindings share it — cloning it would be a pure-waste `frog_clone`
+/// call. This was tried the broader way (`is_heap_ty` on every flattened
+/// leaf) and reverted: `Int | Bad`-style unions (a `Str`-bearing member)
+/// aren't mutable either, but the broad check cloned them on every `Copy`
+/// read anyway, nearly doubling `benches/pipeline.rs`'s `fallible` workload
+/// for a call that only ever hit `GcHeap::clone_obj`'s `Str` no-op branch.
+///
+/// A non-`Var` expression (a literal, a call result, an `if`-merge, ...) is
+/// always freshly produced and never needs this — nothing else can alias a
+/// value that was just computed. Nor does a struct/union/`Str`-typed `Var`
+/// read, for the reason above.
+#[inline]
+fn clone_if_owned(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Vec<Value> {
+    let TypedExprKind::Var(_) = &expr.item.kind else { return vals };
+    if !matches!(&expr.item.ty, Type::List(_)) { return vals; }
+    if ctx.liveness.ownership(expr.item.id) != liveness::Ownership::Copy { return vals; }
+
+    debug_assert_eq!(vals.len(), 1, "a List value is always exactly one leaf");
+    let clone_id = ctx.func_ids["frog_clone"];
+    let callee = ctx.module.declare_func_in_func(clone_id, bcx.func);
+    let call   = bcx.ins().call(callee, &[vals[0]]);
+    let result = bcx.inst_results(call)[0];
+    declare_gc_ptr(bcx, result);
+    vec![result]
+}
+
+/// Compile `expr` for a *transient* consumer: one that reads a pointer only
+/// to address through it (a list index, a struct/union field, a loop's
+/// `iterable`) and stores nothing new, so it must never trigger
+/// `clone_if_owned`'s cloning — that logic assumes the value is being
+/// duplicated into a new persistent home, which is false here by
+/// construction. Skipping this distinction and cloning at every `Var`
+/// occurrence unconditionally was tried and reverted: a scattered read
+/// inside a loop (`xs[j]` for many `j`) is `Copy`-classified on nearly every
+/// occurrence (the name is used again next iteration, by the next `j`), so
+/// it turned an O(n) read pass into an O(n^2) clone storm.
+///
+/// Bypasses cloning only when `expr` is directly a `Var` node — a
+/// `FieldAccess`/`Index` nested inside a transient target (which can't
+/// happen structurally today, but if it ever could) still goes through the
+/// ordinary cloning path via plain recursion into `compile_expr_multi`.
+#[inline]
+fn compile_expr_multi_transient(expr: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    match &expr.item.kind {
+        TypedExprKind::Var(name) => read_var_raw(name, &expr.item.ty, bcx, vars, ctx.structs),
+        _ => compile_expr_multi(expr, bcx, vars, ctx),
+    }
+}
+
+/// `compile_expr_multi_transient` for a single-leaf transient target.
+#[inline]
+fn compile_expr_transient(expr: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Value {
+    let vals = compile_expr_multi_transient(expr, bcx, vars, ctx);
+    assert_eq!(vals.len(), 1, "compile_expr_transient on a multi-leaf expression");
+    vals[0]
 }
 
 // ── Inline heap-object access ────────────────────────────────────────────────
@@ -1314,13 +1410,26 @@ fn compile_expr_multi(
             vec![result]
         },
 
+        // MUTABILITY.md stage 6 / RUNTIME.md: this is the shared funnel for
+        // every read of a binding — a bind, a call argument, a return, a
+        // struct/list-literal field, a `Widen`, a `Block`'s tail, a
+        // `Conditional` branch flowing to its merge — any of which can
+        // duplicate this binding's value into a new persistent home, so
+        // `clone_if_owned` (see its own doc comment) clones a
+        // `Copy`-classified GC-pointer leaf by default. The exceptions are
+        // the handful of *transient* consumers — `Index`/`Slice`/
+        // `FieldAccess`/`IsVariant`/`VariantField`'s target, a loop's
+        // `iterable` — which read a pointer only to address through it and
+        // store nothing; those call `compile_expr_transient`/
+        // `compile_expr_multi_transient` instead, which bypasses this arm's
+        // cloning via `read_var_raw` directly. Skipping that distinction
+        // was tried and reverted: a scattered read inside a loop (`xs[j]`
+        // for many `j`) is `Copy`-classified on nearly every occurrence
+        // (the name is used again next iteration), so cloning indiscriminately
+        // here turned an O(n) read pass into an O(n^2) clone storm.
         TypedExprKind::Var(name) => {
-            struct_fields(&expr.item.ty, ctx.structs).iter().map(|(path, _)| {
-                let key = var_key(name, path);
-                let var = *vars.get(&key)
-                    .unwrap_or_else(|| panic!("unbound variable in codegen: {}", key));
-                bcx.use_var(var)
-            }).collect()
+            let raw = read_var_raw(name, &expr.item.ty, bcx, vars, ctx.structs);
+            clone_if_owned(expr, raw, bcx, ctx)
         },
 
         TypedExprKind::Unary { op, expr: inner } => {
@@ -1350,7 +1459,7 @@ fn compile_expr_multi(
         TypedExprKind::Call { callable, args, mut_args } => compile_call(callable, args, mut_args, bcx, vars, ctx),
 
         TypedExprKind::Index { target, index } => {
-            let list_val = compile_expr(target, bcx, vars, ctx);
+            let list_val = compile_expr_transient(target, bcx, vars, ctx);
             let idx_val  = compile_expr(index, bcx, vars, ctx);
 
             let leafs = struct_fields(&expr.item.ty, ctx.structs);
@@ -1373,7 +1482,7 @@ fn compile_expr_multi(
         },
 
         TypedExprKind::Slice { target, start, end } => {
-            let list_val = compile_expr(target, bcx, vars, ctx);
+            let list_val = compile_expr_transient(target, bcx, vars, ctx);
             // `frog_list_slice` treats i64::MIN/i64::MAX as "bound omitted"
             // sentinels (see its doc comment) — realistic indices never hit
             // these, so there's no ambiguity with an explicit bound.
@@ -1487,7 +1596,7 @@ fn compile_expr_multi(
                             // first member is therefore enough — and needs no
                             // runtime tag test, exactly as the boxed path
                             // needs none.
-                            let slots = compile_expr_multi(target, bcx, vars, ctx);
+                            let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
                             let leaves = unpack_union_member(&members, &members[0], &slots, bcx, ctx.structs);
                             return leaves[offset..offset + leaf_types.len()].to_vec();
                         }
@@ -1497,11 +1606,11 @@ fn compile_expr_multi(
                     // this is a fresh `Value` on every read, so each
                     // heap-typed slot roots itself (see
                     // `for_each_heap_producer`'s matching arm).
-                    let ptr = compile_expr(target, bcx, vars, ctx);
+                    let ptr = compile_expr_transient(target, bcx, vars, ctx);
                     read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
                 },
                 None => {
-                    let target_vals = compile_expr_multi(target, bcx, vars, ctx);
+                    let target_vals = compile_expr_multi_transient(target, bcx, vars, ctx);
                     let (start, len) = field_slice_range(&target.item.ty, field, ctx.structs);
                     target_vals[start..start + len].to_vec()
                 },
@@ -1519,12 +1628,12 @@ fn compile_expr_multi(
         TypedExprKind::IsVariant { target, enum_name, variant, tag } => {
             if let Type::Union(members) = target.item.ty.clone() {
                 if union_is_inline(&members, ctx.structs) {
-                    let slots = compile_expr_multi(target, bcx, vars, ctx);
+                    let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
                     let idx = nominal_member_index(&members, enum_name, variant);
                     return vec![emit_inline_tag_test(bcx, &slots, idx)];
                 }
             }
-            let val = compile_expr(target, bcx, vars, ctx);
+            let val = compile_expr_transient(target, bcx, vars, ctx);
             let def = ctx.unions.get(enum_name).expect("known union in codegen").clone();
             vec![emit_is_variant(bcx, val, &def, *tag)]
         },
@@ -1535,13 +1644,13 @@ fn compile_expr_multi(
                 if union_is_inline(&members, ctx.structs) {
                     // Already guarded by a preceding `IsVariant`, so which
                     // member is live is known statically here.
-                    let slots = compile_expr_multi(target, bcx, vars, ctx);
+                    let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
                     let member_ty = Type::Struct(format!("{}.{}", enum_name, variant));
                     let leaves = unpack_union_member(&members, &member_ty, &slots, bcx, ctx.structs);
                     return leaves[offset..offset + leaf_types.len()].to_vec();
                 }
             }
-            let ptr = compile_expr(target, bcx, vars, ctx);
+            let ptr = compile_expr_transient(target, bcx, vars, ctx);
             read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
         },
 
@@ -1962,6 +2071,36 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         return vec![bcx.ins().iconst(types::I64, 0)];
     }
 
+    // `push(mut xs, v)` — MUTABILITY.md stage 6's unlock. No `func_ids`
+    // entry backs "push" (see typeck's `is_push`), so this must be handled
+    // before the generic lookup below. `xs`'s own value is read through the
+    // ordinary `Var` funnel (`compile_expr`), so it *is* subject to the
+    // clone-on-`Copy` rule — but `liveness.rs`'s `Call`/`mut_args` handling
+    // unconditionally treats a `mut` argument's root as dead going into the
+    // call, so this occurrence is always `Move` and never clones; see
+    // `Ctx::liveness`'s doc comment. `v`'s leaves funnel the same way, so a
+    // `Copy`-classified pushed value is cloned before insertion with no
+    // `push`-specific logic needed here either.
+    if func_name == "push" {
+        let xs_arg = &args[0];
+        let v_arg  = &args[1];
+        let list_val = compile_expr(xs_arg, bcx, vars, ctx);
+        let leafs = struct_fields(&v_arg.item.ty, ctx.structs);
+        let vvals = compile_expr_multi(v_arg, bcx, vars, ctx);
+        for (v, (_, lty)) in vvals.iter().zip(leafs.iter()) {
+            // See `compile_list_lit`'s identical loop: the list's backing
+            // store is a flat i64 buffer, so a Float/Bool leaf needs the
+            // same wire-format conversion every other list-element push does.
+            let wire = to_i64_repr(bcx, lty, *v);
+            emit_list_push(bcx, ctx, list_val, wire);
+        }
+        // No write-back into `xs`'s `Variable`: `emit_list_push`/
+        // `frog_list_push` may reallocate the `FrogList`'s internal `data`
+        // buffer, but never the `FrogList` object itself — the pointer
+        // `list_val` names stays valid and unchanged either way.
+        return vec![bcx.ins().iconst(types::I64, 0)];
+    }
+
     let func_id = ctx.func_ids[&func_name];
     let local_callee = ctx.module.declare_func_in_func(func_id, bcx.func);
 
@@ -2236,8 +2375,15 @@ fn compile_narrow(target_ty: &Type, value: &Spanned<TypedExpr>, bcx: &mut Functi
         other => unreachable!("Narrow source must be a union, got {}", other),
     };
 
+    // `value`'s own leaves are read through, not duplicated: `Narrow`
+    // returns the matched member's *own* fields (a fresh extraction,
+    // handled — or not — by whatever binds them next, same as
+    // `FieldAccess`/`VariantField`), never `value`'s raw pointer itself. A
+    // `match` commonly re-reads its scrutinee this way from inside a loop,
+    // so this must stay transient for the same reason `Index`'s target does
+    // — see `compile_expr_transient`.
     if union_is_inline(&members, ctx.structs) {
-        let slots = compile_expr_multi(value, bcx, vars, ctx);
+        let slots = compile_expr_multi_transient(value, bcx, vars, ctx);
         if matches!(target_ty, Type::None | Type::Never) {
             // Nothing to read — the member carries no information beyond
             // its tag, already proven by the preceding `TypeTag`. One dummy
@@ -2250,10 +2396,10 @@ fn compile_narrow(target_ty: &Type, value: &Spanned<TypedExpr>, bcx: &mut Functi
 
     if *target_ty == Type::None {
         // `value` here is an immediate, not a pointer.
-        let _ = compile_expr(value, bcx, vars, ctx);
+        let _ = compile_expr_transient(value, bcx, vars, ctx);
         return vec![bcx.ins().iconst(types::I64, 0)];
     }
-    let ptr = compile_expr(value, bcx, vars, ctx);
+    let ptr = compile_expr_transient(value, bcx, vars, ctx);
     let leaf_types: Vec<Type> = struct_fields(target_ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
     read_variant_slots(ptr, 0, &leaf_types, bcx, ctx)
 }
@@ -2412,7 +2558,10 @@ fn compile_for_loop(
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
 ) {
-    let list_val = compile_expr(iterable, bcx, vars, ctx);
+    // Read-through, not a duplication: the loop walks this pointer directly
+    // by index and never stores it into a new binding. See
+    // `compile_expr_transient`.
+    let list_val = compile_expr_transient(iterable, bcx, vars, ctx);
     let elem_ty = match &iterable.item.ty {
         Type::List(inner) => (**inner).clone(),
         other => unreachable!("for-loop iterable must be a List after type checking, got {}", other),
@@ -2583,6 +2732,7 @@ impl Codegen {
         builder.symbol("frog_variant_tag", ffi::frog_variant_tag as *const u8);
         builder.symbol("frog_variant_get", ffi::frog_variant_get as *const u8);
         builder.symbol("frog_variant_set", ffi::frog_variant_set as *const u8);
+        builder.symbol("frog_clone",       ffi::frog_clone       as *const u8);
 
         let mut module   = JITModule::new(builder);
         let mut func_ids = HashMap::<String, FuncId>::new();
@@ -2635,6 +2785,9 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_variant_tag", "frog_variant_tag", &[I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_variant_get", "frog_variant_get", &[I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_variant_set", "frog_variant_set", &[I64, I64, I64], None);
+        // Deep-clone-on-Copy for a GC-pointer-bearing `Var` read — see
+        // `compile_expr_multi`'s `TypedExprKind::Var` arm and `Ctx::liveness`.
+        declare_rt(&mut module, &mut func_ids, "frog_clone",      "frog_clone",      &[I64],           Some(I64));
 
         Codegen {
             module,
@@ -2713,16 +2866,21 @@ impl Codegen {
             }
         }
 
+        // A `mut` param's own copy-out (`mut_param_copyout`, consulted at
+        // every `return_`) is the only thing this body's `Ownership` marks
+        // must stay sound against — see `liveness::analyze_body`. Computed
+        // unconditionally now: `Ctx::liveness` is a real codegen input (the
+        // clone-on-`Copy` rule at the `Var` arm), not just a debug dump.
+        let exit_live: liveness::NameSet = mut_params.iter().map(|(n, _)| n.clone()).collect();
+        let body_liveness = liveness::analyze_body(body, &exit_live);
         if std::env::var_os("FROG_DUMP_LIVENESS").is_some() {
-            // A `mut` param's own copy-out (`mut_param_copyout`, consulted
-            // at every `return_`) is the only thing this body's `Ownership`
-            // marks must stay sound against — see `liveness::analyze_body`.
-            let exit_live: liveness::NameSet = mut_params.iter().map(|(n, _)| n.clone()).collect();
-            let body_liveness = liveness::analyze_body(body, &exit_live);
             liveness::dump_body(name, body, &body_liveness);
         }
 
-        let mut ctx = Ctx { func_ids, module, string_arena, structs, unions, printing_unions: Vec::new(), mut_params };
+        let mut ctx = Ctx {
+            func_ids, module, string_arena, structs, unions,
+            printing_unions: Vec::new(), mut_params, liveness: body_liveness,
+        };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
 
         if *return_type != Type::None {
@@ -2825,28 +2983,32 @@ impl Codegen {
         let mut last_val = bcx.ins().iconst(types::I64, 0);
         let mut last_ty = &Type::Int;
 
-        if std::env::var_os("FROG_DUMP_LIVENESS").is_some() {
-            // Every prior entry's binding (`env_types`, since `FrogState::eval`
-            // re-roots all of `env` after every entry regardless of whether
-            // this one touches it — see `liveness::analyze_entry`'s doc
-            // comment) plus this entry's own top-level bindings: both end up
-            // in `env`/`bindings` by the time this entry finishes, so both
-            // must be treated as live through to the end. Over-including a
-            // name that turns out `Never`-typed (skipped from the real
-            // `bindings` list below) only costs precision, never soundness.
-            let mut exit_live: liveness::NameSet = env_types.keys().cloned().collect();
-            for s in stmts {
-                if let TypedExprKind::Assign { name, value } = &s.item.kind {
-                    if !matches!(value.item.kind, TypedExprKind::Function { .. }) {
-                        exit_live.insert(name.clone());
-                    }
+        // Every prior entry's binding (`env_types`, since `FrogState::eval`
+        // re-roots all of `env` after every entry regardless of whether this
+        // one touches it — see `liveness::analyze_entry`'s doc comment) plus
+        // this entry's own top-level bindings: both end up in
+        // `env`/`bindings` by the time this entry finishes, so both must be
+        // treated as live through to the end. Over-including a name that
+        // turns out `Never`-typed (skipped from the real `bindings` list
+        // below) only costs precision, never soundness. Computed
+        // unconditionally now — see `build_func_body`'s matching comment.
+        let mut exit_live: liveness::NameSet = env_types.keys().cloned().collect();
+        for s in stmts {
+            if let TypedExprKind::Assign { name, value } = &s.item.kind {
+                if !matches!(value.item.kind, TypedExprKind::Function { .. }) {
+                    exit_live.insert(name.clone());
                 }
             }
-            let entry_liveness = liveness::analyze_entry(stmts, &exit_live);
+        }
+        let entry_liveness = liveness::analyze_entry(stmts, &exit_live);
+        if std::env::var_os("FROG_DUMP_LIVENESS").is_some() {
             liveness::dump_entry("<entry>", stmts, &entry_liveness);
         }
 
-        let mut ctx = Ctx { func_ids, module, string_arena, structs, unions, printing_unions: Vec::new(), mut_params: Vec::new() };
+        let mut ctx = Ctx {
+            func_ids, module, string_arena, structs, unions,
+            printing_unions: Vec::new(), mut_params: Vec::new(), liveness: entry_liveness,
+        };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
         let mut slot_cursor: usize = 0;

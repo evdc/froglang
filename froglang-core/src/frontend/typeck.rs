@@ -2575,6 +2575,16 @@ impl TypeChecker {
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "print"
         );
+        // `push` is a builtin mutating operation on `List(T)`, polymorphic
+        // over `T` — like `print`, it can't be a monomorphic
+        // `default_context()` entry (there's no generics system; `List(T)`
+        // is already a special-cased "builtin hack" per roadmap.md), so it
+        // special-cases on the callee's literal name the same way `print`
+        // does, rather than being a resolvable binding.
+        let is_push = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "push"
+        );
 
         let (kind, ty) = if let Some(name) = struct_name {
             let field_defs = self.struct_defs.get(&name).cloned().unwrap_or_default();
@@ -2610,6 +2620,84 @@ impl TypeChecker {
             // instead of falsely claiming `None`.
             let ty = if arg.item.ty == Type::Never { Type::Never } else { Type::None };
             (TypedExprKind::Call { callable: Box::new(callable), args: vec![arg], mut_args: vec![false] }, ty)
+        } else if is_push {
+            if c.args.len() != 2 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 2, got {}", c.args.len())
+                }, callee_span));
+            }
+            let mut arg_iter = c.args.into_iter();
+            let xs_arg = arg_iter.next().expect("arity checked just above");
+            let v_arg  = arg_iter.next().expect("arity checked just above");
+            let xs_span = xs_arg.span;
+
+            let xs_inner = match xs_arg.item {
+                Expression::MutArg(inner) => *inner,
+                _ => return Err(Spanned::from(TypeError {
+                    msg: "push's first argument must be marked 'mut'".to_string()
+                }, xs_span)),
+            };
+            // Same check the generic `mut`-argument path applies
+            // (`self.ctx.is_mutable`) — `push`'s receiver is exactly a
+            // `mut` argument, just to a builtin rather than a user `func`.
+            let root = xs_inner.item.get_identifier().map(|s| s.to_string()).ok_or_else(|| Spanned::from(TypeError {
+                msg: "'mut' argument must be a plain mutable binding, not an expression".to_string()
+            }, xs_span))?;
+            match self.ctx.is_mutable(&root) {
+                None => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not declared", root)
+                }, xs_span)),
+                Some(false) => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to pass it as a 'mut' argument", root, root)
+                }, xs_span)),
+                Some(true) => {},
+            }
+
+            let xs_lowered = self.check_and_lower(xs_inner)?;
+            let xs_ty = self.lookup(&xs_lowered.item.ty);
+            let Type::List(elem_ty) = xs_ty.clone() else {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("push's first argument must be a List, got {:?}", xs_ty)
+                }, xs_span));
+            };
+
+            // Exclusivity: `push(mut xs, xs)` rejected, same reasoning as
+            // the generic `mut`-argument path's "no root may also be
+            // another argument" rule — just a fixed two-argument shape
+            // here, not worth generalizing.
+            let v_span = v_arg.span;
+            if v_arg.item.get_identifier().is_some_and(|n| n == root) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' can't be passed 'mut' and also appear as another argument in the same call", root)
+                }, v_span));
+            }
+
+            let v_lowered = self.check_and_lower(v_arg)?;
+            let resolved_argt = self.lookup(&v_lowered.item.ty);
+            let resolved_elem = self.lookup(&elem_ty);
+            if !widens_to(&resolved_argt, &resolved_elem) && !self.unify(&v_lowered.item.ty, &elem_ty) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_elem)
+                }, v_span));
+            }
+            let v_widened = self.lower_widen(v_lowered, &elem_ty)?;
+
+            // No `default_context()` entry backs "push" (see `is_push`'s own
+            // comment), so the callable's `TypedExpr` is synthesized here
+            // rather than resolved by `check_and_lower` — it's never
+            // consulted for anything except `compile_call`'s dispatch on
+            // the literal name `"push"`.
+            let callable = Spanned::from(TypedExpr {
+                id: 0,
+                ty: Type::Function { params: vec![xs_ty.clone(), (*elem_ty).clone()], result: Box::new(Type::None) },
+                kind: TypedExprKind::Var("push".to_string()),
+            }, callee_span);
+
+            (TypedExprKind::Call {
+                callable: Box::new(callable),
+                args: vec![xs_lowered, v_widened],
+                mut_args: vec![true, false],
+            }, Type::None)
         } else {
             let callable = self.check_and_lower(*c.callable)?;
             let func_type = self.lookup(&callable.item.ty);

@@ -1,8 +1,11 @@
 # Mutability and Value Semantics
 
-Status: **design**. Nothing here is implemented beyond what the language already does by
-accident (see "Where the language actually is", below). Syntax is a sketch; the *decisions* in
-"Foundational choices" are the part meant to be stable.
+Status: **implemented**, stages 1-4 and 6 of the plan below (`let`/`mut`, places, `mut`
+parameters, move-on-last-use, and `push`). Stage 5 (closures) waits on closures existing at all;
+stage 7 (COW via a `shared` header bit) is deliberately not attempted — see stage 6's "as built"
+for why it isn't needed for correctness. The *decisions* in "Foundational choices" are what stayed
+stable throughout; "Where the language actually is" below is now historical (it describes the
+pre-stage-1 accidental state, kept for the reasoning that motivated the whole document).
 
 This supersedes the "Objects: mutable structs?" sketch in `DESIGN.md`, and settles a
 prerequisite that `TRAITS.md` (derived `Eq`, `Dict` keys, variance) and `CONCURRENCY.md`
@@ -397,11 +400,67 @@ is visible in the type name, rather than diffused through the collection types.
 4. **`mut` parameters** ✅ with the call-site marker and the single-root exclusivity check, via
    copy-in/copy-out extra Cranelift return values.
 5. **Closure capture by value** — decided now, implemented when closures are.
-6. **Move on last use** — split into three pieces; the analysis landed, the GC-rooting consumer
+6. **Move on last use** ✅ — split into three pieces; the analysis landed, the GC-rooting consumer
    is moot (Cranelift's stack maps own that now — RUNTIME.md Part 2), the semantic consumer
-   (move-elision for a plain value) did not land. See below.
-   *Then* container mutation (`push`, `set`, and `Dict`'s mutating operations) on top of it.
-7. **COW via the `shared` header bit**, if and only if the benchmarks still want it.
+   (move-elision for a plain value) landed as `codegen::clone_if_owned`, threaded from
+   `Ctx::liveness` into `compile_expr_multi`'s `Var` arm. See "Stage 6, as built" below.
+   *Then* container mutation: `push(mut xs, v)` ✅, a special-cased builtin call mirroring
+   `print`'s (`typeck.rs`'s `is_push`, `codegen`'s `func_name == "push"` branch), reusing the
+   existing `emit_list_push`. `set` was already covered by `xs[i] = v` (stage 3). `Dict`'s mutating
+   operations are unimplemented since `Dict` itself doesn't exist yet, but need nothing new here —
+   they'd go through the same `clone_if_owned` mechanism.
+7. **COW via the `shared` header bit** — not needed for correctness (see "Stage 6, as built"'s
+   scoping argument for why); would only reduce clones further in cross-function-call patterns the
+   intraprocedural liveness analysis can't see. Not attempted; revisit only if benchmarks want it.
+
+### Stage 6, as built
+
+The semantic consumer landed narrower than the original sketch, and the scoping turned out to be
+the interesting part.
+
+**Where cloning happens.** A GC-managed value can only ever be mutated in place through a *bare*
+`mut`-rooted `List` binding — `push`/index-assignment both require `flatten_place`/`is_push` to
+resolve a plain identifier root, never a struct field or a union payload. So the only type that
+ever needs protecting is `Type::List(_)` at the top of a binding's own type, exactly — not "any
+type with a GC-pointer leaf". A struct or union value can only ever be *rebound* wholesale, never
+mutated through one alias while another alias still points at the old contents, so cloning one
+would be pure waste. This was tried the broad way first (clone on any `is_heap_ty` leaf) and
+reverted: an `Int | Bad`-shaped union (a `Str`-bearing member, neither of which is ever mutable)
+got cloned on every `Copy`-classified read anyway, costing a real `frog_clone` call for nothing —
+see `benches/pipeline.rs`'s `fallible` workload, which is exactly what caught it.
+
+**Where in codegen.** `Ctx::liveness` (the `Liveness` `analyze_body`/`analyze_entry` already
+computed, now threaded through unconditionally instead of only under `FROG_DUMP_LIVENESS`) is
+consulted by `codegen::clone_if_owned`, called from exactly one place:
+`compile_expr_multi`'s `TypedExprKind::Var` arm. Every non-transient consumer of a binding's value
+— a bind, a call argument, a return, a struct/list/variant literal's field or element, a `Widen`,
+a `Block`'s tail, a `Conditional` branch — reaches that arm automatically by ordinary recursion, so
+none of them needed separate wiring.
+
+**The one real design trap.** A first pass put the clone check directly in the `Var` funnel with no
+exceptions, on the reasoning that "it's the only place a binding's value gets duplicated". That's
+true for *duplication* but the funnel is also where every *transient* read goes — `Index`'s,
+`FieldAccess`'s, `Slice`'s, `IsVariant`'s/`VariantField`'s, `Narrow`'s target, and a `for`-loop's
+`iterable`, none of which store anything new. A scattered read inside a loop (`xs[j]` for many
+`j`) is `Copy`-classified on nearly every occurrence — the name is used again by the next `j` —
+which turned an O(n) read pass into an O(n²) clone storm (`benches/pipeline.rs`'s `lists` workload
+went from 5.4ms to 251ms). The fix was `compile_expr_transient`/`compile_expr_multi_transient`,
+which those specific call sites use instead — they bypass the clone check via `read_var_raw`
+directly, since reading a pointer only to address through it can never need a clone.
+
+**A known, pre-existing, and still-open gap**: reading a leaf back out of a container — a list
+element, a struct/union field, a narrowed match arm — is not itself a `Var` node, so a value
+extracted that way and then bound to a new `mut` name is never cloned, even if it's later `push`ed.
+This predates this work (nothing was ever cloned on that path) and stays out of scope for the same
+reason nested-index place assignment does: no surface syntax reaches it, since `push` and place
+assignment both require a bare identifier root, never `xs[0].listField`.
+
+Measured on `benches/pipeline.rs`: `fallible`, `structs`, `lists`, `orders`, and every other
+existing workload are unchanged within noise against the pre-stage-6 baseline. Two new workloads,
+`list_push_loop` and `list_push_aliased`, demonstrate the elision claim directly — the former costs
+about what `lists`' comprehension build costs (`push`'s own receiver is always `Move`-classified,
+per `liveness.rs`'s `Call`/`mut_args` handling), the latter shows one measurable, once-per-round
+clone cost rather than a per-element one.
 
 ### Stage 6 in detail
 

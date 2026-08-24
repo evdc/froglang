@@ -274,6 +274,45 @@ A `mut` parameter does not escape. It cannot be stored in a struct, returned, or
 is no type to store it *as*, since `mut` is not part of the type. That falls out rather than
 needing a rule.
 
+#### Amendment: the receiver position is exempt (`TRAITS.md` Part 2)
+
+`TRAITS.md` introduces UFCS — `x.f(args)` resolving to a member or to `f(x, args)`. Under the rule
+as stated above, the receiver form would be unusable for exactly the operations most worth
+chaining: `xs.push(x)` desugars to `push(xs, x)` and is rejected for want of a marker.
+
+**The receiver of a dot-form call is exempt from the call-site marker. Every other argument
+position is not.**
+
+```
+xs.push(x)              // receiver: the mutated operand is the leftmost token
+push(mut xs, x)         // prefix: buried in an argument list, marker earns its keep
+swap(mut a, mut b)      // unchanged
+```
+
+The rule generalizes the paragraph above rather than contradicting it: *the marker exists to make
+a mutated operand visually prominent, and the receiver position already is one.* Rust — which
+cares about this more than any other language — reaches the same place via autoref: `vec.push(x)`
+carries no `&mut` at the call site either.
+
+Affordable for two reasons. First, the marker is **semantically inert**: `func_mut_params` is
+consulted by `lower_call` to validate it and to compute the copy-out count, and the copy-out count
+comes from the *declaration*. Nothing downstream reads the marker. Second, the property this
+section protects is already half-carried by the *declaration* site — a `let`-bound variable cannot
+be passed as a `mut` argument at all, so "which variables in this scope are writable" is answered
+without reading any callee either way. The call-site marker adds only "…and it is written *at this
+statement*".
+
+What is given up: adding `mut` to a member's receiver parameter silently changes existing dot-form
+call sites, where marking would have made it a compile error at each. Contained — it can only
+affect bindings already declared `mut`, and only through the dot form.
+
+Accepted knowingly: for a plain (non-member) function, `xs.push(x)` and `push(mut xs, x)` are the
+same call under different marking rules, so a mechanical dot→prefix rewrite can change what is
+legal.
+
+Rejected alternative: exempting *the first parameter* rather than *the receiver position*. It
+sounds more uniform and produces `swap(a, mut b)`, which is worse than either option.
+
 For a callee that wants a local mutable copy rather than write-back — Rust's `mut` — `mut q = p`
 in the body says so in the place where it happens:
 

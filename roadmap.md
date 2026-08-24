@@ -3,11 +3,12 @@
 - Enums / variants, common fields, matching expressions (e.g. via `if x is Circle(r) then ...`) — done: `data X is A | B(...)`, `match`, `is`, boxed+tagged GC representation, exhaustiveness checking
   - follow-ups: structural `==` on enums, named/nested pattern binds, multi-line leading-`|` variant lists
   - done: payload-less variants are unboxed to an immediate tag (`(tag << 1) | 1`, low bit distinguishes them from 8-aligned pointers — see gc.rs "Immediate (unboxed) values")
-- ~~Perf: unbox variants *with* payloads~~ — **done, see RUNTIME.md Part 1**: a union that isn't self-referential and has at most 6 members is flattened into tagged-pointer + scalar columns the way structs already are, boxing only the self-referential ones (`Tree`) and the very wide ones. `benches/orders.frog` went 90ms → 60ms.
-- ~~GC roots: hand-written shadow stack~~ — **done, see RUNTIME.md Part 2**: roots are now Cranelift's own user stack maps, tied to each `Variable`'s real live range rather than a producer-site slot. Needed a Cranelift 0.113→0.135 upgrade (0.113's stack-map tracking missed SSA-inserted block parameters) and closes the pre-existing loop-back-edge rooting hole along with it. `orders.frog` unchanged at 60ms — this was about correctness and deleting hand-written machinery, not about that benchmark's time.
+- Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value (~4M mallocs); after inlining heap access and un-boxing shadow frames it is at 182ms vs 31ms for the same program in Rust, and `malloc`/`free`/`memset` plus the mark phase are ~half of what's left. Secondary: pool/free-list the fixed-size GC blocks, and make shadow frames cheaper than an FFI push/pop + zeroing per call.
 - Error handling, errors as values + early-return sugar, etc — builds on enums (Result/Option as compiler-known enums)
-- Traits/interfaces, explicit-style
-    - Resolve duality between `provides` and trait impls. Explicit `impl Trait for Type` `Type implements Trait {}` blocks?
+- Traits/interfaces, generics, and methods — designed in `plans/TRAITS.md`, decisions settled
+    - The `provides`/impl duality is resolved: one `provides` keyword, inline on `data` or standalone, with a body
+    - Members live in the impl's namespace, not the global one — so there is no function overloading anywhere
+    - `x.f(y)` resolves field → member → free function; UFCS over free functions ships first, on its own
 - Annotations, and auto-deriving trait implementations (macros/comptime?)
 - Structured concurrency
 
@@ -20,18 +21,26 @@ What it takes to get from here to self-hosting compiler
 
 ---
 
-We need to improve performance of unions/errors. In the `orders.frog` benchmark, as one review agent put it:
-> Widen (codegen/mod.rs:1492) always boxes a value crossing into a union type via box_into_variant — a real frog_alloc_variant malloc plus GC-header init — even for a
-  plain Int. There's no unboxed fast path for scalar union members the way nullary members (None, payload-less variants) already get. In orders.frog, this fires twice per item:
-  once widening checked_gross's Int into Int | PricingError, again widening price_item's own Int result. ?'s desugared match then does a tag load + field unbox to get the Int right
-  back out — a full box-then-unbox round trip on a path that never actually holds an error, ~4M extra allocations on top of the Discount boxing the README already calls out.
+Other Ideas
+- tagged numeric literals, eg `14hr`, `33mi`, `12.34s`
+    - lexer recognizes them, interpretation is up to libraries/user
+    - perhaps it just desugars to creating a struct like `Tagged(tag='hr', val=14)`
+    - built-in unit math / dimensional analysis is probably out of scope here
+- similarly, native date/time syntax?
 
-Notes
-- The union-representation question below is answered in RUNTIME.md, and implemented: neither
-  two-slot nor always-boxed, but a tagged pointer carrying the member tag in the low 3 bits of
-  the first pointer column (or in a dedicated column when that column is itself tagged).
-  Measurements and the encoding rules are there.
-- We switched from a two-slot (tag, payload) repr to a one-slot (always-boxed) repr - why?
-    - We found the "global type id" isn't required anywhere else
-    - Perhaps to save a slot?
-- But now we pay the cost of boxing for every enum, even ones that just have primitive members. E.g. a `data Foo is Bar(Int) | Baz(Str)` has to box the Int, whereas it could fit in a (tag, payload) pair. 
+---
+
+Methods — **decided**, see `plans/TRAITS.md` Part 1
+
+- UFCS: `x.f(args)` resolves in a fixed order — a field of `x`, then a member of an impl for
+  `typeof(x)`, then a free `func f` whose first parameter accepts `typeof(x)`
+- `List.push(xs, x)` is rejected, as this note wanted. `xs.push(x)` and `s1.concat(s2)` work
+- No overload on the first argument type: members are namespaced by their impl, so nothing
+  collides. The OOP-ish and Go-style sketches below were both declined — a receiver cannot
+  express `compare(a: Self, b: Self)` or `zero(): Self`, which are the two members that matter
+  most for a language whose error story is trait-keyed
+- The prefix form for a member is trait-qualified: `Ord.compare(a, b)`
+- `mut` is not written on a dot-call receiver: `xs.push(x)`, not `mut xs.push(x)`. See the
+  amendment at the end of `plans/MUTABILITY.md` §3
+
+Declined sketches, kept for the record:

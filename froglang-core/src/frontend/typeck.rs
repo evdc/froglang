@@ -2654,167 +2654,377 @@ impl TypeChecker {
             }
 
             let xs_lowered = self.check_and_lower(xs_inner)?;
-            let xs_ty = self.lookup(&xs_lowered.item.ty);
-            let Type::List(elem_ty) = xs_ty.clone() else {
-                return Err(Spanned::from(TypeError {
-                    msg: format!("push's first argument must be a List, got {:?}", xs_ty)
-                }, xs_span));
-            };
+            return self.finish_push(xs_lowered, xs_span, root, v_arg, callee_span, span);
+        } else if matches!(&c.callable.item, Expression::FieldAccess(_)) {
+            // `x.f(args)` where `f` isn't a struct/union field of
+            // `typeof(x)` — resolved by `lower_ufcs_call` per
+            // `TRAITS.md` Part 1 (steps 1 and 3; step 2, trait members,
+            // doesn't exist yet).
+            let Expression::FieldAccess(fa) = c.callable.item else { unreachable!("matched above") };
+            return self.lower_ufcs_call(fa, c.args, callee_span, span);
+        } else {
+            let callable = self.check_and_lower(*c.callable)?;
+            return self.finish_call(callable, callee_name, c.args, callee_span, span);
+        };
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
+    }
 
-            // Exclusivity: `push(mut xs, xs)` rejected, same reasoning as
-            // the generic `mut`-argument path's "no root may also be
-            // another argument" rule — just a fixed two-argument shape
-            // here, not worth generalizing.
-            let v_span = v_arg.span;
-            if v_arg.item.get_identifier().is_some_and(|n| n == root) {
-                return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' can't be passed 'mut' and also appear as another argument in the same call", root)
-                }, v_span));
-            }
+    /// The tail of a `push` call once its first argument is resolved to
+    /// an already-lowered, already-mutability-checked list with a known
+    /// root binding — shared by `lower_call`'s `is_push` branch (where
+    /// `root` comes from an explicit `mut` marker) and `lower_ufcs_call`
+    /// (where `xs.push(v)`'s receiver is exempt from that marker, per
+    /// `TRAITS.md` Part 2, but `root` still names the same binding).
+    fn finish_push(&mut self, xs_lowered: Spanned<TypedExpr>, xs_span: Span, root: String, v_arg: Spanned<Expression>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let xs_ty = self.lookup(&xs_lowered.item.ty);
+        let Type::List(elem_ty) = xs_ty.clone() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("push's first argument must be a List, got {:?}", xs_ty)
+            }, xs_span));
+        };
 
-            let v_lowered = self.check_and_lower(v_arg)?;
-            let resolved_argt = self.lookup(&v_lowered.item.ty);
-            let resolved_elem = self.lookup(&elem_ty);
-            if !widens_to(&resolved_argt, &resolved_elem) && !self.unify(&v_lowered.item.ty, &elem_ty) {
-                return Err(Spanned::from(TypeError {
-                    msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_elem)
-                }, v_span));
-            }
-            let v_widened = self.lower_widen(v_lowered, &elem_ty)?;
+        // Exclusivity: `push(mut xs, xs)` rejected, same reasoning as
+        // the generic `mut`-argument path's "no root may also be
+        // another argument" rule — just a fixed two-argument shape
+        // here, not worth generalizing.
+        let v_span = v_arg.span;
+        if v_arg.item.get_identifier().is_some_and(|n| n == root) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("'{}' can't be passed 'mut' and also appear as another argument in the same call", root)
+            }, v_span));
+        }
 
-            // No `default_context()` entry backs "push" (see `is_push`'s own
-            // comment), so the callable's `TypedExpr` is synthesized here
-            // rather than resolved by `check_and_lower` — it's never
-            // consulted for anything except `compile_call`'s dispatch on
-            // the literal name `"push"`.
-            let callable = Spanned::from(TypedExpr {
-                id: 0,
-                ty: Type::Function { params: vec![xs_ty.clone(), (*elem_ty).clone()], result: Box::new(Type::None) },
-                kind: TypedExprKind::Var("push".to_string()),
-            }, callee_span);
+        let v_lowered = self.check_and_lower(v_arg)?;
+        let resolved_argt = self.lookup(&v_lowered.item.ty);
+        let resolved_elem = self.lookup(&elem_ty);
+        if !widens_to(&resolved_argt, &resolved_elem) && !self.unify(&v_lowered.item.ty, &elem_ty) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_elem)
+            }, v_span));
+        }
+        let v_widened = self.lower_widen(v_lowered, &elem_ty)?;
 
-            (TypedExprKind::Call {
+        // No `default_context()` entry backs "push" (see `is_push`'s own
+        // comment), so the callable's `TypedExpr` is synthesized here
+        // rather than resolved by `check_and_lower` — it's never
+        // consulted for anything except `compile_call`'s dispatch on
+        // the literal name `"push"`.
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![xs_ty.clone(), (*elem_ty).clone()], result: Box::new(Type::None) },
+            kind: TypedExprKind::Var("push".to_string()),
+        }, callee_span);
+
+        Ok(Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::None,
+            kind: TypedExprKind::Call {
                 callable: Box::new(callable),
                 args: vec![xs_lowered, v_widened],
                 mut_args: vec![true, false],
-            }, Type::None)
+            },
+        }, span))
+    }
+
+    /// The tail shared by an ordinary call (`f(args)`, callable already
+    /// resolved) and a UFCS free-function rewrite (`x.f(args)` →
+    /// `f(x, args)`, `lower_ufcs_call`'s step-3 case): arity, `mut`
+    /// marking/exclusivity, unification and widening against the
+    /// callable's parameter types.
+    fn finish_call(&mut self, callable: Spanned<TypedExpr>, callee_name: Option<String>, call_args: Vec<Spanned<Expression>>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let func_type = self.lookup(&callable.item.ty);
+
+        // If the callee is an unbound TypeVar (e.g. a lambda
+        // parameter used as a function), bind it to a fresh
+        // function type whose arity matches this call site.
+        let func_type = if let Type::TypeVar { name, .. } = &func_type {
+            let param_types: Vec<Type> = call_args.iter().map(|_| self.fresh_var()).collect();
+            let result_type = self.fresh_var();
+            let fn_ty = Type::Function { params: param_types, result: Box::new(result_type) };
+            self.substitutions.insert(name.clone(), fn_ty.clone());
+            fn_ty
         } else {
-            let callable = self.check_and_lower(*c.callable)?;
-            let func_type = self.lookup(&callable.item.ty);
-
-            // If the callee is an unbound TypeVar (e.g. a lambda
-            // parameter used as a function), bind it to a fresh
-            // function type whose arity matches this call site.
-            let func_type = if let Type::TypeVar { name, .. } = &func_type {
-                let param_types: Vec<Type> = c.args.iter().map(|_| self.fresh_var()).collect();
-                let result_type = self.fresh_var();
-                let fn_ty = Type::Function { params: param_types, result: Box::new(result_type) };
-                self.substitutions.insert(name.clone(), fn_ty.clone());
-                fn_ty
-            } else {
-                func_type
-            };
-
-            let Type::Function { params, result } = func_type else {
-                return Err(Spanned::from(TypeError {
-                    msg: format!("Not callable: {}", func_type)
-                }, callee_span));
-            };
-            if c.args.len() != params.len() {
-                return Err(Spanned::from(TypeError {
-                    msg: format!("Wrong number of arguments, expected {}, got {}", params.len(), c.args.len())
-                }, callee_span));
-            }
-            // The callee's declared `mut` parameters, if it's a plain
-            // name resolving to one — `None` means either an indirect
-            // call or a callee with no `mut` parameters, both of which
-            // reject *any* `mut`-marked argument identically below.
-            let declared_mut = callee_name.as_ref().and_then(|n| self.func_mut_params.get(n).cloned());
-
-            let mut args = Vec::with_capacity(c.args.len());
-            let mut mut_args = Vec::with_capacity(c.args.len());
-            // Every argument that's a bare identifier reference, mut or
-            // not — used below to reject a `mut` argument's root
-            // reappearing as any other argument in the same call
-            // (`swap(mut a, mut a)`, `merge(mut xs, xs)`), the exclusivity
-            // rule that's cheap here only because nothing else aliases.
-            //
-            // One entry per argument, `None` for an argument that isn't a
-            // bare identifier — the exclusivity loop below indexes this by
-            // *argument* position, so pushing only the identifier ones
-            // would misalign it. `f(g(x), mut a)` used to push a single
-            // entry and then index it at 1.
-            let mut all_roots: Vec<Option<(String, Span)>> = Vec::with_capacity(c.args.len());
-            for (i, (arg, param)) in c.args.into_iter().zip(params.iter()).enumerate() {
-                let arg_span = arg.span;
-                let (is_mut, inner) = match arg.item {
-                    Expression::MutArg(inner) => (true, *inner),
-                    other => (false, Spanned::from(other, arg_span)),
-                };
-                all_roots.push(inner.item.get_identifier().map(|r| (r.to_string(), arg_span)));
-                if is_mut {
-                    let root = inner.item.get_identifier().map(|s| s.to_string()).ok_or_else(|| Spanned::from(TypeError {
-                        msg: "'mut' argument must be a plain mutable binding, not an expression".to_string()
-                    }, arg_span))?;
-                    match self.ctx.is_mutable(&root) {
-                        None => return Err(Spanned::from(TypeError {
-                            msg: format!("'{}' is not declared", root)
-                        }, arg_span)),
-                        Some(false) => return Err(Spanned::from(TypeError {
-                            msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to pass it as a 'mut' argument", root, root)
-                        }, arg_span)),
-                        Some(true) => {},
-                    }
-                }
-                // `.get(i)`, not `d[i]`: `func_mut_params` is keyed by bare
-                // name with no scoping, so a local binding that shadows a
-                // `func` of the same name can produce a shorter list than
-                // this call has arguments. Treating a missing entry as
-                // "not declared mut" is the same answer an indirect call
-                // gets, which is the conservative one.
-                match declared_mut.as_ref().and_then(|d| d.get(i)).copied() {
-                    Some(true) if !is_mut => return Err(Spanned::from(TypeError {
-                        msg: format!("argument {} must be marked 'mut' — the callee's parameter is 'mut'", i + 1)
-                    }, arg_span)),
-                    Some(false) if is_mut => return Err(Spanned::from(TypeError {
-                        msg: format!("argument {} is marked 'mut', but the callee's parameter isn't", i + 1)
-                    }, arg_span)),
-                    None if is_mut => return Err(Spanned::from(TypeError {
-                        msg: "'mut' arguments are only valid in a direct call to a 'func' declaration".to_string()
-                    }, arg_span)),
-                    _ => {},
-                }
-                let lowered = self.check_and_lower(inner)?;
-                let resolved_argt  = self.lookup(&lowered.item.ty);
-                let resolved_param = self.lookup(param);
-                // Allow implicit widening coercions at call sites (e.g. Int→Float).
-                if !widens_to(&resolved_argt, &resolved_param) && !self.unify(&lowered.item.ty, param) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_param)
-                    }, arg_span));
-                }
-                args.push(self.lower_widen(lowered, param)?);
-                mut_args.push(is_mut);
-            }
-            // Exclusivity: a `mut`-marked root may not also be any other
-            // argument's root in this same call.
-            for (i, is_mut) in mut_args.iter().enumerate() {
-                if !is_mut { continue; }
-                // A `mut` argument is always a bare identifier — the check
-                // above rejects anything else — so this entry is `Some`.
-                let Some((root, root_span)) = &all_roots[i] else { continue };
-                let aliases = all_roots.iter().enumerate()
-                    .any(|(j, other)| j != i && other.as_ref().is_some_and(|(n, _)| n == root));
-                if aliases {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("'{}' can't be passed 'mut' and also appear as another argument in the same call", root)
-                    }, *root_span));
-                }
-            }
-            let ty = self.lookup(&result);
-            (TypedExprKind::Call { callable: Box::new(callable), args, mut_args }, ty)
+            func_type
         };
-        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
+
+        let Type::Function { params, result } = func_type else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Not callable: {}", func_type)
+            }, callee_span));
+        };
+        if call_args.len() != params.len() {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Wrong number of arguments, expected {}, got {}", params.len(), call_args.len())
+            }, callee_span));
+        }
+        // The callee's declared `mut` parameters, if it's a plain
+        // name resolving to one — `None` means either an indirect
+        // call or a callee with no `mut` parameters, both of which
+        // reject *any* `mut`-marked argument identically below.
+        let declared_mut = callee_name.as_ref().and_then(|n| self.func_mut_params.get(n).cloned());
+
+        let mut args = Vec::with_capacity(call_args.len());
+        let mut mut_args = Vec::with_capacity(call_args.len());
+        // Every argument that's a bare identifier reference, mut or
+        // not — used below to reject a `mut` argument's root
+        // reappearing as any other argument in the same call
+        // (`swap(mut a, mut a)`, `merge(mut xs, xs)`), the exclusivity
+        // rule that's cheap here only because nothing else aliases.
+        //
+        // One entry per argument, `None` for an argument that isn't a
+        // bare identifier — the exclusivity loop below indexes this by
+        // *argument* position, so pushing only the identifier ones
+        // would misalign it. `f(g(x), mut a)` used to push a single
+        // entry and then index it at 1.
+        let mut all_roots: Vec<Option<(String, Span)>> = Vec::with_capacity(call_args.len());
+        for (i, (arg, param)) in call_args.into_iter().zip(params.iter()).enumerate() {
+            let declared = declared_mut.as_ref().and_then(|d| d.get(i)).copied();
+            let (lowered, is_mut, root) = self.lower_call_arg(i, arg, param, declared)?;
+            args.push(lowered);
+            mut_args.push(is_mut);
+            all_roots.push(root);
+        }
+        self.check_mut_exclusivity(&mut_args, &all_roots)?;
+        let ty = self.lookup(&result);
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Call { callable: Box::new(callable), args, mut_args } }, span))
+    }
+
+    /// One argument of a call: unwraps a `mut` marker, validates it
+    /// against `declared` (the callee's declared mutability for this
+    /// position, `None` meaning "no declaration reaches here"), then
+    /// unifies/widens the argument's type against `param`. Shared by
+    /// `finish_call` (every argument) and `lower_ufcs_call` (every
+    /// argument after the exempt receiver).
+    fn lower_call_arg(&mut self, i: usize, arg: Spanned<Expression>, param: &Type, declared: Option<bool>) -> Result<(Spanned<TypedExpr>, bool, Option<(String, Span)>), Spanned<TypeError>> {
+        let arg_span = arg.span;
+        let (is_mut, inner) = match arg.item {
+            Expression::MutArg(inner) => (true, *inner),
+            other => (false, Spanned::from(other, arg_span)),
+        };
+        let root = inner.item.get_identifier().map(|r| (r.to_string(), arg_span));
+        if is_mut {
+            let name = root.as_ref().map(|(n, _)| n.clone()).ok_or_else(|| Spanned::from(TypeError {
+                msg: "'mut' argument must be a plain mutable binding, not an expression".to_string()
+            }, arg_span))?;
+            match self.ctx.is_mutable(&name) {
+                None => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not declared", name)
+                }, arg_span)),
+                Some(false) => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to pass it as a 'mut' argument", name, name)
+                }, arg_span)),
+                Some(true) => {},
+            }
+        }
+        // `.get(i)`, not `d[i]`: `func_mut_params` is keyed by bare
+        // name with no scoping, so a local binding that shadows a
+        // `func` of the same name can produce a shorter list than
+        // this call has arguments. Treating a missing entry as
+        // "not declared mut" is the same answer an indirect call
+        // gets, which is the conservative one.
+        match declared {
+            Some(true) if !is_mut => return Err(Spanned::from(TypeError {
+                msg: format!("argument {} must be marked 'mut' — the callee's parameter is 'mut'", i + 1)
+            }, arg_span)),
+            Some(false) if is_mut => return Err(Spanned::from(TypeError {
+                msg: format!("argument {} is marked 'mut', but the callee's parameter isn't", i + 1)
+            }, arg_span)),
+            None if is_mut => return Err(Spanned::from(TypeError {
+                msg: "'mut' arguments are only valid in a direct call to a 'func' declaration".to_string()
+            }, arg_span)),
+            _ => {},
+        }
+        let lowered = self.check_and_lower(inner)?;
+        let resolved_argt  = self.lookup(&lowered.item.ty);
+        let resolved_param = self.lookup(param);
+        // Allow implicit widening coercions at call sites (e.g. Int→Float).
+        if !widens_to(&resolved_argt, &resolved_param) && !self.unify(&lowered.item.ty, param) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_param)
+            }, arg_span));
+        }
+        let widened = self.lower_widen(lowered, param)?;
+        Ok((widened, is_mut, root))
+    }
+
+    /// A `mut`-marked argument's root may not also be any other
+    /// argument's root in the same call (`swap(mut a, mut a)`,
+    /// `merge(mut xs, xs)`).
+    fn check_mut_exclusivity(&self, mut_args: &[bool], all_roots: &[Option<(String, Span)>]) -> Result<(), Spanned<TypeError>> {
+        for (i, is_mut) in mut_args.iter().enumerate() {
+            if !is_mut { continue; }
+            // A `mut` argument is always a bare identifier — the check
+            // above rejects anything else — so this entry is `Some`.
+            let Some((root, root_span)) = &all_roots[i] else { continue };
+            let aliases = all_roots.iter().enumerate()
+                .any(|(j, other)| j != i && other.as_ref().is_some_and(|(n, _)| n == root));
+            if aliases {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' can't be passed 'mut' and also appear as another argument in the same call", root)
+                }, *root_span));
+            }
+        }
+        Ok(())
+    }
+
+    /// The type of a field named `field` on an already-resolved type, or
+    /// `None` if there is no such field — used by `lower_ufcs_call` to
+    /// decide resolution step 1 (field access) versus falling through to
+    /// step 3 (a free function). Mirrors `lower_field_access`'s
+    /// struct/union lookup, but takes an already-resolved `Type` instead
+    /// of lowering the target itself, since the caller has already done
+    /// that once and must not do it again (the target may have side
+    /// effects).
+    fn field_type_of(&self, resolved: &Type, field: &str) -> Option<Type> {
+        if let Type::Struct(sname) = resolved {
+            self.struct_defs.get(sname)
+                .and_then(|fs| fs.iter().find(|(n, _)| n == field))
+                .map(|(_, t)| t.clone())
+        } else if let Some((_, def)) = self.resolve_union(resolved) {
+            def.common.iter().find(|(n, _)| n == field).map(|(_, t)| t.clone())
+        } else {
+            None
+        }
+    }
+
+    /// `x.f(args)` where `f` is not a field of `typeof(x)` directly on the
+    /// `Call` node — i.e. resolution steps 1 and 3 of `TRAITS.md` Part 1.
+    /// Step 2 (trait members) doesn't exist yet — there is no `provides`
+    /// body and no impl registry — so this is the whole of Stage 0.
+    ///
+    /// `fa.target` is lowered exactly once, up front; both the step-1 and
+    /// step-3 branches below reuse that single `TypedExpr` rather than
+    /// re-lowering the raw expression, since the target may have side
+    /// effects (`get_list().push(x)` must call `get_list()` once).
+    fn lower_ufcs_call(&mut self, fa: FieldAccessExpr, rest_args: Vec<Spanned<Expression>>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let target_span = fa.target.span;
+        // Captured before the target is lowered — only a bare identifier
+        // can be the root of a `mut` receiver, same restriction ordinary
+        // `mut` arguments have (`lower_call_arg`).
+        let root_name = fa.target.item.get_identifier().map(|s| s.to_string());
+        let target = self.check_and_lower(*fa.target)?;
+        let resolved = self.lookup(&target.item.ty);
+
+        if let Some(field_ty) = self.field_type_of(&resolved, &fa.field) {
+            // Step 1: `f` is a field — e.g. a struct field holding a
+            // function value. Build the `FieldAccess` node directly
+            // (`target` is already lowered) and hand it to `finish_call`
+            // like any other callable expression.
+            let enum_name = self.resolve_union(&resolved).map(|(n, _)| n.to_string());
+            let callable = Spanned::from(TypedExpr {
+                id: 0,
+                ty: field_ty,
+                kind: TypedExprKind::FieldAccess { target: Box::new(target), field: fa.field, enum_name },
+            }, callee_span);
+            return self.finish_call(callable, None, rest_args, callee_span, span);
+        }
+
+        // Step 3: no such field — a global `func` whose first parameter
+        // accepts `typeof(target)`, rewritten to `f(target, ...rest_args)`.
+        let field = fa.field;
+
+        // `push` has no `ctx` entry at all (see `is_push`'s own comment —
+        // it's polymorphic over `T` with no generics system to express
+        // that), so it's special-cased here the same way `lower_call`
+        // special-cases it, with the receiver's `mut` marker exempted.
+        if field == "push" {
+            if rest_args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", rest_args.len())
+                }, callee_span));
+            }
+            let root = root_name.ok_or_else(|| Spanned::from(TypeError {
+                msg: "the receiver of a mutating method must be a plain mutable binding, not an expression".to_string()
+            }, target_span))?;
+            match self.ctx.is_mutable(&root) {
+                None => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not declared", root)
+                }, target_span)),
+                Some(false) => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to call a mutating method on it", root, root)
+                }, target_span)),
+                Some(true) => {},
+            }
+            let v_arg = rest_args.into_iter().next().expect("arity checked just above");
+            return self.finish_push(target, target_span, root, v_arg, callee_span, span);
+        }
+
+        let Some(func_ty) = self.ctx.get(&field).cloned() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("{} has no field '{}', and there's no function '{}' to call as a method", resolved, field, field)
+            }, span));
+        };
+        let func_ty = self.lookup(&func_ty);
+        let Type::Function { params, result } = func_ty.clone() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("{} has no field '{}', and '{}' isn't a function", resolved, field, field)
+            }, span));
+        };
+        if params.is_empty() {
+            return Err(Spanned::from(TypeError {
+                msg: format!("'{}' takes no arguments, so it can't be called as {}.{}(...)", field, resolved, field)
+            }, span));
+        }
+        let resolved_recv = self.lookup(&params[0]);
+        if !widens_to(&resolved, &resolved_recv) && !self.unify(&target.item.ty, &params[0]) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("{} has no field '{}', and '{}'s first parameter doesn't accept {}", resolved, field, field, resolved)
+            }, target_span));
+        }
+        if rest_args.len() != params.len() - 1 {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Wrong number of arguments, expected {}, got {}", params.len() - 1, rest_args.len())
+            }, callee_span));
+        }
+
+        let declared_mut = self.func_mut_params.get(&field).cloned();
+        let mut_first = declared_mut.as_ref().and_then(|d| d.first()).copied().unwrap_or(false);
+
+        // Receiver exemption (`TRAITS.md` Part 2, `MUTABILITY.md`'s
+        // amendment): no `mut` marker is written or required at the dot
+        // call site. The declaration-site guard the marker would
+        // otherwise gate — "is this root actually a mutable binding" —
+        // still applies directly to the receiver.
+        if mut_first {
+            let root = root_name.clone().ok_or_else(|| Spanned::from(TypeError {
+                msg: "the receiver of a mutating method must be a plain mutable binding, not an expression".to_string()
+            }, target_span))?;
+            match self.ctx.is_mutable(&root) {
+                None => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not declared", root)
+                }, target_span)),
+                Some(false) => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to call a mutating method on it", root, root)
+                }, target_span)),
+                Some(true) => {},
+            }
+        }
+
+        // No `check_and_lower` round-trip for the callee name: the
+        // binding is already resolved (`func_ty` above), so the callable
+        // is synthesized the same way `push`'s is.
+        let callable = Spanned::from(TypedExpr { id: 0, ty: func_ty, kind: TypedExprKind::Var(field.clone()) }, callee_span);
+
+        let mut args = Vec::with_capacity(rest_args.len() + 1);
+        let mut mut_args = Vec::with_capacity(rest_args.len() + 1);
+        let mut all_roots: Vec<Option<(String, Span)>> = Vec::with_capacity(rest_args.len() + 1);
+
+        all_roots.push(root_name.map(|n| (n, target_span)));
+        args.push(self.lower_widen(target, &params[0])?);
+        mut_args.push(mut_first);
+
+        for (i, (arg, param)) in rest_args.into_iter().zip(params[1..].iter()).enumerate() {
+            let declared = declared_mut.as_ref().and_then(|d| d.get(i + 1)).copied();
+            let (lowered, is_mut, root) = self.lower_call_arg(i + 1, arg, param, declared)?;
+            args.push(lowered);
+            mut_args.push(is_mut);
+            all_roots.push(root);
+        }
+
+        self.check_mut_exclusivity(&mut_args, &all_roots)?;
+
+        let ty = self.lookup(&result);
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Call { callable: Box::new(callable), args, mut_args } }, span))
     }
 
     fn lower_tuple(&mut self, elems: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {

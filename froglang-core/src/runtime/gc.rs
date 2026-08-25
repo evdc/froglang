@@ -280,12 +280,31 @@ pub struct RuntimeRoots {
 }
 
 impl RuntimeRoots {
-    /// Root `values` until the returned guard drops.
+    /// Root `values` until the returned guard drops. Every value is treated
+    /// as a GC pointer — callers must know that's true of every slot, e.g.
+    /// because they allocated all of them. A slot that instead holds a raw
+    /// `Int`/`Float` has no tag bits and must never be passed here; use
+    /// [`Self::hold_masked`] when a slot's scannability isn't uniform (as
+    /// with `#[frog_fn]`'s flattened argument buffer).
     #[inline]
     pub fn hold(values: &[i64]) -> Self {
         with_active_heap(|h| {
             for &v in values {
                 h.push_root(v, true);
+            }
+        });
+        RuntimeRoots { held: values.len() }
+    }
+
+    /// Root `values` until the returned guard drops, scanning only the
+    /// slots `is_ptr` marks `true`. `is_ptr` must be exactly `values.len()`
+    /// long.
+    #[inline]
+    pub fn hold_masked(values: &[i64], is_ptr: &[bool]) -> Self {
+        debug_assert_eq!(values.len(), is_ptr.len());
+        with_active_heap(|h| {
+            for (&v, &p) in values.iter().zip(is_ptr.iter()) {
+                h.push_root(v, p);
             }
         });
         RuntimeRoots { held: values.len() }
@@ -496,6 +515,16 @@ impl GcHeap {
 
     pub fn push_root(&mut self, value: i64, is_ptr: bool) {
         self.roots.push((value, is_ptr));
+    }
+
+    /// How many explicit roots are currently pushed. Lets a caller that
+    /// pushes an unknown number of roots one at a time (`runtime::host`'s
+    /// `FrogCtx`, allocating values a host function builds) snapshot a mark
+    /// and later `pop_roots(roots_len() - mark)` to release exactly what it
+    /// added, mirroring `RuntimeRoots`' fixed-size version of the same
+    /// discipline.
+    pub fn roots_len(&self) -> usize {
+        self.roots.len()
     }
 
     /// Drop the `n` most recently pushed explicit roots. Paired with
@@ -811,7 +840,13 @@ impl GcHeap {
     /// offsets are heap pointers — see `FrogList`'s doc comment.
     /// The data buffer is separately allocated (not a GC object).
     pub fn alloc_list(&mut self, cap: usize, stride: usize, ptr_mask: u64) -> *mut FrogList {
-        let stride = stride.max(1);
+        // A zero-wide element doesn't mean anything (every caller already
+        // computes stride as a leaf/slot count, which is at least 1 for any
+        // real type — see `struct_fields`, `FromFrog`/`ToFrog::SLOTS`).
+        // Rejecting it here, rather than silently clamping to 1 as before,
+        // turns a future stride-computation bug into a clear panic instead
+        // of a list quietly built with the wrong element width.
+        assert!(stride > 0, "alloc_list: stride must be nonzero");
         let actual_elem_cap = cap.max(1);
         let slot_cap = actual_elem_cap * stride;
         let data_size = slot_cap * std::mem::size_of::<i64>();

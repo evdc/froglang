@@ -162,15 +162,22 @@ pub struct FrogState {
 
 impl FrogState {
     pub fn new() -> Self {
-        FrogState {
-            heap:         GcHeap::new(),
-            tc:           TypeChecker::new(),
-            codegen:      Codegen::new(),
-            env:          HashMap::new(),
-            env_types:    HashMap::new(),
-            string_arena: Vec::new(),
-            entry_count:  0,
-        }
+        FrogState::builder().build().expect("FrogState::builder().build() with no host functions cannot fail")
+    }
+
+    /// Start building a `FrogState` with host (Rust) functions registered —
+    /// see `plans/EMBEDDING.md` and `crate::host`.
+    pub fn builder() -> FrogStateBuilder {
+        FrogStateBuilder { hosts: Vec::new(), prelude: Vec::new() }
+    }
+
+    /// `FrogState::builder()` with the stdlib (`crate::stdlib`) installed —
+    /// see `plans/STDLIB.md`. `FrogState::new()` deliberately doesn't do
+    /// this itself: it's what the existing test suite calls expecting
+    /// today's minimal (`print`/`push`/`panic`/`gc_dump`-only) surface, so
+    /// the stdlib is opt-in. The CLI (`main.rs`) opts in.
+    pub fn with_stdlib() -> Result<Self, FrogError> {
+        crate::stdlib::install(FrogState::builder()).build()
     }
 
     /// Set `ACTIVE_HEAP` to this state's heap, call `func_ptr` with the
@@ -183,7 +190,20 @@ impl FrogState {
         // `GcHeap::push_scanned_span`.
         self.heap.push_scanned_span(out_ptr as *const i64, out_gc_slots);
         ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut GcHeap));
-        let result = func_ptr(out_ptr);
+        // Publish a `FrogCtx` a host call can fetch via `frog_ctx_current`
+        // (`runtime::host`) — built from raw pointers into `self.heap`/
+        // `self.tc`'s tables, valid only for the duration of this call
+        // (`FrogCtx::new`'s safety doc). Struct/union defs never move once
+        // registered (`TypeChecker::struct_defs`/`union_defs`), so this is
+        // sound even though `compile_entry` above may have just grown them.
+        let mut host_ctx = unsafe {
+            crate::runtime::host::FrogCtx::new(
+                &mut self.heap as *mut GcHeap,
+                self.tc.struct_defs() as *const _,
+                self.tc.union_defs() as *const _,
+            )
+        };
+        let result = crate::runtime::host::with_active_ctx(&mut host_ctx, || func_ptr(out_ptr));
         ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
         self.heap.pop_scanned_span();
         result
@@ -345,5 +365,94 @@ impl FrogState {
 
         let value = FrogValue::from_bits(bits, &result_ty, &self.heap);
         Ok((value, result_ty))
+    }
+}
+
+// ── FrogStateBuilder ─────────────────────────────────────────────────────────
+
+/// Names the frontend matches syntactically rather than by scope lookup
+/// (`typeck.rs`'s `"print"`/`"push"` special cases, plus `panic` and its
+/// reserved `!`-desugaring alias) — registering a host function under one
+/// of these would silently never be called, since the special case wins
+/// before the generic `func_ids` lookup ever runs. Rejected at `build()`
+/// with a clear error instead.
+const RESERVED_NAMES: &[&str] = &["print", "push", "len", "panic", "panic!builtin", "gc_dump"];
+
+/// Builds a `FrogState` with host (Rust) functions registered before the
+/// JIT module exists — required because `JITBuilder::symbol` only accepts
+/// new symbols at construction, not afterward (see `plans/EMBEDDING.md`).
+pub struct FrogStateBuilder {
+    hosts:   Vec<crate::host::HostFn>,
+    prelude: Vec<String>,
+}
+
+impl FrogStateBuilder {
+    /// Register a host function, callable from frog source under
+    /// `host.name`. See `#[frog_fn]` (`froglang_macros`) for the ordinary
+    /// way to build a `HostFn`.
+    pub fn func(mut self, host: crate::host::HostFn) -> Self {
+        self.hosts.push(host);
+        self
+    }
+
+    /// Evaluate `src` before any user code — the mechanism for declaring
+    /// host `data` types (`error IoError(msg: Str)`) a host function's
+    /// signature refers to, since it reuses the ordinary parser/typeck path
+    /// rather than a separate Rust-side type-definition API.
+    pub fn prelude(mut self, src: impl Into<String>) -> Self {
+        self.prelude.push(src.into());
+        self
+    }
+
+    /// Finish building. Fails if two host functions share a name, or a
+    /// host function claims a name the frontend already treats specially
+    /// (`RESERVED_NAMES`) — both are configuration errors in the embedder,
+    /// not something `eval` should discover later as a confusing shadowing
+    /// failure.
+    pub fn build(self) -> Result<FrogState, FrogError> {
+        let mut seen = std::collections::HashSet::new();
+        for host in &self.hosts {
+            if RESERVED_NAMES.contains(&host.name) {
+                return Err(FrogError::Type(format!(
+                    "'{}' is a reserved builtin name and can't be registered as a host function", host.name
+                )));
+            }
+            if !seen.insert(host.name) {
+                return Err(FrogError::Type(format!(
+                    "host function '{}' is registered more than once", host.name
+                )));
+            }
+        }
+
+        // Symbols and their uniform (ctx, args, out) import signatures are
+        // declared before any frog type exists — see `Codegen::new_with_hosts`,
+        // which also rejects a host name that collides with a runtime
+        // primitive's `func_ids` key.
+        let codegen = Codegen::new_with_hosts(&self.hosts).map_err(FrogError::Type)?;
+
+        let mut state = FrogState {
+            heap:         GcHeap::new(),
+            tc:           TypeChecker::new(),
+            codegen,
+            env:          HashMap::new(),
+            env_types:    HashMap::new(),
+            string_arena: Vec::new(),
+            entry_count:  0,
+        };
+
+        // Host `data` types, if any, before anything references them.
+        for src in &self.prelude {
+            state.eval(src)?;
+        }
+
+        // Install each host function's frog-visible name and type into the
+        // checker's global scope — after the prelude, so a signature built
+        // against a prelude-declared struct/union name (once that's
+        // supported — see `plans/EMBEDDING.md`'s follow-ups) would resolve.
+        state.tc.add_ctx(self.hosts.iter().map(|h| {
+            (h.name.to_string(), Type::Function { params: h.params.clone(), result: Box::new(h.ret.clone()) })
+        }));
+
+        Ok(state)
     }
 }

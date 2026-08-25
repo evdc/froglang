@@ -1,0 +1,42 @@
+// WILL NOT WORK yet, until http etc is done
+// but a sketch of how things could look
+
+data LLMResponse(tool_calls: List[ToolCall]?, content: Str?, usage: UsageStats)
+
+// some syntax for 'placeholder, but compiles' like Python's NotImplemented or `...` is useful
+func call_llm(prompt: Str, model: Str = 'sonnet-5'): LLMResponse = NotImplemented
+
+// read a DB to pull history etc (vs keeping history state solely in memory)
+func assemble_context() = NotImplemented
+
+// write to a DB
+func save_history(content: Str, kind = UserMsg | AssistantMsg | ToolCall | ToolResult) = NotImplemented
+
+func agent_loop(user_msg: Str) = {
+    while true {
+        mut tool_results = []
+        let context = assemble_context(user_msg, tool_results)
+        let response = call_llm(context)
+        if response.tool_calls then {
+            tool_results = []
+            for tc in response.tool_calls do {
+                save_history(tc, ToolCall)
+                let result = execute_tool(tc)
+                save_history(result, ToolResult)
+                tool_results.push(result)
+            }
+        }
+        else {
+            save_history(response.content, AssistantMsg)
+            return response.content
+        }
+    }
+}
+
+func main() {
+    while true {
+        let user_msg = read_stdin("> ")
+        let response = agent_loop(user_msg)
+        print(user_msg)
+    }
+}

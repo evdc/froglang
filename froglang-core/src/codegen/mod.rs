@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::mem::{offset_of, size_of};
 
-use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, BlockArg, InstBuilder, MachMemFlags, TrapCode, Value};
+use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, BlockArg, InstBuilder, MachMemFlags, StackSlotData, StackSlotKind, TrapCode, Value};
 use cranelift_codegen::{settings, settings::Configurable, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -18,6 +18,12 @@ pub struct Codegen {
     pub module: JITModule,
     func_ids: HashMap<String, FuncId>,
     builder_ctx: FunctionBuilderContext,
+    /// Names registered via `new_with_hosts` — every one of them also has a
+    /// `func_ids` entry, like any other callable, but `compile_call` needs
+    /// to know *which* names go through the uniform `(ctx, args, out)` shim
+    /// calling convention instead of a plain Cranelift call. See
+    /// `plans/EMBEDDING.md`.
+    host_fns: std::collections::HashSet<String>,
 }
 
 /// Per-function-compilation context threaded through `compile_expr`.
@@ -73,6 +79,8 @@ struct Ctx<'a> {
     /// `Move` means this is the name's last use, so the raw pointer is used
     /// as-is, same as before this existed.
     liveness:      liveness::Liveness,
+    /// See `Codegen::host_fns`.
+    host_fns:      &'a std::collections::HashSet<String>,
 }
 
 /// True iff a slot of this type is a GC-scannable column — a word the
@@ -83,7 +91,7 @@ struct Ctx<'a> {
 /// columns are exactly what `struct_fields` labels with the union type (its
 /// scalar columns are labelled `Type::Int` and are deliberately excluded —
 /// a raw `Int` carries no tag bits and must never be scanned).
-fn is_heap_ty(ty: &Type) -> bool {
+pub fn is_heap_ty(ty: &Type) -> bool {
     matches!(ty, Type::Str | Type::List(_) | Type::Union(_))
 }
 
@@ -97,7 +105,7 @@ pub const MAX_INLINE_UNION_MEMBERS: usize = 6;
 /// The runtime tag for member `index` of an inline union's *normalized*
 /// member list. `Type::normalize` flattens, dedups and sorts, so this is
 /// stable for a given type regardless of how it was spelled.
-fn member_tag(index: usize) -> u32 {
+pub(crate) fn member_tag(index: usize) -> u32 {
     (index + 1) as u32
 }
 
@@ -283,7 +291,7 @@ pub fn union_layout(members: &[Type], structs: &StructDefs) -> UnionLayout {
 /// For each of `member`'s leaves, in declaration order, the slot it occupies
 /// in the enclosing inline union — plus whether that slot's low bits also
 /// hold the tag (so a reader must mask, and a writer must `bor` the tag in).
-fn member_slot_map(member: &Type, layout: &UnionLayout, structs: &StructDefs) -> Vec<(usize, bool)> {
+pub(crate) fn member_slot_map(member: &Type, layout: &UnionLayout, structs: &StructDefs) -> Vec<(usize, bool)> {
     let leaves = member_leaf_types(member, structs);
     let mut out = vec![(0usize, false); leaves.len()];
     let (mut p, mut s) = (0usize, 0usize);
@@ -349,6 +357,39 @@ fn pack_union_member(
     }
     let zero = bcx.ins().iconst(types::I64, 0);
     slots.into_iter().map(|o| o.unwrap_or(zero)).collect()
+}
+
+/// Runtime analog of `pack_union_member`, for building an inline union's
+/// slots directly from Rust (`host.rs`'s `ToFrog for Result<T, E>`) rather
+/// than emitting Cranelift IR. `leaf_vals` are already in wire format —
+/// unlike `pack_union_member`'s `Value`s, there is no `to_i64_repr`
+/// conversion to do here, only slot placement and tag OR-ing.
+pub(crate) fn pack_union_member_runtime(
+    members: &[Type],
+    member_ty: &Type,
+    tag: u32,
+    leaf_vals: &[i64],
+    structs: &StructDefs,
+) -> Vec<i64> {
+    let layout = union_layout(members, structs);
+    let map = member_slot_map(member_ty, &layout, structs);
+    debug_assert_eq!(
+        map.len(), leaf_vals.len(),
+        "union member {} contributes {} leaves but {} values were supplied",
+        member_ty, map.len(), leaf_vals.len(),
+    );
+    let mut slots: Vec<Option<i64>> = vec![None; layout.width()];
+    for (i, (slot, shares_tag)) in map.iter().enumerate() {
+        let mut w = leaf_vals[i];
+        if *shares_tag {
+            w |= tag as i64;
+        }
+        slots[*slot] = Some(w);
+    }
+    if slots[0].is_none() {
+        slots[0] = Some(tag as i64);
+    }
+    slots.into_iter().map(|o| o.unwrap_or(0)).collect()
 }
 
 /// The inverse of `pack_union_member`: recover `member_ty`'s flattened leaf
@@ -2071,6 +2112,26 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         return vec![bcx.ins().iconst(types::I64, 0)];
     }
 
+    // `len(xs)` / `xs.len()` — `List(T)`/`Str`, polymorphic over `T` per
+    // typeck's `finish_len`. No `func_ids` entry backs "len" either, so
+    // this is dispatched on the argument's concrete type the same way
+    // `print` dispatches on its own — reusing `frog_list_len`/`frog_str_len`,
+    // which already exist as internal runtime primitives for indexing and
+    // iteration (`compile_index`, comprehension lowering).
+    if func_name == "len" {
+        let arg = &args[0];
+        let arg_val = compile_expr(arg, bcx, vars, ctx);
+        let rt_name = match &arg.item.ty {
+            Type::Str => "frog_str_len",
+            Type::List(_) => "frog_list_len",
+            ty => panic!("len codegen does not support {:?}", ty),
+        };
+        let func_id = ctx.func_ids[rt_name];
+        let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
+        let call = bcx.ins().call(callee, &[arg_val]);
+        return vec![bcx.inst_results(call)[0]];
+    }
+
     // `push(mut xs, v)` — MUTABILITY.md stage 6's unlock. No `func_ids`
     // entry backs "push" (see typeck's `is_push`), so this must be handled
     // before the generic lookup below. `xs`'s own value is read through the
@@ -2099,6 +2160,15 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         // buffer, but never the `FrogList` object itself — the pointer
         // `list_val` names stays valid and unchanged either way.
         return vec![bcx.ins().iconst(types::I64, 0)];
+    }
+
+    // A registered host function (`FrogStateBuilder::func`,
+    // `plans/EMBEDDING.md`) — every one shares the uniform
+    // `extern "C" fn(ctx, args, out)` shim signature regardless of its frog
+    // type, so it's called through a stack-slot arg/out buffer instead of a
+    // native Cranelift call. See "The uniform shim ABI" in the design doc.
+    if ctx.host_fns.contains(&func_name) {
+        return compile_host_call(&func_name, callable, args, bcx, vars, ctx);
     }
 
     let func_id = ctx.func_ids[&func_name];
@@ -2209,6 +2279,81 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
     }
 
     primary_results
+}
+
+/// Call a registered host function through the uniform shim ABI: flatten
+/// every argument's leaves into a stack-allocated `args` buffer (raw i64
+/// wire format — `to_i64_repr`, the same convention `FrogList`'s data
+/// buffer and `__frog_main`'s `out_ptr` already use), call the shim as
+/// `shim(frog_ctx_current(), &args, &out)`, then load `out`'s leaves back.
+///
+/// This is the codebase's first use of Cranelift stack slots — the shadow
+/// frame's were deleted when GC roots moved to stack maps (RUNTIME.md Part
+/// 2) — because a host shim's `extern "C"` signature can't itself return
+/// more than one value (needed for a struct/union result) or accept
+/// `Bool`/`Float` in their native Cranelift types (`cl_type` gives them
+/// `I8`/`F64`, not `I64`). Neither buffer is covered by *this* function's
+/// own stack map — a raw stack slot isn't a `Value` — which is exactly why
+/// the shim on the other side must `RuntimeRoots::hold` every argument
+/// slot itself (`plans/EMBEDDING.md`, "GC safety").
+fn compile_host_call(func_name: &str, callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    let return_ty: Type = match &callable.item.ty {
+        Type::Function { result, .. } => *result.clone(),
+        _ => Type::Int,
+    };
+
+    // Flatten every argument into (wire-format value, leaf type) pairs, in
+    // the same order `struct_fields` would enumerate them — matching
+    // `make_sig`'s own per-arg flattening convention.
+    let mut arg_leaves: Vec<(Value, Type)> = Vec::new();
+    for a in args {
+        if is_multi_leaf_type(&a.item.ty, ctx.structs) {
+            let leafs = struct_fields(&a.item.ty, ctx.structs);
+            let vals = compile_expr_multi(a, bcx, vars, ctx);
+            for (v, (_, lty)) in vals.iter().zip(leafs.iter()) {
+                arg_leaves.push((to_i64_repr(bcx, lty, *v), lty.clone()));
+            }
+        } else {
+            let v = compile_expr(a, bcx, vars, ctx);
+            arg_leaves.push((to_i64_repr(bcx, &a.item.ty, v), a.item.ty.clone()));
+        }
+    }
+
+    let arg_slots = arg_leaves.len().max(1);
+    let args_ss = bcx.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot, (arg_slots * 8) as u32, 3,
+    ));
+    for (i, (v, _)) in arg_leaves.iter().enumerate() {
+        bcx.ins().stack_store(types::I64, *v, args_ss, (i * 8) as i32);
+    }
+    let args_addr = bcx.ins().stack_addr(types::I64, args_ss, 0);
+
+    let ret_leaf_tys: Vec<Type> = struct_fields(&return_ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
+    let out_slots = ret_leaf_tys.len().max(1);
+    let out_ss = bcx.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot, (out_slots * 8) as u32, 3,
+    ));
+    let out_addr = bcx.ins().stack_addr(types::I64, out_ss, 0);
+
+    let ctx_id = ctx.func_ids["frog_ctx_current"];
+    let ctx_callee = ctx.module.declare_func_in_func(ctx_id, bcx.func);
+    let ctx_call = bcx.ins().call(ctx_callee, &[]);
+    let ctx_val = bcx.inst_results(ctx_call)[0];
+
+    let func_id = ctx.func_ids[func_name];
+    let local_callee = ctx.module.declare_func_in_func(func_id, bcx.func);
+    bcx.ins().call(local_callee, &[ctx_val, args_addr, out_addr]);
+
+    if return_ty == Type::None {
+        return vec![bcx.ins().iconst(types::I64, 0)];
+    }
+    let mut results = Vec::with_capacity(ret_leaf_tys.len());
+    for (i, lty) in ret_leaf_tys.iter().enumerate() {
+        let raw = bcx.ins().stack_load(types::I64, types::I64, out_ss, (i * 8) as i32);
+        results.push(from_i64_repr(bcx, lty, raw));
+    }
+    declare_gc_leaves(bcx, &results, &ret_leaf_tys);
+    results
 }
 
 fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
@@ -2684,6 +2829,24 @@ impl Codegen {
     }
 
     pub fn new() -> Self {
+        // `hosts` is empty, so no name can collide with a runtime primitive.
+        Self::new_with_hosts(&[]).expect("empty host list can't collide")
+    }
+
+    /// As `new`, but also registers `hosts` — every symbol and its uniform
+    /// `(ctx, args, out)` import signature is declared here, before any
+    /// frog type has been resolved, which is what lets `FrogStateBuilder`
+    /// (`state.rs`) install their frog-visible names into the type checker
+    /// afterward. See `plans/EMBEDDING.md`.
+    ///
+    /// Fails if a host function's name collides with a runtime primitive's
+    /// `func_ids` key (e.g. `frog_clone`, `frog_str_len`) — registering one
+    /// would silently overwrite that key, so later codegen that looks it up
+    /// (`ctx.func_ids["frog_clone"]`, ...) would resolve to the host shim's
+    /// `(ctx, args, out)` ABI instead, a wrong-ABI call rather than a
+    /// diagnostic. Checked here, against the actual declared keys, rather
+    /// than a hand-maintained name list that could drift from them.
+    pub fn new_with_hosts(hosts: &[crate::host::HostFn]) -> Result<Self, String> {
         let mut flag_builder = settings::builder();
         flag_builder.set("is_pic", "false").expect("is_pic setting");
         // The collector finds its roots by walking the native stack frame
@@ -2733,9 +2896,23 @@ impl Codegen {
         builder.symbol("frog_variant_get", ffi::frog_variant_get as *const u8);
         builder.symbol("frog_variant_set", ffi::frog_variant_set as *const u8);
         builder.symbol("frog_clone",       ffi::frog_clone       as *const u8);
+        builder.symbol("frog_ctx_current", crate::runtime::host::frog_ctx_current as *const u8);
+
+        // Host functions (`FrogStateBuilder::func`, `plans/EMBEDDING.md`).
+        // Registered before any frog type is resolved — each shim's JIT
+        // signature is the uniform `(ctx, args, out)` triple regardless of
+        // its frog type, which is exactly what makes that ordering
+        // possible. A duplicate `symbol` name here would make
+        // `JITBuilder::symbol` non-deterministic about which address wins;
+        // `FrogStateBuilder::build` is what actually rejects a colliding or
+        // reserved name, so this loop trusts its caller.
+        for host in hosts {
+            builder.symbol(host.symbol, host.shim);
+        }
 
         let mut module   = JITModule::new(builder);
         let mut func_ids = HashMap::<String, FuncId>::new();
+        let mut host_fns = std::collections::HashSet::new();
 
         use types::I64;
         // Declare Cranelift import signatures for each runtime function.
@@ -2788,12 +2965,30 @@ impl Codegen {
         // Deep-clone-on-Copy for a GC-pointer-bearing `Var` read — see
         // `compile_expr_multi`'s `TypedExprKind::Var` arm and `Ctx::liveness`.
         declare_rt(&mut module, &mut func_ids, "frog_clone",      "frog_clone",      &[I64],           Some(I64));
+        // Fetches the `FrogCtx*` a host call passes as its own argument 0
+        // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,
+        // "Getting the ctx pointer without baking an address").
+        declare_rt(&mut module, &mut func_ids, "frog_ctx_current", "frog_ctx_current", &[], Some(I64));
 
-        Codegen {
+        // Every host function shares this one import signature — see
+        // `Ctx`'s `host_fns` field and `compile_call`'s host-call arm.
+        for host in hosts {
+            if func_ids.contains_key(host.name) {
+                return Err(format!(
+                    "host function '{}' collides with a runtime primitive of the same name",
+                    host.name
+                ));
+            }
+            declare_rt(&mut module, &mut func_ids, host.symbol, host.name, &[I64, I64, I64], None);
+            host_fns.insert(host.name.to_string());
+        }
+
+        Ok(Codegen {
             module,
             func_ids,
             builder_ctx: FunctionBuilderContext::new(),
-        }
+            host_fns,
+        })
     }
 
     /// A struct-typed param or return value expands to one `AbiParam` per
@@ -2840,6 +3035,7 @@ impl Codegen {
         string_arena: &mut Vec<Vec<u8>>,
         structs: &StructDefs,
         unions: &UnionDefs,
+        host_fns: &std::collections::HashSet<String>,
     ) {
         let target_config = module.target_config();
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
@@ -2880,6 +3076,7 @@ impl Codegen {
         let mut ctx = Ctx {
             func_ids, module, string_arena, structs, unions,
             printing_unions: Vec::new(), mut_params, liveness: body_liveness,
+            host_fns,
         };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
 
@@ -2954,6 +3151,7 @@ impl Codegen {
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
         unions: &UnionDefs,
+        host_fns: &std::collections::HashSet<String>,
     ) -> Vec<(String, Type)> {
         let target_config = module.target_config();
         let mut bcx = FunctionBuilder::new(&mut cl_ctx.func, builder_ctx);
@@ -3008,6 +3206,7 @@ impl Codegen {
         let mut ctx = Ctx {
             func_ids, module, string_arena, structs, unions,
             printing_unions: Vec::new(), mut_params: Vec::new(), liveness: entry_liveness,
+            host_fns,
         };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
@@ -3172,6 +3371,7 @@ impl Codegen {
                 string_arena,
                 structs,
                 unions,
+                &self.host_fns,
             );
 
             self.module
@@ -3204,6 +3404,7 @@ impl Codegen {
             env_types,
             structs,
             unions,
+            &self.host_fns,
         );
 
         self.module

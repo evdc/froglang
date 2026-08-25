@@ -450,6 +450,17 @@ pub struct TypeChecker {
     /// checking, mirroring how `func_ty` is pre-bound for recursion), and
     /// again, authoritatively, once `lower_function` returns.
     func_mut_params: HashMap<String, Vec<bool>>,
+    /// Names installed by `add_ctx` — i.e. registered host functions
+    /// (`FrogStateBuilder::func`). Codegen's host dispatch (`Ctx::host_fns`,
+    /// `compile_call`) routes a call by name alone, with no regard for
+    /// lexical scope, so a user declaration that rebinds one of these names
+    /// — anywhere, not just at top level — would silently hijack every call
+    /// to it. Checked wherever a `let`/`mut`/`func` declaration binds a
+    /// name, and rejected there instead of surfacing later as a confusing
+    /// codegen/verifier error. Set once, before any checking starts
+    /// (`FrogStateBuilder::build`), so it's left out of
+    /// `TypeCheckerCheckpoint`/`restore` deliberately.
+    host_names: std::collections::HashSet<String>,
 }
 
 pub struct TypeCheckerCheckpoint {
@@ -467,11 +478,11 @@ pub struct TypeCheckerCheckpoint {
 
 impl TypeChecker {
     pub fn empty() -> Self {
-        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new() }
+        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new() }
+        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new() }
     }
 
     /// Check whether a concrete type implements the given trait. Only makes
@@ -618,9 +629,17 @@ impl TypeChecker {
         self.func_mut_params = cp.func_mut_params;
     }
 
-    pub fn add_ctx(mut self, ctx: impl Iterator<Item=(String, Type)>) -> Self {
-        for (k, v) in ctx { self.ctx.insert(k, v); }
-        self
+    /// Install additional global bindings (host functions,
+    /// `FrogStateBuilder::func` — see `plans/EMBEDDING.md`) into scope
+    /// alongside the builtins `default_context` seeds. `&mut self` rather
+    /// than the original by-value builder shape: `FrogState` owns its `tc`
+    /// by value, so a builder method here would force an awkward
+    /// take-then-put-back at every call site.
+    pub fn add_ctx(&mut self, ctx: impl Iterator<Item=(String, Type)>) {
+        for (k, v) in ctx {
+            self.host_names.insert(k.clone());
+            self.ctx.insert(k, v);
+        }
     }
 
     pub fn context(self) -> HashMap<String, Type> {
@@ -2397,6 +2416,20 @@ impl TypeChecker {
                 // *new* binding accepts later reassignment; it says
                 // nothing about whatever it shadows.
                 Some(mutability) => {
+                    // A `let`/`mut`/`func` declaration can shadow an
+                    // ordinary binding at typeck level just fine, but a
+                    // registered host function's dispatch (`Ctx::host_fns`,
+                    // `compile_call`) is name-based, not scope-based — a
+                    // user declaration of the same name would still route
+                    // through the host shim at every call site, at
+                    // whatever type the user declared. Reject it here
+                    // instead of letting it surface as a confusing
+                    // codegen/verifier error later.
+                    if self.host_names.contains(&name) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("'{}' is a registered host function and can't be redeclared", name),
+                        }, span));
+                    }
                     let mutable = mutability == Mutability::Mutable;
                     match &a.typ {
                         Some(ann) => {
@@ -2585,6 +2618,15 @@ impl TypeChecker {
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "push"
         );
+        // `len` is a builtin read-only query on `List(T)` or `Str`,
+        // polymorphic over `T` the same way `push` is — same reason it
+        // can't be a `default_context()` entry (a TypeVar there would get
+        // permanently bound by the first call site, not re-instantiated
+        // per call; there's no generalization/generics system yet).
+        let is_len = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "len"
+        );
 
         let (kind, ty) = if let Some(name) = struct_name {
             let field_defs = self.struct_defs.get(&name).cloned().unwrap_or_default();
@@ -2655,6 +2697,14 @@ impl TypeChecker {
 
             let xs_lowered = self.check_and_lower(xs_inner)?;
             return self.finish_push(xs_lowered, xs_span, root, v_arg, callee_span, span);
+        } else if is_len {
+            if c.args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
+                }, callee_span));
+            }
+            let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
+            return self.finish_len(arg, callee_span, span);
         } else if matches!(&c.callable.item, Expression::FieldAccess(_)) {
             // `x.f(args)` where `f` isn't a struct/union field of
             // `typeof(x)` — resolved by `lower_ufcs_call` per
@@ -2723,6 +2773,31 @@ impl TypeChecker {
                 args: vec![xs_lowered, v_widened],
                 mut_args: vec![true, false],
             },
+        }, span))
+    }
+
+    /// The tail of a `len` call once its argument is already lowered —
+    /// shared by `lower_call`'s `is_len` branch (`len(xs)`) and
+    /// `lower_ufcs_call` (`xs.len()`). Like `finish_push`, synthesizes the
+    /// callable's `TypedExpr` directly rather than resolving it against
+    /// `ctx`, since no `default_context()` entry backs `len` either.
+    fn finish_len(&mut self, arg: Spanned<TypedExpr>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let arg_span = arg.span;
+        let arg_ty = self.lookup(&arg.item.ty);
+        if !matches!(arg_ty, Type::List(_) | Type::Str) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("len's argument must be a List or Str, got {:?}", arg_ty)
+            }, arg_span));
+        }
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![arg_ty.clone()], result: Box::new(Type::Int) },
+            kind: TypedExprKind::Var("len".to_string()),
+        }, callee_span);
+        Ok(Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Int,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![arg], mut_args: vec![false] },
         }, span))
     }
 
@@ -2922,6 +2997,18 @@ impl TypeChecker {
         // Step 3: no such field — a global `func` whose first parameter
         // accepts `typeof(target)`, rewritten to `f(target, ...rest_args)`.
         let field = fa.field;
+
+        // `len` has no `ctx` entry either (`finish_len`'s comment) — same
+        // special-casing as `push` below, minus any `mut` handling since
+        // `len` doesn't mutate its receiver.
+        if field == "len" {
+            if !rest_args.is_empty() {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 0, got {}", rest_args.len())
+                }, callee_span));
+            }
+            return self.finish_len(target, callee_span, span);
+        }
 
         // `push` has no `ctx` entry at all (see `is_push`'s own comment —
         // it's polymorphic over `T` with no generics system to express

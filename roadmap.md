@@ -44,3 +44,76 @@ Methods — **decided**, see `plans/TRAITS.md` Part 1
   amendment at the end of `plans/MUTABILITY.md` §3
 
 Declined sketches, kept for the record:
+
+---
+
+sketching JSON/etc serde
+
+```
+data Person(
+    name: Str
+    age: Int
+    last_name: Str  #json:lastName
+    email: Str?     // optional
+)
+
+let txt = '{"name": "Alice", "lastName": "Jones", "age": 42}'
+// needs a generic argument in expression position here
+let alice = json.parse[Person](txt)
+
+let alice = json.parse(txt) as Person       // another way?
+```
+
+Intersects with reflection/meta-programming. You end up needing *some* facility for it, eventually
+- Runtime reflection: more constrained, pays cost at runtime but you're likely not doing reflect in hot loops anyway
+- Compile time (macros, comptime, etc): better runtime perf, can do more, costs compile time (which froglang wants to keep fast also), more footguns / surface area to do Weird Things
+
+compile time: 
+- `comptime` or `static` keyword or `$` sigil like `comptime if os == OSX`, `static if os == OSX`, `$if os == OSX` etc
+- quote/unquote syntax, e.g. ` for quoting expressions and $ for unquote/splice/interpolate
+- `macro` keyword for functions that run at compile time (after parse, before codegen), taking an AST and producing an AST
+
+eg
+```
+macro adder(n: Int) {
+    return `x -> x + $n`
+}
+
+let inc = adder(1)
+// At macro expansion time, the AST is replaced with the equivalent of
+// let inc = x -> x + 1
+
+inc(2)  // 3
+```
+
+runtime:
+- `reflect` or `meta` module that can be imported
+```
+import reflect
+
+// example from above
+data Person(
+    name: Str
+    age: Int
+    last_name: Str  #json:lastName
+    email: Str?     // optional
+)
+
+reflect.fields(Person)  // :: List[reflect.FieldInfo]
+reflect.fields(Person)[2].annotations   // reflect.FieldAnnotation("json:lastName")
+
+// psuedo
+func to_json(d: T): Str = {
+    let fields = []
+    for f in reflect.fields(T) do {
+        let field_name = if f.annotations[0].startswith("json:") then 
+            f.annotations[0].split(":")[1]
+        else f.name
+        let field_val = reflect.get_field(d, field_name)        // ???
+        fields.push('"${field_name}": ${field_val}')
+    }
+    // ...
+}
+```
+
+how does Go work with struct field annotations?

@@ -9,7 +9,7 @@ pub fn repl() {
     let mut rl = DefaultEditor::new().expect("Couldn't open rustyline");
     println!("🐸 froglang repl");
 
-    let mut state = FrogState::new();
+    let mut state = FrogState::with_stdlib().expect("FrogState::with_stdlib() failed to build");
 
     loop {
         let readline = rl.readline(">> ");
@@ -94,7 +94,10 @@ fn check(src: &str, path: Option<&std::path::Path>) {
 }
 
 fn run(src: &str, path: Option<&std::path::Path>) {
-    let mut state = FrogState::new();
+    let mut state = match FrogState::with_stdlib() {
+        Ok(s) => s,
+        Err(e) => { println!("{}", e); process::exit(1); }
+    };
     let result = match path {
         Some(p) => state.eval_file(p),
         None => state.eval(src),

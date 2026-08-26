@@ -46,6 +46,12 @@ pub fn install(builder: FrogStateBuilder) -> FrogStateBuilder {
     // `error` (not plain `data`) grants `Trait::Error`, so `ErrMsg` values
     // are usable with `catch`/`?`/`!` in addition to plain `match`/`is`.
     let builder = builder.prelude("error ErrMsg(msg: Str)");
+    // `get`'s error member — like `len`/`push`, `get` itself is a hardcoded
+    // builtin in `typeck.rs`/`codegen/mod.rs` (it needs real polymorphism
+    // over `List(T)`), but unlike them it returns a union, so it needs an
+    // `Error`-providing type declared before it's usable — same reasoning
+    // as `ErrMsg` above.
+    let builder = builder.prelude("error IndexError(index: Int, len: Int)");
     let builder = str::install(builder);
     fs::install(builder)
 }

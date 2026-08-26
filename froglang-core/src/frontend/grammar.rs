@@ -548,10 +548,17 @@ impl Grammar {
     pub fn tuple(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
         // `[for x in xs ...]` is a list comprehension, not a list literal —
         // hand off to `for_expr` and wrap the result instead of falling
-        // into the ordinary comma-separated element list below.
+        // into the ordinary comma-separated element list below. Newlines
+        // right after `[` are insignificant here (same as everywhere else
+        // inside brackets, see `expression_list`), so skip them before the
+        // `for` lookahead — otherwise `[\n for x in xs do ...]` silently
+        // falls through to list-literal parsing instead of erroring or
+        // being recognized as a comprehension.
+        parser.skip_newlines();
         if parser.check(&Token::For) {
             let for_tok = parser.advance()?; // consume `for`
             let for_loop = Grammar::for_expr(parser, for_tok)?;
+            parser.skip_newlines();
             let closing = parser.consume(Token::RightBracket)?;
             return Ok(Spanned {
                 span: t.span.merge(closing.span),
@@ -789,7 +796,7 @@ impl Grammar {
             end = closing.span;
         }
 
-        Ok((Pattern { path, variant, binds }, Span { start: first_tok.span.start, end: end.end }))
+        Ok((Pattern { path, variant, binds, resolved_member: None }, Span { start: first_tok.span.start, end: end.end }))
     }
 
     /// `subject is Pattern` — infix on `is`. Legal anywhere as a `Bool`

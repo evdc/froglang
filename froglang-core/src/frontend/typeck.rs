@@ -274,6 +274,14 @@ enum RawPlaceSeg {
 
 struct ErrorArmEntry {
     pattern_variant: String,
+    /// This member's index into the subject's `Type::Union` member list,
+    /// for an *anonymous* union only (`None` for a nominal union's variant,
+    /// which is resolved by name — `check_pattern`'s `def.variant_index`
+    /// looks it up in the actual declaration, not by round-tripping a
+    /// stringified type). Threaded through to `Pattern::resolved_member`
+    /// so a synthesized arm skips `resolve_type_name` entirely — see that
+    /// field's doc comment.
+    member_idx: Option<usize>,
     ty: Type,
     is_error: bool,
     bind_names: Vec<String>,
@@ -931,14 +939,14 @@ impl TypeChecker {
                     bind_names.push(bind);
                 }
                 let whole_value = Expression::call(callee, args);
-                out.push(ErrorArmEntry { pattern_variant: vn.clone(), ty, is_error, bind_names, whole_value });
+                out.push(ErrorArmEntry { pattern_variant: vn.clone(), member_idx: None, ty, is_error, bind_names, whole_value });
             }
         } else if let Type::Union(members) = &resolved {
-            for m in members {
+            for (i, m) in members.iter().enumerate() {
                 let is_error = self.type_implements(m, &Trait::Error);
                 let bind = "__whole".to_string();
                 let whole_value = Expression::literal(Token::Identifier(bind.clone()));
-                out.push(ErrorArmEntry { pattern_variant: m.to_string(), ty: m.clone(), is_error, bind_names: vec![bind], whole_value });
+                out.push(ErrorArmEntry { pattern_variant: m.to_string(), member_idx: Some(i), ty: m.clone(), is_error, bind_names: vec![bind], whole_value });
             }
         } else {
             return Err(Spanned::from(TypeError {
@@ -980,7 +988,7 @@ impl TypeChecker {
         }
         let mut arms = Vec::with_capacity(entries.len());
         for e in entries {
-            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names };
+            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names, resolved_member: e.member_idx };
             let body_expr = if e.is_error {
                 Expression::return_value(Some(Spanned::from(e.whole_value, span)))
             } else {
@@ -1015,7 +1023,7 @@ impl TypeChecker {
         }
         let mut arms = Vec::with_capacity(entries.len());
         for e in entries {
-            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names };
+            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names, resolved_member: e.member_idx };
             let body_expr = if e.is_error {
                 let callee = Spanned::from(Expression::literal(Token::Identifier(UNWRAP_PANIC_NAME.to_string())), span);
                 let msg = Spanned::from(Expression::literal(Token::String("unwrapped an error value with '!'".to_string())), span);
@@ -1055,7 +1063,7 @@ impl TypeChecker {
         };
         let mut arms = Vec::with_capacity(entries.len());
         for e in entries {
-            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names };
+            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names, resolved_member: e.member_idx };
             let body = if e.is_error {
                 match &handler_bind {
                     None => handler_body.clone(),
@@ -1432,7 +1440,7 @@ impl TypeChecker {
                 let ty = Type::Struct(format!("{}.{}", enum_name, vn));
                 if self.type_implements(&ty, &Trait::Error) {
                     out.push(MatchArm {
-                        pattern: Pattern { path: None, variant: vn.clone(), binds: Vec::new() },
+                        pattern: Pattern { path: None, variant: vn.clone(), binds: Vec::new(), resolved_member: None },
                         guard: arm.guard.clone(),
                         body: arm.body.clone(),
                     });
@@ -1456,10 +1464,10 @@ impl TypeChecker {
                     msg: "trait pattern 'Error' cannot bind fields — match on a concrete variant, or use flow narrowing (no binder) to read a specific member's fields".to_string()
                 }, arm.body.span));
             }
-            for m in members {
+            for (i, m) in members.iter().enumerate() {
                 if self.type_implements(m, &Trait::Error) {
                     out.push(MatchArm {
-                        pattern: Pattern { path: None, variant: m.to_string(), binds: Vec::new() },
+                        pattern: Pattern { path: None, variant: m.to_string(), binds: Vec::new(), resolved_member: Some(i) },
                         guard: arm.guard.clone(),
                         body: arm.body.clone(),
                     });
@@ -1506,12 +1514,26 @@ impl TypeChecker {
                 msg: "a qualifier ('X.Y') only applies to a nominal union's variant name".to_string()
             }, span));
         }
-        let member_ty = self.resolve_type_name(&pattern.variant).ok_or_else(|| Spanned::from(TypeError {
-            msg: format!("Unknown type '{}'", pattern.variant)
-        }, span))?;
-        let idx = members.iter().position(|m| *m == member_ty).ok_or_else(|| Spanned::from(TypeError {
-            msg: format!("{} is not a member of {}", member_ty, Type::Union(members.to_vec()))
-        }, span))?;
+        // A pattern the compiler synthesized itself (`union_entries`'s
+        // anonymous-union branch) already knows its member's index — use it
+        // directly rather than re-deriving it from `variant`, which for a
+        // synthesized pattern is only `Type::to_string()`'s *display* form
+        // and may not be a resolvable (or even parseable) type name at all,
+        // e.g. `List(Int)`. See `Pattern::resolved_member`'s doc comment.
+        let (idx, member_ty) = if let Some(idx) = pattern.resolved_member {
+            let member_ty = members.get(idx).cloned().ok_or_else(|| Spanned::from(TypeError {
+                msg: format!("internal error: resolved_member index {} out of range for {}", idx, Type::Union(members.to_vec()))
+            }, span))?;
+            (idx, member_ty)
+        } else {
+            let member_ty = self.resolve_type_name(&pattern.variant).ok_or_else(|| Spanned::from(TypeError {
+                msg: format!("Unknown type '{}'", pattern.variant)
+            }, span))?;
+            let idx = members.iter().position(|m| *m == member_ty).ok_or_else(|| Spanned::from(TypeError {
+                msg: format!("{} is not a member of {}", member_ty, Type::Union(members.to_vec()))
+            }, span))?;
+            (idx, member_ty)
+        };
         if pattern.binds.len() > 1 {
             return Err(Spanned::from(TypeError {
                 msg: format!("Pattern for '{}' expects at most 1 binding, got {}", member_ty, pattern.binds.len())
@@ -2627,6 +2649,18 @@ impl TypeChecker {
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "len"
         );
+        // `get` is a builtin bounds-checked read on `List(T)`, polymorphic
+        // over `T` for the same reason `len`/`push` are — but unlike them
+        // it can't be a plain synthesized `Function` type, since its result
+        // isn't just `T`, it's `T | IndexError` (the stdlib's `get`-specific
+        // error type, `stdlib::install`'s prelude). Desugared entirely in
+        // `finish_get` into ordinary constructs (`if`/index/struct-init)
+        // rather than given dedicated codegen, the same way `?`/`!`/`catch`
+        // desugar into `match` — see `finish_get`'s own comment.
+        let is_get = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "get"
+        );
 
         let (kind, ty) = if let Some(name) = struct_name {
             let field_defs = self.struct_defs.get(&name).cloned().unwrap_or_default();
@@ -2705,6 +2739,16 @@ impl TypeChecker {
             }
             let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
             return self.finish_len(arg, callee_span, span);
+        } else if is_get {
+            if c.args.len() != 2 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 2, got {}", c.args.len())
+                }, callee_span));
+            }
+            let mut arg_iter = c.args.into_iter();
+            let xs_arg = arg_iter.next().expect("arity checked just above");
+            let i_arg  = arg_iter.next().expect("arity checked just above");
+            return self.finish_get(xs_arg, i_arg, span);
         } else if matches!(&c.callable.item, Expression::FieldAccess(_)) {
             // `x.f(args)` where `f` isn't a struct/union field of
             // `typeof(x)` — resolved by `lower_ufcs_call` per
@@ -2799,6 +2843,120 @@ impl TypeChecker {
             ty: Type::Int,
             kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![arg], mut_args: vec![false] },
         }, span))
+    }
+
+    /// `get(xs, i)`'s entire lowering: rather than adding a dedicated
+    /// codegen node with hand-rolled bounds-check IR, this builds a small
+    /// surface-syntax `Expression::Block` — bind the receiver/index once,
+    /// resolve a negative index the same way the runtime's own
+    /// `resolve_index` does, bounds-check it, and either index in-bounds or
+    /// construct an `IndexError` — then lowers that block through the
+    /// ordinary `check_and_lower` path. This is exactly the same strategy
+    /// `?`/`!`/`catch` use (`build_try_arms` etc.): reuse the existing
+    /// `if`/else union-join and struct-construction machinery instead of
+    /// teaching codegen a new node. `xs`/`i` are passed in unlowered (as
+    /// `Expression`, not `TypedExpr`) since they're spliced into the
+    /// desugared block and lowered there, exactly once.
+    fn finish_get(&mut self, xs_arg: Spanned<Expression>, i_arg: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let xs_span = xs_arg.span;
+        let ident = |n: &str| Expression::literal(Token::Identifier(n.to_string()));
+        let let_stmt = |name: &str, value: Spanned<Expression>, sp: Span| Spanned::from(
+            Expression::assign(Spanned::from(ident(name), sp), None, value, Some(Mutability::Immutable)),
+            sp,
+        );
+        let mut stmts = vec![let_stmt("__get_xs", xs_arg, xs_span)];
+        stmts.extend(Self::get_rest_stmts(i_arg, span));
+        self.check_and_lower(Spanned::from(Expression::Block(stmts), span))
+    }
+
+    /// The `xs.get(i)` UFCS form (`lower_ufcs_call`'s `field == "get"`
+    /// branch): unlike `finish_get`, the receiver (`xs_lowered`) is already
+    /// typed — lowered once by the caller, since it may have side effects
+    /// (`get_list().get(i)` must call `get_list()` once, same reasoning as
+    /// `push`/`len`'s UFCS forms). So it can't be spliced back into a raw
+    /// `Expression::Block` and re-lowered (that would evaluate it twice);
+    /// instead its value is bound into scope directly as a synthesized
+    /// `TypedExprKind::Assign` (the same trick `lower_match_lowered` uses
+    /// for its subject temporary), and only the rest of the desugaring
+    /// (`get_rest_stmts`, which only ever refers to `__get_xs` by name) goes
+    /// through ordinary raw-`Expression` lowering.
+    fn finish_get_ufcs(&mut self, xs_lowered: Spanned<TypedExpr>, i_arg: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let xs_ty = xs_lowered.item.ty.clone();
+        let xs_assign = Spanned::from(
+            TypedExpr { id: 0, ty: xs_ty.clone(), kind: TypedExprKind::Assign { name: "__get_xs".to_string(), value: Box::new(xs_lowered) } },
+            span,
+        );
+        let rest_block = Spanned::from(Expression::Block(Self::get_rest_stmts(i_arg, span)), span);
+        let rest = self.with_context_mut(
+            std::iter::once(("__get_xs".to_string(), xs_ty, false)),
+            |t| t.check_and_lower(rest_block),
+        )?;
+        let ty = rest.item.ty.clone();
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Block(vec![xs_assign, rest]) }, span))
+    }
+
+    /// The shared tail of `get`'s desugaring, from `__get_i` onward —
+    /// everything after `__get_xs` is bound, referring to it only by name
+    /// so it's agnostic to how the caller bound it (`finish_get`'s raw
+    /// `let`, or `finish_get_ufcs`'s pre-typed `Assign`): resolve a
+    /// negative index the same way the runtime's own `resolve_index` does
+    /// (`frog_list_get`'s FFI, `runtime/ffi.rs`), bounds-check it, and
+    /// either index in-bounds or construct an `IndexError`. This is the
+    /// same strategy `?`/`!`/`catch` use (`build_try_arms` etc.): reuse the
+    /// existing `if`/else union-join and struct-construction machinery
+    /// instead of teaching codegen a new node.
+    fn get_rest_stmts(i_arg: Spanned<Expression>, span: Span) -> Vec<Spanned<Expression>> {
+        let ident = |n: &str| Expression::literal(Token::Identifier(n.to_string()));
+        let let_stmt = |name: &str, value: Spanned<Expression>, sp: Span| Spanned::from(
+            Expression::assign(Spanned::from(ident(name), sp), None, value, Some(Mutability::Immutable)),
+            sp,
+        );
+
+        let i_span = i_arg.span;
+        let mut stmts = Vec::with_capacity(4);
+        stmts.push(let_stmt("__get_i", i_arg, i_span));
+
+        let len_call = Spanned::from(
+            Expression::call(Spanned::from(ident("len"), span), vec![Spanned::from(ident("__get_xs"), span)]),
+            span,
+        );
+        stmts.push(let_stmt("__get_n", len_call, span));
+
+        // __get_real = if __get_i < 0 then __get_n + __get_i else __get_i
+        let is_negative = Spanned::from(Expression::binary(
+            Token::Lt, Spanned::from(ident("__get_i"), span), Spanned::from(Expression::literal(Token::Int(0)), span),
+        ), span);
+        let wrapped = Spanned::from(Expression::binary(
+            Token::Plus, Spanned::from(ident("__get_n"), span), Spanned::from(ident("__get_i"), span),
+        ), span);
+        let real_val = Spanned::from(
+            Expression::conditional(is_negative, wrapped, Some(Spanned::from(ident("__get_i"), span))),
+            span,
+        );
+        stmts.push(let_stmt("__get_real", real_val, span));
+
+        // __get_real >= 0 and __get_real < __get_n
+        let ge_zero = Spanned::from(Expression::binary(
+            Token::GtEq, Spanned::from(ident("__get_real"), span), Spanned::from(Expression::literal(Token::Int(0)), span),
+        ), span);
+        let lt_len = Spanned::from(Expression::binary(
+            Token::Lt, Spanned::from(ident("__get_real"), span), Spanned::from(ident("__get_n"), span),
+        ), span);
+        let in_bounds = Spanned::from(Expression::binary(Token::And, ge_zero, lt_len), span);
+
+        let index_expr = Spanned::from(
+            Expression::index(Spanned::from(ident("__get_xs"), span), Spanned::from(ident("__get_real"), span)),
+            span,
+        );
+        let index_error = Spanned::from(
+            Expression::call(Spanned::from(ident("IndexError"), span), vec![
+                Spanned::from(Expression::assign(Spanned::from(ident("index"), span), None, Spanned::from(ident("__get_i"), span), None), span),
+                Spanned::from(Expression::assign(Spanned::from(ident("len"), span), None, Spanned::from(ident("__get_n"), span), None), span),
+            ]),
+            span,
+        );
+        stmts.push(Spanned::from(Expression::conditional(in_bounds, index_expr, Some(index_error)), span));
+        stmts
     }
 
     /// The tail shared by an ordinary call (`f(args)`, callable already
@@ -3034,6 +3192,18 @@ impl TypeChecker {
             }
             let v_arg = rest_args.into_iter().next().expect("arity checked just above");
             return self.finish_push(target, target_span, root, v_arg, callee_span, span);
+        }
+
+        // `get` has no `ctx` entry either, same reasoning as `len`/`push`
+        // above — see `finish_get_ufcs`.
+        if field == "get" {
+            if rest_args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", rest_args.len())
+                }, callee_span));
+            }
+            let i_arg = rest_args.into_iter().next().expect("arity checked just above");
+            return self.finish_get_ufcs(target, i_arg, span);
         }
 
         let Some(func_ty) = self.ctx.get(&field).cloned() else {

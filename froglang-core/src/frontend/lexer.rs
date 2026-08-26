@@ -192,12 +192,25 @@ impl<'a> Lexer<'a> {
     fn read_string(&mut self) -> Result<String, LexerError> {
         let mut s = String::new();
         while let Some(c) = self.input.peek() {
-            if *c == '"' {           // escaped quotes, what are those?
+            if *c == '"' {
                 self.advance();      // consume the closing "
                 return Ok(s);
             }
             let ch = self.advance().unwrap();   // safe, just peeked
-            s.push(ch);
+            if ch == '\\' {
+                let escaped = self.advance().ok_or(LexerError::UnterminatedString)?;
+                s.push(match escaped {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\\' => '\\',
+                    '"' => '"',
+                    '0' => '\0',
+                    other => other, // unknown escape: keep the literal character
+                });
+            } else {
+                s.push(ch);
+            }
         };
         // If we exited the while let here, it's because we encountered a None (end of input) before a closing quote
         Err(LexerError::UnterminatedString)

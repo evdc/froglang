@@ -1,0 +1,58 @@
+// Conway's Game of Life
+
+data Grid(rows: List(List(Int)))
+
+func glider(): Grid = {
+    Grid(rows=[
+        [0, 1, 0, 0, 0],
+        [0, 0, 1, 0, 0],
+        [1, 1, 1, 0, 0],
+        [0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0]
+    ])
+}
+
+func show(g: Grid) = {
+    for row in g.rows do {
+        for cell in row do {
+            write_stdout(if cell == 1 then "*" else ".")!
+        }
+        write_stdout("\n")!
+    }
+}
+
+func next_cell(g: Grid, x: Int, y: Int): Int = {
+    mut n_alive = 0
+    for dx in -1..2 do {
+        for dy in -1..2 do {
+            let row = g.rows.get(x+dx) catch []
+            let neighbors = if not (dx == 0 and dy == 0) then row.get(y+dy) catch 0 else 0
+            n_alive = n_alive + neighbors
+        }
+    }
+    let alive = g.rows[x][y]
+    if alive == 1 then 
+        if n_alive == 2 or n_alive == 3 then 1 else 0
+    else
+        if n_alive == 3 then 1 else 0
+}
+
+func next_grid(g: Grid): Grid = {
+    // unsafely just assume the grid is square for some convenience
+    let size = g.rows.len()
+    let rows = [for y in 0..size do [
+        for x in 0..size do next_cell(g, x, y)
+    ]]
+    Grid(rows=rows)
+}
+
+func main() = {
+    mut grid = glider()
+    for i in 0..10 do {
+        show(grid)
+        grid = next_grid(grid)
+        print("-------")
+    }
+}
+
+main()

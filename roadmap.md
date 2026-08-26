@@ -117,3 +117,40 @@ func to_json(d: T): Str = {
 ```
 
 how does Go work with struct field annotations?
+
+---
+
+QoL things
+- Skip field/arg names when the variable has the same name as the field/arg:
+```
+data Person(name: Str, age: Int)
+let name = "alice"
+let age = 42
+let alice = Person(name=name, age=age)      // long form
+let alice2 = Person(name, age)  // short form
+
+func foo(name: Str, age: Int) = ...
+foo(name, age)      // works here too
+```
+
+- lambdas having `[param1, param2] -> e` syntax is an old holdover (at one time, `[]` was going to be tuple syntax)
+    - should be `(param1, param2) -> e`
+    - maybe `=>` actually to match JS, free up `->` for other uses
+
+
+1. `{key=val}` for maps, `{thing1, thing2}` for sets (will want them eventually), and a different block syntax
+    1a. `let result = do ... end` for blocks
+    1b. `()` for blocks: `(expr)` is already grouping, which is a sort of degenerate case of blocks (a group with 1 element)
+    1c. In unambiguous positions, e.g. `func foo(arg): Ret { ... }` we can still use curly braces (e.g. JS manages to do this)
+2. `[key=val]` for maps, paralleling `[a, b, c]` for lists; a map is like a list with named instead of positional "arguments"
+    2a. Then we don't have a dedicated literal for sets and have to do like `Set(a, b, c)` or something but maybe that's fine
+    2b. This is a bit unusual syntax but does parallel struct constructors and fn calls, and has precedent in Lua
+
+a fully consistent, unambiguous syntax would be like
+- `{1, 2, 3}` for anonymous tuples, `{a=1, b=2}` for named tuples / anonymous structs, `Person{name="Alice", age=42}` for nominal structs
+- `(x; y)` for blocks and grouping both (unambiguous with calls, `(` in prefix vs infix position)
+- `[1, 2, 3]` for lists and `["apple"=1, "banana"=2]` (expression keys) for maps
+
+... but I don't exactly like `Person{name="Alice", age=42}` for some reason (Python familiarity, perhaps)
+
+---

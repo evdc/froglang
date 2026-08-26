@@ -176,6 +176,20 @@ pub struct Pattern {
     pub path:    Option<String>,
     pub variant: String,
     pub binds:   Vec<String>,
+    /// Set only by the type checker's own internally-synthesized patterns
+    /// (`TypeChecker::union_entries`'s anonymous-union branch, used to
+    /// desugar `?`/`!`/`catch`) — the pattern's member index into the
+    /// subject's already-known `Type::Union` member list, bypassing
+    /// `variant`'s name-based lookup (`resolve_type_name`) entirely. That
+    /// lookup can only resolve a bare nominal/primitive name, but `variant`
+    /// there is `Type::to_string()`'s *display* form, which for a compound
+    /// member (`List(Int)`, a function type, a nested union) isn't a valid
+    /// name at all (surface `is`-pattern syntax can't spell one either —
+    /// `Grammar::pattern` only ever parses a single identifier) — so
+    /// resolving it back by name was a lossy round-trip through `Display`,
+    /// not a real lookup. Always `None` for a pattern the parser produced,
+    /// since real source text has no way to populate it.
+    pub resolved_member: Option<usize>,
 }
 
 /// One arm of a `match` expression: `is Pattern (and guard)? then body`.

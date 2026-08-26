@@ -347,44 +347,8 @@ of them must print the same result — a differing row means one of them is wron
   `catch`, but since the error branch is never actually taken on this data,
   all five implementations must still print the same total.
 
-Apple M-series, release build; times are the whole process, so froglang's
-include JIT compilation:
-
-| | fib(35) | orders |
-|---|---|---|
-| Rust -O3        | 50ms   | 32ms  |
-| Go (gc)         | 52ms   | 37ms  |
-| LuaJIT          | 71ms   | 58ms  |
-| **froglang**    | 66ms   | 441ms |
-| Lua             | 673ms  | 583ms |
-| Python 3        | 2351ms | 1395ms |
-
-On straight-line arithmetic froglang sits between Go and LuaJIT, as expected
-from a Cranelift backend. `orders` is where the runtime shows, and it regressed
-sharply with this round of changes: the same pipeline without the `?`/`catch`
-wrapping around `price_item` runs in ~180ms on this machine, so routing every
-item through one fallible call and one `catch` roughly *doubles* wall time even
-though the error branch is never taken. `?`/`catch` desugar to an ordinary
-`match` over the subject's union members (see `ERRORS.md` phase 5), so the
-"non-error path is free" property depends entirely on that match, and the
-`Int` member of `Int | PricingError` still has to go through boxed-union
-machinery meant for the general (`Str`/struct/list) case. Cheapening the
-all-primitive-members case of a union match is the next real perf target —
-before this change, the story was allocation:
-
-- **Inline heap access.** Reading a list element, reading or writing a variant
-  payload slot, and appending to a list with spare capacity were each an
-  out-of-line call to an FFI symbol that did a single load or store. Emitting
-  the memory operation directly in Cranelift IR instead (see "Inline
-  heap-object access" in codegen/mod.rs) took 427ms → 242ms.
-- **Unboxed shadow frames.** Every JIT call that touches the heap registers a
-  GC shadow frame; each one was a `Box`, so a `malloc`/`free` pair per call.
-  Keeping them in a `Vec` took 242ms → 182ms.
-
-Payload-less union members are already unboxed into immediates; unboxing
-members *with* payloads — flattening them into tag-plus-fields slots the way
-structs already are, and boxing only what is recursive — is still on the
-table too.
+nb. the result times change often, do not record them here, they are likely to go stale.
+In general froglang should be within ~2x of LuaJIT, otherwise we are doing something Wrong
 
 ---
 

@@ -428,7 +428,57 @@ impl Grammar {
         Ok(Spanned::from(TypeExpr::Func(vec![first], Box::new(rest)), span))
     }
 
-    /// `Name`, `Name(A, B)`, `(T)`, or `(A, B -> C)`.
+    /// Consume a closing `>` for a `<...>` binder/type-argument list,
+    /// special-casing the no-space hazard `X<Y>=5` — the lexer reads its
+    /// last two characters as one `Token::GtEq`, not `Gt` followed by
+    /// `Assign`, since it can't know at lex time that a `>` is closing a
+    /// bracket rather than being a comparison operator. When the current
+    /// token is `GtEq`, this splits it in place: the closing `>`'s span is
+    /// returned, and `parser.current_token` is overwritten in-place to
+    /// become the leftover `=` (as `Token::Assign`), covering exactly the
+    /// second character's span, so whoever parses next sees it as an
+    /// ordinary token. `X<Y> = ...` (with a space) never hits this path —
+    /// it already lexes as separate `Gt`/`Assign` tokens.
+    fn expect_close_angle(parser: &mut Parser) -> Result<Span, Spanned<ParseError>> {
+        if parser.check(&Token::Gt) {
+            let t = parser.consume(Token::Gt)?;
+            return Ok(t.span);
+        }
+        if parser.check(&Token::GtEq) {
+            let old = parser.current_token.span;
+            let split = crate::frontend::tokens::Position { line: old.start.line, col: old.start.col + 1 };
+            let gt_span = Span { start: old.start, end: split };
+            parser.current_token = Spanned { span: Span { start: split, end: old.end }, item: Token::Assign };
+            return Ok(gt_span);
+        }
+        parser.consume(Token::Gt).map(|t| t.span)
+    }
+
+    /// `<A, B>` — a `data` declaration's type-parameter binder list, bare
+    /// names only (no bounds syntax yet, e.g. `<T: Ord>` — a later stage
+    /// per `TRAITS.md`'s "Bounds" section). Assumes the opening `<` has not
+    /// yet been consumed; returns the names in declared order and the
+    /// closing `>`'s span.
+    fn type_param_list(parser: &mut Parser) -> Result<(Vec<String>, Span), Spanned<ParseError>> {
+        parser.consume(Token::Lt)?;
+        let mut names = Vec::new();
+        loop {
+            let tok = parser.identifier()?;
+            match &tok.item {
+                Token::Identifier(s) => names.push(s.clone()),
+                _ => unreachable!("Parser::identifier only returns Token::Identifier"),
+            }
+            if parser.check(&Token::Comma) {
+                parser.advance()?;
+                continue;
+            }
+            break;
+        }
+        let closing = Self::expect_close_angle(parser)?;
+        Ok((names, closing))
+    }
+
+    /// `Name`, `Name<A, B>`, `(T)`, or `(A, B -> C)`.
     fn type_atom(parser: &mut Parser) -> TypeParseResult {
         if parser.check(&Token::LeftParen) {
             let open = parser.advance()?;
@@ -479,15 +529,15 @@ impl Grammar {
             }
             name_span = name_span.merge(part.span);
         }
-        if parser.check(&Token::LeftParen) {
+        if parser.check(&Token::Lt) {
             parser.advance()?;
             let mut args = vec![Self::type_union(parser)?];
             while parser.check(&Token::Comma) {
                 parser.advance()?;
                 args.push(Self::type_union(parser)?);
             }
-            let close = parser.consume(Token::RightParen)?;
-            let span = name_span.merge(close.span);
+            let close_span = Self::expect_close_angle(parser)?;
+            let span = name_span.merge(close_span);
             return Ok(Spanned::from(TypeExpr::Apply(name, args), span));
         }
         Ok(Spanned::from(TypeExpr::Name(name), name_span))
@@ -689,6 +739,13 @@ impl Grammar {
         };
 
         let mut end = name_tok.span;
+        let type_params = if parser.check(&Token::Lt) {
+            let (names, closing) = Self::type_param_list(parser)?;
+            end = closing;
+            names
+        } else {
+            Vec::new()
+        };
         let fields = if parser.check(&Token::LeftParen) {
             let (fields, closing) = Self::field_list(parser)?;
             end = closing;
@@ -750,7 +807,7 @@ impl Grammar {
 
         Ok(Spanned {
             span: token.span.merge(end),
-            item: Expression::DataDecl(DataDeclExpr { name, fields, variants, provides })
+            item: Expression::DataDecl(DataDeclExpr { name, type_params, fields, variants, provides })
         })
     }
 

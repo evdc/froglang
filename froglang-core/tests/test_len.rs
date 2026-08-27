@@ -1,4 +1,4 @@
-//! `len` — a hardcoded builtin over `List(T)`/`Str`, the same mechanism as
+//! `len` — a hardcoded builtin over `List<T>`/`Str`, the same mechanism as
 //! `push` (`frontend/typeck.rs`'s `finish_len`, `codegen/mod.rs`'s
 //! `func_name == "len"` arm) rather than a `FrogStateBuilder`-registered
 //! host function, since it needs to be polymorphic over `T` with no
@@ -26,7 +26,7 @@ fn len_of_a_list_bare_call() {
 #[test]
 fn len_of_an_empty_list() {
     let mut s = FrogState::new();
-    let (v, _) = s.eval("let xs: List(Int) = []\nlen(xs)").unwrap();
+    let (v, _) = s.eval("let xs: List<Int> = []\nlen(xs)").unwrap();
     assert_eq!(int(&v), 0);
 }
 

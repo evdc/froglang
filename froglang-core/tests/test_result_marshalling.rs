@@ -83,11 +83,11 @@ fn first_word(s: String) -> Result<String, Vec<i64>> {
     }
 }
 
-// `List(...)` isn't destructurable in a `match` pattern, and `is List(Int)`
+// `List<...>` isn't destructurable in a `match` pattern, and `is List<Int>`
 // isn't a legal type-test either (`Unknown type 'List'` — the same
 // pre-existing, unrelated gap `test_anon_unions.rs`'s
 // `test_list_member_round_trips` documents), so there's no way in frog
-// source today to narrow `Str | List(Int)` down to its `List` side at all.
+// source today to narrow `Str | List<Int>` down to its `List` side at all.
 // These two therefore only check the tag (`r is Str`), not the `List`
 // payload — payload correctness for this impl is what the mixed
 // scalar/pointer tests above already establish, and is shared code

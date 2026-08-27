@@ -254,33 +254,28 @@ impl FrogState {
                 return Err(FrogError::Type(e.to_string()));
             }
         };
-        // Stamp every node with a fresh id before any post-lowering pass
-        // touches the tree — see `liveness::number_nodes`'s doc comment for
-        // why this must run once, after lowering, rather than during it.
-        crate::frontend::liveness::number_nodes(&mut typed);
         if let Err(e) = self.tc.validate_codegen_constraints(&typed) {
             self.tc.restore(cp);
             return Err(FrogError::Type(e.to_string()));
         }
-        // TRAITS.md Stage 2's codegen gate: a generic instantiated at 2+
-        // distinct concrete types can't yet be compiled (monomorphization
-        // is Stage 3) — reject it here rather than let it reach codegen.
-        // On success, `resolved` names each generalized name's single
-        // concrete instantiation (empty if none were used) — codegen still
-        // needs that instantiation actually applied to the declaration
-        // itself (`resolve_single_instantiations`'s doc comment explains
-        // why: a generalized declaration's own params/return_type are
-        // never resolved by ordinary checking).
-        let resolved = match self.tc.check_generic_monomorphism(&typed) {
-            Ok(r) => r,
-            Err(e) => {
-                self.tc.restore(cp);
-                return Err(FrogError::Type(e.to_string()));
-            }
-        };
-        if !resolved.is_empty() {
-            self.tc.resolve_single_instantiations(&mut typed, &resolved);
+        // `TRAITS.md` Stage 3b: real monomorphization. Clones and
+        // specializes every generic call site's declaration into a
+        // distinctly-named instantiation (mutating `typed` in place —
+        // stripping any raw, un-substituted generic declaration and
+        // inserting its compiled instantiations instead, with every call
+        // site rewritten to the matching mangled name) rather than
+        // rejecting a second concrete type the way Stage 2's gate did.
+        if let Err(e) = self.tc.monomorphize_generics(&mut typed) {
+            self.tc.restore(cp);
+            return Err(FrogError::Type(e.to_string()));
         }
+        // Stamp every node with a fresh id — including whatever
+        // `monomorphize_generics` just cloned in, which starts out
+        // unnumbered (`NodeId`'s doc comment) — before codegen's
+        // liveness-dependent passes touch the tree. Must run after
+        // monomorphization, not before, so newly-inserted instantiation
+        // bodies get real ids too.
+        crate::frontend::liveness::number_nodes(&mut typed);
 
         let result_ty = typed.item.ty.clone();
 

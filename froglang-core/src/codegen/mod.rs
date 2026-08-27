@@ -490,8 +490,14 @@ fn gc_mask<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> i64 {
 /// rather than nested, e.g. `Company{ceo: Person{name, age}}` flattens to
 /// `[("ceo.name", Str), ("ceo.age", Int)]`.
 pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
-    if let Some(name) = ty.as_struct_name() {
-        let fields = structs.get(name).cloned().unwrap_or_default();
+    if let Some(key) = ty.struct_key() {
+        // A generic instantiation's concrete layout (`TRAITS.md` Stage 3a)
+        // is registered under this same key by
+        // `TypeChecker::materialize_struct`/`instantiate_struct` while
+        // typeck runs — by the time codegen calls this, every
+        // instantiation appearing anywhere in the typed program is
+        // already present.
+        let fields = structs.get(&key).cloned().unwrap_or_default();
         let mut out = Vec::new();
         for (fname, fty) in fields {
             for (sub_path, sub_ty) in struct_fields(&fty, structs) {
@@ -1114,7 +1120,8 @@ fn list_elem_kind(elem_ty: &Type) -> i64 {
 fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
     if let Some(name) = ty.as_struct_name() {
         print_fragment(&format!("{}(", name), bcx, ctx);
-        let fields = ctx.structs.get(name).expect("known struct in codegen");
+        let key = ty.struct_key().expect("as_struct_name Some implies struct_key Some");
+        let fields = ctx.structs.get(&key).expect("known struct in codegen");
         // A positionally-declared ("tuple struct") field has no
         // source-level name — `field_name_or_positional` gave it its
         // index instead (`is_positional_fields`) — so print it bare
@@ -2651,7 +2658,8 @@ fn enum_field_leaf_types(enum_name: &str, variant: Option<&str>, field: &str, st
 fn field_slice_range(struct_ty: &Type, field: &str, structs: &StructDefs) -> (usize, usize) {
     let name = struct_ty.as_struct_name()
         .unwrap_or_else(|| unreachable!("field_slice_range called on non-struct type {:?}", struct_ty));
-    let decl_fields = structs.get(name).cloned().unwrap_or_default();
+    let key = struct_ty.struct_key().expect("as_struct_name Some implies struct_key Some");
+    let decl_fields = structs.get(&key).cloned().unwrap_or_default();
     let mut offset = 0;
     for (fname, fty) in &decl_fields {
         let leaf_count = struct_fields(fty, structs).len();

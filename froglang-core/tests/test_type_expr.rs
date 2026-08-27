@@ -68,7 +68,7 @@ fn test_parse_optional_is_postfix_on_the_atom_not_the_union() {
 
 #[test]
 fn test_parse_apply() {
-    match parse_ty("List(Int)") {
+    match parse_ty("List<Int>") {
         TypeExpr::Apply(name, args) => {
             assert_eq!(name, "List");
             assert_eq!(args.len(), 1);
@@ -118,14 +118,14 @@ fn test_union_annotation_rejects_a_non_member() {
 
 #[test]
 fn test_list_annotation() {
-    assert_eq!(infer_src("let xs: List(Int) = [1, 2, 3]").unwrap(), Type::list(Type::Int));
-    assert!(infer_src("let xs: List(Str) = [1, 2, 3]").is_err());
+    assert_eq!(infer_src("let xs: List<Int> = [1, 2, 3]").unwrap(), Type::list(Type::Int));
+    assert!(infer_src("let xs: List<Str> = [1, 2, 3]").is_err());
 }
 
 #[test]
 fn test_nested_list_annotation() {
     assert_eq!(
-        infer_src("let xs: List(List(Int)) = [[1], [2]]").unwrap(),
+        infer_src("let xs: List<List<Int>> = [[1], [2]]").unwrap(),
         Type::list(Type::list(Type::Int)),
     );
 }
@@ -150,12 +150,12 @@ fn test_func_return_type_may_be_a_union() {
 
 #[test]
 fn test_func_param_type_may_be_a_list() {
-    assert_eq!(infer_src("func total(xs: List(Int)): Int = xs[0]\ntotal([7])").unwrap(), Type::Int);
+    assert_eq!(infer_src("func total(xs: List<Int>): Int = xs[0]\ntotal([7])").unwrap(), Type::Int);
 }
 
 #[test]
 fn test_data_field_type_may_be_a_list() {
-    let src = "data Bag(items: List(Int))\nlet b = Bag(items=[1, 2])\nb.items[1]";
+    let src = "data Bag(items: List<Int>)\nlet b = Bag(items=[1, 2])\nb.items[1]";
     assert_eq!(infer_src(src).unwrap(), Type::Int);
 }
 
@@ -170,7 +170,7 @@ fn test_data_field_type_may_be_a_union() {
 
 #[test]
 fn test_variant_field_type_may_be_compound() {
-    let src = "data Shape is Poly(pts: List(Int)) | Dot\nlet s = Poly(pts=[1, 2])\nif s is Dot then 0 else 1";
+    let src = "data Shape is Poly(pts: List<Int>) | Dot\nlet s = Poly(pts=[1, 2])\nif s is Dot then 0 else 1";
     assert_eq!(infer_src(src).unwrap(), Type::Int);
 }
 
@@ -190,12 +190,42 @@ fn test_a_local_cannot_shadow_a_type_name() {
 
 #[test]
 fn test_list_arity_is_checked() {
-    assert!(type_error("let x: List(Int, Str) = [1]").contains("exactly 1 type argument"));
+    assert!(type_error("let x: List<Int, Str> = [1]").contains("exactly 1 type argument"));
 }
 
 #[test]
 fn test_non_generic_type_rejects_arguments() {
-    assert!(type_error("let x: Int(Str) = 1").contains("does not take type arguments"));
+    assert!(type_error("let x: Int<Str> = 1").contains("does not take type arguments"));
+}
+
+// ── `TRAITS.md` Stage 3a: generic `data` declarations ────────────────────────
+
+#[test]
+fn test_generic_struct_field_access_at_two_instantiations() {
+    // `Pair<A, B>`'s field template is stored once (with placeholder
+    // `TypeVar`s); each construction call instantiates it fresh
+    // (`TypeChecker::instantiate_struct`), so two calls in the same
+    // program can bind `A`/`B` to different concrete types without one
+    // clobbering the other's inferred field types.
+    let src = "data Pair<A, B>(fst: A, snd: B)\n\
+               let p = Pair(fst=1, snd=\"x\")\n\
+               let q = Pair(fst=\"y\", snd=2.5)\n\
+               p.fst + q.snd";
+    assert_eq!(infer_src(src).unwrap(), Type::Float);
+}
+
+#[test]
+fn test_generic_struct_arity_mismatch_is_an_error() {
+    assert!(type_error("data Pair<A, B>(fst: A, snd: B)\nlet p: Pair<Int> = Pair(fst=1, snd=2)")
+        .contains("exactly 2 type argument"));
+}
+
+#[test]
+fn test_generic_struct_annotation_pins_down_field_types() {
+    let src = "data Pair<A, B>(fst: A, snd: B)\n\
+               let p: Pair<Int, Str> = Pair(fst=1, snd=\"x\")\n\
+               p.fst";
+    assert_eq!(infer_src(src).unwrap(), Type::Int);
 }
 
 #[test]

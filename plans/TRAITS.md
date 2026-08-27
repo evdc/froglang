@@ -626,12 +626,11 @@ here since Stage 3 will re-encounter them:
    of a clean error. `generic_instantiations` (checkpointed like `substitutions`) tracks each
    generalized name's confirmed instantiation across the whole session.
 
-**Known remaining boundary, left for Stage 3**: a generic declared in one REPL entry and never
-called there, then called for the first time in a *later* entry, still fails — safely (a caught
-Cranelift verifier panic, not silent corruption), but without the gate's clean message. Fixing
-that means deferring a generic's codegen to its first call site, which is genuinely
-"on-demand compilation", i.e. Stage 3's actual job, not something a gate can paper over. Every
-case that matters in practice — declare-and-use within one entry or one file — works end-to-end.
+**Known remaining boundary, left for Stage 3 — closed by sub-stage 3b**: a generic declared in one
+REPL entry and never called there, then called for the first time in a *later* entry, used to fail
+(safely — a caught Cranelift verifier panic, not silent corruption — but without the gate's clean
+message). Sub-stage 3b's `generic_templates` (a declaration's template survives past its own entry)
+fixes this for real: on-demand compilation at first call site, however many entries later.
 
 ### Stage 3 — Generic syntax and monomorphization
 
@@ -639,6 +638,190 @@ case that matters in practice — declare-and-use within one entry or one file �
 type parser; `List` becomes a prelude declaration; monomorphization at instantiation, emitting
 mangled symbol names into the typed AST. `List(T)` → `List<T>` migration across README, tests,
 error messages, and `CONCURRENCY.md`.
+
+#### Sub-stage 3a — Generic `data` declarations — **done**
+
+`<A, B>` binders on `data` (`func` binders are Stage 3b, untouched); `TypeExpr::Apply`'s delimiter
+switched from `(...)` to `<...>` everywhere (paren-style type application retired, migrated across
+`froglang-core/tests/`); `Grammar::expect_close_angle` splits the `X<Y>=5` `GtEq` lexer hazard.
+
+**The struct-instantiation design from the top of this file held exactly as predicted**: no mangled
+symbols, no duplicated compiled bodies. What it turned out to need instead:
+
+1. **A struct's stored field template needs *two* different kinds of instantiation**, depending on
+   whether the concrete type arguments are already known or still being inferred:
+   - **Construction** (`Name(...)`) doesn't know its arguments up front — they're inferred from the
+     constructor call's own argument types. `TypeChecker::instantiate_struct` mints one *fresh*
+     `TypeVar` per binder per call (exactly `instantiate`'s per-call-fresh-renaming move, applied to
+     a struct's binders instead of a scheme's free variables) so two `Pair(...)` calls in one
+     program don't fight over a shared global substitution.
+   - **Reading** an already-typed value's field (`FieldAccess`, place-assignment, UFCS field lookup)
+     already has concrete `args` sitting in the resolved `Type::Named` — no inference needed, just
+     substitution. `TypeChecker::materialize_struct` does that directly.
+2. **Codegen needs a *distinct* concrete layout per instantiation, keyed by something codegen can
+   compute from the type alone.** `StructDefs` is a flat `HashMap<String, Vec<(String, Type)>>`
+   threaded through ~50 call sites in `codegen/mod.rs` — threading a second `struct_type_params`
+   table through all of them (the originally-planned shape) would have meant touching every one.
+   Instead: `Type::struct_key()` reuses `Display`'s existing `Name(Arg1, Arg2)` rendering for a
+   non-empty-`args` `Named` as the lookup key (a bare name, unchanged, for a non-generic struct), and
+   `materialize_struct`/`instantiate_struct` register each instantiation's concrete field list into
+   `struct_defs` under that key the moment typeck first computes it (construction or field access,
+   whichever happens first) — memoized, so a repeat lookup of the same instantiation is free. By the
+   time codegen runs, every instantiation appearing anywhere in the typed program is already
+   present; `codegen::struct_fields`/`field_slice_range` needed exactly one line changed each
+   (`ty.as_struct_name()` → `ty.struct_key()`), no signature changes, no new parameter threaded
+   anywhere. `as_struct_name` itself stays a bare-name accessor (now just widened to accept non-empty
+   `args`) — used wherever *identity*, not layout, is what's wanted (e.g. `print_value`'s printed
+   prefix, which must say `Pair(...)`, never the mangled `Pair(Int, Str)(...)`).
+3. **Generic unions are out of scope, rejected explicitly.** A struct's "instantiation" is a layout
+   substitution; a nominal union's members are boxed/tagged (`FrogVariant`) — different enough
+   machinery that folding them in wasn't attempted. `hoist_data_decls` rejects `data Name<A> is
+   X | Y` with a clear error rather than silently mistyping it.
+4. **A pre-existing gap, left alone on purpose**: `build_struct_eq` (the `==` desugaring into
+   per-field comparisons) still reads a struct's *un-substituted* template — untouched by this
+   substage, since fixing it would require the same materialize-on-read treatment threaded into a
+   third place, and no test exercises `==` on a generic struct's concrete field values end-to-end.
+   `type_implements`'s `Eq` arm (what actually gates whether the `==` operator type-checks at all) is
+   fixed: it recurses into a generic instantiation's `args`, so `Pair<Int, Int>` is `Eq` and
+   `Box<List<Int>>` is correctly rejected — but the desugared comparison's own per-field types, for a
+   generic struct specifically, aren't verified beyond that gate. Matches the file's pre-existing
+   "structural derivation must recurse" note (Part 3) — not newly introduced here, not fixed here.
+
+#### Sub-stage 3b — Generic `func`/let-bound-lambda monomorphization — **done**
+
+Real monomorphization: a generalized name (Stage 2's inferred generalization — see below for why no
+new `<A, B>` syntax was added) may now be called at any number of distinct concrete types, in one
+entry or split across several REPL entries, and each distinct instantiation gets its own compiled
+body under a mangled symbol name. `TypeChecker::check_generic_monomorphism` (the single-instantiation
+rejection gate) and `resolve_single_instantiations` (its "make the one instantiation compile" helper)
+are both gone, replaced by `TypeChecker::monomorphize_generics`.
+
+1. **No `<A, B>` binder syntax was added to `func` declarations.** The plan's stated fallback —
+   "the existing scheme-inference path may be sufficient" — held: Stage 2's `generalize` already
+   infers exactly the right binder set from every unconstrained free type variable in a syntactic
+   function value (`func` or let-bound lambda), and nothing about *compiling* N instantiations
+   instead of 1 needed the binder set to originate from explicit syntax instead. Revisit only if a
+   future stage needs a user-written trait bound beyond what inference can discover on its own.
+2. **The declaration's template must survive past its own entry.** `generic_templates: HashMap<String,
+   GenericTemplate>` (new `TypeChecker` field, checkpointed) retains each generalized declaration's
+   binder list, declared (abstract) `Type::Function`, and its `TypedExprKind::Function`'s `params`/
+   `return_type`/`body` — populated in `lower_assign` alongside `ctx.insert_generalized`, never
+   removed once inserted. Keyed by a **per-declaration template symbol** (`name#42`, minted once per
+   generalization and recorded on the scope-stack `Binding`), not by the source name — see the
+   follow-up notes below for why a name is not an identity here. This is what closes Stage 2's documented
+   boundary: a generic declared in one entry and never called there now monomorphizes correctly the
+   first time a *later* entry calls it, at as many distinct types as it's ever called at.
+3. **Mangling deliberately avoids `Display`.** `TypeChecker::mangle_type` is a dedicated,
+   non-parseable-back string (`Int`, `Named_Arg1_Arg2`, `Fn_Arg_Result`, ...) — reusing `Display`
+   would have coupled symbol names to the string Stage 1 already flagged as load-bearing for union-tag
+   sort order. A full instantiation's mangled name is `name$mangled_binder_1$mangled_binder_2...`,
+   built from the same `zip_binder_types` Stage 2 already had (declared type structurally zipped
+   against the call site's resolved concrete type).
+4. **One session-wide set of already-compiled mangled names (`emitted_instantiations`) avoids
+   redundant recompilation.** `codegen::func_ids` already persists across entries (Stage 2 relied on
+   this too) — a generic called at the same concrete type from two different entries reuses the
+   first entry's `FuncId` rather than cloning+compiling the body again.
+5. **A per-entry rewrite, not a whole-program one.** `monomorphize_generics` runs once per `eval`
+   call: collect every `(name, concrete type)` pair this entry's typed AST actually references
+   (`collect_generic_var_types`, now accumulating a *set* per name instead of erroring past the
+   first); for each pair not already in `emitted_instantiations`, clone the template body, substitute
+   binder `TypeVar`s via a **local** mapping (`substitute_types_deep` — deliberately not the shared
+   session-wide `substitutions` map, which is single-valued per name and exactly incompatible with
+   two live instantiations coexisting), and insert the specialized `Assign` before the entry's own
+   tail statement (so the entry's result value is never accidentally reassigned to a declaration).
+   Every un-substituted generic `Assign` is stripped from what reaches codegen — only mangled
+   instantiations do — and every `Var` reference (including a recursive self-call inside a freshly
+   cloned body, which is what makes recursive generics monomorphize correctly too) is rewritten to
+   its instantiation's mangled name in one final pass (`rewrite_call_sites`).
+6. **An unrelated latent bug surfaced and was fixed in passing**: `lower_call_arg`/`lower_widen`
+   stamp a `Coerce`/`Widen` node's `.ty` with the callee's parameter type *as it stood at that call
+   site* — for a generalized function this is a fresh per-call `TypeVar`, only resolved later via
+   `unify` writing into `self.substitutions`. Nothing re-resolves it in place afterward unless
+   something walks the whole entry's typed tree through `lookup`. Stage 2's `resolve_types_deep` did
+   this (unconditionally, over the whole entry, whenever any instantiation existed) but only as a
+   side effect of its single-instantiation freeze; losing that when `resolve_single_instantiations`
+   was deleted reintroduced the bug (surfaced immediately as a codegen panic, `"no widening from Int
+   to TypeVar"`, in every generics test). Fixed by keeping exactly that whole-entry resolve step —
+   `substitute_types_deep` called with an empty mapping is exactly Stage 2's `resolve_types_deep` —
+   run over every statement before instantiations are inserted, not only inside a generic's own body.
+7. **The single collection pass was not enough, and is now a fixed point.** Filed originally as a
+   speculative "known gap" about type-changing recursion, this turned out to bite the ordinary case
+   too: a generic whose body calls *another* generic (`func id(x) = x; func idpair(a) = id(a)`).
+   The inner `id` reference sits at `idpair`'s own un-resolved binder `TypeVar` in the
+   pre-monomorphization tree, so collecting once over that tree records a garbage instantiation and
+   never emits `id$Int` at all — a `no entry found for key` codegen panic. `monomorphize_generics`
+   now drains a worklist: every body it emits is re-run through `collect_generic_var_types` (its
+   binders are concrete by then, so the calls inside it finally name real instantiations) and
+   anything new goes back on the queue. A body's mangled name is claimed in `emitted_instantiations`
+   *before* its own body is walked, which is the recursion guard.
+
+Acceptance, run end-to-end rather than only checked: `let f = x -> x + x; f(1); f(1.5)` now compiles
+and runs both instantiations correctly (`tests/test_generics_stage2.rs`'s
+`a_generic_used_at_two_types_runs_both_instantiations_correctly` — previously the rejection case);
+a generic declared in one REPL entry and called for the first time in a later one, at multiple
+distinct types across further entries, also runs correctly
+(`tests/test_state.rs`'s `test_generic_declared_without_being_called_monomorphizes_on_first_call_in_a_later_entry`).
+
+#### Stage 3 follow-up: what a code review of the above found
+
+Five defects, all in code the stages above introduced. Two were local; three shared one root cause.
+
+- **Instantiation discovery had to become a fixed point** — see note 7 above.
+- **`==` on a generic struct compared the wrong field types.** `desugar_struct_eq`/`build_struct_eq`
+  looked the field layout up by the struct's *bare declared name*, which for a generic struct holds
+  the placeholder-`TypeVar` template; the synthesized `FieldAccess` nodes were stamped at a `TypeVar`
+  and codegen compared every field as a raw `I64`, so two identical `Pair(fst="ab", snd="cd")`
+  values compared unequal. Both now take the resolved `Type` and go through `materialize_struct`,
+  the way `lower_field_access`/`lower_place_assign` already did.
+- **A name is not an identity.** `generalized_names` (a global, never-emptied, name-keyed set) drove
+  three separate wrong answers at once: a later monomorphic `let f = ...` was stripped from codegen
+  and its calls redirected to the earlier generic's instantiation; redefining a generic in a later
+  REPL entry reused the previous definition's compiled body, because `emitted_instantiations` keyed
+  `f$Int` off the bare name; and a plain parameter that merely shared a name with a generic
+  (`func g(id: Int)` under a generic `id`) was treated as an instantiation, mangled to `id$None`,
+  and rewritten into an unbound symbol. The fix is to decide *which declaration a reference belongs
+  to* in scope, at lowering time, where the scope stack still exists: each generalization mints a
+  unique template symbol, `Binding::generic_symbol` carries it, and every `Var` that resolves to a
+  generalized declaration — plus the declaration's own `Assign` node — is emitted under that symbol
+  instead of the source name. `generic_templates`' key set then *is* the "is this a generic
+  reference?" test, and `generalized_names` is deleted. (`lower_ufcs_call` synthesizes its callee
+  `Var` directly rather than through `lower_literal`, so it needs the same rename.)
+- **An entry ending in a generic declaration** now evaluates to `None` rather than to the statement
+  before it: the tail is pulled aside *before* the strip, and a stripped tail is replaced by
+  `NoneLit`.
+
+#### Stage 3 follow-up: functions in value position
+
+The review's fifth finding — `let f = g; f(3)` panicking with `unbound variable in codegen` — was
+correctly identified as pre-existing and *not* generic-specific: it reproduces for a plain `func`,
+because froglang has no runtime representation of a function at all. There is no closure object, no
+function pointer, and no indirect call; `codegen::compile_call` resolves a callee by name through
+`func_ids` and panics on anything else. Every use of a function in value position therefore ended in
+one of two panics rather than a diagnostic.
+
+Rather than invent function values (a real feature — closures, an indirect-call ABI, GC tracing of
+captured environments — and one no stage here has asked for yet), the resolution is to make the
+language's actual position explicit and enforce it:
+
+- **`let f = g` is an alias, not a copy.** The one thing a user reasonably wants from a function in
+  value position is a second name for it, and that needs no runtime value: `lower_assign` binds `f`
+  to `g`'s type, binders, codegen symbol (`Binding::symbol`, the same field the template symbols
+  ride on) and `func_mut_params` entry, and the declaration compiles to nothing. An alias of a
+  generic is therefore still generic, instantiating through the target's own template and sharing
+  its already-emitted instantiations. `mut f = g` is deliberately *not* an alias — reassigning it
+  would have to change what a call site resolves to at runtime, which is precisely the indirect
+  call that doesn't exist.
+- **Everything else is a spanned type error.** `validate_codegen_constraints` rejects a `Var` of
+  function type anywhere except a call's callable (which the `Call` arm no longer recurses into),
+  and a `Function` literal anywhere except as a declaration's own value. That covers `print(g)`,
+  `[g]`, `mut f = g`, `map(xs, x -> x*2)`, and `(x -> x + 1)(5)` — all of which named the mangled
+  or synthetic symbol in a panic message before, and now name the source identifier in a diagnostic
+  (`Self::source_name` strips the `#42` off a template symbol).
+
+This closes the last codegen panic reachable through the generics work. `tests/test_state.rs`'s
+`test_codegen_panic_becomes_clean_error_and_state_survives` — which used the IIFE as its "codegen
+still panics on something" specimen — now uses `print(none)` instead, the panic `plans/DATA.md`
+Stage 1 is scheduled to remove.
 
 ### Stage 4 — A real standard library
 

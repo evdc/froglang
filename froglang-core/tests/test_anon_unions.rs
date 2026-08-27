@@ -166,19 +166,19 @@ fn test_str_member_round_trips() {
 
 #[test]
 fn test_list_member_round_trips() {
-    // `Str | List(Int)` has no scalar (`Int`/`Float`/`Bool`) member, so this
+    // `Str | List<Int>` has no scalar (`Int`/`Float`/`Bool`) member, so this
     // is the one-slot boxed path, not the two-slot `cond_mask` one — both
     // members are boxed via `box_into_variant` exactly the same way.
     //
-    // Discriminates via `is Str` only, not `is List(l)`: pattern-matching a
+    // Discriminates via `is Str` only, not `is List<l>`: pattern-matching a
     // bare parametric type name is a separate, pre-existing gap
     // (`TypeChecker::check_type_pattern`'s `resolve_type_name` has no case
     // for `List`, `Function`, etc — unrelated to whether `List` is a legal
     // union member, which is what this test is actually about) — a
     // `List`-typed union member is fully constructible and discriminable by
-    // tag today, just not yet destructurable by a `List(...)` pattern.
+    // tag today, just not yet destructurable by a `List<...>` pattern.
     assert_eq!(compile_and_run(
-        "func is_str(x: Str | List(Int)): Int = if x is Str then 1 else 0\n\
+        "func is_str(x: Str | List<Int>): Int = if x is Str then 1 else 0\n\
          is_str(\"hi\") * 10 + is_str([1, 2, 3])"
     ), 10);
 }
@@ -191,7 +191,7 @@ fn test_str_union_member_survives_gc_pressure() {
     // on the wrapping `FrogVariant` would either free a still-live boxed
     // string or crash trying to follow a raw `Int` payload as a pointer.
     assert_eq!(compile_and_run(
-        "let xs: List(Int | Str) = [for i in 0..8000 do (if i - (i / 2) * 2 == 0 then i else \"hello\")]\n\
+        "let xs: List<Int | Str> = [for i in 0..8000 do (if i - (i / 2) * 2 == 0 then i else \"hello\")]\n\
          mut total = 0\n\
          for i in 0..8000 do (total = total + match xs[i] {\n\
          is Int(n) then n\n\
@@ -221,7 +221,7 @@ fn test_assigning_into_a_union_typed_struct_field_widens() {
 
 // ── a scalar-carrying union as a list element ─────────────────────────────────
 //
-// A `List(Int | Point)` element is laid out inline (`codegen::UnionLayout`):
+// A `List<Int | Point>` element is laid out inline (`codegen::UnionLayout`):
 // a tagged pointer column plus a scalar column, no allocation for the `Int`
 // case. Both columns' pointer-ness is static — the scalar column is never
 // scanned, and the pointer column is scanned unconditionally, with the
@@ -234,7 +234,7 @@ fn test_assigning_into_a_union_typed_struct_field_widens() {
 fn test_list_of_scalar_and_struct_union_round_trips() {
     assert_eq!(compile_and_run(
         "data Point(x: Int, y: Int)\n\
-         let xs: List(Int | Point) = [1, Point(x=3, y=4), 5]\n\
+         let xs: List<Int | Point> = [1, Point(x=3, y=4), 5]\n\
          let a = match xs[0] { is Int(n) then n\nis Point(p) then -1\n }\n\
          let b = match xs[1] { is Int(n) then -1\nis Point(p) then p.x + p.y\n }\n\
          let c = match xs[2] { is Int(n) then n\nis Point(p) then -1\n }\n\
@@ -252,7 +252,7 @@ fn test_list_of_scalar_union_survives_gc_pressure() {
     // misread as a pointer during marking (a crash, not a wrong answer).
     assert_eq!(compile_and_run(
         "data Point(x: Int, y: Int)\n\
-         let xs: List(Int | Point) = [for i in 0..6000 do (if i - (i / 2) * 2 == 0 then i else Point(x=i, y=i))]\n\
+         let xs: List<Int | Point> = [for i in 0..6000 do (if i - (i / 2) * 2 == 0 then i else Point(x=i, y=i))]\n\
          mut total = 0\n\
          for i in 0..6000 do (total = total + match xs[i] {\n\
          is Int(n) then n\n\
@@ -283,7 +283,7 @@ fn test_two_distinct_scalar_unions_in_one_struct() {
         "data Point(x: Int, y: Int)\n\
          data Line(a: Point, b: Point)\n\
          data Both(m: Int | Point, n: Float | Line)\n\
-         let items: List(Both) = [Both(m=1, n=2.0), Both(m=Point(x=3, y=4), n=5.0)]\n\
+         let items: List<Both> = [Both(m=1, n=2.0), Both(m=Point(x=3, y=4), n=5.0)]\n\
          match items[1].m { is Int(k) then k\nis Point(p) then p.x + p.y\n }"
     );
     match result {
@@ -307,7 +307,7 @@ fn test_for_loop_over_scalar_union_list_allocating_in_the_body() {
     assert_eq!(compile_and_run(
         "data Point(x: Int, y: Int)\n\
          func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\
-         let xs: List(Int | Point) = [4000000, 4000002, 4000004]\n\
+         let xs: List<Int | Point> = [4000000, 4000002, 4000004]\n\
          mut total = 0\n\
          for x in xs do (total = total + burn(1) + match x {\n\
          is Int(n) then n\n\
@@ -326,7 +326,7 @@ fn test_indexing_a_scalar_union_list_allocating_between_reads() {
     assert_eq!(compile_and_run(
         "data Point(x: Int, y: Int)\n\
          func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\
-         let xs: List(Int | Point) = [4000000, 4000002, 4000004]\n\
+         let xs: List<Int | Point> = [4000000, 4000002, 4000004]\n\
          mut total = 0\n\
          for i in 0..3 do (total = total + match xs[i] {\n\
          is Int(n) then n + burn(1)\n\

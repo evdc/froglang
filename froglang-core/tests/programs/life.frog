@@ -1,6 +1,6 @@
 // Conway's Game of Life
 
-data Grid(rows: List(List(Int)))
+data Grid(rows: List<List<Int>>)
 
 func glider(): Grid = {
     Grid(rows=[

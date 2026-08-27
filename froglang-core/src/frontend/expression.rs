@@ -160,6 +160,13 @@ pub struct VariantDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataDeclExpr {
     pub name:     String,
+    /// `<A, B>` binder names declared right after the data name, before any
+    /// field list — `TRAITS.md` Stage 3a. Empty for an ordinary
+    /// (non-generic) declaration; never bound to a `TypeVar` here — that
+    /// happens in `TypeChecker::hoist_data_decls`, which mints one fresh
+    /// placeholder per name and resolves `fields`'s `TypeExpr`s against
+    /// them.
+    pub type_params: Vec<String>,
     pub fields:   Vec<FieldDecl>,
     pub variants: Vec<VariantDecl>,
     pub provides: Vec<String>,

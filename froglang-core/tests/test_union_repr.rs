@@ -121,7 +121,7 @@ print(Named(who="ada", n=3))
 #[test]
 fn anonymous_scalar_and_pointer_union_round_trips() {
     both(
-        r#"let xs: List(Int | Str) = [1, "two", 3, "four"]
+        r#"let xs: List<Int | Str> = [1, "two", 3, "four"]
 mut n = 0
 for x in xs do {
   let churn = [for i in 0..300 do "p" + "q"]
@@ -229,7 +229,7 @@ print(sum(Node(v=1, l=Node(v=2, l=Leaf, r=Leaf), r=Node(v=3, l=Leaf, r=Leaf))))
 
 /// A union reachable from itself only *through a struct field* is still
 /// self-referential and must still box — the cycle does not have to be
-/// direct. `List(Branchy)` deliberately does not count, being a pointer that
+/// direct. `List<Branchy>` deliberately does not count, being a pointer that
 /// breaks the cycle, so this uses a plain struct instead.
 #[test]
 fn a_union_that_cycles_through_a_struct_stays_boxed() {

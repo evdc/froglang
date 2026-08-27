@@ -1,4 +1,4 @@
-//! Value semantics for `List(T)`, and `push` — MUTABILITY.md stage 6.
+//! Value semantics for `List<T>`, and `push` — MUTABILITY.md stage 6.
 //!
 //! Distinct from `test_gc_roots.rs`: that file guards against a *missing
 //! root* (a value the collector should have kept alive but didn't). This
@@ -105,7 +105,7 @@ print(xs)
 #[test]
 fn push_inside_a_mut_param_function_does_not_alias_the_callers_other_binding() {
     let src = r#"
-func addOne(mut xs: List(Int)): None = { push(mut xs, 99) }
+func addOne(mut xs: List<Int>): None = { push(mut xs, 99) }
 mut a = [1, 2, 3]
 mut b = a
 addOne(mut b)

@@ -495,7 +495,7 @@ fn test_block_type_inference() {
 #[test]
 fn test_list_type_inference() {
     let mut t = TypeChecker::new();
-    // [1, 2, 3] :: List(Int)
+    // [1, 2, 3] :: List<Int>
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
     assert_eq!(t.infer(&list).unwrap(), Type::list(Type::Int));
 }
@@ -529,7 +529,7 @@ fn test_index_non_int_index_is_error() {
 #[test]
 fn test_slice_type_inference() {
     let mut t = TypeChecker::new();
-    // [1, 2, 3][0:2] :: List(Int)
+    // [1, 2, 3][0:2] :: List<Int>
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
     let s = spanned(Expression::slice(list, Some(int(0)), Some(int(2))));
     assert_eq!(t.infer(&s).unwrap(), Type::list(Type::Int));
@@ -538,7 +538,7 @@ fn test_slice_type_inference() {
 #[test]
 fn test_slice_omitted_bounds() {
     let mut t = TypeChecker::new();
-    // [1, 2, 3][:] :: List(Int)
+    // [1, 2, 3][:] :: List<Int>
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
     let s = spanned(Expression::slice(list, None, None));
     assert_eq!(t.infer(&s).unwrap(), Type::list(Type::Int));
@@ -562,7 +562,7 @@ fn test_slice_non_int_bound_is_error() {
 #[test]
 fn test_range_type_inference() {
     let mut t = TypeChecker::new();
-    // 1..5 :: List(Int)
+    // 1..5 :: List<Int>
     let r = spanned(Expression::range(int(1), int(5)));
     assert_eq!(t.infer(&r).unwrap(), Type::list(Type::Int));
 }
@@ -618,7 +618,7 @@ fn test_for_loop_non_bool_cond_is_error() {
 #[test]
 fn test_comprehension_type_inference() {
     let mut t = TypeChecker::new();
-    // [for x in [1, 2, 3] do x]  ::  List(Int)
+    // [for x in [1, 2, 3] do x]  ::  List<Int>
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
     let fl = spanned(Expression::for_loop("x".to_string(), list, None, ident("x")));
     let comp = spanned(Expression::comprehension(fl));
@@ -1188,7 +1188,7 @@ fn a_nested_funcs_mut_parameters_do_not_leak_to_the_outer_scope() {
 
 /// Pushing an empty mutable list's own alias into itself unifies the
 /// list's still-open element TypeVar with the list's own type — `~t` with
-/// `List(~t)` — which is exactly the infinite type an occurs check exists
+/// `List<~t>` — which is exactly the infinite type an occurs check exists
 /// to reject. Two separate bindings (`xs`/`ys`) rather than `xs.push(xs)`
 /// directly, since that's already rejected earlier by `finish_push`'s
 /// same-root exclusivity check (`push_with_the_same_root_as_both_arguments_
@@ -1256,4 +1256,30 @@ fn a_generic_functions_bounds_are_enforced_at_every_instantiation() {
 fn ufcs_over_a_generic_free_function_resolves_independently_at_each_receiver_type() {
     let src = "{ func id(x) = x\nlet a = (1).id()\nlet b = (\"s\").id()\na }";
     assert_eq!(infer_src(src).unwrap(), Type::Int);
+}
+
+// ── `TRAITS.md` Stage 3a: generic `data` declarations ────────────────────────
+
+/// `==`'s operator-type check (`builtin_op_type`'s `"==" | "!="` arm)
+/// unifies both operands against a fresh `Eq`-bounded `TypeVar`, which
+/// consults `type_implements`'s `Eq` arm when binding it to a concrete
+/// type. For a generic struct instantiation that arm now recurses into
+/// `args` — `Pair<Int, Int>` is `Eq` because `Int` is (on both args).
+#[test]
+fn a_generic_struct_instantiated_at_eq_args_is_itself_eq() {
+    let src = "data Pair<A, B>(fst: A, snd: B)\n\
+               Pair(fst=1, snd=2) == Pair(fst=3, snd=4)";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+}
+
+/// Same struct, instantiated instead at a non-`Eq` arg (`List` doesn't
+/// implement `Eq`) — the recursive `args.iter().all(..)` check must
+/// reject it rather than blanket-approving any generic instantiation
+/// just because it's a registered struct name.
+#[test]
+fn a_generic_struct_instantiated_at_a_non_eq_arg_is_not_eq() {
+    let src = "data Box<A>(item: A)\n\
+               Box(item=[1, 2]) == Box(item=[3, 4])";
+    let err = infer_src(src).unwrap_err();
+    assert!(err.contains("Eq"), "unexpected error: {}", err);
 }

@@ -16,6 +16,13 @@ fn int(v: &FrogValue) -> i64 {
     }
 }
 
+fn float(v: &FrogValue) -> f64 {
+    match v {
+        FrogValue::Float(n) => *n,
+        other => panic!("expected Float, got {:?}", other),
+    }
+}
+
 /// A `let` followed by a bare expression in the *same* entry must bind the
 /// `let`'s own value, not the entry's trailing expression value.
 #[test]
@@ -144,13 +151,18 @@ fn test_rebinding_same_name_does_not_leak_old_value() {
     );
 }
 
-/// Codegen still panics internally on constructs the type checker allows but
-/// doesn't implement (e.g. calling an immediately-invoked lambda expression,
-/// as opposed to a bare named function — see codegen/mod.rs's "only named
-/// function calls supported" panic). `eval` must convert that panic into a
-/// clean `Err`, not let it escape — and, critically, the `FrogState` must
-/// stay fully usable afterward: defining and calling new functions, and
-/// referencing bindings made before the panic.
+/// Codegen still panics internally on constructs the type checker allows
+/// but doesn't implement — here `print(none)`, which reaches
+/// `print_value`'s "print codegen does not support" panic (`plans/DATA.md`
+/// Stage 1 plans to replace it with a real `none` rendering). `eval` must
+/// convert that panic into a clean `Err`, not let it escape — and,
+/// critically, the `FrogState` must stay fully usable afterward: defining
+/// and calling new functions, and referencing bindings made before the
+/// panic.
+///
+/// This used to use `(x -> x + 1)(5)`, which now fails earlier and better,
+/// as a spanned type error — see
+/// `test_typeck.rs`'s function-value diagnostics.
 ///
 /// This prints a panic message to stderr (Rust's default panic hook runs
 /// before `catch_unwind` recovers) — that's expected, not a test failure.
@@ -161,7 +173,7 @@ fn test_codegen_panic_becomes_clean_error_and_state_survives() {
     let mut s = FrogState::new();
     s.eval("let kept = 41").unwrap();
 
-    match s.eval("(x -> x + 1)(5)") {
+    match s.eval("print(none)") {
         Err(FrogError::Codegen(_)) => {},
         other => panic!("expected a Codegen error, got {:?}", other),
     }
@@ -265,13 +277,15 @@ checksum
     );
 }
 
-// ── Type schemes across entries (TRAITS.md Stage 2) ─────────────────────────
+// ── Type schemes across entries (TRAITS.md Stage 2/3b) ───────────────────────
 
 /// A generic that establishes its concrete type by being *called* in its
-/// own entry (which is what makes `resolve_single_instantiations` able to
-/// fix up its declaration node before that entry's own codegen runs) keeps
-/// working at that same type from a later entry — the ordinary "define in
-/// one REPL entry, use it in a later one" pattern the REPL exists for.
+/// own entry (which is what makes `monomorphize_generics` able to compile
+/// that instantiation before that entry's own codegen runs) keeps working
+/// at that same type from a later entry — the ordinary "define in one
+/// REPL entry, use it in a later one" pattern the REPL exists for. The
+/// second call reuses the same compiled instantiation
+/// (`emitted_instantiations`) rather than recompiling it.
 #[test]
 fn test_generic_established_in_one_entry_is_callable_from_a_later_entry() {
     let mut s = FrogState::new();
@@ -281,35 +295,142 @@ fn test_generic_established_in_one_entry_is_callable_from_a_later_entry() {
     assert_eq!(int(&result), 6);
 }
 
-/// A generic instantiated at one type in an early entry and at a genuinely
-/// different type in a later entry is rejected with the same clean
-/// TRAITS.md Stage 3 message a same-entry conflict gets — not a raw
-/// Cranelift verifier panic. `check_generic_monomorphism`'s per-entry walk
-/// alone can't see this: it only ever looks at one entry's typed AST, so
-/// `generic_instantiations` (checked across the whole session) is what
-/// catches it.
+/// `TRAITS.md` Stage 3b's real monomorphization closes the Stage 2 gap: a
+/// generic instantiated at one type in an early entry and at a genuinely
+/// different type in a later entry now compiles and runs *both*
+/// instantiations correctly, rather than being rejected.
+/// `monomorphize_generics`'s per-entry walk only sees each entry's own
+/// typed AST, but that's enough — each entry independently notices its
+/// own new instantiation and compiles it, keyed by mangled name so the two
+/// instantiations' `FuncId`s never collide.
 #[test]
-fn test_generic_instantiated_at_a_different_type_in_a_later_entry_is_a_clean_error() {
+fn test_generic_instantiated_at_a_different_type_in_a_later_entry_both_work() {
     let mut s = FrogState::new();
     s.eval("let f = x -> x + x\nf(1)").unwrap();
 
-    let err = s.eval("f(1.5)").unwrap_err();
-    assert!(
-        err.to_string().contains("is generic and is used at two different types"),
-        "unexpected error: {}", err,
-    );
-}
+    let (result, _) = s.eval("f(1.5)").unwrap();
+    assert_eq!(float(&result), 3.0);
 
-/// The rejected entry above must not poison the state or leave a
-/// half-recorded instantiation behind — `generic_instantiations` rolls
-/// back via `checkpoint`/`restore` exactly like `substitutions` does, so a
-/// later entry reusing `f` at its original type still works.
-#[test]
-fn test_eval_recovers_after_a_generic_instantiation_conflict() {
-    let mut s = FrogState::new();
-    s.eval("let f = x -> x + x\nf(1)").unwrap();
-    assert!(s.eval("f(1.5)").is_err());
-
+    // The original entry's instantiation must still work unchanged.
     let (result, _) = s.eval("f(10)").unwrap();
     assert_eq!(int(&result), 20);
+}
+
+/// `TRAITS.md` Stage 2's documented "known remaining boundary": a generic
+/// declared in one entry and never called there must still monomorphize
+/// correctly the first time it's called — in a later entry — at each of
+/// several distinct concrete types, closing the boundary Stage 2 left
+/// open (a declaration's un-substituted binder `TypeVar`s used to only
+/// ever get resolved by the entry that first called it).
+#[test]
+fn test_generic_declared_without_being_called_monomorphizes_on_first_call_in_a_later_entry() {
+    let mut s = FrogState::new();
+    s.eval("let f = x -> x + x").unwrap();
+
+    let (result, _) = s.eval("f(4)").unwrap();
+    assert_eq!(int(&result), 8);
+
+    let (result, _) = s.eval("f(2.5)").unwrap();
+    assert_eq!(float(&result), 5.0);
+}
+
+/// Redefining a generic in a later entry must compile the *new* body, not
+/// silently reuse the old one. `emitted_instantiations` is keyed by the
+/// mangled name, which used to be built from the bare source name — so the
+/// redefinition's `f$Int` was already marked emitted and its body was
+/// skipped, with call sites rewritten to the stale symbol. Each generalized
+/// declaration now carries its own template symbol, so the two `f`s mangle
+/// to different names and never collide.
+#[test]
+fn test_redefining_a_generic_in_a_later_entry_uses_the_new_body() {
+    let mut s = FrogState::new();
+    s.eval("let f = x -> x").unwrap();
+    assert_eq!(int(&s.eval("f(3)").unwrap().0), 3);
+
+    s.eval("let f = x -> x + x").unwrap();
+    assert_eq!(int(&s.eval("f(3)").unwrap().0), 6);
+}
+
+/// An entry whose last statement is a generic declaration has no
+/// representable result value — the declaration is stripped from codegen
+/// like any other, and `None` stands in for it. It used to fall through to
+/// the value of the statement *before* it.
+#[test]
+fn test_an_entry_ending_in_a_generic_declaration_evaluates_to_none() {
+    let mut s = FrogState::new();
+    let (result, ty) = s.eval("let x = 5\nlet f = y -> y").unwrap();
+    assert!(matches!(result, FrogValue::None), "expected None, got {:?}", result);
+    assert_eq!(format!("{}", ty), "None");
+}
+
+/// `let f = g` where `g` names a function is an *alias*: froglang has no
+/// runtime function value to copy, so a second name for a function is a
+/// compile-time rebinding and the declaration itself compiles to nothing.
+/// It used to reach codegen as `Assign { f, Var(g) }` and panic with
+/// "unbound variable in codegen: g". The alias must survive into later
+/// entries like any other binding.
+#[test]
+fn test_a_function_alias_is_callable_in_a_later_entry() {
+    let mut s = FrogState::new();
+    s.eval("func g(x: Int): Int = x + 1\nlet f = g").unwrap();
+
+    assert_eq!(int(&s.eval("f(3)").unwrap().0), 4);
+    // Aliasing an alias resolves to the same underlying declaration.
+    s.eval("let h = f").unwrap();
+    assert_eq!(int(&s.eval("h(10)").unwrap().0), 11);
+}
+
+/// An alias of a *generic* stays generic — it carries the target's binders
+/// and its template symbol, so calling it instantiates through the same
+/// template (and shares already-emitted instantiations with the original
+/// name rather than compiling duplicates).
+#[test]
+fn test_an_alias_of_a_generic_instantiates_through_the_same_template() {
+    let mut s = FrogState::new();
+    s.eval("func id(x) = x\nlet f = id").unwrap();
+
+    assert_eq!(int(&s.eval("f(3)").unwrap().0), 3);
+    assert_eq!(float(&s.eval("f(1.5)").unwrap().0), 1.5);
+    // The original name still works, at an instantiation the alias made.
+    assert_eq!(int(&s.eval("id(7)").unwrap().0), 7);
+}
+
+/// Every other use of a function in value position — there is no closure
+/// object, function pointer, or indirect call to compile it to — is a
+/// spanned type error now, not a codegen panic. `mut f = g` is included
+/// deliberately: reassigning it would have to change what a call site
+/// resolves to at runtime, which is exactly the indirect call that
+/// doesn't exist.
+#[test]
+fn test_using_a_function_as_a_value_is_a_type_error() {
+    use froglang_core::state::FrogError;
+
+    for src in ["func g(x: Int): Int = x\nprint(g)",
+                "func g(x: Int): Int = x\nmut f = g",
+                "func g(x: Int): Int = x\nlet xs = [g]"] {
+        let mut s = FrogState::new();
+        match s.eval(src) {
+            Err(FrogError::Type(msg)) => assert!(
+                msg.contains("is a function"), "unexpected error for {:?}: {}", src, msg),
+            other => panic!("expected a Type error for {:?}, got {:?}", src, other),
+        }
+    }
+}
+
+/// The same for a function *literal* outside a declaration — an argument,
+/// a list element, or the callee of an immediately-invoked lambda.
+#[test]
+fn test_using_a_function_literal_as_a_value_is_a_type_error() {
+    use froglang_core::state::FrogError;
+
+    for src in ["(x -> x + 1)(5)",
+                "func apply2(h, v) = h(v)\napply2(x -> x + 1, 4)",
+                "let xs = [x -> x]"] {
+        let mut s = FrogState::new();
+        match s.eval(src) {
+            Err(FrogError::Type(msg)) => assert!(
+                msg.contains("function literal"), "unexpected error for {:?}: {}", src, msg),
+            other => panic!("expected a Type error for {:?}, got {:?}", src, other),
+        }
+    }
 }

@@ -22,8 +22,8 @@ print(5.double())
 #[test]
 fn ufcs_chains_across_multiple_free_functions() {
     let src = r#"
-func inc(xs: List(Int)): List(Int) = xs
-func double_all(xs: List(Int)): List(Int) = xs
+func inc(xs: List<Int>): List<Int> = xs
+func double_all(xs: List<Int>): List<Int> = xs
 print([1, 2, 3].inc().double_all())
 "#;
     assert_eq!(run(src), "[1, 2, 3]\n");

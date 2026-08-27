@@ -90,7 +90,52 @@ pub enum Type {
     Never,
 }
 
+/// The type-constructor name `Type::List` will be spelled as once it and
+/// `Type::Struct` collapse into `Type::Named { name, args }` (`TRAITS.md`
+/// Stage 1). Introduced now so every call site migrates onto the same
+/// constant ahead of that change, rather than a literal `"List"`.
+pub const LIST_NAME: &str = "List";
+
 impl Type {
+    /// `Type::List(Box::new(elem))`, spelled as it will be once `List`
+    /// becomes an ordinary `Type::Named { name: LIST_NAME, args: vec![elem] }`
+    /// (`TRAITS.md` Stage 1). Prefer this over constructing `Type::List`
+    /// directly so call sites don't need to change again when it lands.
+    pub fn list(elem: Type) -> Type {
+        Type::List(Box::new(elem))
+    }
+
+    /// `Type::Struct(name)`, spelled as it will be once `Struct` becomes an
+    /// ordinary `Type::Named { name, args: vec![] }` (`TRAITS.md` Stage 1).
+    pub fn strukt(name: impl Into<String>) -> Type {
+        Type::Struct(name.into())
+    }
+
+    /// `Some(elem)` iff this is a `List`, mirroring the `Named` shape:
+    /// under Stage 1 this becomes `args.first()` of a `Named{name: LIST_NAME, ..}`.
+    pub fn as_list_elem(&self) -> Option<&Type> {
+        match self {
+            Type::List(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    /// `Some(name)` iff this is a `Struct`.
+    pub fn as_struct_name(&self) -> Option<&str> {
+        match self {
+            Type::Struct(name) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn is_list(&self) -> bool {
+        matches!(self, Type::List(_))
+    }
+
+    pub fn is_struct(&self) -> bool {
+        matches!(self, Type::Struct(_))
+    }
+
     /// Normalize a union type: flatten nested unions, deduplicate, and sort
     /// variants into a canonical order. Non-union types are returned unchanged.
     ///
@@ -229,7 +274,7 @@ pub fn is_positional_fields(field_defs: &[(String, Type)]) -> bool {
 /// declaration order (declaration order fixes each member's runtime tag —
 /// see `Codegen`/`runtime::gc::FrogVariant`). `ty` is the resolved
 /// `Type::Union` this declaration's name stands for — every member is a
-/// nominal marker `Type::Struct("Name.Member")`, sorted the same way
+/// nominal marker `Type::strukt("Name.Member")`, sorted the same way
 /// `Type::normalize()` would sort them, so it can be looked up in
 /// `TypeChecker.union_names` in the other direction.
 #[derive(Debug, Clone)]
@@ -737,7 +782,7 @@ impl TypeChecker {
             "Bool"  => Some(Type::Bool),
             "Str"   => Some(Type::Str),
             "None"  => Some(Type::None),
-            _ if self.struct_defs.contains_key(name) => Some(Type::Struct(name.to_string())),
+            _ if self.struct_defs.contains_key(name) => Some(Type::strukt(name)),
             _ if self.union_defs.contains_key(name)  => Some(self.union_defs[name].ty.clone()),
             _ => None,
         }
@@ -881,7 +926,7 @@ impl TypeChecker {
                     items.push(self.lower_expected(e, &elem_ty)?);
                 }
                 Ok(Spanned::from(
-                    TypedExpr { id: 0, ty: Type::List(Box::new(elem_ty)), kind: TypedExprKind::List(items) },
+                    TypedExpr { id: 0, ty: Type::list(elem_ty), kind: TypedExprKind::List(items) },
                     span,
                 ))
             },
@@ -914,7 +959,7 @@ impl TypeChecker {
         if let Some((enum_name, def)) = self.resolve_union(&resolved) {
             let enum_name = enum_name.to_string();
             for (vn, fields) in &def.variants {
-                let ty = Type::Struct(format!("{}.{}", enum_name, vn));
+                let ty = Type::strukt(format!("{}.{}", enum_name, vn));
                 let is_error = self.type_implements(&ty, &Trait::Error);
                 let callee = Spanned::from(
                     Expression::field_access(
@@ -1123,7 +1168,7 @@ impl TypeChecker {
                     // member's fields are resolved, `Tree`'s own `Type`
                     // (and its `union_names` reverse entry) already exist.
                     let mut member_types: Vec<Type> = d.variants.iter()
-                        .map(|v| Type::Struct(format!("{}.{}", d.name, v.name)))
+                        .map(|v| Type::strukt(format!("{}.{}", d.name, v.name)))
                         .collect();
                     member_types.sort_by_cached_key(|t| t.to_string());
                     let ty = Type::Union(member_types.clone());
@@ -1160,7 +1205,7 @@ impl TypeChecker {
                     }
                     // Also register each qualified member name as an
                     // ordinary struct — common fields, then the variant's
-                    // own — so `Type::Struct("X.Variant")` is a legitimate
+                    // own — so `Type::strukt("X.Variant")` is a legitimate
                     // standalone (unboxed) type, not just a tag inside the
                     // union's own boxed representation. Nothing routed a
                     // value through this path before flow narrowing
@@ -1231,7 +1276,7 @@ impl TypeChecker {
         path.push(name.to_string());
         if let Some(fields) = self.struct_defs.get(name).cloned() {
             for (_, fty) in &fields {
-                if let Type::Struct(inner) = fty {
+                if let Some(inner) = fty.as_struct_name() {
                     self.check_struct_acyclic(inner, path, span)?;
                 }
             }
@@ -1437,7 +1482,7 @@ impl TypeChecker {
                 }, arm.body.span));
             }
             for (vn, _) in &def.variants {
-                let ty = Type::Struct(format!("{}.{}", enum_name, vn));
+                let ty = Type::strukt(format!("{}.{}", enum_name, vn));
                 if self.type_implements(&ty, &Trait::Error) {
                     out.push(MatchArm {
                         pattern: Pattern { path: None, variant: vn.clone(), binds: Vec::new(), resolved_member: None },
@@ -1720,7 +1765,7 @@ impl TypeChecker {
                 params: params.iter().map(|ty| self.lookup(ty)).collect(),
                 result: Box::new(self.lookup(&result)),
             },
-            Type::List(inner)      => Type::List(Box::new(self.lookup(inner))),
+            Type::List(inner)      => Type::list(self.lookup(inner)),
             Type::Union(variants)  => Type::Union(variants.iter().map(|t| self.lookup(t)).collect()),
             _ => ty.clone(),
         }
@@ -2225,8 +2270,9 @@ impl TypeChecker {
             let right = self.coerce_truthy(right, span);
             TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
         } else if matches!(b.op, Token::EqEq | Token::NotEq) {
-            if let Type::Struct(name) = self.lookup(&left.item.ty) {
-                self.desugar_struct_eq(b.op, left, right, &name, span)
+            let resolved = self.lookup(&left.item.ty);
+            if let Some(name) = resolved.as_struct_name() {
+                self.desugar_struct_eq(b.op, left, right, name, span)
             } else {
                 TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
             }
@@ -2365,7 +2411,7 @@ impl TypeChecker {
             match seg {
                 RawPlaceSeg::Field(fname) => {
                     let resolved = self.lookup(&cur_ty);
-                    let Type::Struct(struct_name) = &resolved else {
+                    let Some(struct_name) = resolved.as_struct_name() else {
                         return Err(Spanned::from(TypeError {
                             msg: format!("Can't assign field '{}' on {}, expected a struct", fname, resolved)
                         }, span));
@@ -2387,9 +2433,9 @@ impl TypeChecker {
                     }
                     seen_index = true;
                     let resolved = self.lookup(&cur_ty);
-                    let elem_ty = match &resolved {
-                        Type::List(inner) => (**inner).clone(),
-                        _ => return Err(Spanned::from(TypeError {
+                    let elem_ty = match resolved.as_list_elem() {
+                        Some(inner) => inner.clone(),
+                        None => return Err(Spanned::from(TypeError {
                             msg: format!("Can't index into {}, expected a List", resolved)
                         }, span)),
                     };
@@ -2665,7 +2711,7 @@ impl TypeChecker {
         let (kind, ty) = if let Some(name) = struct_name {
             let field_defs = self.struct_defs.get(&name).cloned().unwrap_or_default();
             let ordered = self.lower_record_args(&name, &field_defs, c.args, callee_span)?;
-            let ty = Type::Struct(name.clone());
+            let ty = Type::strukt(name.clone());
             (TypedExprKind::StructInit { name, fields: ordered }, ty)
         } else if let Some((enum_name, variant)) = variant_callee.map_err(|msg| Spanned::from(TypeError { msg }, callee_span))? {
             let def = self.union_defs.get(&enum_name).cloned()
@@ -2771,7 +2817,7 @@ impl TypeChecker {
     /// `TRAITS.md` Part 2, but `root` still names the same binding).
     fn finish_push(&mut self, xs_lowered: Spanned<TypedExpr>, xs_span: Span, root: String, v_arg: Spanned<Expression>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let xs_ty = self.lookup(&xs_lowered.item.ty);
-        let Type::List(elem_ty) = xs_ty.clone() else {
+        let Some(elem_ty) = xs_ty.as_list_elem() else {
             return Err(Spanned::from(TypeError {
                 msg: format!("push's first argument must be a List, got {:?}", xs_ty)
             }, xs_span));
@@ -2790,13 +2836,13 @@ impl TypeChecker {
 
         let v_lowered = self.check_and_lower(v_arg)?;
         let resolved_argt = self.lookup(&v_lowered.item.ty);
-        let resolved_elem = self.lookup(&elem_ty);
-        if !widens_to(&resolved_argt, &resolved_elem) && !self.unify(&v_lowered.item.ty, &elem_ty) {
+        let resolved_elem = self.lookup(elem_ty);
+        if !widens_to(&resolved_argt, &resolved_elem) && !self.unify(&v_lowered.item.ty, elem_ty) {
             return Err(Spanned::from(TypeError {
                 msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_elem)
             }, v_span));
         }
-        let v_widened = self.lower_widen(v_lowered, &elem_ty)?;
+        let v_widened = self.lower_widen(v_lowered, elem_ty)?;
 
         // No `default_context()` entry backs "push" (see `is_push`'s own
         // comment), so the callable's `TypedExpr` is synthesized here
@@ -3109,7 +3155,7 @@ impl TypeChecker {
     /// that once and must not do it again (the target may have side
     /// effects).
     fn field_type_of(&self, resolved: &Type, field: &str) -> Option<Type> {
-        if let Type::Struct(sname) = resolved {
+        if let Some(sname) = resolved.as_struct_name() {
             self.struct_defs.get(sname)
                 .and_then(|fs| fs.iter().find(|(n, _)| n == field))
                 .map(|(_, t)| t.clone())
@@ -3286,7 +3332,7 @@ impl TypeChecker {
 
     fn lower_tuple(&mut self, elems: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let (kind, ty) = if elems.is_empty() {
-            (TypedExprKind::List(Vec::new()), Type::List(Box::new(self.fresh_var())))
+            (TypedExprKind::List(Vec::new()), Type::list(self.fresh_var()))
         } else {
             let mut items: Vec<Spanned<TypedExpr>> = Vec::with_capacity(elems.len());
             let mut first_ty: Option<Type> = None;
@@ -3310,7 +3356,7 @@ impl TypeChecker {
                 items.push(lowered);
             }
             let elem_ty = self.lookup(&first_ty.expect("elems is non-empty"));
-            (TypedExprKind::List(items), Type::List(Box::new(elem_ty)))
+            (TypedExprKind::List(items), Type::list(elem_ty))
         };
         Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
     }
@@ -3368,7 +3414,7 @@ impl TypeChecker {
             Type::List(inner) => (**inner).clone(),
             Type::TypeVar { .. } => {
                 let elem = self.fresh_var();
-                if !self.unify(&target_ty, &Type::List(Box::new(elem.clone()))) {
+                if !self.unify(&target_ty, &Type::list(elem.clone())) {
                     return Err(Spanned::from(TypeError {
                         msg: format!("Can't index into {}", resolved_target)
                     }, target_span));
@@ -3401,7 +3447,7 @@ impl TypeChecker {
             Type::List(_) => resolved_target.clone(),
             Type::TypeVar { .. } => {
                 let elem = self.fresh_var();
-                let list_ty = Type::List(Box::new(elem));
+                let list_ty = Type::list(elem);
                 if !self.unify(&target_ty, &list_ty) {
                     return Err(Spanned::from(TypeError {
                         msg: format!("Can't slice {}", resolved_target)
@@ -3453,7 +3499,7 @@ impl TypeChecker {
             }, end_span));
         }
         Ok(Spanned::from(TypedExpr { id: 0,
-            ty: Type::List(Box::new(Type::Int)),
+            ty: Type::list(Type::Int),
             kind: TypedExprKind::Range { start: Box::new(start), end: Box::new(end) },
         }, span))
     }
@@ -3475,7 +3521,7 @@ impl TypeChecker {
         // result list rather than discarding it, so must-handle
         // does not apply here — unlike a plain ForLoop.
         let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
-        let ty = Type::List(Box::new(self.lookup(&body.item.ty)));
+        let ty = Type::list(self.lookup(&body.item.ty));
         Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Comprehension { var, iterable, cond, body } }, span))
     }
 
@@ -3483,7 +3529,7 @@ impl TypeChecker {
         let target_span = fa.target.span;
         let target = self.check_and_lower(*fa.target)?;
         let resolved = self.lookup(&target.item.ty);
-        let (kind, ty) = if let Type::Struct(sname) = &resolved {
+        let (kind, ty) = if let Some(sname) = resolved.as_struct_name() {
             let field_ty = self.struct_defs.get(sname)
                 .and_then(|fs| fs.iter().find(|(n, _)| *n == fa.field))
                 .map(|(_, t)| t.clone())
@@ -3621,7 +3667,7 @@ impl TypeChecker {
             Type::List(inner) => (**inner).clone(),
             Type::TypeVar { .. } => {
                 let elem = self.fresh_var();
-                if !self.unify(&iter_ty, &Type::List(Box::new(elem.clone()))) {
+                if !self.unify(&iter_ty, &Type::list(elem.clone())) {
                     return Err(Spanned::from(TypeError {
                         msg: format!("Can't iterate over {}", resolved_iter)
                     }, iterable_span));
@@ -3802,7 +3848,7 @@ impl TypeChecker {
                     )))
                 });
                 let narrowed_fields: Vec<(String, TypedExprRef)> = common_fields.chain(own_fields).collect();
-                let narrowed_ty = Type::Struct(qualified.clone());
+                let narrowed_ty = Type::strukt(qualified.clone());
                 let value = Spanned::from(
                     TypedExpr { id: 0, ty: narrowed_ty.clone(), kind: TypedExprKind::StructInit { name: qualified, fields: narrowed_fields } },
                     span,
@@ -4160,7 +4206,7 @@ impl TypeChecker {
                     .map(|a| self.resolve_type_expr(a))
                     .collect::<Result<_, _>>()?;
                 match (name.as_str(), arg_types.len()) {
-                    ("List", 1) => Ok(Type::List(Box::new(arg_types.into_iter().next().expect("len checked")))),
+                    ("List", 1) => Ok(Type::list(arg_types.into_iter().next().expect("len checked"))),
                     ("List", n) => Err(Spanned::from(
                         TypeError { msg: format!("List takes exactly 1 type argument, got {}", n) }, span)),
                     _ => Err(Spanned::from(
@@ -4241,8 +4287,8 @@ mod helper_tests {
     fn normalize_leaves_non_unions_alone() {
         assert_eq!(Type::Int.normalize(), Type::Int);
         assert_eq!(
-            Type::List(Box::new(Type::Int)).normalize(),
-            Type::List(Box::new(Type::Int)),
+            Type::list(Type::Int).normalize(),
+            Type::list(Type::Int),
         );
     }
 

@@ -131,7 +131,7 @@ impl ToFrog for &str {
 }
 
 impl<T: FromFrog> FromFrog for Vec<T> {
-    fn frog_type() -> Type { Type::List(Box::new(T::frog_type())) }
+    fn frog_type() -> Type { Type::list(T::frog_type()) }
     fn from_frog(ctx: &FrogCtx, slots: &[i64]) -> Self {
         let w = slots[0];
         let stride = T::SLOTS.max(1);
@@ -146,7 +146,7 @@ impl<T: FromFrog> FromFrog for Vec<T> {
 }
 impl<T: ToFrog> ToFrog for Vec<T> {
     const IS_PTR: bool = true;
-    fn frog_type() -> Type { Type::List(Box::new(T::frog_type())) }
+    fn frog_type() -> Type { Type::list(T::frog_type()) }
     fn to_frog(self, ctx: &mut FrogCtx, out: &mut [i64]) {
         let stride = T::SLOTS.max(1);
         let mut flat: Vec<i64> = Vec::with_capacity(self.len() * stride);

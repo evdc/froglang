@@ -25,14 +25,14 @@ mod str;
 /// Str` to plain `Str`, losing the tag) — which a `String`-shaped error
 /// would hit on the very first stdlib function whose success value is
 /// *also* a `Str` (`slice`, and file IO's eventual `read_file`). `ErrMsg`
-/// is a distinct nominal type (`Type::Struct("ErrMsg")`), so it never
+/// is a distinct nominal type (`Type::strukt("ErrMsg")`), so it never
 /// collides with any `Ok` type, string-shaped or not — the uniform error
 /// convention for every fallible function in this module.
 pub(crate) struct ErrMsg(pub String);
 
 impl ToFrog for ErrMsg {
     const IS_PTR: bool = true;
-    fn frog_type() -> Type { Type::Struct("ErrMsg".to_string()) }
+    fn frog_type() -> Type { Type::strukt("ErrMsg") }
     fn to_frog(self, ctx: &mut FrogCtx, out: &mut [i64]) {
         out[0] = ctx.alloc_str(&self.0);
     }

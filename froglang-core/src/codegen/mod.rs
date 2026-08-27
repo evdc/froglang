@@ -441,7 +441,7 @@ fn emit_inline_tag_test(bcx: &mut FunctionBuilder, slots: &[Value], index: usize
 /// `IsVariant.tag`). Inline layout keys the runtime tag and the slot map off
 /// the normalized position, so every nominal-union site converts here.
 fn nominal_member_index(members: &[Type], enum_name: &str, variant: &str) -> usize {
-    let want = Type::Struct(format!("{}.{}", enum_name, variant));
+    let want = Type::strukt(format!("{}.{}", enum_name, variant));
     members.iter().position(|m| *m == want).unwrap_or_else(|| {
         panic!("variant {}.{} is not a member of its own union's normalized member list", enum_name, variant)
     })
@@ -686,7 +686,7 @@ fn read_var_raw(name: &str, ty: &Type, bcx: &mut FunctionBuilder, vars: &HashMap
 #[inline]
 fn clone_if_owned(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Vec<Value> {
     let TypedExprKind::Var(_) = &expr.item.kind else { return vals };
-    if !matches!(&expr.item.ty, Type::List(_)) { return vals; }
+    if !expr.item.ty.is_list() { return vals; }
     if ctx.liveness.ownership(expr.item.id) != liveness::Ownership::Copy { return vals; }
 
     debug_assert_eq!(vals.len(), 1, "a List value is always exactly one leaf");
@@ -1232,7 +1232,7 @@ fn print_union_body(members: &[Type], arg_vals: &[Value], bcx: &mut FunctionBuil
 
     let cases: Vec<(Type, u32)> = match nominal {
         Some((name, def)) => def.variants.iter().enumerate()
-            .map(|(i, (variant, _))| (Type::Struct(format!("{}.{}", name, variant)), i as u32))
+            .map(|(i, (variant, _))| (Type::strukt(format!("{}.{}", name, variant)), i as u32))
             .collect(),
         None => members.iter().cloned().zip(0u32..).collect(),
     };
@@ -1397,7 +1397,7 @@ fn compile_place_assign(
         // sub-range under `suffix` if not (`xs[0].f = v`).
         Some((idx_expr, elem_ty)) => {
             let list_key = var_key(root, &prefix);
-            let list_ty = Type::List(Box::new(elem_ty.clone()));
+            let list_ty = Type::list(elem_ty.clone());
             let list_var = get_or_declare_var(bcx, vars, &list_key, &list_ty);
             let list_val = bcx.use_var(list_var);
             let idx_val = compile_expr(idx_expr, bcx, vars, ctx);
@@ -1686,7 +1686,7 @@ fn compile_expr_multi(
                     // Already guarded by a preceding `IsVariant`, so which
                     // member is live is known statically here.
                     let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
-                    let member_ty = Type::Struct(format!("{}.{}", enum_name, variant));
+                    let member_ty = Type::strukt(format!("{}.{}", enum_name, variant));
                     let leaves = unpack_union_member(&members, &member_ty, &slots, bcx, ctx.structs);
                     return leaves[offset..offset + leaf_types.len()].to_vec();
                 }
@@ -2069,7 +2069,7 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
             debug_assert!(vals.is_empty(), "Never-typed expr produced values");
             return Vec::new();
         }
-        if matches!(&arg.item.ty, Type::Struct(_)) {
+        if arg.item.ty.is_struct() {
             let values = compile_expr_multi(arg, bcx, vars, ctx);
             let mut cursor = 0;
             print_value(&arg.item.ty, &values, &mut cursor, bcx, ctx);
@@ -2357,10 +2357,7 @@ fn compile_host_call(func_name: &str, callable: &Spanned<TypedExpr>, args: &[Spa
 }
 
 fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
-    let elem_ty = match list_ty {
-        Type::List(inner) => (**inner).clone(),
-        _ => Type::Int,
-    };
+    let elem_ty = list_ty.as_list_elem().cloned().unwrap_or(Type::Int);
     let leafs = struct_fields(&elem_ty, ctx.structs);
     let ptr_mask = gc_mask(leafs.iter().map(|(_, t)| t));
     let stride = (leafs.len().max(1)) as i64;
@@ -2413,7 +2410,7 @@ fn compile_variant_init(
 ) -> Vec<Value> {
     // `fields` is the enum's common fields followed by this variant's own
     // (see `check_and_lower`'s variant-call arm), i.e. exactly
-    // `struct_fields(Type::Struct("Enum.Variant"))`'s order.
+    // `struct_fields(Type::strukt("Enum.Variant"))`'s order.
     let mut flat_vals: Vec<Value> = Vec::new();
     let mut flat_types: Vec<Type> = Vec::new();
     for (_, v) in fields {
@@ -2428,7 +2425,7 @@ fn compile_variant_init(
             // `data Discount is NoDiscount | Percent(pct: Int) | ...` —
             // `roadmap.md`'s top perf item.
             let idx = nominal_member_index(members, enum_name, variant);
-            let member_ty = Type::Struct(format!("{}.{}", enum_name, variant));
+            let member_ty = Type::strukt(format!("{}.{}", enum_name, variant));
             return pack_union_member(members, &member_ty, member_tag(idx), &flat_vals, bcx, ctx.structs);
         }
     }
@@ -2639,10 +2636,8 @@ fn enum_field_leaf_types(enum_name: &str, variant: Option<&str>, field: &str, st
 /// expression of that type) that `field` occupies. `len` is `1` for a
 /// scalar/heap-pointer field, >1 for a nested-struct field.
 fn field_slice_range(struct_ty: &Type, field: &str, structs: &StructDefs) -> (usize, usize) {
-    let name = match struct_ty {
-        Type::Struct(n) => n,
-        _ => unreachable!("field_slice_range called on non-struct type {:?}", struct_ty),
-    };
+    let name = struct_ty.as_struct_name()
+        .unwrap_or_else(|| unreachable!("field_slice_range called on non-struct type {:?}", struct_ty));
     let decl_fields = structs.get(name).cloned().unwrap_or_default();
     let mut offset = 0;
     for (fname, fty) in &decl_fields {
@@ -2707,10 +2702,8 @@ fn compile_for_loop(
     // by index and never stores it into a new binding. See
     // `compile_expr_transient`.
     let list_val = compile_expr_transient(iterable, bcx, vars, ctx);
-    let elem_ty = match &iterable.item.ty {
-        Type::List(inner) => (**inner).clone(),
-        other => unreachable!("for-loop iterable must be a List after type checking, got {}", other),
-    };
+    let elem_ty = iterable.item.ty.as_list_elem().cloned()
+        .unwrap_or_else(|| unreachable!("for-loop iterable must be a List after type checking, got {}", iterable.item.ty));
     let elem_leafs = struct_fields(&elem_ty, ctx.structs);
 
     let len_id = ctx.func_ids["frog_list_len"];

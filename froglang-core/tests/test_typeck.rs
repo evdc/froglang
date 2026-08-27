@@ -1204,3 +1204,56 @@ fn pushing_a_lists_own_alias_into_itself_is_a_type_error_not_a_hang() {
     let err = infer_src(src).unwrap_err();
     assert!(err.contains("Can't unify"), "unexpected error: {}", err);
 }
+
+// ── Type schemes: generalization and instantiation (TRAITS.md Stage 2) ────────
+
+/// The acceptance test stated in TRAITS.md Stage 2, verbatim: a
+/// let-bound lambda generalizes, so each call gets its own fresh
+/// instantiation instead of the first call permanently pinning the type.
+#[test]
+fn a_let_bound_lambda_generalizes_across_calls_at_different_types() {
+    let src = "{ let f = x -> x + x\nlet a = f(1)\nlet b = f(1.5)\na }";
+    assert_eq!(infer_src(src).unwrap(), Type::Int);
+}
+
+/// Same acceptance case, spelled as a `func` declaration rather than a
+/// let-bound lambda — both are "a syntactic function value", the value
+/// restriction's criterion.
+#[test]
+fn a_func_declaration_generalizes_across_calls_at_different_types() {
+    let src = "{ func id(x) = x\nlet a = id(1)\nlet b = id(\"s\")\na }";
+    assert_eq!(infer_src(src).unwrap(), Type::Int);
+}
+
+/// The value restriction: a `mut`-bound lambda does not generalize, even
+/// though its value is a syntactic function — the same program with `let`
+/// in place of `mut` type-checks (previous test), so this failure is
+/// specifically about mutability, not about the lambda shape.
+#[test]
+fn a_mut_bound_lambda_does_not_generalize() {
+    let src = "{ mut f = x -> x + x\nlet a = f(1)\nlet b = f(1.5)\na }";
+    let err = infer_src(src).unwrap_err();
+    assert!(err.contains("Can't unify"), "unexpected error: {}", err);
+}
+
+/// Bounds travel from a scheme's binders onto each fresh instantiation
+/// (not just the first) — `max`'s `x > y` requires `Ord`, so an `Ord`
+/// call succeeds and a non-`Ord` call (`Bool`) fails, at every
+/// instantiation, not only the one that happened to run first.
+#[test]
+fn a_generic_functions_bounds_are_enforced_at_every_instantiation() {
+    let src = "{ func maxof(x, y) = if x > y then x else y\nlet a = maxof(1, 2)\nlet b = maxof(true, false)\na }";
+    let err = infer_src(src).unwrap_err();
+    assert!(err.contains("Can't unify"), "unexpected error: {}", err);
+}
+
+/// UFCS resolution step 3 (`lower_ufcs_call`'s free-function branch) does
+/// its own `ctx.get` lookup outside `lower_literal`'s `Var` arm, so it
+/// needs its own instantiation call — without it, a generic free
+/// function's receiver parameter binds permanently to whichever type
+/// dot-called it first.
+#[test]
+fn ufcs_over_a_generic_free_function_resolves_independently_at_each_receiver_type() {
+    let src = "{ func id(x) = x\nlet a = (1).id()\nlet b = (\"s\").id()\na }";
+    assert_eq!(infer_src(src).unwrap(), Type::Int);
+}

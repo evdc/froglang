@@ -481,6 +481,13 @@ impl ScopeStack {
     fn into_bindings(self) -> HashMap<String, Type> {
         self.bindings.into_iter().map(|(k, b)| (k, b.ty)).collect()
     }
+
+    /// Every currently-bound type, flat across all open scopes — used by
+    /// `TypeChecker::generalize`'s "what's free elsewhere in the
+    /// environment" scan.
+    fn bound_types(&self) -> impl Iterator<Item = &Type> {
+        self.bindings.values().map(|b| &b.ty)
+    }
 }
 
 pub struct TypeChecker {
@@ -723,6 +730,52 @@ impl TypeChecker {
             }
         }
         subst(ty, &mapping)
+    }
+
+    /// Collect every free `TypeVar` (after substitution) reachable from
+    /// `ty`, name and bounds, into `out` — deduplicated by name. Shared by
+    /// `generalize`'s two scans: `ty`'s own free vars, and every free var
+    /// still live somewhere in the environment.
+    fn free_vars(&self, ty: &Type, out: &mut Vec<(String, Vec<Trait>)>) {
+        match self.lookup(ty) {
+            Type::TypeVar { name, bounds } => {
+                if !out.iter().any(|(n, _)| *n == name) {
+                    out.push((name, bounds));
+                }
+            },
+            Type::Function { params, result } => {
+                for p in &params { self.free_vars(p, out); }
+                self.free_vars(&result, out);
+            },
+            Type::Named { args, .. } => {
+                for a in &args { self.free_vars(a, out); }
+            },
+            Type::Union(variants) => {
+                for v in &variants { self.free_vars(v, out); }
+            },
+            Type::None | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Never => {},
+        }
+    }
+
+    /// Which of `ty`'s free vars should become this binding's quantified
+    /// binders (`TRAITS.md` Stage 2's generalization step, "env-scanning
+    /// generalization"): free in `ty` but not free anywhere else in the
+    /// current environment. A var `ty` shares with something already in
+    /// scope — captured from an enclosing binding, most concretely a
+    /// still-open outer lambda parameter — is deliberately left
+    /// un-generalized, since fresh-renaming it per call would silently
+    /// disconnect it from what it's meant to stay linked to. Called
+    /// *before* the binding being generalized is itself inserted, so the
+    /// environment scan doesn't see it.
+    fn generalize(&self, ty: &Type) -> Vec<(String, Vec<Trait>)> {
+        let mut ty_vars = Vec::new();
+        self.free_vars(ty, &mut ty_vars);
+        if ty_vars.is_empty() { return Vec::new(); }
+        let mut env_vars = Vec::new();
+        for bound in self.ctx.bound_types() {
+            self.free_vars(bound, &mut env_vars);
+        }
+        ty_vars.into_iter().filter(|(n, _)| !env_vars.iter().any(|(en, _)| en == n)).collect()
     }
 
     pub fn checkpoint(&self) -> TypeCheckerCheckpoint {
@@ -2663,7 +2716,22 @@ impl TypeChecker {
                             }
                             let value = self.check_and_lower(*a.value)?;
                             let ty = self.lookup(&value.item.ty);
-                            self.ctx.insert_mut(name.clone(), ty.clone(), mutable);
+                            // The value restriction (`TRAITS.md` Stage 2):
+                            // generalize exactly a syntactic function value
+                            // bound immutably — a `func` declaration or a
+                            // let-bound lambda literal. `mut xs = []` and
+                            // every other binding stay monomorphic, which
+                            // is what keeps generalization sound against
+                            // mutable lists. Computed *before* the
+                            // authoritative bind below, so `generalize`'s
+                            // environment scan doesn't see `name` itself.
+                            let is_fn_value = matches!(&value.item.kind, TypedExprKind::Function { .. });
+                            if !mutable && is_fn_value {
+                                let binders = self.generalize(&ty);
+                                self.ctx.insert_generalized(name.clone(), ty.clone(), binders);
+                            } else {
+                                self.ctx.insert_mut(name.clone(), ty.clone(), mutable);
+                            }
                             // Authoritative overwrite: covers the
                             // not-fully-annotated case the pre-bind above
                             // skips, and stays correct even when it ran.

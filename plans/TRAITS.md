@@ -635,9 +635,10 @@ fixes this for real: on-demand compilation at first call site, however many entr
 ### Stage 3 — Generic syntax and monomorphization
 
 `<>` binders on `data` and `func`; `TypeExpr::Apply`'s delimiter switches; `GtEq` splitting in the
-type parser; `List` becomes a prelude declaration; monomorphization at instantiation, emitting
-mangled symbol names into the typed AST. `List(T)` → `List<T>` migration across README, tests,
-error messages, and `CONCURRENCY.md`.
+type parser; `List`'s arity check folded into the same generic-declaration table `data Name<A>`
+uses (not a prelude declaration — see 3c below for why that fuller version was skipped);
+monomorphization at instantiation, emitting mangled symbol names into the typed AST. `List(T)` →
+`List<T>` migration across README, tests, error messages, and `CONCURRENCY.md`.
 
 #### Sub-stage 3a — Generic `data` declarations — **done**
 
@@ -761,6 +762,44 @@ and runs both instantiations correctly (`tests/test_generics_stage2.rs`'s
 a generic declared in one REPL entry and called for the first time in a later one, at multiple
 distinct types across further entries, also runs correctly
 (`tests/test_state.rs`'s `test_generic_declared_without_being_called_monomorphizes_on_first_call_in_a_later_entry`).
+
+#### Sub-stage 3c — `List`'s arity check folded into `struct_type_params` — **done**
+
+Scoped down from the plan's original "`List` becomes a prelude declaration" framing. That version
+was explicitly flagged as the risky one (`FrogState::new()`'s no-stdlib callers, used by most of
+the existing test suite, would need unconditional prelude injection) and the plan itself said to
+skip it if a smaller unification sufficed — it did.
+
+What actually shipped: `resolve_type_expr`'s `TypeExpr::Apply` arm had two branches doing the same
+arity check twice — a hardcoded `if name == LIST_NAME` branch, and a `struct_type_params.get(name)`
+branch for user `data Name<A>` declarations. `TypeChecker::initial_struct_type_params()` (called
+from both `new()` and `empty()`) now seeds `struct_type_params` with `"List" -> vec!["T"]` (arity
+1, placeholder binder name never actually substituted anywhere), so both cases go through the same
+lookup and the same length check. `List` keeps its own `Type::list(...)` construction — reached via
+an inner `if name == LIST_NAME` *inside* the now-unified branch, after the shared arity check
+passes — since `Type::list` builds `Type::Named{name: LIST_NAME, args: vec![elem]}` (per 3a's own
+exploration notes, already identical to what the generic branch would build) but a plain struct
+still needs the general `Type::Named{name, args}` fallthrough. The mismatch error message for
+`List` specifically keeps its original wording (`"List takes exactly 1 type argument, got N"`,
+pre-existing test coverage in `tests/test_type_expr.rs` locks it in) rather than the generic
+`"{name} takes exactly N type argument(s), got M"` phrasing, since unifying the *check* doesn't
+require unifying the *wording*.
+
+Confirmed unaffected, by inspection and by the full suite staying green: `as_struct_name`/
+`struct_key`/`is_struct` are keyed on `name != LIST_NAME` directly (not on `struct_type_params`
+membership), so seeding the table doesn't make `List` start looking like a struct anywhere else —
+`materialize_struct`/`instantiate_struct` (the two other `struct_type_params` readers) are only
+ever reached through a `struct_defs`-gated or already-struct-confirmed path, and `struct_defs` has
+no `"List"` entry (deliberately — no field template was added). Runtime representation, GC
+scanning, and `codegen`'s `is_list()`/`as_list_elem()`/`list_elem_kind` special-casing are all
+completely untouched — this substage only touched the type-checking arity-lookup seam.
+
+New coverage: `tests/test_type_expr.rs`'s
+`test_list_and_a_user_generic_struct_are_arity_checked_through_the_same_table` builds a user
+`data Box<A>` alongside `List` in one program and checks both a `Box<Int, Str>` arity mismatch and
+a `List<Int, Str>` arity mismatch are caught, plus that a correctly-aritied `Box<Int>` and
+`List<Int>` coexist and type-check normally — demonstrating the shared table holds both
+registrations without either clobbering the other.
 
 #### Stage 3 follow-up: what a code review of the above found
 

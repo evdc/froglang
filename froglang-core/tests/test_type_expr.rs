@@ -198,6 +198,22 @@ fn test_non_generic_type_rejects_arguments() {
     assert!(type_error("let x: Int<Str> = 1").contains("does not take type arguments"));
 }
 
+#[test]
+fn test_list_and_a_user_generic_struct_are_arity_checked_through_the_same_table() {
+    // `TRAITS.md` Stage 3c: `List` is registered in the same
+    // `struct_type_params` arity table a user `data Name<A>` declaration
+    // uses, rather than through a separate hardcoded branch. Both a
+    // built-in `List<...>` mismatch and a user struct's own `<...>`
+    // mismatch must still be caught, in the same program, without either
+    // registration clobbering the other.
+    assert!(type_error("data Box<A>(v: A)\nlet x: Box<Int, Str> = Box(v=1)").contains("exactly 1 type argument(s)"));
+    assert!(type_error("data Box<A>(v: A)\nlet x: List<Int, Str> = [1]").contains("exactly 1 type argument"));
+    assert_eq!(
+        infer_src("data Box<A>(v: A)\nlet b: Box<Int> = Box(v=1)\nlet xs: List<Int> = [1]\nb.v").unwrap(),
+        Type::Int
+    );
+}
+
 // ── `TRAITS.md` Stage 3a: generic `data` declarations ────────────────────────
 
 #[test]

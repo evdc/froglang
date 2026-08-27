@@ -728,12 +728,26 @@ pub struct TypeCheckerCheckpoint {
 }
 
 impl TypeChecker {
+    /// `struct_type_params`'s initial contents: just `List`, registered at
+    /// arity 1 so `resolve_type_expr`'s `TypeExpr::Apply` arm can arity-check
+    /// `List<...>` through the same lookup it uses for a user `data
+    /// Name<A>` declaration (`TRAITS.md` Stage 3c), rather than a second
+    /// hardcoded branch. The placeholder name is never substituted into
+    /// anything — `List` has no field template (`struct_defs` has no entry
+    /// for it, deliberately: it stays builtin-represented, not a struct) —
+    /// it exists purely so `.len()` reads 1.
+    fn initial_struct_type_params() -> HashMap<String, Vec<String>> {
+        let mut m = HashMap::new();
+        m.insert(LIST_NAME.to_string(), vec!["T".to_string()]);
+        m
+    }
+
     pub fn empty() -> Self {
-        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_type_params: HashMap::new(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_type_params: HashMap::new(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
     }
 
     /// Check whether a concrete type implements the given trait. Only makes
@@ -5443,27 +5457,29 @@ impl TypeChecker {
                 let arg_types: Vec<Type> = args.iter()
                     .map(|a| self.resolve_type_expr(a))
                     .collect::<Result<_, _>>()?;
-                // Declared arity of a named type constructor: `List` is
-                // hardcoded at 1 (still special-cased until `TRAITS.md`
-                // Stage 3c folds it into this same table); a `data Name<A,
-                // B>` declaration (`TRAITS.md` Stage 3a) registers its own
-                // arity into `struct_type_params` during `hoist_data_decls`
-                // — this is the seam that extends.
-                if name == LIST_NAME {
-                    if arg_types.len() == 1 {
-                        return Ok(Type::list(arg_types.into_iter().next().expect("len checked")));
-                    }
-                    return Err(Spanned::from(
-                        TypeError { msg: format!("List takes exactly 1 type argument, got {}", arg_types.len()) }, span));
-                }
+                // Declared arity of a named type constructor: every
+                // registered generic name — including `List`, registered at
+                // arity 1 by `TypeChecker::initial_struct_type_params`
+                // (`TRAITS.md` Stage 3c) — is arity-checked through this one
+                // `struct_type_params` lookup. `List` still gets its own
+                // dedicated `Type::list` construction below (never a plain
+                // `Type::Named` built by this generic branch), since it has
+                // no field template and stays builtin-represented — this is
+                // purely a shared arity check, not a representation change.
                 if let Some(binder_names) = self.struct_type_params.get(name) {
                     if arg_types.len() != binder_names.len() {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!(
+                        let msg = if name == LIST_NAME {
+                            format!("List takes exactly 1 type argument, got {}", arg_types.len())
+                        } else {
+                            format!(
                                 "{} takes exactly {} type argument(s), got {}",
                                 name, binder_names.len(), arg_types.len()
                             )
-                        }, span));
+                        };
+                        return Err(Spanned::from(TypeError { msg }, span));
+                    }
+                    if name == LIST_NAME {
+                        return Ok(Type::list(arg_types.into_iter().next().expect("arity checked above")));
                     }
                     return Ok(Type::Named { name: name.clone(), args: arg_types });
                 }

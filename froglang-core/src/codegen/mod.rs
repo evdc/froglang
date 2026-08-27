@@ -485,7 +485,7 @@ fn gc_mask<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> i64 {
 /// list. For any non-struct type, returns a single `("", ty)` pair — the
 /// empty path lets `var_key` degrade to exactly today's plain `vars["name"]`
 /// scheme for every existing scalar type, so nothing about non-struct
-/// codegen changes. For `Type::Struct(name)`, recurses into each declared
+/// codegen changes. For a struct type, recurses into each declared
 /// field (in declaration order) so a struct-typed field is expanded inline
 /// rather than nested, e.g. `Company{ceo: Person{name, age}}` flattens to
 /// `[("ceo.name", Str), ("ceo.age", Int)]`.
@@ -661,7 +661,7 @@ fn read_var_raw(name: &str, ty: &Type, bcx: &mut FunctionBuilder, vars: &HashMap
 
 /// MUTABILITY.md stage 6 / RUNTIME.md: clone `vals` (the just-compiled
 /// value of `expr`) if `expr` is itself a `Var` read of **exactly**
-/// `Type::List(_)` and `Ownership::Copy` (see `Ctx::liveness`) — otherwise
+/// `List` (`Type::is_list`) and `Ownership::Copy` (see `Ctx::liveness`) — otherwise
 /// return it unchanged. Called from the `Var` arm of `compile_expr_multi` —
 /// every *non*-transient consumer of a binding's value (a bind, a call
 /// argument, a return, a struct/list/variant literal's field or element, a

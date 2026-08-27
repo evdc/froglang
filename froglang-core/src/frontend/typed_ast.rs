@@ -146,7 +146,7 @@ pub enum TypedExprKind {
     },
 
     /// `Name(field=value, ...)` struct construction, already reordered into
-    /// declared-field order. Result type is `Type::Struct(name)`.
+    /// declared-field order. Result type is `Type::strukt(name)`.
     StructInit {
         name:   String,
         fields: Vec<(String, TypedExprRef)>,

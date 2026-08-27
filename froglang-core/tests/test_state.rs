@@ -264,3 +264,52 @@ checksum
         s.heap.bytes_allocated
     );
 }
+
+// ── Type schemes across entries (TRAITS.md Stage 2) ─────────────────────────
+
+/// A generic that establishes its concrete type by being *called* in its
+/// own entry (which is what makes `resolve_single_instantiations` able to
+/// fix up its declaration node before that entry's own codegen runs) keeps
+/// working at that same type from a later entry — the ordinary "define in
+/// one REPL entry, use it in a later one" pattern the REPL exists for.
+#[test]
+fn test_generic_established_in_one_entry_is_callable_from_a_later_entry() {
+    let mut s = FrogState::new();
+    s.eval("let f = x -> x + x\nf(1)").unwrap();
+
+    let (result, _) = s.eval("f(3)").unwrap();
+    assert_eq!(int(&result), 6);
+}
+
+/// A generic instantiated at one type in an early entry and at a genuinely
+/// different type in a later entry is rejected with the same clean
+/// TRAITS.md Stage 3 message a same-entry conflict gets — not a raw
+/// Cranelift verifier panic. `check_generic_monomorphism`'s per-entry walk
+/// alone can't see this: it only ever looks at one entry's typed AST, so
+/// `generic_instantiations` (checked across the whole session) is what
+/// catches it.
+#[test]
+fn test_generic_instantiated_at_a_different_type_in_a_later_entry_is_a_clean_error() {
+    let mut s = FrogState::new();
+    s.eval("let f = x -> x + x\nf(1)").unwrap();
+
+    let err = s.eval("f(1.5)").unwrap_err();
+    assert!(
+        err.to_string().contains("is generic and is used at two different types"),
+        "unexpected error: {}", err,
+    );
+}
+
+/// The rejected entry above must not poison the state or leave a
+/// half-recorded instantiation behind — `generic_instantiations` rolls
+/// back via `checkpoint`/`restore` exactly like `substitutions` does, so a
+/// later entry reusing `f` at its original type still works.
+#[test]
+fn test_eval_recovers_after_a_generic_instantiation_conflict() {
+    let mut s = FrogState::new();
+    s.eval("let f = x -> x + x\nf(1)").unwrap();
+    assert!(s.eval("f(1.5)").is_err());
+
+    let (result, _) = s.eval("f(10)").unwrap();
+    assert_eq!(int(&result), 20);
+}

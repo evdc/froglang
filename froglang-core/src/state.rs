@@ -262,6 +262,25 @@ impl FrogState {
             self.tc.restore(cp);
             return Err(FrogError::Type(e.to_string()));
         }
+        // TRAITS.md Stage 2's codegen gate: a generic instantiated at 2+
+        // distinct concrete types can't yet be compiled (monomorphization
+        // is Stage 3) — reject it here rather than let it reach codegen.
+        // On success, `resolved` names each generalized name's single
+        // concrete instantiation (empty if none were used) — codegen still
+        // needs that instantiation actually applied to the declaration
+        // itself (`resolve_single_instantiations`'s doc comment explains
+        // why: a generalized declaration's own params/return_type are
+        // never resolved by ordinary checking).
+        let resolved = match self.tc.check_generic_monomorphism(&typed) {
+            Ok(r) => r,
+            Err(e) => {
+                self.tc.restore(cp);
+                return Err(FrogError::Type(e.to_string()));
+            }
+        };
+        if !resolved.is_empty() {
+            self.tc.resolve_single_instantiations(&mut typed, &resolved);
+        }
 
         let result_ty = typed.item.ty.clone();
 

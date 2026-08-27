@@ -551,6 +551,32 @@ pub struct TypeChecker {
     /// (`FrogStateBuilder::build`), so it's left out of
     /// `TypeCheckerCheckpoint`/`restore` deliberately.
     host_names: std::collections::HashSet<String>,
+    /// Every name ever bound to a generalized scheme (non-empty `binders`)
+    /// during this compilation — `TRAITS.md` Stage 2's codegen gate
+    /// consults this in `check_generic_monomorphism` to know which
+    /// `Var(name)` references to watch. Monomorphization (Stage 3) is what
+    /// eventually makes this field unnecessary; until then, a name in this
+    /// set that resolves to 2+ distinct concrete types across the program
+    /// is rejected rather than silently miscompiled — a Cranelift function
+    /// has exactly one signature.
+    generalized_names: std::collections::HashSet<String>,
+    /// The single concrete type each generalized name has been observed
+    /// instantiated at, across the *whole session* — not just the current
+    /// entry. `check_generic_monomorphism`'s own per-entry walk only sees
+    /// that entry's typed AST, which is exactly the REPL hazard
+    /// `TRAITS.md` Stage 2 flags: a scheme minted at entry 1 and
+    /// instantiated at entry 5 needs a check that spans entries, or a
+    /// genuinely conflicting second instantiation reaches codegen as a raw
+    /// Cranelift verifier panic instead of this gate's clean error —
+    /// `f`'s declaration was already frozen concrete by its first use (via
+    /// `resolve_single_instantiations` writing straight into
+    /// `substitutions`, which persists for the rest of the session), so a
+    /// later, different-typed call doesn't even go through the ordinary
+    /// occurs-check/unify path that would catch it. Checkpointed like
+    /// `substitutions`: a failed entry's would-be instantiation must not
+    /// stick, but a successful one persists for the rest of the session,
+    /// same as any other type-checking fact learned so far.
+    generic_instantiations: HashMap<String, Type>,
 }
 
 pub struct TypeCheckerCheckpoint {
@@ -564,15 +590,17 @@ pub struct TypeCheckerCheckpoint {
     return_types: Vec<Type>,
     provides: HashMap<String, Vec<Trait>>,
     func_mut_params: HashMap<String, Vec<bool>>,
+    generalized_names: std::collections::HashSet<String>,
+    generic_instantiations: HashMap<String, Type>,
 }
 
 impl TypeChecker {
     pub fn empty() -> Self {
-        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generalized_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generalized_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new() }
     }
 
     /// Check whether a concrete type implements the given trait. Only makes
@@ -790,6 +818,8 @@ impl TypeChecker {
             return_types: self.return_types.clone(),
             provides: self.provides.clone(),
             func_mut_params: self.func_mut_params.clone(),
+            generalized_names: self.generalized_names.clone(),
+            generic_instantiations: self.generic_instantiations.clone(),
         }
     }
 
@@ -803,6 +833,8 @@ impl TypeChecker {
         self.variant_owners = cp.variant_owners;
         self.return_types = cp.return_types;
         self.provides = cp.provides;
+        self.generalized_names = cp.generalized_names;
+        self.generic_instantiations = cp.generic_instantiations;
         self.func_mut_params = cp.func_mut_params;
     }
 
@@ -2274,6 +2306,373 @@ impl TypeChecker {
         }
     }
 
+    /// `TRAITS.md` Stage 2's codegen gate: monomorphization is Stage 3, and
+    /// a Cranelift function has exactly one signature, so a generalized
+    /// binding (`generalized_names`) that's actually instantiated at 2+
+    /// distinct concrete types across this program can type-check but
+    /// can't yet be compiled. Reject that here — after
+    /// `validate_codegen_constraints`, since both walk the same
+    /// fully-resolved typed AST and this one is the rarer case — naming
+    /// both types, rather than let it reach codegen and either panic or
+    /// (worse) silently compile one instantiation's shape and miscompile
+    /// the other's call sites.
+    ///
+    /// A generic instantiated at exactly one concrete type anywhere in the
+    /// program is unaffected and compiles normally — that's what makes a
+    /// same-shaped conversion of `push`/`len`/`get` viable once Stage 3
+    /// lands monomorphization proper.
+    ///
+    /// Name-keyed rather than scope-keyed: two *unrelated* bindings that
+    /// happen to share a name (one shadowing the other) and are each
+    /// individually monomorphic would be lumped together and could trip
+    /// this check unnecessarily. Accepted for this stage — the failure
+    /// direction is "reject a program that would actually have been fine",
+    /// never "silently miscompile", which is the property this gate exists
+    /// to guarantee.
+    ///
+    /// On success, returns the single concrete type each generalized name
+    /// was actually instantiated at (empty if none were used at all) —
+    /// `resolve_single_instantiations` needs exactly this map to make that
+    /// one instantiation compile.
+    ///
+    /// Also cross-checks against `generic_instantiations`, which spans the
+    /// whole session rather than just this entry — see its doc comment for
+    /// why a per-entry-only check misses a scheme minted at one REPL entry
+    /// and instantiated at a genuinely different type by a later one.
+    pub fn check_generic_monomorphism(&mut self, expr: &Spanned<TypedExpr>) -> Result<HashMap<String, Type>, Spanned<TypeError>> {
+        if self.generalized_names.is_empty() { return Ok(HashMap::new()); }
+        let mut seen: HashMap<String, (Type, Span)> = HashMap::new();
+        self.collect_generic_var_types(expr, &mut seen)?;
+        for (name, (ty, span)) in &seen {
+            if let Some(prev) = self.generic_instantiations.get(name) {
+                if prev != ty {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!(
+                            "'{}' is generic and is used at two different types ({} and {}) across this session — \
+                             not yet supported (TRAITS.md Stage 3, monomorphization); \
+                             give it a type annotation to pin it to one type, or write a second function",
+                            name, prev, ty
+                        )
+                    }, *span));
+                }
+            }
+        }
+        for (name, (ty, _)) in &seen {
+            self.generic_instantiations.entry(name.clone()).or_insert_with(|| ty.clone());
+        }
+        Ok(seen.into_iter().map(|(k, (ty, _))| (k, ty)).collect())
+    }
+
+    fn collect_generic_var_types(&self, expr: &Spanned<TypedExpr>, seen: &mut HashMap<String, (Type, Span)>) -> Result<(), Spanned<TypeError>> {
+        if let TypedExprKind::Var(name) = &expr.item.kind {
+            if self.generalized_names.contains(name) {
+                // `expr.item.ty` is the type as it stood at the moment
+                // this `Var` node was built — a freshly-instantiated,
+                // still-unbound `TypeVar` at that point, since unification
+                // against this call's actual arguments happens afterward.
+                // `lookup` resolves it to what it was actually pinned to,
+                // which is the comparison that matters here; two
+                // instantiations that both happened to resolve to `Int`
+                // must not be flagged just because their fresh `TypeVar`
+                // names differ.
+                let resolved = self.lookup(&expr.item.ty);
+                match seen.get(name) {
+                    Some((prev_ty, _)) if *prev_ty != resolved => {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!(
+                                "'{}' is generic and is used at two different types ({} and {}) in this program — \
+                                 not yet supported (TRAITS.md Stage 3, monomorphization); \
+                                 give it a type annotation to pin it to one type, or write a second function",
+                                name, prev_ty, resolved
+                            )
+                        }, expr.span));
+                    },
+                    Some(_) => {},
+                    None => { seen.insert(name.clone(), (resolved, expr.span)); },
+                }
+            }
+        }
+        match &expr.item.kind {
+            TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)
+            | TypedExprKind::StrLit(_) | TypedExprKind::NoneLit | TypedExprKind::Var(_) => Ok(()),
+
+            TypedExprKind::Unary { expr: inner, .. } => self.collect_generic_var_types(inner, seen),
+
+            TypedExprKind::Binary { left, right, .. } => {
+                self.collect_generic_var_types(left, seen)?;
+                self.collect_generic_var_types(right, seen)
+            },
+
+            TypedExprKind::Conditional { cond, true_branch, false_branch } => {
+                self.collect_generic_var_types(cond, seen)?;
+                self.collect_generic_var_types(true_branch, seen)?;
+                if let Some(fb) = false_branch { self.collect_generic_var_types(fb, seen)?; }
+                Ok(())
+            },
+
+            TypedExprKind::Assign { value, .. } => self.collect_generic_var_types(value, seen),
+
+            TypedExprKind::Function { body, .. } => self.collect_generic_var_types(body, seen),
+
+            TypedExprKind::Call { callable, args, .. } => {
+                self.collect_generic_var_types(callable, seen)?;
+                for a in args { self.collect_generic_var_types(a, seen)?; }
+                Ok(())
+            },
+
+            TypedExprKind::Index { target, index } => {
+                self.collect_generic_var_types(target, seen)?;
+                self.collect_generic_var_types(index, seen)
+            },
+
+            TypedExprKind::Slice { target, start, end } => {
+                self.collect_generic_var_types(target, seen)?;
+                if let Some(s) = start { self.collect_generic_var_types(s, seen)?; }
+                if let Some(e) = end { self.collect_generic_var_types(e, seen)?; }
+                Ok(())
+            },
+
+            TypedExprKind::Range { start, end } => {
+                self.collect_generic_var_types(start, seen)?;
+                self.collect_generic_var_types(end, seen)
+            },
+
+            TypedExprKind::List(elems) => {
+                for e in elems { self.collect_generic_var_types(e, seen)?; }
+                Ok(())
+            },
+
+            TypedExprKind::Block(stmts) => {
+                for s in stmts { self.collect_generic_var_types(s, seen)?; }
+                Ok(())
+            },
+
+            TypedExprKind::ForLoop { iterable, cond, body, .. } => {
+                self.collect_generic_var_types(iterable, seen)?;
+                if let Some(c) = cond { self.collect_generic_var_types(c, seen)?; }
+                self.collect_generic_var_types(body, seen)
+            },
+
+            TypedExprKind::Comprehension { iterable, cond, body, .. } => {
+                self.collect_generic_var_types(iterable, seen)?;
+                if let Some(c) = cond { self.collect_generic_var_types(c, seen)?; }
+                self.collect_generic_var_types(body, seen)
+            },
+
+            TypedExprKind::StructInit { fields, .. } => {
+                for (_, v) in fields { self.collect_generic_var_types(v, seen)?; }
+                Ok(())
+            },
+
+            TypedExprKind::FieldAccess { target, .. } => self.collect_generic_var_types(target, seen),
+            TypedExprKind::PlaceAssign { path, value, .. } => {
+                for seg in path {
+                    if let PlaceSeg::Index { index, .. } = seg {
+                        self.collect_generic_var_types(index, seen)?;
+                    }
+                }
+                self.collect_generic_var_types(value, seen)
+            },
+
+            TypedExprKind::VariantInit { fields, .. } => {
+                for (_, v) in fields { self.collect_generic_var_types(v, seen)?; }
+                Ok(())
+            },
+
+            TypedExprKind::IsVariant { target, .. } => self.collect_generic_var_types(target, seen),
+            TypedExprKind::VariantField { target, .. } => self.collect_generic_var_types(target, seen),
+
+            TypedExprKind::Return(value) => {
+                if let Some(v) = value { self.collect_generic_var_types(v, seen)?; }
+                Ok(())
+            },
+
+            TypedExprKind::Widen { value, .. } => self.collect_generic_var_types(value, seen),
+
+            TypedExprKind::Narrow { value, .. } => self.collect_generic_var_types(value, seen),
+            TypedExprKind::TypeTag { target, .. } => self.collect_generic_var_types(target, seen),
+            TypedExprKind::Truthy(value) => self.collect_generic_var_types(value, seen),
+            TypedExprKind::Coerce(value) => self.collect_generic_var_types(value, seen),
+        }
+    }
+
+    /// Makes a single-instantiation generic actually compile. This is
+    /// deliberately a narrow slice of monomorphization (`TRAITS.md` Stage
+    /// 3's real job), viable only because `check_generic_monomorphism` has
+    /// already proven there is exactly one concrete instantiation per name
+    /// in `resolved` — no duplication, no mangled symbols, nothing Stage 3
+    /// still needs to add.
+    ///
+    /// Why this is needed at all: a generalized declaration's own
+    /// `params`/`return_type` are never resolved to a concrete type by
+    /// ordinary checking. `instantiate` mints a *fresh* `TypeVar` per call
+    /// site precisely so calls don't contaminate the declaration or each
+    /// other — so the declaration's own binder (say `~t3`) never gets a
+    /// `substitutions` entry, even after the one call site that used it
+    /// (via its own fresh `~t4`) fully resolved. Codegen's `make_sig`
+    /// builds a Cranelift signature straight from the declaration's stored
+    /// `params`/`return_type` with no resolution step of its own — see
+    /// `TypedExpr`'s doc comment, "all TypeVars reachable from `ty` are
+    /// fully resolved", which generalization is the one thing that
+    /// violates without this pass.
+    ///
+    /// For each generalized name, structurally zips its declared
+    /// (abstract) type against the one concrete type it was used at to
+    /// recover `binder name -> concrete type`, writes that into
+    /// `substitutions`, then rewrites every node's stored type throughout
+    /// the whole typed AST via `lookup` — including `Function` nodes' own
+    /// `params`/`return_type`, which aren't reachable through any node's
+    /// plain `.ty` field.
+    pub fn resolve_single_instantiations(&mut self, typed: &mut Spanned<TypedExpr>, resolved: &HashMap<String, Type>) {
+        for (name, concrete) in resolved {
+            let Some(binders) = self.ctx.binders(name) else { continue };
+            if binders.is_empty() { continue; }
+            let binders = binders.to_vec();
+            let Some(declared) = self.ctx.get(name).cloned() else { continue };
+            let mut mapping = HashMap::new();
+            Self::zip_binder_types(&declared, concrete, &binders, &mut mapping);
+            for (var_name, ty) in mapping {
+                self.substitutions.insert(var_name, ty);
+            }
+        }
+        self.resolve_types_deep(typed);
+    }
+
+    /// Walk `declared` and `concrete` in lockstep (same shape by
+    /// construction — `concrete` is `lookup(instantiate(declared, ..))`
+    /// resolved at some call site) and record, for every `TypeVar` in
+    /// `declared` whose name is one of `binders`, the type standing in the
+    /// same position in `concrete`.
+    fn zip_binder_types(declared: &Type, concrete: &Type, binders: &[(String, Vec<Trait>)], out: &mut HashMap<String, Type>) {
+        if let Type::TypeVar { name, .. } = declared {
+            if binders.iter().any(|(n, _)| n == name) {
+                out.entry(name.clone()).or_insert_with(|| concrete.clone());
+                return;
+            }
+        }
+        match (declared, concrete) {
+            (Type::Function { params: p1, result: r1 }, Type::Function { params: p2, result: r2 }) => {
+                for (a, b) in p1.iter().zip(p2.iter()) { Self::zip_binder_types(a, b, binders, out); }
+                Self::zip_binder_types(r1, r2, binders, out);
+            },
+            (Type::Named { args: a1, .. }, Type::Named { args: a2, .. }) => {
+                for (a, b) in a1.iter().zip(a2.iter()) { Self::zip_binder_types(a, b, binders, out); }
+            },
+            (Type::Union(v1), Type::Union(v2)) => {
+                for (a, b) in v1.iter().zip(v2.iter()) { Self::zip_binder_types(a, b, binders, out); }
+            },
+            _ => {},
+        }
+    }
+
+    /// Rewrite `expr.item.ty`, recursively, to `lookup(expr.item.ty)` —
+    /// and, for a `Function` node, its `params`/`return_type` too, since
+    /// those live outside any node's own `.ty` field. Mutates in place
+    /// rather than rebuilding, since every other field of every node is
+    /// already correct; only the `Type`s themselves may be stale.
+    fn resolve_types_deep(&self, expr: &mut Spanned<TypedExpr>) {
+        expr.item.ty = self.lookup(&expr.item.ty);
+        match &mut expr.item.kind {
+            TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)
+            | TypedExprKind::StrLit(_) | TypedExprKind::NoneLit | TypedExprKind::Var(_) => {},
+
+            TypedExprKind::Unary { expr: inner, .. } => self.resolve_types_deep(inner),
+
+            TypedExprKind::Binary { left, right, .. } => {
+                self.resolve_types_deep(left);
+                self.resolve_types_deep(right);
+            },
+
+            TypedExprKind::Conditional { cond, true_branch, false_branch } => {
+                self.resolve_types_deep(cond);
+                self.resolve_types_deep(true_branch);
+                if let Some(fb) = false_branch { self.resolve_types_deep(fb); }
+            },
+
+            TypedExprKind::Assign { value, .. } => self.resolve_types_deep(value),
+
+            TypedExprKind::Function { params, return_type, body } => {
+                for (_, ty, _) in params.iter_mut() { *ty = self.lookup(ty); }
+                *return_type = self.lookup(return_type);
+                self.resolve_types_deep(body);
+            },
+
+            TypedExprKind::Call { callable, args, .. } => {
+                self.resolve_types_deep(callable);
+                for a in args.iter_mut() { self.resolve_types_deep(a); }
+            },
+
+            TypedExprKind::Index { target, index } => {
+                self.resolve_types_deep(target);
+                self.resolve_types_deep(index);
+            },
+
+            TypedExprKind::Slice { target, start, end } => {
+                self.resolve_types_deep(target);
+                if let Some(s) = start { self.resolve_types_deep(s); }
+                if let Some(e) = end { self.resolve_types_deep(e); }
+            },
+
+            TypedExprKind::Range { start, end } => {
+                self.resolve_types_deep(start);
+                self.resolve_types_deep(end);
+            },
+
+            TypedExprKind::List(elems) => {
+                for e in elems.iter_mut() { self.resolve_types_deep(e); }
+            },
+
+            TypedExprKind::Block(stmts) => {
+                for s in stmts.iter_mut() { self.resolve_types_deep(s); }
+            },
+
+            TypedExprKind::ForLoop { iterable, cond, body, .. } => {
+                self.resolve_types_deep(iterable);
+                if let Some(c) = cond { self.resolve_types_deep(c); }
+                self.resolve_types_deep(body);
+            },
+
+            TypedExprKind::Comprehension { iterable, cond, body, .. } => {
+                self.resolve_types_deep(iterable);
+                if let Some(c) = cond { self.resolve_types_deep(c); }
+                self.resolve_types_deep(body);
+            },
+
+            TypedExprKind::StructInit { fields, .. } => {
+                for (_, v) in fields.iter_mut() { self.resolve_types_deep(v); }
+            },
+
+            TypedExprKind::FieldAccess { target, .. } => self.resolve_types_deep(target),
+
+            TypedExprKind::PlaceAssign { path, value, .. } => {
+                for seg in path.iter_mut() {
+                    if let PlaceSeg::Index { index, elem_ty } = seg {
+                        self.resolve_types_deep(index);
+                        *elem_ty = self.lookup(elem_ty);
+                    }
+                }
+                self.resolve_types_deep(value);
+            },
+
+            TypedExprKind::VariantInit { fields, .. } => {
+                for (_, v) in fields.iter_mut() { self.resolve_types_deep(v); }
+            },
+
+            TypedExprKind::IsVariant { target, .. } => self.resolve_types_deep(target),
+            TypedExprKind::VariantField { target, .. } => self.resolve_types_deep(target),
+
+            TypedExprKind::Return(value) => {
+                if let Some(v) = value { self.resolve_types_deep(v); }
+            },
+
+            TypedExprKind::Widen { value, .. } => self.resolve_types_deep(value),
+            TypedExprKind::Narrow { value, .. } => self.resolve_types_deep(value),
+            TypedExprKind::TypeTag { target, .. } => self.resolve_types_deep(target),
+            TypedExprKind::Truthy(value) => self.resolve_types_deep(value),
+            TypedExprKind::Coerce(value) => self.resolve_types_deep(value),
+        }
+    }
+
     /// Statically predict whether `codegen::print_union` would recurse into
     /// itself while printing a value of type `ty` — mirrors its own guard
     /// (`ctx.printing_unions`, keyed by the union's member list) exactly,
@@ -2728,6 +3127,16 @@ impl TypeChecker {
                             let is_fn_value = matches!(&value.item.kind, TypedExprKind::Function { .. });
                             if !mutable && is_fn_value {
                                 let binders = self.generalize(&ty);
+                                // Only a *genuinely* polymorphic binding
+                                // (non-empty binders) needs the codegen
+                                // gate to watch it — a monomorphic func
+                                // declaration (e.g. every parameter and
+                                // the return type annotated) is generalized
+                                // trivially to zero binders and compiles
+                                // exactly as before.
+                                if !binders.is_empty() {
+                                    self.generalized_names.insert(name.clone());
+                                }
                                 self.ctx.insert_generalized(name.clone(), ty.clone(), binders);
                             } else {
                                 self.ctx.insert_mut(name.clone(), ty.clone(), mutable);

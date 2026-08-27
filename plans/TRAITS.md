@@ -1,8 +1,9 @@
 # Traits, Generics, and Methods
 
-Status: **design**. Nothing here is implemented. Syntax is a sketch and should be expected to
-change; the *decisions* in "Foundational choices" are the part meant to be stable, since they
-are the ones that are expensive to revisit later.
+Status: **in progress**. Stages 0-2 (`Implementation plan`, below) are implemented — UFCS,
+`Type::Named`, and type schemes/instantiation. Nothing past that is. Syntax past this point is
+still a sketch and should be expected to change; the *decisions* in "Foundational choices" are
+the part meant to be stable, since they are the ones that are expensive to revisit later.
 
 This supersedes the roadmap's "Traits/interfaces, explicit-style" and "User-definable generics"
 bullets, and answers both the duality that bullet flags between `provides` and impl blocks and
@@ -11,7 +12,12 @@ the method-syntax sketches at the bottom of `roadmap.md`.
 ## What exists today
 
 Verified against the tree, not remembered — several earlier drafts of this document were wrong
-about these, and the errors pointed at the wrong stage being the risky one.
+about these, and the errors pointed at the wrong stage being the risky one. **This section is a
+snapshot from before Stages 0-2 landed** — kept as-is because it's the reasoning that justified
+the staging order, not a claim about the current tree; see the `Implementation plan` section
+below for what's actually true now. In particular the "No polymorphism of any kind" example
+below now type-checks (Stage 2), and `Type::List(Box<Type>)`/`Type::Struct(String)` no longer
+exist (Stage 1 collapsed them into `Type::Named`).
 
 - **Five hardcoded traits**, not four: `Num`, `Eq`, `Ord`, `Error`, `Truthy` (`typeck.rs`,
   `enum Trait`). `Truthy` is a coercion relation consulted by `check_condition`, not a callable
@@ -558,7 +564,7 @@ Two consequences of the module system being a flat mangling pre-pass:
 Reordered from earlier drafts by cost and by what unblocks the stdlib. Each stage is usable on its
 own and forward-compatible with the next.
 
-### Stage 0 — UFCS over free functions
+### Stage 0 — UFCS over free functions — **done** (`d3abff8`)
 
 Resolution steps 1 and 3 only; no traits, no impls, no overloading. Confined to
 `lower_field_access` and the `Call` arm of `check_and_lower`: when a `FieldAccess` target has no
@@ -572,20 +578,60 @@ through to the `mut`-argument validation.
 - Cheapest item in the plan; the only one that is user-visible on its own before stage 4.
 - Requires the `MUTABILITY.md` amendment to land with it.
 
-### Stage 1 — `Type::Named`
+### Stage 1 — `Type::Named` — **done** (`86da661`, `4d767dd`)
 
 Collapse `Type::Struct` and `Type::List` into `Type::Named { name, args }`; unification,
 normalization, display, and codegen layout recurse into `args`. 70 sites. No user-visible change —
 a pure refactor, landed and tested on its own.
 
-### Stage 2 — Type schemes and instantiation
+Landed in two commits (accessor migration, then the enum swap itself) rather than one, to keep
+`cargo test` green at each step given the load-bearing hazards below. Fixed the `List(~t)` /
+`List(Int)` unification gap as a side effect — `unify` had no structural arm for `Type::List`
+at all before this.
+
+**Hazards that turned out to matter, for the next person touching this code**: `Display`'s output
+feeds `normalize`'s sort key, which feeds `nominal_member_index`'s runtime union tags — it had to
+stay byte-identical (`[T]` for `List`, bare name for a zero-arg `Named`). `clone_if_owned`,
+`list_elem_kind`, and `union_is_recursive` in `codegen/mod.rs` all had `List`/`Struct`-specific
+logic (a deliberately-narrow copy-on-write predicate, a runtime type tag, and a cycle-breaking
+rule) that had to be preserved by name (`Named{name: "List", ..}`) rather than widened to "any
+`Named` with args" or "any zero-arg `Named`".
+
+### Stage 2 — Type schemes and instantiation — **done** (`324b543`, `a6c30d4`, `8d4bb6d`)
 
 Generalization at `func` and `let`-bound-lambda boundaries; fresh instantiation at call sites;
 `TypeCheckerCheckpoint` extended to cover schemes; REPL persistence across entries. No new syntax.
 
-Acceptance: `let f = x -> x + x; f(1); f(1.5)` type-checks. That one line is the whole stage.
+Acceptance: `let f = x -> x + x; f(1); f(1.5)` type-checks — done, verbatim.
 
-**This is the risk in the plan**, not the trait stage. It should be scheduled as such.
+**This turned out to have two more moving parts than the plan anticipated**, both worth recording
+here since Stage 3 will re-encounter them:
+
+1. **Even a single instantiation didn't compile without extra work.** A generalized
+   declaration's own `params`/`return_type` are never resolved to a concrete type by ordinary
+   checking — `instantiate` mints a *fresh* `TypeVar` per call site precisely so calls don't
+   contaminate the declaration or each other, so the declaration's own binder never gets a
+   `substitutions` entry even after its one call site fully resolves. `make_sig` builds a
+   Cranelift signature straight from the declaration's stored types with no resolution step
+   (`cl_type` silently defaults an unresolved `TypeVar` to `I64`). Fixed by
+   `TypeChecker::resolve_single_instantiations`: once `check_generic_monomorphism` has proven
+   there's exactly one concrete instantiation, zip the declared type against it to recover
+   `binder -> concrete`, write that into `substitutions`, and rewrite every node's stored type
+   throughout the whole typed AST (including `Function` nodes' own `params`/`return_type`) via
+   `lookup`. This is a genuine (if deliberately narrow — no duplication, no mangled symbols)
+   slice of what Stage 3 does for real.
+2. **The codegen gate needs to span REPL entries, not just one.** `check_generic_monomorphism`'s
+   own walk only sees the current entry's typed AST; a scheme minted at entry 1 and instantiated
+   differently at entry 5 would otherwise reach codegen as a raw Cranelift verifier panic instead
+   of a clean error. `generic_instantiations` (checkpointed like `substitutions`) tracks each
+   generalized name's confirmed instantiation across the whole session.
+
+**Known remaining boundary, left for Stage 3**: a generic declared in one REPL entry and never
+called there, then called for the first time in a *later* entry, still fails — safely (a caught
+Cranelift verifier panic, not silent corruption), but without the gate's clean message. Fixing
+that means deferring a generic's codegen to its first call site, which is genuinely
+"on-demand compilation", i.e. Stage 3's actual job, not something a gate can paper over. Every
+case that matters in practice — declare-and-use within one entry or one file — works end-to-end.
 
 ### Stage 3 — Generic syntax and monomorphization
 
@@ -678,3 +724,6 @@ Not foundational; none of them constrain the above.
 - **Zig** — comptime-as-generics (declined; a separate evaluation model is a larger novelty spend
   than `<>`), and per-instantiation checking (adopted for regions in `CONCURRENCY.md`; the same
   trade applies here).
+
+
+---

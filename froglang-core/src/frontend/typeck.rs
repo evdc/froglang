@@ -754,40 +754,109 @@ impl TypeChecker {
     /// sense for non-TypeVar types; TypeVar-TypeVar unification is handled
     /// separately so this is never called on a TypeVar.
     fn type_implements(&self, ty: &Type, tr: &Trait) -> bool {
+        self.type_implements_rec(ty, tr, &mut Vec::new())
+    }
+
+    /// `type_implements`'s body, carrying the set of struct types already
+    /// being examined further up this recursion.
+    ///
+    /// A structural derivation must recurse into field types
+    /// (`TRAITS.md` Part 3, `plans/DATA.md` stage 1): `data W(xs: List<Int>)`
+    /// used to satisfy `Eq` because *any* struct did, and
+    /// `build_struct_eq`'s synthesized per-field `Binary` nodes are never
+    /// re-checked, so `W(xs=[1]) == W(xs=[1])` compiled into a raw pointer
+    /// comparison and answered `false` — a silent wrong answer, exactly
+    /// what the trait check exists to prevent. Recursing here reports at the
+    /// struct instead, before any comparison is synthesized.
+    ///
+    /// `seen` makes this total over a type that reaches itself (a nominal
+    /// union's variant whose field is that union again — the shape
+    /// `hoist_data_decls` permits because the field is boxed). Re-entering a
+    /// type is treated as satisfied: the derivation for it is exactly the
+    /// one still being decided, so the recursion is well-founded on the
+    /// fields that are *not* cyclic.
+    fn type_implements_rec(&self, ty: &Type, tr: &Trait, seen: &mut Vec<Type>) -> bool {
         match ty {
-            // A union satisfies a trait iff every variant does.
-            Type::Union(variants) => variants.iter().all(|v| self.type_implements(v, tr)),
-            // Structs get structural `==`/`!=` (desugared into a per-field
+            // A union satisfies a trait iff every variant does. For `Eq`
+            // that is decided at runtime by `codegen::eq_union`: compare the
+            // two tags, then that member's payload. A *recursive* union is
+            // the one case that rule can't reach — the dispatch would need
+            // unbounded branch trees — and it is rejected at the operator by
+            // `check_comparable`, with a span, rather than here: "not `Eq`"
+            // would be the wrong reason.
+            Type::Union(variants) => variants.iter().all(|v| self.type_implements_rec(v, tr, seen)),
+            // `List(T)` is `Eq` iff `T` is. The comparison is structural —
+            // lengths, then elements pairwise — not identity, which is what
+            // anyone coming from Python expects `[1, 2] == [1, 2]` to mean.
+            // It cannot be desugared into a fixed conjunction the way a
+            // struct's is (the length is a runtime value), so codegen emits
+            // the element loop instead: `eq_list`. `seen` guards the same
+            // cycle a struct field can form (`data W(xs: List<W>)`).
+            Type::Named { name, args } if name == LIST_NAME && *tr == Trait::Eq => {
+                if seen.contains(ty) { return true; }
+                seen.push(ty.clone());
+                // An element type still a variable is undetermined, not
+                // failing — an empty list literal never fixes one, and
+                // `[] == []` should hold.
+                let ok = args.iter()
+                    .all(|a| matches!(a, Type::TypeVar { .. }) || self.type_implements_rec(a, tr, seen));
+                seen.pop();
+                ok
+            },
+            // Structs get structural `==`/`!=`, desugared into a per-field
             // conjunction at lowering time — see `TypeChecker::desugar_struct_eq`
-            // in `check_and_lower`'s `Binary` arm), so they satisfy `Eq`. A
-            // struct with a field type that itself doesn't implement `Eq` (e.g.
-            // a `List` field — lists don't support `==` at all currently) will
-            // fail type-checking when the desugared per-field comparison is
-            // itself inferred, which is the correct place for that error to
-            // surface, not here.
-            // A generic instantiation (`TRAITS.md` Stage 3a) is `Eq` iff
-            // every one of its concrete `args` is — `args.iter().all(..)`
-            // is vacuously `true` for a non-generic struct's empty `args`,
-            // so this one arm covers both. This checks only the *args*
-            // themselves, not each field's own type — `build_struct_eq`'s
-            // per-field desugaring doesn't yet recurse into a nested
-            // struct field to confirm *it* is `Eq` either (a pre-existing
-            // gap, `TRAITS.md` Part 3's "structural derivation must
-            // recurse" — not fixed here, out of Stage 3a's scope).
-            Type::Named { name, args } if name != LIST_NAME && *tr == Trait::Eq =>
-                args.iter().all(|a| self.type_implements(a, tr)),
+            // in `check_and_lower`'s `Binary` arm — so a struct satisfies
+            // `Eq` iff every one of its fields does, and iff every one of
+            // its generic `args` does (`TRAITS.md` Stage 3a; vacuously true
+            // for a non-generic struct's empty `args`). The `args` check is
+            // not redundant with the field check: a binder that appears in
+            // no field still has to be `Eq` for the instantiation to be.
+            Type::Named { name, args } if name != LIST_NAME && *tr == Trait::Eq => {
+                if seen.contains(ty) { return true; }
+                if !args.iter().all(|a| self.type_implements_rec(a, tr, seen)) { return false; }
+                seen.push(ty.clone());
+                let ok = self.struct_field_types(name, args).iter()
+                    // A field still typed as a variable is undetermined, not
+                    // failing — this runs during inference, and generic code
+                    // is checked again per instantiation.
+                    .all(|fty| matches!(fty, Type::TypeVar { .. }) || self.type_implements_rec(fty, tr, seen));
+                seen.pop();
+                ok
+            },
             // `Error` is granted, not structural — see `provides`.
             Type::Named { name, args } if args.is_empty() && name != LIST_NAME && *tr == Trait::Error => {
                 self.provides.get(name).map(|ts| ts.contains(tr)).unwrap_or(false)
             },
             _ => match tr {
                 Trait::Num    => matches!(ty, Type::Int | Type::Float),
-                Trait::Eq     => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
+                // `None` is `Eq` so an optional is: `Int | None` satisfies
+                // the union rule above only if every member does, and
+                // `none == none` is true by construction — the type has
+                // exactly one value.
+                Trait::Eq     => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None),
                 Trait::Ord    => matches!(ty, Type::Int | Type::Float | Type::Str),
                 Trait::Error  => false,
                 Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None) || ty.is_list(),
             }
         }
+    }
+
+    /// `materialize_struct`'s read-only counterpart: this instantiation's
+    /// field types, with the declared binders substituted by `args`. Kept
+    /// separate because `type_implements` runs behind `&self` and must not
+    /// register anything under `struct_key` as a side effect of *asking a
+    /// question*.
+    fn struct_field_types(&self, name: &str, args: &[Type]) -> Vec<Type> {
+        let template = match self.struct_defs.get(name) {
+            Some(fields) => fields,
+            None => return Vec::new(),
+        };
+        if args.is_empty() {
+            return template.iter().map(|(_, fty)| fty.clone()).collect();
+        }
+        let binders = self.struct_type_params.get(name).cloned().unwrap_or_default();
+        let mapping: HashMap<String, Type> = binders.into_iter().zip(args.iter().cloned()).collect();
+        template.iter().map(|(_, fty)| fty.substitute(&mapping)).collect()
     }
 
     /// Validate a condition-position type: `Bool` unifies
@@ -2136,7 +2205,13 @@ impl TypeChecker {
 
             "==" | "!=" => {
                 let t = self.fresh_bounded_var(vec![Trait::Eq]);
-                for (argt, arg_span) in args {
+                // Union-typed operands first: `unify` accepts a bare member
+                // against a union it belongs to but not the reverse, so
+                // binding `t` to the narrower side would reject `none == x`
+                // while accepting the identical `x == none`.
+                let mut ordered: Vec<&(Type, Span)> = args.iter().collect();
+                ordered.sort_by_key(|(argt, _)| !matches!(self.lookup(argt), Type::Union(_)));
+                for (argt, arg_span) in ordered {
                     if !self.unify(argt, &t) {
                         let resolved_t    = self.lookup(&t);
                         let resolved_argt = self.lookup(argt);
@@ -3200,33 +3275,99 @@ impl TypeChecker {
     /// rhs: Node)` where `Node` is itself that union) would need unbounded
     /// branch trees at codegen time to print.
     fn check_printable(&self, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
-        fn walk(ty: &Type, structs: &StructDefs, seen: &mut Vec<Vec<Type>>, span: Span) -> Result<(), Spanned<TypeError>> {
-            if let Some(name) = ty.as_struct_name() {
-                if let Some(fields) = structs.get(name) {
-                    for (_, fty) in fields { walk(fty, structs, seen, span)?; }
-                }
-                return Ok(());
-            }
-            match ty {
-                Type::Union(members) => {
-                    if seen.iter().any(|s| s == members) {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!(
-                                "unsupported: printing a recursive union type ({}) isn't supported yet \
-                                 — write a recursive function that formats it field-by-field instead.",
-                                Type::Union(members.clone())
-                            )
-                        }, span));
-                    }
-                    seen.push(members.clone());
-                    for m in members { walk(m, structs, seen, span)?; }
-                    seen.pop();
-                    Ok(())
-                },
-                _ => Ok(()),
+        self.check_no_recursive_union(ty, span, "printing", "formats it field-by-field")
+    }
+
+    /// The same prediction for `codegen::eq_union` (guard: `ctx.comparing_
+    /// unions`), which dispatches on both operands' tags and then compares
+    /// that member's payload — recursing through a struct member's fields
+    /// exactly as printing does, and hitting exactly the same wall on a
+    /// recursive union.
+    ///
+    /// This is why `type_implements` can keep saying a recursive union *is*
+    /// `Eq`: it is, structurally — what's missing is a way to emit the
+    /// comparison, which is a codegen limit and deserves to be reported as
+    /// one, at the operator.
+    fn check_comparable(&self, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        self.check_no_recursive_union(ty, span, "comparing", "compares it field-by-field")
+    }
+
+    /// The field list codegen will actually walk for `ty`, with a generic
+    /// struct's type arguments already substituted in — the read-only
+    /// counterpart of `materialize_struct`, for callers that only have
+    /// `&self`. The registered `struct_key` layout is preferred when it
+    /// exists (`materialize_struct` may already have cached it); otherwise
+    /// the bare-name template's binder `TypeVar`s are substituted
+    /// positionally from `args`, the same way `materialize_struct` does it.
+    /// Returning the *uninstantiated* template instead would hide any cycle
+    /// that only closes through a type argument, since the template's field
+    /// types are still binders at that point.
+    fn substituted_struct_fields(&self, ty: &Type) -> Option<Vec<(String, Type)>> {
+        let Type::Named { name, args } = ty else { return None };
+        if ty.as_struct_name().is_none() { return None }
+        if let Some(key) = ty.struct_key() {
+            if let Some(fields) = self.struct_defs.get(&key) {
+                return Some(fields.clone());
             }
         }
-        walk(ty, &self.struct_defs, &mut Vec::new(), span)
+        let template = self.struct_defs.get(name)?;
+        if args.is_empty() { return Some(template.clone()) }
+        let binder_names = self.struct_type_params.get(name).cloned().unwrap_or_default();
+        let mapping: HashMap<String, Type> = binder_names.into_iter().zip(args.iter().cloned()).collect();
+        Some(template.iter().map(|(f, fty)| (f.clone(), fty.substitute(&mapping))).collect())
+    }
+
+    /// Shared body of `check_printable`/`check_comparable`: walk `ty` the way
+    /// the corresponding codegen walk does — through a list's static element
+    /// type, through a struct's fields, through a union's members — and fail
+    /// if it reaches a type it is already inside.
+    ///
+    /// Both codegen walks are *monomorphizing*: each step emits the code for
+    /// one statically known type, so a type that encloses itself would need
+    /// an unbounded amount of code. A cycle can only close through something
+    /// boxed — a union member, or (since `plans/DATA.md` stage 0 taught the
+    /// walks to descend into a list's element type) a `List` field, which is
+    /// how `data Tree(v: Int, kids: List<Tree>)` closes one. Both are
+    /// rejected here, with a span, rather than by overflowing the compiler's
+    /// own stack.
+    fn check_no_recursive_union(&self, ty: &Type, span: Span, verb: &str, advice: &str) -> Result<(), Spanned<TypeError>> {
+        fn walk(
+            ty: &Type, tc: &TypeChecker, seen: &mut Vec<Type>,
+            span: Span, verb: &str, advice: &str,
+        ) -> Result<(), Spanned<TypeError>> {
+            if let Some(elem) = ty.as_list_elem() {
+                return walk(elem, tc, seen, span, verb, advice);
+            }
+            // Only composite types can close a cycle, and only they are
+            // worth naming in the error. `seen` is a DFS *stack*, popped on
+            // the way out, so two sibling fields of the same struct type are
+            // not a cycle — only re-entering a type still being walked is.
+            let composite = matches!(ty, Type::Union(_)) || ty.as_struct_name().is_some();
+            if composite {
+                if seen.contains(ty) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!(
+                            "unsupported: {} a recursive type ({}) isn't supported yet \
+                             — write a recursive function that {} instead.",
+                            verb, ty, advice,
+                        )
+                    }, span));
+                }
+                seen.push(ty.clone());
+            }
+            let result = match ty {
+                Type::Union(members) => members.iter()
+                    .try_for_each(|m| walk(m, tc, seen, span, verb, advice)),
+                _ => match tc.substituted_struct_fields(ty) {
+                    Some(fields) => fields.iter()
+                        .try_for_each(|(_, fty)| walk(fty, tc, seen, span, verb, advice)),
+                    None => Ok(()),
+                },
+            };
+            if composite { seen.pop(); }
+            result
+        }
+        walk(ty, self, &mut Vec::new(), span, verb, advice)
     }
 
     /// Type-check and lower an untyped `Spanned<Expression>` into a
@@ -3380,7 +3521,27 @@ impl TypeChecker {
             let right = self.coerce_truthy(right, span);
             TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
         } else if matches!(b.op, Token::EqEq | Token::NotEq) {
-            let resolved = self.lookup(&left.item.ty);
+            let left_ty  = self.lookup(&left.item.ty);
+            let right_ty = self.lookup(&right.item.ty);
+            // When either side is union-typed, both are widened into the
+            // joined union exactly as `lower_conditional` widens its
+            // branches — `codegen::eq_union` dispatches on a tag and reads
+            // the union's full layout width from *both* operands, so a bare
+            // member (`x == none`, `x == 1`) has to be boxed on the way in
+            // or codegen reads slots the operand doesn't have.
+            let (left, right, resolved) =
+                if matches!(left_ty, Type::Union(_)) || matches!(right_ty, Type::Union(_)) {
+                    let joined = self.join_types(&left_ty, &right_ty);
+                    let left  = self.lower_widen(left,  &joined)?;
+                    let right = self.lower_widen(right, &joined)?;
+                    (left, right, joined)
+                } else {
+                    (left, right, left_ty)
+                };
+            // `codegen::eq_union`'s tag dispatch can't be emitted for a
+            // union that encloses itself — the same wall `print_union` hits.
+            // Reported here, at the operator, rather than as "not Eq".
+            self.check_comparable(&resolved, span)?;
             if resolved.as_struct_name().is_some() {
                 self.desugar_struct_eq(b.op, left, right, &resolved, span)
             } else {

@@ -152,17 +152,16 @@ fn test_rebinding_same_name_does_not_leak_old_value() {
 }
 
 /// Codegen still panics internally on constructs the type checker allows
-/// but doesn't implement — here `print(none)`, which reaches
-/// `print_value`'s "print codegen does not support" panic (`plans/DATA.md`
-/// Stage 1 plans to replace it with a real `none` rendering). `eval` must
-/// convert that panic into a clean `Err`, not let it escape — and,
-/// critically, the `FrogState` must stay fully usable afterward: defining
-/// and calling new functions, and referencing bindings made before the
-/// panic.
+/// but doesn't implement — here printing a `List(Never)`, which
+/// `print_value` has no arm for. `eval` must convert that panic into a
+/// clean `Err`, not let it escape — and, critically, the `FrogState` must
+/// stay fully usable afterward: defining and calling new functions, and
+/// referencing bindings made before the panic.
 ///
 /// This used to use `(x -> x + 1)(5)`, which now fails earlier and better,
-/// as a spanned type error — see
-/// `test_typeck.rs`'s function-value diagnostics.
+/// as a spanned type error — see `test_typeck.rs`'s function-value
+/// diagnostics; and then `print(none)`, which `plans/DATA.md` stage 1 made
+/// print `none` as it always should have.
 ///
 /// This prints a panic message to stderr (Rust's default panic hook runs
 /// before `catch_unwind` recovers) — that's expected, not a test failure.
@@ -173,7 +172,7 @@ fn test_codegen_panic_becomes_clean_error_and_state_survives() {
     let mut s = FrogState::new();
     s.eval("let kept = 41").unwrap();
 
-    match s.eval("print(none)") {
+    match s.eval("print([panic(\"boom\")])") {
         Err(FrogError::Codegen(_)) => {},
         other => panic!("expected a Codegen error, got {:?}", other),
     }

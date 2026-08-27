@@ -17,6 +17,81 @@ fn print_formats_structs_and_nested_structs() {
     ), "Person(name=\"Ada\", address=Address(city=\"London\", zip=123))\n");
 }
 
+// ── lists ────────────────────────────────────────────────────────────────────
+//
+// Before plans/DATA.md stage 0, a list was printed by the runtime from a
+// pointer plus a one-byte element-kind tag, which is all the type
+// information that survived — so every element that wasn't a scalar came out
+// as `<struct>` or `<list>`. The element loop is emitted in codegen now, with
+// the static element type in hand, so the walk reaches through the list.
+
+#[test]
+fn print_walks_nested_lists() {
+    assert_eq!(run("print([[1, 2], [3]])"), "[[1, 2], [3]]\n");
+    assert_eq!(run("print([[[\"x\"]]])"), "[[[\"x\"]]]\n");
+}
+
+#[test]
+fn print_walks_struct_elements() {
+    assert_eq!(
+        run("data Person(name: Str, age: Int)\nprint([Person(name=\"Ada\", age=36), Person(name=\"Bo\", age=1)])"),
+        "[Person(name=\"Ada\", age=36), Person(name=\"Bo\", age=1)]\n",
+    );
+}
+
+#[test]
+fn print_walks_union_elements() {
+    assert_eq!(
+        run("data Shape is Sq(w: Int) | Circle(r: Int)\nprint([Sq(w=2), Circle(r=3)])"),
+        "[Shape.Sq(w=2), Shape.Circle(r=3)]\n",
+    );
+}
+
+#[test]
+fn print_quotes_string_elements() {
+    // A `Str` inside a composite prints as a literal, the same as a struct
+    // field does — the list walk shares `print_value`'s leaf policy rather
+    // than having its own. A bare `print(s)` still prints raw text.
+    assert_eq!(run("print([\"a\", \"b\"])"), "[\"a\", \"b\"]\n");
+    assert_eq!(run("print(\"a\")"), "a\n");
+}
+
+#[test]
+fn print_handles_an_empty_list() {
+    // Nothing fixed the element type, so it is still a `TypeVar` at codegen
+    // — the loop body is dead, and the brackets are all that print.
+    assert_eq!(run("print([])"), "[]\n");
+}
+
+/// A field-less struct (`data E()`) flattens to zero leaves — `struct_fields`
+/// returns an empty slice for it — so a naive per-element push loop
+/// (`zip`ping pushed values against leaf types) pushes nothing per element
+/// even though the list's `stride` was computed as `leafs.len().max(1) ==
+/// 1`. `len` then never advances, and every such list read back as empty
+/// regardless of how many elements it held.
+#[test]
+fn print_counts_field_less_struct_elements() {
+    assert_eq!(run("data E()\nprint([E(), E()])"), "[E(), E()]\n");
+}
+
+/// Stage 0 taught the printing walk to descend into a list's element type,
+/// which introduced a cycle it hadn't had before: `Tree` → `List<Tree>` →
+/// `Tree`. `print_value`/`print_list` monomorphize one static type per step,
+/// so this overflowed the *compiler's* stack — `check_printable` predicts it
+/// now, the same way it always did for a recursive union.
+#[test]
+fn print_rejects_a_struct_that_recurses_through_a_list() {
+    let out = common::run_raw("data Tree(v: Int, kids: List<Tree>)\nprint(Tree(v=1, kids=[]))");
+    let text = format!("{}{}", out.stdout, out.stderr);
+    assert!(text.contains("recursive") && text.contains("Tree"), "unexpected output: {}", text);
+}
+
+#[test]
+fn print_distinguishes_float_and_int_elements() {
+    assert_eq!(run("print([1.0, 2.5])"), "[1.0, 2.5]\n");
+    assert_eq!(run("print([1, 2])"), "[1, 2]\n");
+}
+
 // ── unions ───────────────────────────────────────────────────────────────────
 
 #[test]
@@ -61,12 +136,21 @@ fn print_handles_mixed_payload_and_payload_less_variants() {
 #[test]
 fn print_handles_an_optional() {
     // `Int | None` — `print_value` had no `Type::None` arm at all, so this
-    // aborted codegen with "print codegen does not support None". Note the
-    // value literal is lowercase `none` while the *type* is `None`.
+    // aborted codegen with "print codegen does not support None". The
+    // printed form is the lowercase *value* literal `none`, not the type
+    // name `None`: what is printed has to be what reads back
+    // (plans/DATA.md stage 1).
     assert_eq!(
         run("func f(c: Bool): Int | None = if c then 1 else none\nprint(f(true))\nprint(f(false))"),
-        "1\nNone\n",
+        "1\nnone\n",
     );
+}
+
+#[test]
+fn print_handles_a_bare_none() {
+    // The top-level `print` path never reached `print_value`'s `None` arm at
+    // all, so this aborted codegen outright.
+    assert_eq!(run("print(none)"), "none\n");
 }
 
 #[test]

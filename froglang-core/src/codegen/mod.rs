@@ -64,6 +64,12 @@ struct Ctx<'a> {
     /// to detect that recursion and fail clearly instead of emitting an
     /// unbounded branch tree.
     printing_unions: Vec<String>,
+    /// The same stack for `eq_union`, which recurses through a union member's
+    /// fields exactly as printing does and hits the same wall on a
+    /// self-referential type. Kept separate from `printing_unions` because
+    /// the two walks nest independently — a comparison inside a `print`
+    /// argument is not a recursion.
+    comparing_unions: Vec<String>,
     /// This function's own `mut` parameters (name, type), in declaration
     /// order — empty for `build_main_body`'s entry function, which never
     /// has parameters. Consulted by every `return_`-emitting site
@@ -784,6 +790,28 @@ fn variant_slot_offset(slot: usize) -> i32 {
 /// push is a store plus a length bump — is inline; growing the buffer still
 /// goes through `frog_list_push`, which has to reallocate and report the new
 /// bytes to the GC.
+/// Push one *element*'s worth of slots — `leafs.len()` values from `vals`,
+/// each converted to wire format — matching the `stride` an allocation
+/// site computed as `leafs.len().max(1)` (`compile_list_lit`,
+/// `Comprehension`, `push`). A field-less struct element (`data E()`) has
+/// `leafs.len() == 0`, so a plain `zip` pushes nothing per element and
+/// `len` never advances even though `stride` is 1 — every list of such
+/// elements then reports length 0 to `frog_list_len` regardless of how
+/// many were pushed. Pushing one dummy `0` slot per element instead keeps
+/// `len` advancing in step with `stride`, matching what the allocation
+/// site already promised.
+fn push_element(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, vals: &[Value], leafs: &[(String, Type)]) {
+    if leafs.is_empty() {
+        let zero = bcx.ins().iconst(types::I64, 0);
+        emit_list_push(bcx, ctx, list, zero);
+        return;
+    }
+    for (v, (_, lty)) in vals.iter().zip(leafs.iter()) {
+        let wire = to_i64_repr(bcx, lty, *v);
+        emit_list_push(bcx, ctx, list, wire);
+    }
+}
+
 fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, val: Value) {
     let len = bcx.ins().load(types::I32, heap_mem(), list, offset_of!(FrogList, len) as i32);
     let cap = bcx.ins().load(types::I32, heap_mem(), list, offset_of!(FrogList, cap) as i32);
@@ -1099,19 +1127,81 @@ fn print_fragment(text: &str, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
     bcx.ins().call(callee, &[data, len]);
 }
 
-/// The `kind` discriminant `frog_list_print`/`frog_list_println` (in
-/// runtime/ffi.rs) switch on to render a list's element type. Both codegen
-/// call sites that build this discriminant must agree on the encoding.
-fn list_elem_kind(elem_ty: &Type) -> i64 {
-    if elem_ty.is_list() { return 4; }
-    if elem_ty.is_struct() { return 5; }
-    match elem_ty {
-        Type::Int => 0,
-        Type::Float => 1,
-        Type::Bool => 2,
-        Type::Str => 3,
-        _ => 6,
+/// Print a list by emitting the element loop here, in codegen, where the
+/// *static* element type is still known — rather than handing the runtime a
+/// pointer and a one-byte kind tag, which is what the deleted
+/// `frog_list_print`/`list_elem_kind` pair did. The runtime has no type
+/// information left, so that version printed `<struct>`/`<list>`
+/// placeholders for every element that wasn't a scalar; recursing into
+/// `print_value` instead means the type-directed walk reaches through a
+/// list, which is what makes nested lists, struct elements and union
+/// elements print at all (plans/DATA.md stage 0).
+///
+/// The loop mirrors `compile_for_loop`'s element read: `frog_list_len` gives
+/// the element count, and leaf `k` of element `i` lives at slot
+/// `i * stride + k`, needing no bounds check because the header already
+/// bounded `i`.
+fn print_list(elem_ty: &Type, list_val: Value, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    print_fragment("[", bcx, ctx);
+
+    let elem_leafs = struct_fields(elem_ty, ctx.structs);
+    let len_callee = ctx.module.declare_func_in_func(ctx.func_ids["frog_list_len"], bcx.func);
+    let len_call = bcx.ins().call(len_callee, &[list_val]);
+    let len_val = bcx.inst_results(len_call)[0];
+    let stride_val = list_stride(bcx, list_val);
+
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    let exit_bb   = bcx.create_block();
+    bcx.append_block_param(header_bb, types::I64);
+
+    let zero = bcx.ins().iconst(types::I64, 0);
+    bcx.ins().jump(header_bb, &[BlockArg::from(zero)]);
+
+    // Sealed only after the back edge below exists, as in `compile_for_loop`.
+    bcx.switch_to_block(header_bb);
+    let i = bcx.block_params(header_bb)[0];
+    let in_range = bcx.ins().icmp(IntCC::SignedLessThan, i, len_val);
+    bcx.ins().brif(in_range, body_bb, &[], exit_bb, &[]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+
+    // Separator before every element but the first.
+    let sep_bb  = bcx.create_block();
+    let elem_bb = bcx.create_block();
+    let is_first = bcx.ins().icmp_imm_s(IntCC::Equal, i, 0);
+    bcx.ins().brif(is_first, elem_bb, &[], sep_bb, &[]);
+    bcx.switch_to_block(sep_bb);
+    bcx.seal_block(sep_bb);
+    print_fragment(", ", bcx, ctx);
+    bcx.ins().jump(elem_bb, &[]);
+    bcx.switch_to_block(elem_bb);
+    bcx.seal_block(elem_bb);
+
+    let base_slot = bcx.ins().imul(i, stride_val);
+    let mut elem_vals = Vec::with_capacity(elem_leafs.len());
+    for (leaf_idx, (_, lty)) in elem_leafs.iter().enumerate() {
+        let slot = bcx.ins().iadd_imm_s(base_slot, leaf_idx as i64);
+        let addr = list_slot_addr(bcx, list_val, slot);
+        let raw = bcx.ins().load(types::I64, heap_mem(), addr, 0);
+        elem_vals.push(from_i64_repr(bcx, lty, raw));
     }
+    // No GC rooting of the loaded leaves: printing allocates nothing, so
+    // there is no collection point between the loads and their last use.
+    let mut cursor = 0;
+    print_value(elem_ty, &elem_vals, &mut cursor, bcx, ctx);
+
+    // `print_value` may have emitted its own blocks (a union's tag
+    // dispatch); the back edge goes from wherever it left the builder.
+    let i_next = bcx.ins().iadd_imm_s(i, 1);
+    bcx.ins().jump(header_bb, &[BlockArg::from(i_next)]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(exit_bb);
+    bcx.seal_block(exit_bb);
+
+    print_fragment("]", bcx, ctx);
 }
 
 /// Print one value without a trailing newline. Structs are represented as a
@@ -1137,10 +1227,10 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
         return;
     }
     if let Some(inner) = ty.as_list_elem() {
-        let callee = ctx.module.declare_func_in_func(ctx.func_ids["frog_list_print"], bcx.func);
-        let kind = bcx.ins().iconst(types::I64, list_elem_kind(inner));
-        bcx.ins().call(callee, &[values[*cursor], kind]);
+        let inner = inner.clone();
+        let list_val = values[*cursor];
         *cursor += 1;
+        print_list(&inner, list_val, bcx, ctx);
         return;
     }
     match ty {
@@ -1161,8 +1251,12 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
         // `None` carries no data — its slot exists only so leaf counts line
         // up (`struct_fields` gives it one, and `print_union_member`
         // materialises a dummy for it), so consume it and print the literal.
+        //
+        // Lowercase `none`: this prints a *value*, and the value literal is
+        // the one that has to read back. `None` is the type's name, which is
+        // not spellable in expression position (plans/DATA.md stage 1).
         Type::None => {
-            print_fragment("None", bcx, ctx);
+            print_fragment("none", bcx, ctx);
             *cursor += 1;
         }
         Type::Int | Type::Float | Type::Bool => {
@@ -1174,6 +1268,15 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
             };
             let callee = ctx.module.declare_func_in_func(ctx.func_ids[id], bcx.func);
             bcx.ins().call(callee, &[values[*cursor]]);
+            *cursor += 1;
+        }
+        // An element type left unresolved by inference — which only happens
+        // for a list that is provably empty (`print([])`), since any element
+        // would have fixed the variable. The loop body is therefore dead;
+        // emit a `<...>` form rather than a panic, because a placeholder may
+        // exist but must never look like notation (plans/DATA.md stage 1).
+        Type::TypeVar { .. } => {
+            print_fragment("<?>", bcx, ctx);
             *cursor += 1;
         }
         other => panic!("print codegen does not support {:?}", other),
@@ -1232,28 +1335,8 @@ fn resolve_nominal_union<'a>(members: &[Type], unions: &'a UnionDefs) -> Option<
 
 fn print_union_body(members: &[Type], arg_vals: &[Value], bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
     let inline = union_is_inline(members, ctx.structs);
+    let (nominal, cases) = union_dispatch_cases(members, inline, ctx.unions);
 
-    // A nominal union walks its variants in *declared* order, since that is
-    // what `emit_is_variant` and the boxed `FrogVariant` header agree on;
-    // an anonymous one walks the normalized member list. Either way each
-    // case names a member type and the tag to test for.
-    //
-    // An inline union needs neither: its tag is slot 0's low bits and its
-    // members are exactly the normalized list, so declared order is
-    // irrelevant and only the member types matter.
-    let nominal = if inline { None } else { resolve_nominal_union(members, ctx.unions) };
-
-    let cases: Vec<(Type, u32)> = match nominal {
-        Some((name, def)) => def.variants.iter().enumerate()
-            .map(|(i, (variant, _))| (Type::strukt(format!("{}.{}", name, variant)), i as u32))
-            .collect(),
-        None => members.iter().cloned().zip(0u32..).collect(),
-    };
-
-    // Anonymous boxed unions only ever have `None` as an immediate member —
-    // see `TypedExprKind::Widen`. A nominal union's immediates come from its
-    // `UnionDef` instead, via `emit_is_variant`.
-    let any_immediate = members.iter().any(|m| *m == Type::None);
     let merge_bb = bcx.create_block();
     let last = cases.len() - 1;
 
@@ -1264,13 +1347,7 @@ fn print_union_body(members: &[Type], arg_vals: &[Value], bcx: &mut FunctionBuil
         let cont_bb = if i < last { Some(bcx.create_block()) } else { None };
 
         if let Some(cont_bb) = cont_bb {
-            let is_match = if inline {
-                emit_inline_tag_test(bcx, arg_vals, *tag as usize)
-            } else if let Some((_, def)) = nominal {
-                emit_is_variant(bcx, arg_vals[0], def, *tag)
-            } else {
-                emit_tag_test(bcx, arg_vals[0], *member_ty == Type::None, any_immediate, *tag)
-            };
+            let is_match = emit_union_tag_test(members, member_ty, *tag, arg_vals, inline, nominal, bcx);
             bcx.ins().brif(is_match, body_bb, &[], cont_bb, &[]);
         } else {
             bcx.ins().jump(body_bb, &[]);
@@ -1292,9 +1369,14 @@ fn print_union_body(members: &[Type], arg_vals: &[Value], bcx: &mut FunctionBuil
 }
 
 /// Narrow a union member's carrier out of `slots` — the same unboxing
-/// `TypedExprKind::Narrow` does, inline or boxed — and print it.
-fn print_union_member(members: &[Type], member_ty: &Type, slots: &[Value], inline: bool, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
-    let values = if inline {
+/// `TypedExprKind::Narrow` does, inline or boxed — into that member's own
+/// flattened leaves, ready for `print_value`/`eq_value`.
+///
+/// `None` (and `Never`, which is only ever a layout placeholder) carries no
+/// data, so it gets a dummy leaf: every walk over a union's members expects
+/// one value per member slot, and `struct_fields` counts one for it.
+fn unpack_union_slots(members: &[Type], member_ty: &Type, slots: &[Value], inline: bool, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Vec<Value> {
+    if inline {
         if matches!(member_ty, Type::None | Type::Never) {
             vec![bcx.ins().iconst(types::I64, 0)]
         } else {
@@ -1307,9 +1389,297 @@ fn print_union_member(members: &[Type], member_ty: &Type, slots: &[Value], inlin
     } else {
         let leaf_types: Vec<Type> = struct_fields(member_ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
         read_variant_slots(slots[0], 0, &leaf_types, bcx, ctx)
-    };
+    }
+}
+
+fn print_union_member(members: &[Type], member_ty: &Type, slots: &[Value], inline: bool, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    let values = unpack_union_slots(members, member_ty, slots, inline, bcx, ctx);
     let mut cursor = 0;
     print_value(member_ty, &values, &mut cursor, bcx, ctx);
+}
+
+/// The member list a union dispatch has to walk, each paired with the tag
+/// that identifies it at runtime — shared by `print_union_body` and
+/// `eq_union_body` so the two agree on tag provenance, which is the thing
+/// that has already gone wrong once (see `resolve_nominal_union`).
+///
+/// A nominal union walks its variants in *declared* order, since that is
+/// what `emit_is_variant` and the boxed `FrogVariant` header agree on; an
+/// anonymous one walks the normalized member list. An inline union needs
+/// neither: its tag is slot 0's low bits and its members are exactly the
+/// normalized list, so declared order is irrelevant.
+///
+/// Takes `unions` rather than the whole `Ctx` so the returned `UnionDef`
+/// borrow lives as long as the definitions themselves, leaving the caller
+/// free to keep using `ctx` mutably while it emits.
+fn union_dispatch_cases<'a>(members: &[Type], inline: bool, unions: &'a UnionDefs) -> (Option<(&'a str, &'a UnionDef)>, Vec<(Type, u32)>) {
+    let nominal = if inline { None } else { resolve_nominal_union(members, unions) };
+    let cases = match nominal {
+        Some((name, def)) => def.variants.iter().enumerate()
+            .map(|(i, (variant, _))| (Type::strukt(format!("{}.{}", name, variant)), i as u32))
+            .collect(),
+        None => members.iter().cloned().zip(0u32..).collect(),
+    };
+    (nominal, cases)
+}
+
+/// Emit the runtime test "does this union value hold the member at `tag`?".
+/// The three representations need three different tests, and picking the
+/// wrong one is silently wrong rather than loud — see `resolve_nominal_union`.
+fn emit_union_tag_test(
+    members: &[Type], member_ty: &Type, tag: u32, vals: &[Value],
+    inline: bool, nominal: Option<(&str, &UnionDef)>, bcx: &mut FunctionBuilder,
+) -> Value {
+    if inline {
+        emit_inline_tag_test(bcx, vals, tag as usize)
+    } else if let Some((_, def)) = nominal {
+        emit_is_variant(bcx, vals[0], def, tag)
+    } else {
+        // Anonymous boxed unions only ever have `None` as an immediate
+        // member — see `TypedExprKind::Widen`.
+        let any_immediate = members.iter().any(|m| *m == Type::None);
+        emit_tag_test(bcx, vals[0], *member_ty == Type::None, any_immediate, tag)
+    }
+}
+
+/// Structural `==` for two lists of static element type `elem_ty`, emitted
+/// here for the same reason `print_list` is: the runtime sees a pointer and
+/// a stride, and could only compare identity or raw slots, which is wrong
+/// for a `Str` element (two equal strings, two pointers) and wrong again for
+/// a nested list.
+///
+/// Unequal lengths decide it without touching an element; otherwise this is
+/// `print_list`'s loop with an early exit — the first unequal element jumps
+/// straight to the merge with `false`, so a long common prefix costs only
+/// what it compares. Returns an `I8` boolean.
+fn eq_list(elem_ty: &Type, lv: Value, rv: Value, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
+    let elem_leafs = struct_fields(elem_ty, ctx.structs);
+    let len_id = ctx.func_ids["frog_list_len"];
+
+    let len_callee = ctx.module.declare_func_in_func(len_id, bcx.func);
+    let l_len_call = bcx.ins().call(len_callee, &[lv]);
+    let l_len = bcx.inst_results(l_len_call)[0];
+    let r_len_call = bcx.ins().call(len_callee, &[rv]);
+    let r_len = bcx.inst_results(r_len_call)[0];
+
+    let merge_bb = bcx.create_block();
+    bcx.append_block_param(merge_bb, types::I8);
+    let loop_bb   = bcx.create_block();
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    bcx.append_block_param(header_bb, types::I64);
+
+    let same_len = bcx.ins().icmp(IntCC::Equal, l_len, r_len);
+    let no = bcx.ins().iconst(types::I8, 0);
+    bcx.ins().brif(same_len, loop_bb, &[], merge_bb, &[BlockArg::from(no)]);
+
+    bcx.switch_to_block(loop_bb);
+    bcx.seal_block(loop_bb);
+    // Same element type on both sides, so the two strides agree; each list
+    // still carries its own, and the loads have to use the matching one.
+    let l_stride = list_stride(bcx, lv);
+    let r_stride = list_stride(bcx, rv);
+    let zero = bcx.ins().iconst(types::I64, 0);
+    bcx.ins().jump(header_bb, &[BlockArg::from(zero)]);
+
+    // Sealed only after the back edge below exists, as in `print_list`.
+    bcx.switch_to_block(header_bb);
+    let i = bcx.block_params(header_bb)[0];
+    let in_range = bcx.ins().icmp(IntCC::SignedLessThan, i, l_len);
+    // Ran off the end with nothing unequal: the lists are equal.
+    let yes = bcx.ins().iconst(types::I8, 1);
+    bcx.ins().brif(in_range, body_bb, &[], merge_bb, &[BlockArg::from(yes)]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+    let l_base = bcx.ins().imul(i, l_stride);
+    let r_base = bcx.ins().imul(i, r_stride);
+    let mut l_vals = Vec::with_capacity(elem_leafs.len());
+    let mut r_vals = Vec::with_capacity(elem_leafs.len());
+    for (leaf_idx, (_, lty)) in elem_leafs.iter().enumerate() {
+        for (base, list, out) in [(l_base, lv, &mut l_vals), (r_base, rv, &mut r_vals)] {
+            let slot = bcx.ins().iadd_imm_s(base, leaf_idx as i64);
+            let addr = list_slot_addr(bcx, list, slot);
+            let raw = bcx.ins().load(types::I64, heap_mem(), addr, 0);
+            out.push(from_i64_repr(bcx, lty, raw));
+        }
+    }
+    // No GC rooting of the loaded leaves: comparing allocates nothing, so
+    // there is no collection point between the loads and their last use.
+    let mut cursor = 0;
+    let eq = eq_value(elem_ty, &l_vals, &r_vals, &mut cursor, bcx, ctx);
+
+    // `eq_value` may have emitted its own blocks (a nested list's loop);
+    // the back edge goes from wherever it left the builder.
+    let i_next = bcx.ins().iadd_imm_s(i, 1);
+    let no = bcx.ins().iconst(types::I8, 0);
+    bcx.ins().brif(eq, header_bb, &[BlockArg::from(i_next)], merge_bb, &[BlockArg::from(no)]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(merge_bb);
+    bcx.seal_block(merge_bb);
+    bcx.block_params(merge_bb)[0]
+}
+
+/// Structural `==` for two values of the same union type — the equality
+/// counterpart of `print_union`, and the reason a `data` union compares by
+/// contents rather than by box address.
+///
+/// Both operands are dispatched at runtime, because which member each holds
+/// is only known then. The shape is: find the member the *left* one holds
+/// (one tag test per case but the last, which needs none — the tag is
+/// guaranteed to be one of them), then ask whether the right one holds that
+/// same member; if it doesn't the answer is `false` without unpacking
+/// anything, and if it does, unpack both carriers and compare them with
+/// `eq_value`. Returns an `I8` boolean.
+fn eq_union(members: &[Type], l: &[Value], r: &[Value], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
+    // A union-typed struct field is stored as a single opaque boxed pointer,
+    // never flattened, which is what makes `data Node is Add(lhs: Node, ...)`
+    // representable — and what makes this walk re-derive the same union type
+    // with no static bound on depth. `TypeChecker::check_comparable` predicts
+    // this and reports it with a span; the guard stays as the backstop, in
+    // the same shape as `print_union`'s.
+    let shape = format!("{:?}", members);
+    if ctx.comparing_unions.contains(&shape) {
+        panic!(
+            "unsupported: comparing a recursive union type ({}) isn't supported yet \
+             — write a recursive function that compares it field-by-field instead.",
+            Type::Union(members.to_vec())
+        );
+    }
+    ctx.comparing_unions.push(shape);
+    let result = eq_union_body(members, l, r, bcx, ctx);
+    ctx.comparing_unions.pop();
+    result
+}
+
+fn eq_union_body(members: &[Type], l: &[Value], r: &[Value], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
+    let inline = union_is_inline(members, ctx.structs);
+    let (nominal, cases) = union_dispatch_cases(members, inline, ctx.unions);
+
+    let merge_bb = bcx.create_block();
+    bcx.append_block_param(merge_bb, types::I8);
+    let last = cases.len() - 1;
+
+    for (i, (member_ty, tag)) in cases.iter().enumerate() {
+        let body_bb = bcx.create_block();
+        let cont_bb = if i < last { Some(bcx.create_block()) } else { None };
+
+        if let Some(cont_bb) = cont_bb {
+            let is_match = emit_union_tag_test(members, member_ty, *tag, l, inline, nominal, bcx);
+            bcx.ins().brif(is_match, body_bb, &[], cont_bb, &[]);
+        } else {
+            bcx.ins().jump(body_bb, &[]);
+        }
+
+        bcx.switch_to_block(body_bb);
+        bcx.seal_block(body_bb);
+
+        // The right operand is tested in *every* case, the last included:
+        // "left holds this member" says nothing about the right one, and
+        // two different members are never equal.
+        let same_bb = bcx.create_block();
+        let r_match = emit_union_tag_test(members, member_ty, *tag, r, inline, nominal, bcx);
+        let no = bcx.ins().iconst(types::I8, 0);
+        bcx.ins().brif(r_match, same_bb, &[], merge_bb, &[BlockArg::from(no)]);
+
+        bcx.switch_to_block(same_bb);
+        bcx.seal_block(same_bb);
+        let l_vals = unpack_union_slots(members, member_ty, l, inline, bcx, ctx);
+        let r_vals = unpack_union_slots(members, member_ty, r, inline, bcx, ctx);
+        let mut cursor = 0;
+        let eq = eq_value(member_ty, &l_vals, &r_vals, &mut cursor, bcx, ctx);
+        // `eq_value` may have emitted its own blocks; jump from wherever it
+        // left the builder.
+        bcx.ins().jump(merge_bb, &[BlockArg::from(eq)]);
+
+        if let Some(cont_bb) = cont_bb {
+            bcx.switch_to_block(cont_bb);
+            bcx.seal_block(cont_bb);
+        }
+    }
+
+    bcx.switch_to_block(merge_bb);
+    bcx.seal_block(merge_bb);
+    bcx.block_params(merge_bb)[0]
+}
+
+/// Structural `==` for one value of type `ty`, given both operands' flattened
+/// leaves — `print_value`'s counterpart, consuming the same leaf sequence
+/// through the same `cursor`. Returns an `I8` boolean.
+///
+/// Only reached from `eq_list` (an element, and recursively that element's
+/// fields): a top-level struct comparison is desugared into a per-field
+/// conjunction of source-level `==` back in `TypeChecker::desugar_struct_eq`,
+/// which short-circuits. This one folds with a bitwise `and` instead — the
+/// leaves are already loaded and comparing them has no side effects, so
+/// there is nothing to be gained by branching per field.
+fn eq_value(ty: &Type, l: &[Value], r: &[Value], cursor: &mut usize, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
+    if ty.is_struct() {
+        let key = ty.struct_key().expect("is_struct implies struct_key Some");
+        let fields = ctx.structs.get(&key).expect("known struct in codegen").clone();
+        let mut acc: Option<Value> = None;
+        for (_, field_ty) in &fields {
+            let sub = eq_value(field_ty, l, r, cursor, bcx, ctx);
+            acc = Some(match acc {
+                None => sub,
+                Some(prev) => bcx.ins().band(prev, sub),
+            });
+        }
+        // A field-less struct: all its values are equal.
+        return acc.unwrap_or_else(|| bcx.ins().iconst(types::I8, 1));
+    }
+    if let Some(inner) = ty.as_list_elem() {
+        let inner = inner.clone();
+        let (lv, rv) = (l[*cursor], r[*cursor]);
+        *cursor += 1;
+        return eq_list(&inner, lv, rv, bcx, ctx);
+    }
+    let (lv, rv) = (l.get(*cursor).copied(), r.get(*cursor).copied());
+    match ty {
+        Type::Str => {
+            *cursor += 1;
+            let callee = ctx.module.declare_func_in_func(ctx.func_ids["frog_str_eq"], bcx.func);
+            let call = bcx.ins().call(callee, &[lv.expect("Str leaf"), rv.expect("Str leaf")]);
+            let result = bcx.inst_results(call)[0];
+            bcx.ins().ireduce(types::I8, result)
+        }
+        Type::Int | Type::Bool => {
+            *cursor += 1;
+            bcx.ins().icmp(IntCC::Equal, lv.expect("scalar leaf"), rv.expect("scalar leaf"))
+        }
+        Type::Float => {
+            *cursor += 1;
+            bcx.ins().fcmp(FloatCC::Equal, lv.expect("Float leaf"), rv.expect("Float leaf"))
+        }
+        // An element type inference never fixed, which only happens for a
+        // provably empty list (`[] == []`) — the loop body is dead, so the
+        // answer here is never observed. See `print_value`'s same arm.
+        Type::TypeVar { .. } => {
+            *cursor += 1;
+            bcx.ins().iconst(types::I8, 1)
+        }
+        // Mirrors `print_value`'s `Union` arm: a boxed union consumes 1 leaf
+        // (the pointer/immediate), an inline one its whole `UnionLayout`
+        // width. Which member is held is a runtime question, so this is a
+        // dispatch, not a comparison — see `eq_union`.
+        Type::Union(members) => {
+            let members = members.clone();
+            let n = struct_fields(&Type::Union(members.clone()), ctx.structs).len();
+            let (ls, rs) = (l[*cursor..*cursor + n].to_vec(), r[*cursor..*cursor + n].to_vec());
+            *cursor += n;
+            eq_union(&members, &ls, &rs, bcx, ctx)
+        }
+        // `None` has exactly one value, so two of them are equal without
+        // looking. The leaf exists only so counts line up — `struct_fields`
+        // gives it one and `unpack_union_slots` materialises a dummy for it,
+        // the same as printing does.
+        Type::None => {
+            *cursor += 1;
+            bcx.ins().iconst(types::I8, 1)
+        }
+        other => panic!("equality codegen does not support {:?}", other),
+    }
 }
 
 /// Compile a scalar (non-struct-typed) expression into Cranelift IR,
@@ -1751,6 +2121,16 @@ fn compile_expr_multi(
     }
 }
 
+/// The structural comparisons all compute equality; `!=` is its negation.
+fn negate_if_ne(op: &Token, eq: Value, bcx: &mut FunctionBuilder) -> Value {
+    if *op == Token::NotEq {
+        let one = bcx.ins().iconst(types::I8, 1);
+        bcx.ins().bxor(eq, one)
+    } else {
+        eq
+    }
+}
+
 fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     // ── String operations (must short-circuit before numeric path) ──
     if left.item.ty == Type::Str {
@@ -1795,6 +2175,32 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
             },
             _ => unimplemented!("string binary op {:?}", op),
         }];
+    }
+
+    // ── List equality (structural — see `eq_list`) ──────────────────
+    //
+    // Reached both from a source-level `[1, 2] == [1, 2]` and from a
+    // `List`-typed field of a struct comparison, whose per-field `Binary`
+    // nodes `build_struct_eq` synthesizes with the field's own type.
+    if left.item.ty.is_list() && matches!(op, Token::EqEq | Token::NotEq) {
+        let elem = left.item.ty.as_list_elem().expect("is_list implies an element type").clone();
+        let lv = compile_expr(left,  bcx, vars, ctx);
+        let rv = compile_expr(right, bcx, vars, ctx);
+        let eq = eq_list(&elem, lv, rv, bcx, ctx);
+        return vec![negate_if_ne(op, eq, bcx)];
+    }
+
+    // ── Union equality (runtime tag dispatch — see `eq_union`) ──────
+    //
+    // `compile_expr_multi`, not `compile_expr`: an inline union occupies its
+    // whole layout width, and reaching this through the scalar path below is
+    // what used to abort codegen on a multi-leaf operand.
+    if matches!(left.item.ty, Type::Union(_)) && matches!(op, Token::EqEq | Token::NotEq) {
+        let members = match &left.item.ty { Type::Union(m) => m.clone(), _ => unreachable!() };
+        let lv = compile_expr_multi(left,  bcx, vars, ctx);
+        let rv = compile_expr_multi(right, bcx, vars, ctx);
+        let eq = eq_union(&members, &lv, &rv, bcx, ctx);
+        return vec![negate_if_ne(op, eq, bcx)];
     }
 
     // ── Logical and/or (must short-circuit — `right` can have side
@@ -2082,49 +2488,39 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
             debug_assert!(vals.is_empty(), "Never-typed expr produced values");
             return Vec::new();
         }
-        if arg.item.ty.is_struct() {
+        // Structs, unions and `none` all go through the same type-directed
+        // walk as a nested field would — `print_value`'s `Union` arm does
+        // the runtime tag dispatch itself, so the top level needs no
+        // separate copy of it, and routing `None` here is what makes
+        // `print(none)` work instead of falling into the scalar match's
+        // panic below.
+        if arg.item.ty.is_struct() || matches!(arg.item.ty, Type::Union(_) | Type::None) {
             let values = compile_expr_multi(arg, bcx, vars, ctx);
             let mut cursor = 0;
             print_value(&arg.item.ty, &values, &mut cursor, bcx, ctx);
             print_fragment("\n", bcx, ctx);
             return vec![bcx.ins().iconst(types::I64, 0)];
         }
-        if let Type::Union(members) = &arg.item.ty {
-            // Unlike the `Struct` case above, `print_value` can't
-            // just walk a union's flattened leaves — which
-            // member's leaves they even *are* is a runtime fact
-            // (the tag), whether it's a one-slot boxed union (a
-            // nominal `data ... is A | B`, represented as an
-            // anonymous `Union` of its variant structs) or an
-            // inline one. Dispatch on the
-            // tag at runtime (mirroring what `match`'s `TypeTag`/
-            // `Narrow` desugaring does for user code) and print
-            // whichever member matched.
-            let values = compile_expr_multi(arg, bcx, vars, ctx);
-            print_union(members, &values, bcx, ctx);
+        if let Some(inner) = arg.item.ty.as_list_elem().cloned() {
+            // Same type-directed walk the struct case above uses: the
+            // element loop is emitted here, not delegated to a runtime
+            // function that has lost `inner` (plans/DATA.md stage 0).
+            let list_val = compile_expr(arg, bcx, vars, ctx);
+            print_list(&inner, list_val, bcx, ctx);
             print_fragment("\n", bcx, ctx);
             return vec![bcx.ins().iconst(types::I64, 0)];
         }
         let arg_val = compile_expr(arg, bcx, vars, ctx);
-        let (rt_name, extra_arg): (&str, Option<i64>) = if let Some(inner) = arg.item.ty.as_list_elem() {
-            ("frog_list_println", Some(list_elem_kind(inner)))
-        } else {
-            match &arg.item.ty {
-                Type::Str => ("print", None),
-                Type::Int => ("frog_int_println", None),
-                Type::Float => ("frog_float_println", None),
-                Type::Bool => ("frog_bool_println", None),
-                ty => panic!("print codegen does not support {:?}", ty),
-            }
+        let rt_name = match &arg.item.ty {
+            Type::Str => "print",
+            Type::Int => "frog_int_println",
+            Type::Float => "frog_float_println",
+            Type::Bool => "frog_bool_println",
+            ty => panic!("print codegen does not support {:?}", ty),
         };
         let func_id = ctx.func_ids[rt_name];
         let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
-        if let Some(kind) = extra_arg {
-            let kind = bcx.ins().iconst(types::I64, kind);
-            bcx.ins().call(callee, &[arg_val, kind]);
-        } else {
-            bcx.ins().call(callee, &[arg_val]);
-        }
+        bcx.ins().call(callee, &[arg_val]);
         return vec![bcx.ins().iconst(types::I64, 0)];
     }
 
@@ -2167,13 +2563,8 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         let list_val = compile_expr(xs_arg, bcx, vars, ctx);
         let leafs = struct_fields(&v_arg.item.ty, ctx.structs);
         let vvals = compile_expr_multi(v_arg, bcx, vars, ctx);
-        for (v, (_, lty)) in vvals.iter().zip(leafs.iter()) {
-            // See `compile_list_lit`'s identical loop: the list's backing
-            // store is a flat i64 buffer, so a Float/Bool leaf needs the
-            // same wire-format conversion every other list-element push does.
-            let wire = to_i64_repr(bcx, lty, *v);
-            emit_list_push(bcx, ctx, list_val, wire);
-        }
+        // See `compile_list_lit`'s identical push via `push_element`.
+        push_element(bcx, ctx, list_val, &vvals, &leafs);
         // No write-back into `xs`'s `Variable`: `emit_list_push`/
         // `frog_list_push` may reallocate the `FrogList`'s internal `data`
         // buffer, but never the `FrogList` object itself — the pointer
@@ -2401,17 +2792,11 @@ fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut Func
         // list's flat backing store self-describing (see FrogList's
         // doc comment in runtime/gc.rs).
         let evs = compile_expr_multi(elem, bcx, vars, ctx);
-        for (ev, (_, lty)) in evs.iter().zip(leafs.iter()) {
-            // The list's backing store is a flat i64 buffer (see
-            // FrogList in runtime/gc.rs); Float and Bool elements need
-            // the same bitcast/zero-extend conversion applied to every
-            // other i64-wire-format value (see to_i64_repr). Without
-            // this, pushing an F64 or I8 SSA value into an i64-typed
-            // call argument is a Cranelift type mismatch — a "Verifier
-            // errors" panic, not a bug in the pushed value itself.
-            let ev = to_i64_repr(bcx, lty, *ev);
-            emit_list_push(bcx, ctx, list_ptr, ev);
-        }
+        // The list's backing store is a flat i64 buffer (see FrogList in
+        // runtime/gc.rs); Float and Bool elements need the same
+        // bitcast/zero-extend conversion applied to every other
+        // i64-wire-format value (see to_i64_repr and push_element).
+        push_element(bcx, ctx, list_ptr, &evs, &leafs);
     }
 
     vec![list_ptr]
@@ -2800,10 +3185,7 @@ fn compile_for_loop(
     let body_vals = compile_expr_multi(body, bcx, vars, ctx);
     if let Some(list_ptr) = result_list {
         let body_leafs = struct_fields(&body.item.ty, ctx.structs);
-        for (v, (_, lty)) in body_vals.iter().zip(body_leafs.iter()) {
-            let pushed = to_i64_repr(bcx, lty, *v);
-            emit_list_push(bcx, ctx, list_ptr, pushed);
-        }
+        push_element(bcx, ctx, list_ptr, &body_vals, &body_leafs);
     }
 
     let i_next = bcx.ins().iadd_imm_s(i, 1);
@@ -2895,8 +3277,6 @@ impl Codegen {
         builder.symbol("frog_int_print", ffi::frog_int_print as *const u8);
         builder.symbol("frog_float_print", ffi::frog_float_print as *const u8);
         builder.symbol("frog_bool_print", ffi::frog_bool_print as *const u8);
-        builder.symbol("frog_list_print", ffi::frog_list_print as *const u8);
-        builder.symbol("frog_list_println", ffi::frog_list_println as *const u8);
         builder.symbol("frog_alloc_list",  ffi::frog_alloc_list  as *const u8);
         builder.symbol("frog_list_len",    ffi::frog_list_len    as *const u8);
         builder.symbol("frog_list_get",    ffi::frog_list_get    as *const u8);
@@ -2962,8 +3342,6 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_int_print", "frog_int_print", &[I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_float_print", "frog_float_print", &[types::F64], None);
         declare_rt(&mut module, &mut func_ids, "frog_bool_print", "frog_bool_print", &[types::I8], None);
-        declare_rt(&mut module, &mut func_ids, "frog_list_print", "frog_list_print", &[I64, I64], None);
-        declare_rt(&mut module, &mut func_ids, "frog_list_println", "frog_list_println", &[I64, I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_alloc_list", "frog_alloc_list", &[I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_list_len",   "frog_list_len",   &[I64],           Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_list_get",   "frog_list_get",   &[I64, I64, I64], Some(I64));
@@ -3089,7 +3467,7 @@ impl Codegen {
 
         let mut ctx = Ctx {
             func_ids, module, string_arena, structs, unions,
-            printing_unions: Vec::new(), mut_params, liveness: body_liveness,
+            printing_unions: Vec::new(), comparing_unions: Vec::new(), mut_params, liveness: body_liveness,
             host_fns,
         };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
@@ -3219,7 +3597,7 @@ impl Codegen {
 
         let mut ctx = Ctx {
             func_ids, module, string_arena, structs, unions,
-            printing_unions: Vec::new(), mut_params: Vec::new(), liveness: entry_liveness,
+            printing_unions: Vec::new(), comparing_unions: Vec::new(), mut_params: Vec::new(), liveness: entry_liveness,
             host_fns,
         };
 

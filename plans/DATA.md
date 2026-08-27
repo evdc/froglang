@@ -1,6 +1,6 @@
 # Data, Notation, and Annotations
 
-Status: **design**. Stage 0 is a bug fix that should land regardless of the rest. Everything
+Status: **design**, with Stage 0 done and Stage 1's `print` half done. Everything
 from Stage 3 on is a sketch; the *decisions* table is the part meant to be stable.
 
 This supersedes the roadmap's "Annotations, and auto-deriving trait implementations" bullet and
@@ -33,9 +33,9 @@ Measured behaviour of `print` today:
 | `1.0` | `1.0` | yes — the `.0` keeps Float ≠ Int in notation |
 | `1e100` | `1e100` | **no** — the lexer has no exponent literal |
 | `1.0/0.0` | `inf` | **no** — no literal |
-| `none` | *codegen panic:* `print codegen does not support None` | **no** |
-| `[[1,2],[3]]` | `[<list>, <list>]` | **no** |
-| `[Person(...)]` | `[<struct>]` | **no** |
+| `none` | ~~*codegen panic*~~ → `none` | yes — *fixed, stage 1* |
+| `[[1,2],[3]]` | ~~`[<list>, <list>]`~~ → `[[1, 2], [3]]` | yes — *fixed, stage 0* |
+| `[Person(...)]` | ~~`[<struct>]`~~ → `[Person(name="Alice", age=42)]` | yes — *fixed, stage 0* |
 
 Structural facts behind that table:
 
@@ -43,12 +43,11 @@ Structural facts behind that table:
   flattened field layout, emitted inline per call site. It is a monomorphized `Show` derive
   written in Rust. `desugar_struct_eq` (`typeck.rs`) is a second such derive, at the AST layer.
   So froglang already has compile-time reflection, hardcoded, for two consumers, at two layers.
-- **List printing is the exception, and it is type-erased.** `print_value`'s `Type::List(inner)`
-  arm collapses `inner` to a one-byte `list_elem_kind` tag and calls `frog_list_print`
-  (`runtime/ffi.rs:181`), which has no type information left and emits `<struct>` / `<list>`
-  placeholders. This one decision causes every `no` in the table except the float and `none`
-  rows, and it means **the type-directed walk does not currently reach through a list** — which
-  is most real data.
+- ~~**List printing is the exception, and it is type-erased.**~~ *(Fixed in stage 0.)*
+  `print_value`'s list arm used to collapse the element type to a one-byte `list_elem_kind`
+  tag and call `frog_list_print`, which had no type information left and emitted
+  `<struct>` / `<list>` placeholders. That one decision caused every `no` in the table
+  except the float and `none` rows. The walk reaches through a list now.
 - **`frog_float_print` uses Rust's `{:?}`** (`ffi.rs:166`). Shortest-roundtrip formatting, which
   is the hard half already correct — but it emits `1e100`, `inf`, and `NaN`, none of which the
   lexer accepts.
@@ -137,8 +136,8 @@ tier and the interop tier; the syntax changes are deliberately last.
 
 | # | Stage | Unblocks | Depends on |
 |---|---|---|---|
-| 0 | List printing into the codegen walk | everything | — |
-| 1 | `print` / `repr` split; `Show`+`Eq` totality | the law | 0 |
+| 0 | **done** — List printing into the codegen walk | everything | — |
+| 1 | **`print` half done** — `print` / `repr` split; `Show`+`Eq` totality | the law | 0 |
 | 2 | Float and string notation fixes | the law | — |
 | 3 | Source map: fn-ptr → span | diagnostics, function printing | — |
 | 4 | `StrBuf` / `Sink` | every serializer | — |
@@ -153,7 +152,7 @@ parallel.
 
 ---
 
-## Stage 0 — list printing into the codegen walk
+## Stage 0 — list printing into the codegen walk — **done**
 
 **The single highest-leverage item in this document, and the cheapest.**
 
@@ -166,6 +165,30 @@ serializer, `repr`, or derive worth having, because without it the type-directed
 reach through the most common container in the language.
 
 Do this first and independently of every design decision below.
+
+### What it took
+
+`print_list` in `codegen/mod.rs` emits the element loop, modelled on
+`compile_for_loop`'s element read (`frog_list_len` for the count, slot
+`i * stride + leaf` per leaf, no bounds check since the header bounds `i`), and
+recurses into `print_value` with the static element type. `frog_list_print`/
+`frog_list_println`/`list_elem_kind` are gone, and the top-level `print` path calls
+`print_list` directly instead of a runtime function.
+
+Two things fell out that the plan didn't call:
+
+- **An empty list literal's element type is still a `TypeVar`.** The loop body is dead
+  (nothing fixed the variable, so there is no element), but it is still emitted, so
+  `print_value` needs an arm. It prints `<?>` — Stage 1's rule that a placeholder may
+  exist but must not look like notation, arriving one stage early.
+- **`check_printable` had to learn to descend through a list.** It predicts
+  `print_union`'s recursion guard at typeck time so the user gets a spanned error rather
+  than a codegen panic; now that the walk reaches through a list, `print([Add(..)])`
+  would otherwise have slipped past it into the panic.
+
+`Str` elements now print as quoted literals (`["a"]`, not `[a]`), because the list walk
+shares `print_value`'s leaf policy instead of having its own — which is the point, and is
+what the notation needs.
 
 ---
 
@@ -198,6 +221,32 @@ that. Report at the struct, not at the field.
 
 **Guard against drift** between the two implementations of the struct walk (codegen for `print`,
 typed AST for `repr`) with a test asserting `print(x) == repr(x)` for every `Show` type.
+
+### Status
+
+Done, all of it on the `print` side:
+
+- `print_value` emits lowercase `none`, and the top-level `print` path routes `None`
+  (with structs and unions) through `print_value` instead of the scalar match, so
+  `print(none)` prints instead of aborting codegen.
+- **`Eq` now recurses into field types** (`type_implements_rec` +
+  `struct_field_types`, an immutable counterpart to `materialize_struct`). This was worse
+  than the plan recorded: `build_struct_eq`'s synthesized per-field `Binary` nodes are
+  never re-checked by `builtin_op_type`, so a `List` field wasn't caught "later" at all —
+  it compiled to a raw pointer comparison, and `W(xs=[1]) == W(xs=[1])` answered `false`.
+  The error now names the struct. A type that reaches itself (a nominal union's variant
+  carrying that union) terminates via a `seen` list and is treated as satisfied.
+
+Not done, deliberately:
+
+- **`Show` as a `Trait` variant.** Its only consumer is `repr`, which is Stage 5 by this
+  document's own layer table, and `print` is total and requires no trait. The recursion
+  in `type_implements_rec` is trait-generic, so adding the variant is the whole change
+  when Stage 5 arrives.
+- **`<func ... @ span>`.** Function values can't be used as values at all yet ("'g' is a
+  function — it can be called, or given another name with 'let', but not used as a
+  value"), so there is nothing to print. Stage 3's source map and this land together.
+- **`print(x) == repr(x)` drift test.** Needs `repr`.
 
 ### Why two layers is correct here, not an accident
 

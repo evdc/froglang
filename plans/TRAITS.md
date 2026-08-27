@@ -323,10 +323,54 @@ reordering fields in a `data` declaration is a behaviour change. `DESIGN.md` alr
 once it ships it is something a reader can trip over, and it belongs in the language reference.
 
 **Structural derivation must recurse.** A struct is `Eq` only if every field's type is `Eq`.
-Today `type_implements` returns `true` for any struct and the per-field comparison fails later —
-the comments call this deliberate, and the *place* is right, but with a `List` field the user
-currently gets an error about `==` on lists rather than about `Eq` on their struct. Fix when this
-is formalized: check the fields, report at the struct.
+~~Today `type_implements` returns `true` for any struct and the per-field comparison fails later~~
+— **done**, and it was worse than described: `build_struct_eq`'s synthesized per-field `Binary`
+nodes are never re-checked by `builtin_op_type`, so nothing failed "later" at all. A non-`Eq`
+field compiled into a raw pointer comparison and `W(xs=[1]) == W(xs=[1])` answered `false`.
+`type_implements_rec` now recurses into field types (and into a generic instantiation's `args`),
+with a `seen` list making it total over a type that reaches itself.
+
+### `List` and union equality
+
+Two more types had to answer the `Eq` question, since the recursion above now asks it of every
+field. Both are decided in codegen, alongside `print_list`/`print_union` and for the same reason:
+only codegen still knows the static type, and the runtime would compare a `Str` by address.
+
+- **`List(T)` is `Eq` iff `T` is** — structural, like Python's, which is what `[1, 2] == [1, 2]`
+  is expected to mean. It can't be desugared into a fixed conjunction the way a struct's is (the
+  length is a runtime value), so codegen emits the element loop: `eq_list`, lengths first, then
+  elements pairwise with an early exit.
+- **A union is `Eq` iff every member is** — `eq_union`, the equality counterpart of `print_union`:
+  find the member the left operand holds, ask whether the right one holds the same, and if so
+  unpack both carriers and compare them. The two share their tag-provenance helpers
+  (`union_dispatch_cases`, `emit_union_tag_test`, `unpack_union_slots`) so they can't drift on the
+  one detail that is silently wrong rather than loud — a nominal union's tag is its *declaration*
+  index, an anonymous one's its normalized position.
+- **`None` is `Eq`**, so an optional is. Without it `Int | None` failed the member rule and no
+  optional could be compared at all.
+
+With that, **every value type is `Eq`** — there is no longer a negative witness to write a test
+against, since the only non-`Eq` types (`Never`, a function type) can be neither a struct field
+nor a type argument. That is the intended end state: `Eq`/`Ord`/`Show` just work for value types.
+
+### Recursive types are a codegen limit, not a trait answer
+
+A type that encloses itself *is* structurally `Eq`; what's missing is a way to emit the
+comparison, since each step of these walks monomorphizes one statically known type. So it is
+rejected at the operator by `check_comparable` — sharing its walk with `check_printable`, which
+predicts the same wall for printing — rather than by `type_implements` saying "not `Eq`", which
+would name the wrong cause.
+
+A cycle can close two ways, and only the first was being caught:
+
+- through a **union member** (boxed), e.g. `data Node is Lit(v: Int) | Add(lhs: Node, rhs: Node)`;
+- through a **`List` field**, e.g. `data Tree(v: Int, kids: List<Tree>)`. This one became reachable
+  when `DATA.md` stage 0 taught the printing walk to descend into a list's element type, and was a
+  live bug: `print(tree)` overflowed the *compiler's* stack. Both walks now reject it.
+
+Lifting the limit means an out-of-line comparison — one emitted function per type, recursing at
+runtime rather than at codegen time — which is the same machinery a real `Show`/`repr` will need
+for recursive types. Worth doing together, not before.
 
 ### Deferred: opt-out
 

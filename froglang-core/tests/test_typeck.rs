@@ -1272,14 +1272,136 @@ fn a_generic_struct_instantiated_at_eq_args_is_itself_eq() {
     assert_eq!(infer_src(src).unwrap(), Type::Bool);
 }
 
-/// Same struct, instantiated instead at a non-`Eq` arg (`List` doesn't
-/// implement `Eq`) — the recursive `args.iter().all(..)` check must
-/// reject it rather than blanket-approving any generic instantiation
-/// just because it's a registered struct name.
+/// Instantiated at a composite arg, which is where the recursion into
+/// `args` actually earns its keep: `Box<List<Str>>` is `Eq` only because
+/// `List<Str>` is, and that answer comes from the `List` arm, not from
+/// "it's a registered struct name".
+///
+/// There is deliberately no negative twin any more. Every *value* type is
+/// `Eq` now — scalars, `None`, structs, lists, unions, and any nesting of
+/// them — which is the point of the `DATA.md` effort; the two types that
+/// aren't (`Never`, and a function type) can't be a struct field or a type
+/// argument. What used to be the negative case, a recursive type, is
+/// rejected at the operator by `check_comparable` instead, with a
+/// different error — see `a_self_referential_union_is_rejected_at_the_operator`.
 #[test]
-fn a_generic_struct_instantiated_at_a_non_eq_arg_is_not_eq() {
+fn a_generic_struct_instantiated_at_a_composite_arg_is_eq() {
     let src = "data Box<A>(item: A)\n\
-               Box(item=[1, 2]) == Box(item=[3, 4])";
+               Box(item=[\"a\"]) == Box(item=[\"b\"])";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+}
+
+// ── `plans/DATA.md` stage 1: structural derivation recurses into fields ──────
+
+/// `Eq` is structural for every value type: the derivation recurses into a
+/// struct's fields, a list's elements and a union's members, at any nesting.
+/// The composites here are the ones that each needed their own arm — a
+/// nested struct, a `List`, a union with a payload, an optional.
+///
+/// Before the recursion existed, every struct name satisfied `Eq` outright,
+/// and since `build_struct_eq`'s synthesized per-field comparisons are never
+/// re-checked, a field whose type had no real comparison was compared as a
+/// raw pointer: two structs with equal contents answered `false`, silently.
+#[test]
+fn a_struct_is_eq_when_its_fields_are() {
+    let src = "data Inner(v: Int)\n\
+               data Outer(i: Inner, name: Str)\n\
+               Outer(i=Inner(v=1), name=\"a\") == Outer(i=Inner(v=1), name=\"a\")";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+
+    let src = "data W(xs: List<Int>)\n\
+               W(xs=[1]) == W(xs=[1])";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+
+    let src = "data Shape is Sq(w: Int) | Circle(r: Int)\n\
+               data Inner(s: Shape)\n\
+               data Outer(i: Inner)\n\
+               Outer(i=Inner(s=Sq(w=1))) == Outer(i=Inner(s=Sq(w=1)))";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+
+    let src = "data W(o: Int | None)\n\
+               W(o=1) == W(o=none)";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+}
+
+// ── recursive types: rejected at the operator, not by the trait ──────────────
+//
+// A recursive type *is* structurally `Eq` — `type_implements` says so, and
+// its `seen` guard is what makes deciding that terminate. What's missing is
+// a way to *emit* the comparison: both `eq_union` and `eq_list` monomorphize
+// one statically known type per step, so a type that encloses itself would
+// need unbounded code. `check_comparable` predicts that and reports it at
+// the operator, which is where the limit actually is.
+
+#[test]
+fn a_self_referential_union_is_rejected_at_the_operator() {
+    let src = "data Node is Lit(v: Int) | Add(lhs: Node, rhs: Node)\n\
+               Lit(v=1) == Lit(v=2)";
     let err = infer_src(src).unwrap_err();
-    assert!(err.contains("Eq"), "unexpected error: {}", err);
+    assert!(err.contains("recursive") && err.contains("comparing"), "unexpected error: {}", err);
+}
+
+/// The other way a cycle can close: a struct reaching itself through a
+/// `List` field. Nothing boxes it away the way a union member is boxed, and
+/// before `plans/DATA.md` stage 0 taught the walks to descend into a list's
+/// element type it wasn't a cycle for them at all — `print` on one of these
+/// overflowed the compiler's own stack.
+#[test]
+fn a_struct_recursive_through_a_list_field_is_rejected_at_the_operator() {
+    let src = "data Tree(v: Int, kids: List<Tree>)\n\
+               Tree(v=1, kids=[]) == Tree(v=1, kids=[])";
+    let err = infer_src(src).unwrap_err();
+    assert!(err.contains("recursive") && err.contains("Tree"), "unexpected error: {}", err);
+}
+
+/// Two sibling fields of the same type are not a cycle — `check_comparable`
+/// pops its stack on the way back out, so it must not mistake a diamond for
+/// recursion.
+#[test]
+fn a_type_repeated_across_sibling_fields_is_not_recursive() {
+    let src = "data Inner(v: Int)\n\
+               data Outer(a: Inner, b: Inner)\n\
+               Outer(a=Inner(v=1), b=Inner(v=2)) == Outer(a=Inner(v=1), b=Inner(v=2))";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+}
+
+// ── structural equality on lists and unions ──────────────────────────────────
+
+/// `List(T)` is `Eq` when `T` is — what anyone coming from Python expects
+/// `[1, 2] == [1, 2]` to mean. It used to be a flat "requires Eq, got
+/// [Int]".
+#[test]
+fn a_list_of_eq_elements_is_eq() {
+    assert_eq!(infer_src("[1, 2] == [1, 2]").unwrap(), Type::Bool);
+    assert_eq!(infer_src("[[\"a\"]] != [[\"b\"]]").unwrap(), Type::Bool);
+}
+
+/// An empty list literal never fixes its element type, so the check meets a
+/// bare variable there — undetermined, not failing.
+#[test]
+fn an_empty_list_is_eq() {
+    assert_eq!(infer_src("[] == []").unwrap(), Type::Bool);
+}
+
+/// Unions, both kinds: a payload-less one (whose value *is* its tag) and a
+/// payload-carrying one (which needs `eq_union`'s runtime dispatch).
+#[test]
+fn a_union_is_eq_when_its_members_are() {
+    let src = "data Color is Red | Green | Blue\n\
+               Red == Green";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+
+    let src = "data Shape is Sq(w: Int) | Circle(r: Int)\n\
+               [Sq(w=1)] == [Circle(r=2)]";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
+}
+
+/// `None` is `Eq`, so an optional is — without it `Int | None` failed the
+/// "every member is `Eq`" rule and no optional could be compared at all.
+#[test]
+fn an_optional_is_eq() {
+    assert_eq!(infer_src("none == none").unwrap(), Type::Bool);
+    let src = "func f(c: Bool): Int | None = if c then 1 else none\n\
+               f(true) == f(false)";
+    assert_eq!(infer_src(src).unwrap(), Type::Bool);
 }

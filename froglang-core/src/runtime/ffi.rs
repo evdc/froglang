@@ -168,48 +168,9 @@ pub extern "C" fn frog_float_print(n: f64) { print!("{n:?}"); }
 #[no_mangle]
 pub extern "C" fn frog_bool_print(b: i8) { print!("{}", b != 0); }
 
-/// Print a list whose element representation is described by `kind`.
-/// Nested lists deliberately use a compact placeholder: list elements carry
-/// no recursive type metadata at runtime.
-#[no_mangle]
-pub extern "C" fn frog_list_println(list: i64, kind: i64) {
-    frog_list_print(list, kind);
-    println!();
-}
-
-#[no_mangle]
-pub extern "C" fn frog_list_print(list: i64, kind: i64) {
-    let list = unsafe { &*(list as *const FrogList) };
-    let stride = (list.stride as usize).max(1);
-    let elem_len = list.len as usize / stride;
-    let mut out = String::from("[");
-    for i in 0..elem_len {
-        if i != 0 { out.push_str(", "); }
-        if stride != 1 {
-            // Struct elements aren't printable yet — see DESIGN discussion.
-            out.push_str("<struct>");
-            continue;
-        }
-        let value = unsafe { *list.data.add(i) };
-        match kind {
-            0 => out.push_str(&value.to_string()),
-            // `{:?}`, not `Display`/`to_string` — Rust's `Display` for f64
-            // renders 1.0 as "1", which would make a `List(Float)` print
-            // identically to a `List(Int)`. `frog_float_print` already uses
-            // `{:?}` for the scalar case; this keeps the two agreeing.
-            1 => out.push_str(&format!("{:?}", f64::from_bits(value as u64))),
-            2 => out.push_str(&(value != 0).to_string()),
-            3 => unsafe {
-                let s = value as *const FrogStr;
-                let data = (s as *const u8).add(std::mem::size_of::<FrogStr>());
-                let bytes = std::slice::from_raw_parts(data, (*s).len as usize);
-                out.push_str(&String::from_utf8_lossy(bytes));
-            },
-            _ => out.push_str("<list>"),
-        }
-    }
-    print!("{out}]");
-}
+// List printing lives in codegen (`print_list`), not here: the runtime has
+// no element-type information, so a runtime printer could only emit
+// `<struct>`/`<list>` placeholders. See plans/DATA.md stage 0.
 
 // ── List operations ───────────────────────────────────────────────────────────
 

@@ -195,7 +195,7 @@ fn test_conditional() {
 #[test]
 fn test_list_literal() {
     let r = lower("[1, 2, 3]");
-    assert_eq!(r.ty, Type::List(Box::new(Type::Int)));
+    assert_eq!(r.ty, Type::list(Type::Int));
     assert!(matches!(r.kind, TypedExprKind::List(_)));
 }
 

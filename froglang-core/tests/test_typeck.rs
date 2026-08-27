@@ -497,7 +497,7 @@ fn test_list_type_inference() {
     let mut t = TypeChecker::new();
     // [1, 2, 3] :: List(Int)
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
-    assert_eq!(t.infer(&list).unwrap(), Type::List(Box::new(Type::Int)));
+    assert_eq!(t.infer(&list).unwrap(), Type::list(Type::Int));
 }
 
 #[test]
@@ -532,7 +532,7 @@ fn test_slice_type_inference() {
     // [1, 2, 3][0:2] :: List(Int)
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
     let s = spanned(Expression::slice(list, Some(int(0)), Some(int(2))));
-    assert_eq!(t.infer(&s).unwrap(), Type::List(Box::new(Type::Int)));
+    assert_eq!(t.infer(&s).unwrap(), Type::list(Type::Int));
 }
 
 #[test]
@@ -541,7 +541,7 @@ fn test_slice_omitted_bounds() {
     // [1, 2, 3][:] :: List(Int)
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
     let s = spanned(Expression::slice(list, None, None));
-    assert_eq!(t.infer(&s).unwrap(), Type::List(Box::new(Type::Int)));
+    assert_eq!(t.infer(&s).unwrap(), Type::list(Type::Int));
 }
 
 #[test]
@@ -564,7 +564,7 @@ fn test_range_type_inference() {
     let mut t = TypeChecker::new();
     // 1..5 :: List(Int)
     let r = spanned(Expression::range(int(1), int(5)));
-    assert_eq!(t.infer(&r).unwrap(), Type::List(Box::new(Type::Int)));
+    assert_eq!(t.infer(&r).unwrap(), Type::list(Type::Int));
 }
 
 #[test]
@@ -622,7 +622,7 @@ fn test_comprehension_type_inference() {
     let list = spanned(Expression::Tuple(vec![int(1), int(2), int(3)]));
     let fl = spanned(Expression::for_loop("x".to_string(), list, None, ident("x")));
     let comp = spanned(Expression::comprehension(fl));
-    assert_eq!(t.infer(&comp).unwrap(), Type::List(Box::new(Type::Int)));
+    assert_eq!(t.infer(&comp).unwrap(), Type::list(Type::Int));
 }
 
 #[test]

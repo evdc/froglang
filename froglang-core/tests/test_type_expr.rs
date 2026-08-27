@@ -118,7 +118,7 @@ fn test_union_annotation_rejects_a_non_member() {
 
 #[test]
 fn test_list_annotation() {
-    assert_eq!(infer_src("let xs: List(Int) = [1, 2, 3]").unwrap(), Type::List(Box::new(Type::Int)));
+    assert_eq!(infer_src("let xs: List(Int) = [1, 2, 3]").unwrap(), Type::list(Type::Int));
     assert!(infer_src("let xs: List(Str) = [1, 2, 3]").is_err());
 }
 
@@ -126,7 +126,7 @@ fn test_list_annotation() {
 fn test_nested_list_annotation() {
     assert_eq!(
         infer_src("let xs: List(List(Int)) = [[1], [2]]").unwrap(),
-        Type::List(Box::new(Type::List(Box::new(Type::Int)))),
+        Type::list(Type::list(Type::Int)),
     );
 }
 

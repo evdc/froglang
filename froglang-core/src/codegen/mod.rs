@@ -92,7 +92,7 @@ struct Ctx<'a> {
 /// scalar columns are labelled `Type::Int` and are deliberately excluded —
 /// a raw `Int` carries no tag bits and must never be scanned).
 pub fn is_heap_ty(ty: &Type) -> bool {
-    matches!(ty, Type::Str | Type::List(_) | Type::Union(_))
+    matches!(ty, Type::Str | Type::Union(_)) || ty.is_list()
 }
 
 /// The largest number of members a union can have and still be laid out
@@ -137,16 +137,20 @@ pub fn union_is_inline(members: &[Type], structs: &StructDefs) -> bool {
 /// belt-and-braces terminator rather than the thing doing the work.
 fn union_is_recursive(members: &[Type], structs: &StructDefs) -> bool {
     fn reaches(target: &[Type], ty: &Type, structs: &StructDefs, seen: &mut Vec<String>) -> bool {
+        // `as_struct_name` returns `None` for `List` (it excludes it by
+        // construction), so a `List(Tree)` field is never recursed into —
+        // it's a pointer regardless of element type, so it breaks the
+        // cycle, same as before `Type::Named` collapsed `List`/`Struct`.
+        if let Some(name) = ty.as_struct_name() {
+            if seen.iter().any(|s| s == name) { return false; }
+            seen.push(name.to_string());
+            let hit = structs.get(name).is_some_and(|fields| {
+                fields.iter().any(|(_, f)| reaches(target, f, structs, seen))
+            });
+            seen.pop();
+            return hit;
+        }
         match ty {
-            Type::Struct(name) => {
-                if seen.iter().any(|s| s == name) { return false; }
-                seen.push(name.clone());
-                let hit = structs.get(name).is_some_and(|fields| {
-                    fields.iter().any(|(_, f)| reaches(target, f, structs, seen))
-                });
-                seen.pop();
-                hit
-            },
             Type::Union(ms) => {
                 ms.as_slice() == target
                     || ms.iter().any(|m| reaches(target, m, structs, seen))
@@ -165,7 +169,7 @@ fn union_is_recursive(members: &[Type], structs: &StructDefs) -> bool {
 /// a boxed union's word may be an immediate (`(t << 3) | 7`). Overlaying a
 /// second tag on either corrupts it — RUNTIME.md's second open question.
 fn overlay_safe(leaf_ty: &Type) -> bool {
-    matches!(leaf_ty, Type::Str | Type::List(_))
+    matches!(leaf_ty, Type::Str) || leaf_ty.is_list()
 }
 
 /// Slot layout of an inline union (`union_is_inline`).
@@ -451,8 +455,8 @@ fn nominal_member_index(members: &[Type], enum_name: &str, variant: &str) -> usi
 /// merge block as more than one flat Cranelift value (see `struct_fields`):
 /// a struct, or an inline union.
 fn is_multi_leaf_type(ty: &Type, structs: &StructDefs) -> bool {
+    if ty.is_struct() { return true; }
     match ty {
-        Type::Struct(_) => true,
         Type::Union(members) => union_is_inline(members, structs),
         _ => false,
     }
@@ -486,18 +490,18 @@ fn gc_mask<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> i64 {
 /// rather than nested, e.g. `Company{ceo: Person{name, age}}` flattens to
 /// `[("ceo.name", Str), ("ceo.age", Int)]`.
 pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
-    match ty {
-        Type::Struct(name) => {
-            let fields = structs.get(name).cloned().unwrap_or_default();
-            let mut out = Vec::new();
-            for (fname, fty) in fields {
-                for (sub_path, sub_ty) in struct_fields(&fty, structs) {
-                    let path = if sub_path.is_empty() { fname.clone() } else { format!("{}.{}", fname, sub_path) };
-                    out.push((path, sub_ty));
-                }
+    if let Some(name) = ty.as_struct_name() {
+        let fields = structs.get(name).cloned().unwrap_or_default();
+        let mut out = Vec::new();
+        for (fname, fty) in fields {
+            for (sub_path, sub_ty) in struct_fields(&fty, structs) {
+                let path = if sub_path.is_empty() { fname.clone() } else { format!("{}.{}", fname, sub_path) };
+                out.push((path, sub_ty));
             }
-            out
-        },
+        }
+        return out;
+    }
+    match ty {
         // An inline union (`union_is_inline`) is flattened into its
         // `UnionLayout` columns instead of boxing: pointer columns first —
         // slot 0 carrying the member tag — then scalar columns. Each leaf
@@ -1093,13 +1097,13 @@ fn print_fragment(text: &str, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
 /// runtime/ffi.rs) switch on to render a list's element type. Both codegen
 /// call sites that build this discriminant must agree on the encoding.
 fn list_elem_kind(elem_ty: &Type) -> i64 {
+    if elem_ty.is_list() { return 4; }
+    if elem_ty.is_struct() { return 5; }
     match elem_ty {
         Type::Int => 0,
         Type::Float => 1,
         Type::Bool => 2,
         Type::Str => 3,
-        Type::List(_) => 4,
-        Type::Struct(_) => 5,
         _ => 6,
     }
 }
@@ -1108,23 +1112,31 @@ fn list_elem_kind(elem_ty: &Type) -> i64 {
 /// sequence of flattened leaf values, so this recursively consumes that
 /// sequence according to the declared field layout.
 fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
-    match ty {
-        Type::Struct(name) => {
-            print_fragment(&format!("{}(", name), bcx, ctx);
-            let fields = ctx.structs.get(name).expect("known struct in codegen");
-            // A positionally-declared ("tuple struct") field has no
-            // source-level name — `field_name_or_positional` gave it its
-            // index instead (`is_positional_fields`) — so print it bare
-            // (`Point(1, 2)`), not with that synthetic name attached
-            // (`Point(0=1, 1=2)`).
-            let positional = is_positional_fields(fields);
-            for (i, (field, field_ty)) in fields.iter().enumerate() {
-                if i != 0 { print_fragment(", ", bcx, ctx); }
-                if !positional { print_fragment(&format!("{}=", field), bcx, ctx); }
-                print_value(field_ty, values, cursor, bcx, ctx);
-            }
-            print_fragment(")", bcx, ctx);
+    if let Some(name) = ty.as_struct_name() {
+        print_fragment(&format!("{}(", name), bcx, ctx);
+        let fields = ctx.structs.get(name).expect("known struct in codegen");
+        // A positionally-declared ("tuple struct") field has no
+        // source-level name — `field_name_or_positional` gave it its
+        // index instead (`is_positional_fields`) — so print it bare
+        // (`Point(1, 2)`), not with that synthetic name attached
+        // (`Point(0=1, 1=2)`).
+        let positional = is_positional_fields(fields);
+        for (i, (field, field_ty)) in fields.iter().enumerate() {
+            if i != 0 { print_fragment(", ", bcx, ctx); }
+            if !positional { print_fragment(&format!("{}=", field), bcx, ctx); }
+            print_value(field_ty, values, cursor, bcx, ctx);
         }
+        print_fragment(")", bcx, ctx);
+        return;
+    }
+    if let Some(inner) = ty.as_list_elem() {
+        let callee = ctx.module.declare_func_in_func(ctx.func_ids["frog_list_print"], bcx.func);
+        let kind = bcx.ins().iconst(types::I64, list_elem_kind(inner));
+        bcx.ins().call(callee, &[values[*cursor], kind]);
+        *cursor += 1;
+        return;
+    }
+    match ty {
         Type::Union(members) => {
             // Mirrors `struct_fields`'s `Union` arm: a boxed union
             // consumes 1 leaf (the pointer/immediate), an inline one
@@ -1146,21 +1158,15 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
             print_fragment("None", bcx, ctx);
             *cursor += 1;
         }
-        Type::Int | Type::Float | Type::Bool | Type::List(_) => {
-            let (id, extra) = match ty {
-                Type::Int => ("frog_int_print", None),
-                Type::Float => ("frog_float_print", None),
-                Type::Bool => ("frog_bool_print", None),
-                Type::List(inner) => ("frog_list_print", Some(list_elem_kind(inner))),
+        Type::Int | Type::Float | Type::Bool => {
+            let id = match ty {
+                Type::Int => "frog_int_print",
+                Type::Float => "frog_float_print",
+                Type::Bool => "frog_bool_print",
                 _ => unreachable!(),
             };
             let callee = ctx.module.declare_func_in_func(ctx.func_ids[id], bcx.func);
-            if let Some(kind) = extra {
-                let kind = bcx.ins().iconst(types::I64, kind);
-                bcx.ins().call(callee, &[values[*cursor], kind]);
-            } else {
-                bcx.ins().call(callee, &[values[*cursor]]);
-            }
+            bcx.ins().call(callee, &[values[*cursor]]);
             *cursor += 1;
         }
         other => panic!("print codegen does not support {:?}", other),
@@ -2093,13 +2099,16 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
             return vec![bcx.ins().iconst(types::I64, 0)];
         }
         let arg_val = compile_expr(arg, bcx, vars, ctx);
-        let (rt_name, extra_arg) = match &arg.item.ty {
-            Type::Str => ("print", None),
-            Type::Int => ("frog_int_println", None),
-            Type::Float => ("frog_float_println", None),
-            Type::Bool => ("frog_bool_println", None),
-            Type::List(inner) => ("frog_list_println", Some(list_elem_kind(inner))),
-            ty => panic!("print codegen does not support {:?}", ty),
+        let (rt_name, extra_arg): (&str, Option<i64>) = if let Some(inner) = arg.item.ty.as_list_elem() {
+            ("frog_list_println", Some(list_elem_kind(inner)))
+        } else {
+            match &arg.item.ty {
+                Type::Str => ("print", None),
+                Type::Int => ("frog_int_println", None),
+                Type::Float => ("frog_float_println", None),
+                Type::Bool => ("frog_bool_println", None),
+                ty => panic!("print codegen does not support {:?}", ty),
+            }
         };
         let func_id = ctx.func_ids[rt_name];
         let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
@@ -2121,10 +2130,13 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
     if func_name == "len" {
         let arg = &args[0];
         let arg_val = compile_expr(arg, bcx, vars, ctx);
-        let rt_name = match &arg.item.ty {
-            Type::Str => "frog_str_len",
-            Type::List(_) => "frog_list_len",
-            ty => panic!("len codegen does not support {:?}", ty),
+        let rt_name = if arg.item.ty.is_list() {
+            "frog_list_len"
+        } else {
+            match &arg.item.ty {
+                Type::Str => "frog_str_len",
+                ty => panic!("len codegen does not support {:?}", ty),
+            }
         };
         let func_id = ctx.func_ids[rt_name];
         let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
@@ -2548,6 +2560,15 @@ fn compile_narrow(target_ty: &Type, value: &Spanned<TypedExpr>, bcx: &mut Functi
 
 fn compile_truthy(value: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     let v = compile_expr(value, bcx, vars, ctx);
+    if value.item.ty.is_list() {
+        let id     = ctx.func_ids["frog_list_len"];
+        let callee = ctx.module.declare_func_in_func(id, bcx.func);
+        let call   = bcx.ins().call(callee, &[v]);
+        let len    = bcx.inst_results(call)[0];
+        let zero   = bcx.ins().iconst(types::I64, 0);
+        let truthy = bcx.ins().icmp(IntCC::NotEqual, len, zero);
+        return vec![truthy];
+    }
     let truthy = match &value.item.ty {
         Type::Int => {
             let zero = bcx.ins().iconst(types::I64, 0);
@@ -2561,14 +2582,6 @@ fn compile_truthy(value: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &
         Type::None => bcx.ins().iconst(types::I8, 0),
         Type::Str => {
             let id     = ctx.func_ids["frog_str_len"];
-            let callee = ctx.module.declare_func_in_func(id, bcx.func);
-            let call   = bcx.ins().call(callee, &[v]);
-            let len    = bcx.inst_results(call)[0];
-            let zero   = bcx.ins().iconst(types::I64, 0);
-            bcx.ins().icmp(IntCC::NotEqual, len, zero)
-        },
-        Type::List(_) => {
-            let id     = ctx.func_ids["frog_list_len"];
             let callee = ctx.module.declare_func_in_func(id, bcx.func);
             let call   = bcx.ins().call(callee, &[v]);
             let len    = bcx.inst_results(call)[0];

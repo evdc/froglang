@@ -72,16 +72,18 @@ pub enum Type {
     /// Type variable with optional trait bounds.
     /// Empty bounds = unconstrained (used for lambda parameters).
     TypeVar { name: String, bounds: Vec<Trait> },
-    List(Box<Type>),
+    /// A named type constructor applied to zero or more arguments —
+    /// `List<Int>` is `Named{name: "List", args: [Int]}`, a plain struct
+    /// `Point` is `Named{name: "Point", args: []}`. Nominal for a
+    /// zero-arg name: only the name is compared (derived `PartialEq`
+    /// gives this for free), and field names/types for a struct live in
+    /// `TypeChecker.struct_defs`, not here, so cloning stays cheap
+    /// regardless of field count. `unify`/`lookup` recurse into `args`
+    /// invariantly — see `TRAITS.md` Part 4, "Variance".
+    Named { name: String, args: Vec<Type> },
     /// Sum / union type: a value whose type is one of the variants.
     /// Produced by if-expressions whose branches have incompatible types.
     Union(Vec<Type>),
-    /// A `data Name(...)` struct type. Nominal: only the name is compared
-    /// (derived `PartialEq`/`unify`'s `t1 == t2` fast path already give
-    /// this for free — two structs unify iff their names match). Field
-    /// names/types live in `TypeChecker.struct_defs`, not here, so cloning
-    /// a `Type::Struct` stays cheap regardless of field count.
-    Struct(String),
     /// The bottom type: no value of this type is ever produced. `return`'s
     /// own type (see `TypeChecker::return_types`) — it unifies with
     /// anything and vanishes from any union it appears in (`normalize`,
@@ -90,50 +92,48 @@ pub enum Type {
     Never,
 }
 
-/// The type-constructor name `Type::List` will be spelled as once it and
-/// `Type::Struct` collapse into `Type::Named { name, args }` (`TRAITS.md`
-/// Stage 1). Introduced now so every call site migrates onto the same
-/// constant ahead of that change, rather than a literal `"List"`.
+/// The `List` type constructor's name, as it appears in `Type::Named`.
 pub const LIST_NAME: &str = "List";
 
 impl Type {
-    /// `Type::List(Box::new(elem))`, spelled as it will be once `List`
-    /// becomes an ordinary `Type::Named { name: LIST_NAME, args: vec![elem] }`
-    /// (`TRAITS.md` Stage 1). Prefer this over constructing `Type::List`
-    /// directly so call sites don't need to change again when it lands.
+    /// `Type::Named { name: LIST_NAME, args: vec![elem] }`. Prefer this
+    /// over constructing `Type::Named` directly for a list.
     pub fn list(elem: Type) -> Type {
-        Type::List(Box::new(elem))
+        Type::Named { name: LIST_NAME.to_string(), args: vec![elem] }
     }
 
-    /// `Type::Struct(name)`, spelled as it will be once `Struct` becomes an
-    /// ordinary `Type::Named { name, args: vec![] }` (`TRAITS.md` Stage 1).
+    /// `Type::Named { name, args: vec![] }` — a plain struct/nullary type.
     pub fn strukt(name: impl Into<String>) -> Type {
-        Type::Struct(name.into())
+        Type::Named { name: name.into(), args: vec![] }
     }
 
-    /// `Some(elem)` iff this is a `List`, mirroring the `Named` shape:
-    /// under Stage 1 this becomes `args.first()` of a `Named{name: LIST_NAME, ..}`.
+    /// `Some(elem)` iff this is `List<elem>` — i.e. a `Named` whose name is
+    /// `LIST_NAME` and which therefore has exactly one argument.
     pub fn as_list_elem(&self) -> Option<&Type> {
         match self {
-            Type::List(inner) => Some(inner),
+            Type::Named { name, args } if name == LIST_NAME => args.first(),
             _ => None,
         }
     }
 
-    /// `Some(name)` iff this is a `Struct`.
+    /// `Some(name)` iff this is a zero-argument `Named` type other than
+    /// `List` — i.e. a plain struct. (`List` is excluded so a caller that
+    /// wants "the struct name" never mistakes a bare `List` for one; no
+    /// zero-arg `List` value exists anyway since it's always applied to
+    /// exactly one element type.)
     pub fn as_struct_name(&self) -> Option<&str> {
         match self {
-            Type::Struct(name) => Some(name.as_str()),
+            Type::Named { name, args } if args.is_empty() && name != LIST_NAME => Some(name.as_str()),
             _ => None,
         }
     }
 
     pub fn is_list(&self) -> bool {
-        matches!(self, Type::List(_))
+        matches!(self, Type::Named { name, .. } if name == LIST_NAME)
     }
 
     pub fn is_struct(&self) -> bool {
-        matches!(self, Type::Struct(_))
+        self.as_struct_name().is_some()
     }
 
     /// Normalize a union type: flatten nested unions, deduplicate, and sort
@@ -206,12 +206,18 @@ impl Display for Type {
                     write!(f, "~{}:{}", name, bs)
                 }
             },
-            Type::List(inner) => write!(f, "[{}]", inner),
+            Type::Named { name, args } if name == LIST_NAME => {
+                write!(f, "[{}]", args.first().expect("List always has exactly one arg"))
+            }
+            Type::Named { name, args } if args.is_empty() => write!(f, "{}", name),
+            Type::Named { name, args } => {
+                let strs: Vec<String> = args.iter().map(|t| t.to_string()).collect();
+                write!(f, "{}({})", name, strs.join(", "))
+            }
             Type::Union(variants) => {
                 let strs: Vec<String> = variants.iter().map(|t| format!("{}", t)).collect();
                 write!(f, "{}", strs.join(" | "))
             }
-            Type::Struct(name) => write!(f, "{}", name),
             Type::Never => write!(f, "Never"),
         }
     }
@@ -553,9 +559,9 @@ impl TypeChecker {
             // fail type-checking when the desugared per-field comparison is
             // itself inferred, which is the correct place for that error to
             // surface, not here.
-            Type::Struct(_) if *tr == Trait::Eq => true,
+            Type::Named { name, args } if args.is_empty() && name != LIST_NAME && *tr == Trait::Eq => true,
             // `Error` is granted, not structural — see `provides`.
-            Type::Struct(name) if *tr == Trait::Error => {
+            Type::Named { name, args } if args.is_empty() && name != LIST_NAME && *tr == Trait::Error => {
                 self.provides.get(name).map(|ts| ts.contains(tr)).unwrap_or(false)
             },
             _ => match tr {
@@ -563,7 +569,7 @@ impl TypeChecker {
                 Trait::Eq     => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
                 Trait::Ord    => matches!(ty, Type::Int | Type::Float | Type::Str),
                 Trait::Error  => false,
-                Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::List(_) | Type::None),
+                Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None) || ty.is_list(),
             }
         }
     }
@@ -919,8 +925,8 @@ impl TypeChecker {
         }
 
         match (expr.item, &expected) {
-            (Expression::Tuple(elems), Type::List(elem_ty)) => {
-                let elem_ty = (**elem_ty).clone();
+            (Expression::Tuple(elems), _) if expected.as_list_elem().is_some() => {
+                let elem_ty = expected.as_list_elem().expect("checked above").clone();
                 let mut items = Vec::with_capacity(elems.len());
                 for e in elems {
                     items.push(self.lower_expected(e, &elem_ty)?);
@@ -1765,7 +1771,10 @@ impl TypeChecker {
                 params: params.iter().map(|ty| self.lookup(ty)).collect(),
                 result: Box::new(self.lookup(&result)),
             },
-            Type::List(inner)      => Type::list(self.lookup(inner)),
+            Type::Named { name, args } => Type::Named {
+                name: name.clone(),
+                args: args.iter().map(|a| self.lookup(a)).collect(),
+            },
             Type::Union(variants)  => Type::Union(variants.iter().map(|t| self.lookup(t)).collect()),
             _ => ty.clone(),
         }
@@ -1897,6 +1906,23 @@ impl TypeChecker {
                 }
                 p1.iter().zip(p2.iter()).all(|(l, r)| self.unify(l, r)) &&
                 self.unify(&r1, &r2)
+            },
+            // Structural unification for named type constructors — invariant
+            // in every argument position (`TRAITS.md` Part 4, "Variance"):
+            // `List(Int)` does not unify with `List(Int | Str)` in either
+            // direction, since a list's runtime layout (stride, ptr_mask)
+            // depends on its element type and differs between them. Same
+            // constructor name and arity is required; a zero-arg `Named`
+            // (an ordinary struct) still falls out of this as a vacuous
+            // conjunction over zero arguments, so this arm also replaces
+            // the old nominal struct comparison — nothing else needs to be
+            // said for that case since `t1 == t2`'s fast path above already
+            // catches the common one, and this arm covers the (rare)
+            // remaining case where one side still carries a TypeVar in a
+            // field of a not-yet-fully-resolved structural type.
+            (Type::Named { name: n1, args: a1 }, Type::Named { name: n2, args: a2 }) => {
+                n1 == n2 && a1.len() == a2.len()
+                    && a1.iter().zip(a2.iter()).all(|(l, r)| self.unify(l, r))
             },
             _ => false,
         }
@@ -2108,13 +2134,13 @@ impl TypeChecker {
     /// branch trees at codegen time to print.
     fn check_printable(&self, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
         fn walk(ty: &Type, structs: &StructDefs, seen: &mut Vec<Vec<Type>>, span: Span) -> Result<(), Spanned<TypeError>> {
+            if let Some(name) = ty.as_struct_name() {
+                if let Some(fields) = structs.get(name) {
+                    for (_, fty) in fields { walk(fty, structs, seen, span)?; }
+                }
+                return Ok(());
+            }
             match ty {
-                Type::Struct(name) => {
-                    if let Some(fields) = structs.get(name) {
-                        for (_, fty) in fields { walk(fty, structs, seen, span)?; }
-                    }
-                    Ok(())
-                },
                 Type::Union(members) => {
                     if seen.iter().any(|s| s == members) {
                         return Err(Spanned::from(TypeError {
@@ -2874,7 +2900,7 @@ impl TypeChecker {
     fn finish_len(&mut self, arg: Spanned<TypedExpr>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let arg_span = arg.span;
         let arg_ty = self.lookup(&arg.item.ty);
-        if !matches!(arg_ty, Type::List(_) | Type::Str) {
+        if !arg_ty.is_list() && arg_ty != Type::Str {
             return Err(Spanned::from(TypeError {
                 msg: format!("len's argument must be a List or Str, got {:?}", arg_ty)
             }, arg_span));
@@ -3410,9 +3436,9 @@ impl TypeChecker {
         let target = self.check_and_lower(*idx.target)?;
         let target_ty = target.item.ty.clone();
         let resolved_target = self.lookup(&target_ty);
-        let elem_ty = match &resolved_target {
-            Type::List(inner) => (**inner).clone(),
-            Type::TypeVar { .. } => {
+        let elem_ty = match resolved_target.as_list_elem() {
+            Some(inner) => inner.clone(),
+            None if matches!(&resolved_target, Type::TypeVar { .. }) => {
                 let elem = self.fresh_var();
                 if !self.unify(&target_ty, &Type::list(elem.clone())) {
                     return Err(Spanned::from(TypeError {
@@ -3443,21 +3469,21 @@ impl TypeChecker {
         let target = self.check_and_lower(*s.target)?;
         let target_ty = target.item.ty.clone();
         let resolved_target = self.lookup(&target_ty);
-        let list_ty = match &resolved_target {
-            Type::List(_) => resolved_target.clone(),
-            Type::TypeVar { .. } => {
-                let elem = self.fresh_var();
-                let list_ty = Type::list(elem);
-                if !self.unify(&target_ty, &list_ty) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("Can't slice {}", resolved_target)
-                    }, target_span));
-                }
-                list_ty
-            },
-            _ => return Err(Spanned::from(TypeError {
+        let list_ty = if resolved_target.is_list() {
+            resolved_target.clone()
+        } else if matches!(&resolved_target, Type::TypeVar { .. }) {
+            let elem = self.fresh_var();
+            let list_ty = Type::list(elem);
+            if !self.unify(&target_ty, &list_ty) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Can't slice {}", resolved_target)
+                }, target_span));
+            }
+            list_ty
+        } else {
+            return Err(Spanned::from(TypeError {
                 msg: format!("Can't slice {}, expected a List", resolved_target)
-            }, target_span)),
+            }, target_span));
         };
 
         let mut bounds = Vec::with_capacity(2);
@@ -3663,9 +3689,9 @@ impl TypeChecker {
         let iterable = self.check_and_lower(*fl.iterable)?;
         let iter_ty = iterable.item.ty.clone();
         let resolved_iter = self.lookup(&iter_ty);
-        let elem_ty = match &resolved_iter {
-            Type::List(inner) => (**inner).clone(),
-            Type::TypeVar { .. } => {
+        let elem_ty = match resolved_iter.as_list_elem() {
+            Some(inner) => inner.clone(),
+            None if matches!(&resolved_iter, Type::TypeVar { .. }) => {
                 let elem = self.fresh_var();
                 if !self.unify(&iter_ty, &Type::list(elem.clone())) {
                     return Err(Spanned::from(TypeError {
@@ -4174,9 +4200,9 @@ impl TypeChecker {
         for (fname, fty) in &fields {
             let lf = Spanned::from(TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(l.clone()), field: fname.clone(), enum_name: None } }, span);
             let rf = Spanned::from(TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(r.clone()), field: fname.clone(), enum_name: None } }, span);
-            let sub = match fty {
-                Type::Struct(inner) => self.build_struct_eq(inner, lf, rf, span),
-                _ => Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::EqEq, left: Box::new(lf), right: Box::new(rf) } }, span),
+            let sub = match fty.as_struct_name() {
+                Some(inner) => self.build_struct_eq(inner, lf, rf, span),
+                None => Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::EqEq, left: Box::new(lf), right: Box::new(rf) } }, span),
             };
             chain = Some(match chain {
                 None => sub,
@@ -4205,13 +4231,23 @@ impl TypeChecker {
                 let arg_types: Vec<Type> = args.iter()
                     .map(|a| self.resolve_type_expr(a))
                     .collect::<Result<_, _>>()?;
-                match (name.as_str(), arg_types.len()) {
-                    ("List", 1) => Ok(Type::list(arg_types.into_iter().next().expect("len checked"))),
-                    ("List", n) => Err(Spanned::from(
-                        TypeError { msg: format!("List takes exactly 1 type argument, got {}", n) }, span)),
-                    _ => Err(Spanned::from(
-                        TypeError { msg: format!("Type '{}' does not take type arguments", name) }, span)),
+                // Declared arity of a named type constructor — `List` is 1,
+                // every registered struct/union name is 0 for now (no
+                // user-definable generics yet). This is the seam `TRAITS.md`
+                // Stage 3 extends for `data Pair<A, B>`.
+                if name == LIST_NAME {
+                    if arg_types.len() == 1 {
+                        return Ok(Type::list(arg_types.into_iter().next().expect("len checked")));
+                    }
+                    return Err(Spanned::from(
+                        TypeError { msg: format!("List takes exactly 1 type argument, got {}", arg_types.len()) }, span));
                 }
+                if arg_types.is_empty() && (self.struct_defs.contains_key(name) || self.union_defs.contains_key(name)) {
+                    return self.resolve_type_name(name)
+                        .ok_or_else(|| Spanned::from(TypeError { msg: format!("Unknown type '{}'", name) }, span));
+                }
+                Err(Spanned::from(
+                    TypeError { msg: format!("Type '{}' does not take type arguments", name) }, span))
             }
 
             TypeExpr::Union(members) => {

@@ -26,6 +26,16 @@ pub enum FrogValue {
 
 impl FrogValue {
     pub fn from_bits(bits: i64, ty: &Type, _heap: &GcHeap) -> Self {
+        if let Some(inner_ty) = ty.as_list_elem() {
+            let len = runtime::ffi::frog_list_len(bits) as usize;
+            let elems = (0..len)
+                .map(|i| {
+                    let elem = runtime::ffi::frog_list_get(bits, i as i64, 0);
+                    FrogValue::from_bits(elem, inner_ty, _heap)
+                })
+                .collect();
+            return FrogValue::List(elems);
+        }
         match ty {
             Type::Int  => FrogValue::Int(bits),
             Type::Float => FrogValue::Float(f64::from_bits(bits as u64)),
@@ -35,17 +45,6 @@ impl FrogValue {
                     runtime::gc::frog_str_as_str(bits as *const runtime::gc::FrogStr)
                 };
                 FrogValue::Str(s.to_owned())
-            },
-            Type::List(inner) => {
-                let len = runtime::ffi::frog_list_len(bits) as usize;
-                let inner_ty = inner.as_ref();
-                let elems = (0..len)
-                    .map(|i| {
-                        let elem = runtime::ffi::frog_list_get(bits, i as i64, 0);
-                        FrogValue::from_bits(elem, inner_ty, _heap)
-                    })
-                    .collect();
-                FrogValue::List(elems)
             },
             // Struct values aren't yet representable in the embedding API's
             // `FrogValue` (they're multi-slot in the JIT ABI — see
@@ -61,7 +60,10 @@ impl FrogValue {
             // which isn't threaded through here.
             // `Never` is never a value's actual runtime type — nothing of
             // that type is ever produced — but the match must stay exhaustive.
-            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Struct(_) | Type::Never => {
+            // A `Named` reaching here is always a plain struct (`List` was
+            // handled above), so it falls into the same "not yet
+            // representable" bucket.
+            Type::None | Type::Function { .. } | Type::Union(_) | Type::TypeVar { .. } | Type::Named { .. } | Type::Never => {
                 FrogValue::None
             },
         }

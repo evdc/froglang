@@ -1183,3 +1183,24 @@ fn a_nested_funcs_mut_parameters_do_not_leak_to_the_outer_scope() {
         f(5)";
     assert!(infer_src(src).is_ok(), "expected this to type-check: {:?}", infer_src(src));
 }
+
+// ── Occurs check (TRAITS.md Stage 2) ────────────────────────────────────────
+
+/// Pushing an empty mutable list's own alias into itself unifies the
+/// list's still-open element TypeVar with the list's own type — `~t` with
+/// `List(~t)` — which is exactly the infinite type an occurs check exists
+/// to reject. Two separate bindings (`xs`/`ys`) rather than `xs.push(xs)`
+/// directly, since that's already rejected earlier by `finish_push`'s
+/// same-root exclusivity check (`push_with_the_same_root_as_both_arguments_
+/// is_rejected` in test_value_semantics.rs) — this test wants the occurs
+/// check specifically, not that unrelated guard.
+#[test]
+fn pushing_a_lists_own_alias_into_itself_is_a_type_error_not_a_hang() {
+    let src = "\
+        mut xs = []\n\
+        mut ys = xs\n\
+        xs.push(ys)\n\
+        xs";
+    let err = infer_src(src).unwrap_err();
+    assert!(err.contains("Can't unify"), "unexpected error: {}", err);
+}

@@ -378,6 +378,11 @@ pub struct ScopeMark(usize);
 struct Binding {
     ty:      Type,
     mutable: bool,
+    /// A `func` or let-bound-lambda's generalized type parameters
+    /// (`TRAITS.md` Stage 2's type schemes) — empty for every other
+    /// binding, which is the ordinary monomorphic case. Non-empty only for
+    /// an immutable binding; see `TypeChecker::generalize`/`instantiate`.
+    binders: Vec<(String, Vec<Trait>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -393,13 +398,20 @@ impl ScopeStack {
     /// ever introduce a mutable one.
     fn new(bindings: HashMap<String, Type>) -> Self {
         let bindings = bindings.into_iter()
-            .map(|(k, ty)| (k, Binding { ty, mutable: false }))
+            .map(|(k, ty)| (k, Binding { ty, mutable: false, binders: Vec::new() }))
             .collect();
         ScopeStack { bindings, log: Vec::new(), depth: 0 }
     }
 
     fn get(&self, name: &str) -> Option<&Type> {
         self.bindings.get(name).map(|b| &b.ty)
+    }
+
+    /// This binding's generalized type parameters (`TRAITS.md` Stage 2),
+    /// or `None` if `name` isn't bound — distinct from `Some(&[])`, an
+    /// ordinary monomorphic binding.
+    fn binders(&self, name: &str) -> Option<&[(String, Vec<Trait>)]> {
+        self.bindings.get(name).map(|b| b.binders.as_slice())
     }
 
     /// `None` if `name` isn't bound at all — distinct from `Some(false)`,
@@ -428,7 +440,19 @@ impl ScopeStack {
     /// As `insert`, but the caller states the binding's mutability
     /// explicitly — the declaration path in `lower_assign`.
     fn insert_mut(&mut self, name: String, ty: Type, mutable: bool) {
-        let previous = self.bindings.insert(name.clone(), Binding { ty, mutable });
+        self.insert_raw(name, Binding { ty, mutable, binders: Vec::new() });
+    }
+
+    /// A generalized (`TRAITS.md` Stage 2) immutable binding — a `func` or
+    /// let-bound-lambda whose type scheme quantifies over `binders`. The
+    /// value restriction: only ever called for a syntactic function value,
+    /// never for a `mut` binding.
+    fn insert_generalized(&mut self, name: String, ty: Type, binders: Vec<(String, Vec<Trait>)>) {
+        self.insert_raw(name, Binding { ty, mutable: false, binders });
+    }
+
+    fn insert_raw(&mut self, name: String, binding: Binding) {
+        let previous = self.bindings.insert(name.clone(), binding);
         if self.depth > 0 {
             self.log.push((name, previous));
         }
@@ -658,6 +682,47 @@ impl TypeChecker {
         let v = Type::TypeVar { name: format!("t{}", self.next_id), bounds };
         self.next_id += 1;
         v
+    }
+
+    /// Instantiate a type scheme (`TRAITS.md` Stage 2): fresh-rename every
+    /// occurrence of each name in `binders` within `ty`, substituting a
+    /// fresh bounded `TypeVar` per binder — one fresh set per call, so
+    /// `let f = x -> x + x; f(1); f(1.5)` gets an independent instantiation
+    /// at each call rather than sharing one substitution the way an
+    /// ordinary (non-generalized) `TypeVar` would. Bounds travel from the
+    /// binder onto the fresh var, since `unify`/`type_implements` only ever
+    /// consult a `TypeVar`'s own `bounds` field, never a separate table —
+    /// this is what keeps `func max<T: Ord>(x: T, y: T): T` constrained at
+    /// every instantiation, not just the first.
+    ///
+    /// A structural walk over `ty` itself, not through `lookup`/
+    /// `substitutions` — a scheme's binders are bound within the stored
+    /// type, distinct from the mutable global unification variables an
+    /// ordinary `TypeVar` participates in. Any free `TypeVar` in `ty` that
+    /// is *not* one of `binders` (possible if `ty` closes over an outer,
+    /// still-live variable) is left untouched, so it stays linked to
+    /// whatever it already resolves to rather than being fresh-renamed.
+    fn instantiate(&mut self, ty: &Type, binders: &[(String, Vec<Trait>)]) -> Type {
+        if binders.is_empty() { return ty.clone(); }
+        let mapping: HashMap<String, Type> = binders.iter()
+            .map(|(name, bounds)| (name.clone(), self.fresh_bounded_var(bounds.clone())))
+            .collect();
+        fn subst(ty: &Type, mapping: &HashMap<String, Type>) -> Type {
+            match ty {
+                Type::TypeVar { name, .. } => mapping.get(name).cloned().unwrap_or_else(|| ty.clone()),
+                Type::Function { params, result } => Type::Function {
+                    params: params.iter().map(|p| subst(p, mapping)).collect(),
+                    result: Box::new(subst(result, mapping)),
+                },
+                Type::Named { name, args } => Type::Named {
+                    name: name.clone(),
+                    args: args.iter().map(|a| subst(a, mapping)).collect(),
+                },
+                Type::Union(variants) => Type::Union(variants.iter().map(|v| subst(v, mapping)).collect()),
+                _ => ty.clone(),
+            }
+        }
+        subst(ty, &mapping)
     }
 
     pub fn checkpoint(&self) -> TypeCheckerCheckpoint {
@@ -1837,6 +1902,27 @@ impl TypeChecker {
         })
     }
 
+    /// True iff the type variable named `name` appears free anywhere inside
+    /// `ty` (after substitution) — i.e. binding `name := ty` in
+    /// `substitutions` would create an infinite type, like `~t = List(~t)`.
+    /// `unify`'s TypeVar-binding arms all check this before writing to
+    /// `substitutions`; without it, `List(~t)` unifying with `~t` would
+    /// silently loop the next time anything called `lookup` on `~t`.
+    /// Harmless before `TRAITS.md` Stage 2 (no generalization means no
+    /// scheme can introduce a genuinely cyclic constraint on its own), but
+    /// generalization makes this reachable, so it's added now rather than
+    /// discovered as a hang once schemes exist.
+    fn occurs_in(&self, name: &str, ty: &Type) -> bool {
+        match self.lookup(ty) {
+            Type::TypeVar { name: n, .. } => n == name,
+            Type::Function { params, result } =>
+                params.iter().any(|p| self.occurs_in(name, p)) || self.occurs_in(name, &result),
+            Type::Named { args, .. } => args.iter().any(|a| self.occurs_in(name, a)),
+            Type::Union(variants) => variants.iter().any(|v| self.occurs_in(name, v)),
+            Type::None | Type::Int | Type::Float | Type::Bool | Type::Str | Type::Never => false,
+        }
+    }
+
     fn unify(&mut self, t1: &Type, t2: &Type) -> bool {
         let t1 = self.lookup(t1);
         let t2 = self.lookup(t2);
@@ -1851,6 +1937,12 @@ impl TypeChecker {
             // propagate when a bounded operator TypeVar unifies with an unconstrained
             // lambda parameter TypeVar.
             (Type::TypeVar { name: n1, bounds: b1 }, Type::TypeVar { name: n2, bounds: b2 }) => {
+                // `t1 == t2` above already caught `n1 == n2` with identical
+                // bounds; a same-named pair with different bounds shouldn't
+                // arise (a TypeVar's bounds are fixed at creation), but
+                // binding a variable to itself is a no-op guarded against
+                // here rather than relied upon not to happen.
+                if n1 == n2 { return true; }
                 if b2.len() > b1.len() {
                     // t2 has more bounds: bind t1 -> t2
                     self.substitutions.insert(n1.clone(), t2.clone());
@@ -1863,6 +1955,7 @@ impl TypeChecker {
             // Union ↔ bounded TypeVar: accept if every union member satisfies every bound,
             // e.g. `Int | Float` satisfies `Num`. Must come before the generic TypeVar arms.
             (Type::Union(variants), Type::TypeVar { name, bounds }) => {
+                if self.occurs_in(name, &t1) { return false; }
                 if bounds.iter().all(|b| variants.iter().all(|v| self.type_implements(v, b))) {
                     self.substitutions.insert(name.clone(), t1.clone());
                     true
@@ -1871,6 +1964,7 @@ impl TypeChecker {
                 }
             },
             (Type::TypeVar { name, bounds }, Type::Union(variants)) => {
+                if self.occurs_in(name, &t2) { return false; }
                 if bounds.iter().all(|b| variants.iter().all(|v| self.type_implements(v, b))) {
                     self.substitutions.insert(name.clone(), t2.clone());
                     true
@@ -1880,6 +1974,7 @@ impl TypeChecker {
             },
             // Bounded TypeVar on left, concrete type on right.
             (Type::TypeVar { name, bounds }, _) => {
+                if self.occurs_in(name, &t2) { return false; }
                 if !bounds.iter().all(|b| self.type_implements(&t2, b)) {
                     return false;
                 }
@@ -1888,6 +1983,7 @@ impl TypeChecker {
             },
             // Concrete type on left, bounded TypeVar on right.
             (_, Type::TypeVar { name, bounds }) => {
+                if self.occurs_in(name, &t1) { return false; }
                 if !bounds.iter().all(|b| self.type_implements(&t1, b)) {
                     return false;
                 }
@@ -2253,7 +2349,16 @@ impl TypeChecker {
             // `data Color is Red | ...`) — see `infer_bare_variant`.
             Token::Identifier(nm) => match self.ctx.get(&nm).cloned() {
                 Some(bound) => {
-                    let ty = self.lookup(&bound);
+                    // Instantiate the scheme (`TRAITS.md` Stage 2) before
+                    // resolving substitutions — a generalized binding's
+                    // binders are frozen quantifiers, not live unification
+                    // variables, so `lookup` must never see them until
+                    // after they've been fresh-renamed for this call. For
+                    // an ordinary monomorphic binding `binders` is empty
+                    // and `instantiate` is a no-op clone, same as before.
+                    let binders = self.ctx.binders(&nm).expect("just found by get").to_vec();
+                    let instantiated = self.instantiate(&bound, &binders);
+                    let ty = self.lookup(&instantiated);
                     (TypedExprKind::Var(nm), ty)
                 },
                 None => {
@@ -3283,6 +3388,15 @@ impl TypeChecker {
                 msg: format!("{} has no field '{}', and there's no function '{}' to call as a method", resolved, field, field)
             }, span));
         };
+        // Instantiate `field`'s scheme (`TRAITS.md` Stage 2) before
+        // testing receiver acceptance below — this call site doesn't go
+        // through `lower_literal`'s `Var` arm (it's synthesizing a callee
+        // from a bare name, not lowering an `Expression::Var`), so without
+        // this a generic free function's first parameter would bind
+        // permanently to whichever type dot-called it first, via the
+        // mutating `unify` a few lines down.
+        let binders = self.ctx.binders(&field).expect("just found by get").to_vec();
+        let func_ty = self.instantiate(&func_ty, &binders);
         let func_ty = self.lookup(&func_ty);
         let Type::Function { params, result } = func_ty.clone() else {
             return Err(Spanned::from(TypeError {

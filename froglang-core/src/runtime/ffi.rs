@@ -122,7 +122,9 @@ pub extern "C" fn frog_str_repr_print(s: i64) {
         let len = (*ptr).len as usize;
         let data = (ptr as *const u8).add(std::mem::size_of::<FrogStr>());
         let bytes = std::slice::from_raw_parts(data, len);
-        let _ = write!(std::io::stdout(), "{:?}", String::from_utf8_lossy(bytes));
+        // `crate::notation::escape_str`, not Rust's `{:?}`: `escape_debug`
+        // spells escapes froglang's lexer doesn't accept.
+        let _ = write!(std::io::stdout(), "{}", crate::notation::escape_str(&String::from_utf8_lossy(bytes)));
         let _ = std::io::stdout().flush();
     }
 }
@@ -151,7 +153,7 @@ pub extern "C" fn frog_int_println(n: i64) {
 
 #[no_mangle]
 pub extern "C" fn frog_float_println(n: f64) {
-    print!("{n:?}\n");
+    print!("{}\n", crate::notation::float_repr(n));
 }
 
 #[no_mangle]
@@ -163,7 +165,7 @@ pub extern "C" fn frog_bool_println(b: i8) {
 pub extern "C" fn frog_int_print(n: i64) { print!("{n}"); }
 
 #[no_mangle]
-pub extern "C" fn frog_float_print(n: f64) { print!("{n:?}"); }
+pub extern "C" fn frog_float_print(n: f64) { print!("{}", crate::notation::float_repr(n)); }
 
 #[no_mangle]
 pub extern "C" fn frog_bool_print(b: i8) { print!("{}", b != 0); }

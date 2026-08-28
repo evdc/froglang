@@ -153,7 +153,11 @@ fn int_to_str(n: i64) -> String {
 
 #[frog_fn]
 fn float_to_str(f: f64) -> String {
-    f.to_string()
+    // Frog notation (`crate::notation`), not Rust's `Display` — this used
+    // to disagree with `print`'s own float formatting (`"1"` not `"1.0"`,
+    // `"NaN"` not `"nan"`), which is unreadable back into the lexer either
+    // way.
+    crate::notation::float_repr(f)
 }
 
 #[frog_fn]

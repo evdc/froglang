@@ -1,6 +1,6 @@
 # Data, Notation, and Annotations
 
-Status: **design**, with Stage 0 done and Stage 1's `print` half done. Everything
+Status: **design**, with Stages 0 and 2 done and Stage 1's `print` half done. Everything
 from Stage 3 on is a sketch; the *decisions* table is the part meant to be stable.
 
 This supersedes the roadmap's "Annotations, and auto-deriving trait implementations" bullet and
@@ -31,8 +31,8 @@ Measured behaviour of `print` today:
 | `42` | `42` | yes |
 | `0.1+0.2` | `0.30000000000000004` | yes — shortest-roundtrip |
 | `1.0` | `1.0` | yes — the `.0` keeps Float ≠ Int in notation |
-| `1e100` | `1e100` | **no** — the lexer has no exponent literal |
-| `1.0/0.0` | `inf` | **no** — no literal |
+| `1e100` | `1e100` | yes — *fixed, stage 2* |
+| `1.0/0.0` | `inf` | yes — *fixed, stage 2* |
 | `none` | ~~*codegen panic*~~ → `none` | yes — *fixed, stage 1* |
 | `[[1,2],[3]]` | ~~`[<list>, <list>]`~~ → `[[1, 2], [3]]` | yes — *fixed, stage 0* |
 | `[Person(...)]` | ~~`[<struct>]`~~ → `[Person(name="Alice", age=42)]` | yes — *fixed, stage 0* |
@@ -48,13 +48,14 @@ Structural facts behind that table:
   tag and call `frog_list_print`, which had no type information left and emitted
   `<struct>` / `<list>` placeholders. That one decision caused every `no` in the table
   except the float and `none` rows. The walk reaches through a list now.
-- **`frog_float_print` uses Rust's `{:?}`** (`ffi.rs:166`). Shortest-roundtrip formatting, which
-  is the hard half already correct — but it emits `1e100`, `inf`, and `NaN`, none of which the
-  lexer accepts.
-- **`frog_str_repr_print` uses Rust's `{:?}`** (`ffi.rs:119`), i.e. `escape_debug`. The lexer's
-  escape set is `\n \t \r \\ \" \0` (`lexer.rs:202-210`) — no `\u{...}`, no `\x..` — and an
-  **unknown escape silently degrades to the literal character**. So a control character prints as
-  `\u{7}` and reads back as the four-character string `u{7}`: wrong, silently, with no error.
+- ~~**`frog_float_print` uses Rust's `{:?}`**~~ *(Fixed in stage 2.)* Shortest-roundtrip
+  formatting was the hard half already correct, but it emitted `1e100`, `inf`, and `NaN`, none
+  of which the lexer accepted. Both float printers go through `notation::float_repr` now.
+- ~~**`frog_str_repr_print` uses Rust's `{:?}`**~~ *(Fixed in stage 2.)* `escape_debug` spells a
+  control character `\u{7}`, which the lexer had no escape for — and an **unknown escape
+  silently degraded to the literal character**, so it read back as the four-character string
+  `u{7}`: wrong, silently, with no error. `notation::escape_str` and the lexer now share one
+  escape set, and an unknown escape is an error.
 - **Blocks are a prefix parselet on `LeftBrace`** (`tokens.rs:185`), so `{` can begin an
   expression anywhere. But across all 38 `.frog` files, all 54 `{` are preceded by a keyword or
   `=` (`for..do`, `func..=`, `then`/`else`, `while`, `match`, `import`). Zero occurrences in
@@ -138,9 +139,9 @@ tier and the interop tier; the syntax changes are deliberately last.
 |---|---|---|---|
 | 0 | **done** — List printing into the codegen walk | everything | — |
 | 1 | **`print` half done** — `print` / `repr` split; `Show`+`Eq` totality | the law | 0 |
-| 2 | Float and string notation fixes | the law | — |
+| 2 | **done** — float and string notation fixes | the law | — |
 | 3 | Source map: fn-ptr → span | diagnostics, function printing | — |
-| 4 | `StrBuf` / `Sink` | every serializer | — |
+| 4 | `Sink` (implemented by `StrBuf`) | every serializer | — |
 | 5 | `repr` / `read` at the typed-AST layer; the property test | Tier 1 | 1, 2, 4 |
 | 6 | Annotations: syntax, typed declarations, validation | Tier 2, host-side libs | — |
 | 7 | Host exposure of the declaration table | ORM/DB use case | 6 |
@@ -264,7 +265,7 @@ different strategies for real reasons:
 
 ---
 
-## Stage 2 — float and string notation
+## Stage 2 — float and string notation — **done**
 
 **Floats.** Add exponent literals to the lexer (`1e100`, `1E5`, `1.5e-3`; do not swallow `e100`
 as an identifier) — wanted independently of this document. Add `inf` and `nan` as lowercase
@@ -292,6 +293,34 @@ language for generated code should do.
 **Future constraint**: if an interpolating string form (`'${...}'`) is added, `repr` must emit
 the non-interpolating form or escape `$`. Note it in the interpolation design when it happens.
 
+### What it took
+
+Option (1) was taken: the lexer grew `\u{...}` (1–6 hex digits, `char::from_u32`'s range,
+with a surrogate rejected rather than replaced), and unknown escapes are a lex error.
+
+The formatters moved out of `ffi.rs` into **`src/notation.rs`**, a crate-root module, because
+three places print a value and all three were formatting it differently: `runtime::ffi` (what a
+compiled `print` calls), `state::FrogValue::display_str` (what the embedding API and the REPL
+render — it was still on `{:?}` for both floats and strings), and stage 5's `repr`, which will
+be the third. `float_repr` and `escape_str` are stated there as the lexer's counterpart, and
+their unit tests are round trips *through the lexer* rather than expected strings, so the two
+sides cannot drift silently again — which is the whole failure this stage existed to fix.
+
+Three things the plan didn't call:
+
+- **`inf`/`nan` are keyword tokens** (`Token::Inf`/`Token::Nan`, `#[prefix(Grammar::literal)]`),
+  not lexed as `Token::Float(f64::NAN)` — `Token` derives `PartialEq`, and a `Float(NAN)` token
+  is not equal to itself, which is a hazard to leave lying in the parser's token comparisons.
+- **The exponent scan needs two characters of lookahead**, not one: `e` is a name character, so
+  the sign may sit between it and the first digit, and `1 else x` / `1e` must keep their `e`
+  for `read_name`.
+- **A bad escape resyncs to the closing quote** instead of returning immediately. Returning
+  early left the lexer positioned *inside* the string, so one mistyped escape cascaded into an
+  unterminated-string error plus whatever the rest of the literal lexed as.
+
+Not done, deliberately: `1e400` parses to `inf` rather than erroring, which is Rust's `f64`
+parse behaviour and round-trips (it prints `inf`).
+
 ---
 
 ## Stage 3 — source map
@@ -313,17 +342,93 @@ no `Show`, `print` shows them in `<...>`, `repr` rejects them.
 
 ---
 
-## Stage 4 — `StrBuf` / `Sink`
-
-`Str` is immutable, so a derive that builds a string by concatenation is O(n²). Every serializer
-in this document needs a mutable buffer.
+## Stage 4 — `Sink`, implemented by `StrBuf`
 
 Not currently on `roadmap.md` or in any plan. It is the real gate on Stage 5 and Stage 8, and it
 is worth listing as its own item rather than discovering it inside them.
 
-Minimum: a GC-managed growable byte buffer with `push_str`, `finish(): Str`. Whether it is the
-same object as a future `Sink` trait (so a serializer can write to a file or a socket without
-materializing a `Str`) is worth deciding at design time rather than retrofitting.
+### `StrBuf` is not the primitive here — `Sink` is
+
+The original framing was "`Str` is immutable, so a derive that builds a string by concatenation
+is O(n²), add a mutable buffer." That motivation turns out to be smaller than it looks: froglang
+already has a mutable-accumulator idiom with no new type at all.
+
+```frog
+func emit(mut out: List<Str>, depth: Int): Int = {
+    out.push("(")
+    if depth > 0 then emit(mut out, depth - 1) else 0
+    out.push(")")
+    0
+}
+mut acc = []
+emit(mut acc, 3)
+acc.join("")   // "(((())))"
+```
+
+`mut` parameters thread an accumulator through recursion with the pushes visible to the caller —
+copy-in/copy-out, no aliasing, the mutation marked at the call site the way the language already
+insists on. `List<Str>` + `join` is O(n) bytes copied once; the O(n²) case is `s = s + x`, which
+this was never going to reach for. What a byte-buffer type would still buy over it is a constant
+factor — one GC object instead of one per fragment — which is real for a hot serializer but is
+*tuning*, not a semantic gap, and tuning is exactly what shouldn't force a language decision this
+early.
+
+**The part that is semantic is identity, and it's the more important of the two reasons `Sink`
+exists.** Streaming to a file or socket without materializing the whole output first is a real
+memory-complexity difference — but the sharper point is that **a sink is the first thing in
+froglang with identity.** Every value in the language today is copied, not aliased (`mut`
+params included — copy-in/copy-out preserves that, it doesn't break it); nothing has "the same
+object" semantics, and that absence is exactly what keeps `repr` total with no seen-set (see
+"Why the notation is a tree," above). Writing to one sink twice is not writing to two copies of
+it — a `Sink` value has to be checked against duplication, not merely documented against it.
+That's a bigger decision than a buffer type, and it's the one worth making explicitly rather than
+backing into via `StrBuf`. `TRAITS.md` Part 7 (`Linear`) is that decision: a marker trait, no new
+trait-system machinery, checked by extending the liveness pass that already exists.
+
+### The sketch
+
+```frog
+trait Sink {
+    func write(mut self, s: Str): None
+    func flush(mut self): Result<None, ErrMsg>
+}
+```
+
+- **`mut self`, not a return-new-value method** — a `Sink` implementation needs no new mutation
+  mechanism; `mut` is already the language's spelling for "this call has an externally visible
+  effect." What makes aliasing through it safe is `Linear` (`TRAITS.md` Part 7), required
+  alongside `Sink` on every implementer: `data StrBuf(...) provides Sink, Linear`.
+- **Monomorphized per implementation, not `any Trait`.** A serializer's sink type is always
+  known statically at its call site (`repr(x, mut out: StrBuf)` vs `repr(x, mut out: FileSink)`
+  are two monomorphizations, exactly like any other generic function here) — so `Sink` needs
+  none of TRAITS.md's deferred dynamic-dispatch machinery. `any Trait` and runtime reflection
+  were declined together for the same reason (see "Reflection," below); `Sink` is the
+  counterexample that shows a trait doesn't need that machinery just because it crosses an I/O
+  boundary.
+- **`StrBuf` is an implementation of `Sink`, not a peer of it** — the accumulating case, backed
+  by (at minimum) `List<Str>` under the hood, or a dedicated growable byte buffer if a benchmark
+  ever asks for the constant factor. Its representation is private either way, so which one it
+  starts as is not a decision that has to be made now, and changing it later is not a signature
+  change. This resolves the open question of whether `StrBuf` and `Sink` are the same object:
+  they aren't, and `Sink` should land first since it's the thing every other decision here hangs
+  off of.
+- **`write_stdout`/`write_stderr`/file writes (`stdlib/fs.rs`) become `Sink` implementations**
+  once `Sink` exists, rather than the free path-based functions they are today (`fs.rs`'s own
+  doc comment already flags this: no file *handles* exist yet, every operation is whole-file).
+  That is the concrete reason to want `Sink` beyond `repr`/serde — it is also the shape a real
+  file-handle API needs, and inventing it twice (once for I/O, once for serialization) would be
+  the special-case duplication this whole document argues against.
+
+### `<<` — deliberately not sketched here
+
+UFCS already gets most of what the operator would buy: `out.write(x)` reads as well as
+`out << x` would, with no new token, no precedence question (`<<` sits next to `<`/`<=`, and
+`a << b == c` needs a ruling), and no divergence from how every other method call in the
+language looks. What the operator would actually change is that `out << x` visually *hides* the
+mutation the way `f(mut x)` deliberately doesn't — defensible, since `Sink`'s `Linear` marker is
+the same "this is safe to alias through" ruling that would justify hiding it, but that is the
+identity decision above wearing different clothes. Decide `Sink`'s `Linear` story first (`TRAITS.md`
+Part 7); the operator, if wanted, is a one-line sugar afterward, not a design of its own.
 
 ---
 
@@ -549,8 +654,19 @@ TRAITS.md stages 2–3 land. Runtime reflection declined.**
   must be their literal too, and `DESIGN.md` line 98 already flags the grouping-paren collision.
 - **`without` opt-out from structural derives.** TRAITS.md Part 3 defers it; serde's
   `data Password(hash: Str)` case is the first concrete customer.
+    -> follow up note: perhaps it's just a null impl: `data Password implements Show {}`
 - **Non-JSON interop formats.** The `Sink`-based lowering is format-parameterized by design, so
   CBOR / query-params slot in without new machinery.
+- **A `Byte` primitive (`u8`).** Came up sketching stage 4: a byte-buffer `Sink` implementation
+  wants a real byte type rather than treating everything as `Str`/`List<Int>`, and CBOR/binary
+  interop formats want it more than JSON does. `Int` is froglang's one integer type today
+  (`isize`-width); the general fixed-width family (`i8`/`i16`/`i32`/`u8`/... ) is out of scope —
+  it's a much bigger surface (arithmetic overflow behavior per width, conversions, literal
+  suffixes) for a use case this document doesn't need. `Byte` alone is narrower and has an
+  independent justification: it's the element type a byte buffer, a file's raw contents, and a
+  socket read all actually want, none of which is well-modeled by `Int` (8x too wide, silently
+  allows out-of-range values) or `Str` (implies UTF-8, which raw bytes aren't). Revisit alongside
+  stage 4 if a byte-buffer `Sink` implementation is actually built; no urgency before then.
 
 ---
 
@@ -579,15 +695,19 @@ TRAITS.md stages 2–3 land. Runtime reflection declined.**
 
 ## Open questions
 
-- **`\u{...}` in the lexer, or `repr` rejects unspellable strings?** Leaning the former.
-- **Should unknown escapes become a parse error?** Small breaking change; turns silent wrongness
-  into a diagnostic, which is what the language is for.
+- ~~**`\u{...}` in the lexer, or `repr` rejects unspellable strings?**~~ *Settled, stage 2*: the
+  lexer has `\u{...}`, so no string is unspellable.
+- ~~**Should unknown escapes become a parse error?**~~ *Settled, stage 2*: yes.
 - **Which JSON stack is canonical** for a value crossing the embedding boundary.
 - **Default union tagging** — external or internal.
 - **Is `StrBuf` the same object as a `Sink` trait**, or does `Sink` come later as an abstraction
   over it? Deciding at design time is cheaper than retrofitting.
 - **Does closing `project_list_aliasing_gap` become a prerequisite** for asserting the law, or
   can `repr` ship with a depth limit as a stopgap? Prefer the former.
+- ~~**`Sink`'s exemption from value semantics**~~ *Settled*: `Sink` implementers require
+  `provides Linear` (`TRAITS.md` Part 7) — a checked marker trait, not a special-cased rule, and
+  it generalizes to any future host-provided handle type (locks, channels, one-shot futures) with
+  no `Sink`-specific machinery.
 
 ---
 

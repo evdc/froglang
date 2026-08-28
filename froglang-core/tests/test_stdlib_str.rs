@@ -133,6 +133,17 @@ fn round_trip_conversions() {
     assert_eq!(string(&s.eval("bool_to_str(true)").unwrap().0), "true");
 }
 
+/// `float_to_str` used to go through Rust's `Display` (`"1"`, `"NaN"`),
+/// disagreeing with `print`'s own frog-notation formatting (`"1.0"`,
+/// `"nan"`) — see `crate::notation`. Both go through the same formatter now.
+#[test]
+fn float_to_str_matches_frog_notation() {
+    let mut s = FrogState::with_stdlib().unwrap();
+    assert_eq!(string(&s.eval("float_to_str(1.0)").unwrap().0), "1.0");
+    assert_eq!(string(&s.eval("float_to_str(1.0 / 0.0)").unwrap().0), "inf");
+    assert_eq!(string(&s.eval("float_to_str(0.0 / 0.0)").unwrap().0), "nan");
+}
+
 /// `slice`'s `ErrMsg` and its `Ok` value are both `Str`-shaped
 /// (`Result<String, ErrMsg>`) — the exact shape `host.rs`'s doc comment
 /// warns a bare `Result<String, String>` would collide on. `ErrMsg` being a

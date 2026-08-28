@@ -73,9 +73,11 @@ impl FrogValue {
     pub fn display_str(&self) -> String {
         match self {
             FrogValue::Int(n)    => format!("{}", n),
-            FrogValue::Float(f)  => format!("{:?}", f),
+            // Frog notation, not Rust's — a REPL result is a value the user
+            // may well paste back in. See `crate::notation`.
+            FrogValue::Float(f)  => crate::notation::float_repr(*f),
             FrogValue::Bool(b)   => format!("{}", b),
-            FrogValue::Str(s)    => format!("{:?}", s),
+            FrogValue::Str(s)    => crate::notation::escape_str(s),
             FrogValue::List(v)   => format!(
                 "[{}]",
                 v.iter().map(|e| e.display_str()).collect::<Vec<_>>().join(", ")

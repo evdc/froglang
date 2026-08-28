@@ -116,6 +116,26 @@ print(b)
     assert_eq!(run_gc_stress(src), "[1, 2, 3]\n[1, 2, 3, 99]\n");
 }
 
+/// An empty-list literal passed as a `mut` argument, into a parameter whose
+/// element type is concrete. `lower_call_arg` unifies the literal's
+/// still-unresolved `TypeVar` element type against the parameter, but
+/// `lower_widen` used to compare the *unresolved* `TypedExpr::ty` and fall
+/// through unchanged — so codegen, reading `ty` directly, saw a `List<t0>`
+/// value land in a `List<Str>` slot and panicked ("no widening from
+/// List<t0> to List<Str>"). `mut acc = ["seed"]` masked this: only an
+/// argument the *element type itself* is never independently fixed by
+/// triggers it.
+#[test]
+fn an_empty_list_literal_widens_through_a_mut_argument() {
+    let src = r#"
+func fill(mut out: List<Str>): None = { push(mut out, "x") }
+mut acc = []
+fill(mut acc)
+print(acc)
+"#;
+    assert_eq!(run(src), "[\"x\"]\n");
+}
+
 // ── typeck rejections ─────────────────────────────────────────────────────
 
 fn expect_push_type_error(src: &str, needle: &str) {

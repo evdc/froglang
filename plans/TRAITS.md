@@ -573,6 +573,90 @@ ambient instance chosen at runtime is the one case monomorphization cannot erase
 
 ---
 
+# Part 7 — `Linear`: a marker trait for resource identity
+
+Motivated by `DATA.md`'s `Sink`, but not specific to it — see below for other customers.
+
+## The problem
+
+Every value in froglang today is copied, not aliased: `mut` params are copy-in/copy-out, `List`/
+`Str` deep-clone on any aliasing-risk read (`codegen/mod.rs`'s `Move`/`Copy` liveness
+classification). That is exactly right for data, and exactly wrong for a handle to something
+external — a `Sink`, a file, a lock guard, a channel endpoint, a one-shot future. Writing to one
+copy of a sink and reading from another is not "two independent values that happen to look
+alike," the way two copies of a `List` are; it's the same resource observed through a broken
+window. The earlier framing of this problem (an earlier draft of `DATA.md`'s Stage 4) was "such
+types are exempt from value semantics" — workable, but a blanket carve-out rather than a checked
+property, and it doesn't generalize to "the compiler catches me if I alias one of these."
+
+## `Linear`, not a new trait mechanism
+
+`Linear` is an ordinary marker trait, structurally identical to `Error`: no members, granted by
+`provides`, never structurally derived. Nothing about the trait-resolution machinery in Part 1
+changes.
+
+```frog
+data StrBuf(...) provides Sink, Linear
+```
+
+**Why `Linear` rather than `Handle` or `IO`**: the property being enforced is "duplicating this
+value is a bug," not "this represents an external resource" (`Handle`) or "this does I/O" (`IO`).
+Locks, channel endpoints, one-shot futures/promises, transaction handles, and capability tokens
+are all real customers with nothing to do with I/O — `IO` would misname the mechanism and invite
+someone to reach for it on the wrong axis.
+
+## No supertraits needed
+
+`trait Sink: Handle` was the first draft of this idea, and it doesn't fit: **TRAITS.md has no
+trait-inheritance mechanism today**, and adding one raises the same "two traits declare the same
+member name" question Part 1 spent effort avoiding for ordinary traits — a real feature, not
+earned by this alone. Instead: a type states both markers (`provides Sink, Linear`), and impl
+registration — already the place duplicate `(Trait, Type)` pairs are rejected, see "Coherence" —
+gets one more targeted check: registering `Sink` without `Linear` on the same type is an error.
+That buys "every `Sink` is `Linear`" as a checked conjunction, not a general inheritance feature.
+Revisit only if a second, unrelated case wants real supertraits.
+
+## The check itself
+
+No new algorithm class, and reuses infrastructure that already exists:
+
+- `codegen/mod.rs`'s liveness pass already classifies every read of a GC-pointer-bearing binding
+  as `Move` (last use, no clone) or `Copy` (aliasing risk, clone before use). For an ordinary type
+  this decides "clone or don't"; for a `Linear` type, a `Copy`-classified read becomes a **type
+  error** ("`buf` is `Linear`; it can only be moved or passed `mut`, not aliased") instead of a
+  silent clone. Emitted at typeck, before codegen ever sees it.
+- At a branch join (`if`/`match`), a `Linear` binding must be consumed on every path or none —
+  the same fixpoint the existing `mut`-liveness back-edge analysis (`transfer_loop`) already
+  computes, extended to error rather than merge when the arms disagree.
+- No lifetimes, no region variables, no annotation burden beyond what `mut` already asks for.
+  froglang has no borrowing (`&`) — `mut` is copy-in/copy-out, never a reference — so this needs
+  none of the flow-sensitive lifetime inference that makes Rust's borrow checker (as opposed to
+  its ownership rules) hard to build or to use. See "Prior art" below for the specific precedent.
+- A `Linear` value's GC representation can be a genuine identity handle — `clone_obj` returns the
+  same pointer rather than deep-copying — since the type checker has already ruled out the
+  `Copy`-classified read that would make that observable as aliasing.
+
+## Relationship to `CONCURRENCY.md`'s regions
+
+Orthogonal axes, meant to compose, on purpose — the same split as Rust's ownership (can this be
+duplicated) versus borrowing (how long can a reference live). Region-bound types (`CONCURRENCY.md`
+Rule B) answer *where a value may travel*: it can't escape its `with` block. They do **not**
+answer *how many live references exist within the block* — Rule B's own text permits a bound value
+to be "passed as a function argument, bound to a local, and read freely," which allows
+`let g = f` inside the region. `Linear` is what closes that gap. A real `File` wants both:
+
+```frog
+data File(fd: Int) provides Read, Write, Sink, Linear
+```
+
+region-bound so it can't outlive its `with` block (no use-after-close — already a stated win of
+regions), and `Linear` so it can't be silently duplicated within the block (no double-write
+through an alias — a case regions alone don't cover). `Scope`/`Task(T)` are plausible second
+customers once `Linear` exists — nothing stops `let s2 = scope_value` today — though that's a note
+for `CONCURRENCY.md` to pick up, not a blocker here.
+
+---
+
 # Dispatch and representation
 
 Monomorphize. Trait calls resolve statically at each instantiation; no vtables. This keeps
@@ -950,6 +1034,8 @@ Not foundational; none of them constrain the above.
 - **Annotation-driven derives** (`#db:model` and friends). Structural defaults remove the need for
   `#derive(Eq)` specifically; annotations are still wanted for serde/DB work, on their own track.
 - **Trait members in `data` fields, and variance thereof.**
+- **General trait inheritance (`trait A: B`).** See Part 7 — deliberately not built for `Linear`;
+  revisit only if a second, unrelated case wants it.
 
 # Open questions
 
@@ -970,6 +1056,9 @@ Not foundational; none of them constrain the above.
 - **Which of steps 2 and 3 fired?** A reader cannot tell from `x.f()` alone. Probably a tooling
   answer (hover, `frog explain`) rather than a syntax one, but it is the ergonomic cost of Part 1
   and should be watched.
+- **Does `Scope`/`Task(T)` want `Linear` too?** (Part 7.) Nothing in `CONCURRENCY.md` today stops
+  `let s2 = scope_value`; not a blocker for `Linear` shipping, but worth `CONCURRENCY.md` picking
+  up once it exists.
 
 # Prior art
 
@@ -987,6 +1076,12 @@ Not foundational; none of them constrain the above.
 - **Nim / D** — UFCS as a rewrite rule rather than a method system; step 3 is theirs exactly.
 - **Swift** — `mutating func` and the dynamic exclusivity enforcement froglang avoids by having no
   aliases.
+- **Clean** — uniqueness types, the precedent for Part 7: a value looks and is written like an
+  ordinary one, but the type system guarantees exactly one live reference, licensing in-place
+  mutation without aliasing risk. Rust's ownership rules (not its borrow checker — froglang has no
+  borrowing) are the same idea reached independently; Part 7 is deliberately the cheap half of
+  Rust's model, without the lifetime-annotation half, since froglang's `mut` gives temporary
+  exclusive access via copy-in/copy-out rather than via references.
 - **Zig** — comptime-as-generics (declined; a separate evaluation model is a larger novelty spend
   than `<>`), and per-instantiation checking (adopted for regions in `CONCURRENCY.md`; the same
   trade applies here).

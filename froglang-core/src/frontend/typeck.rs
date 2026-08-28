@@ -1257,9 +1257,30 @@ impl TypeChecker {
     /// `codegen::MAX_INLINE_UNION_MEMBERS` members, or self-referential) is
     /// boxed into a `FrogVariant` exactly like a nominal union's non-nullary
     /// member already is (`box_into_variant`).
-    fn lower_widen(&self, lowered: Spanned<TypedExpr>, target: &Type) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
-        let from = lowered.item.ty.clone();
-        if from == *target || from == Type::Never {
+    fn lower_widen(&self, mut lowered: Spanned<TypedExpr>, target: &Type) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // Resolved, not the raw `TypedExpr::ty` — an empty-list literal (or
+        // anything else whose element type was a bare `TypeVar` at lowering
+        // time) can have just been unified against `target` by the caller
+        // (`lower_call_arg`, a struct field, ...), but `unify` only updates
+        // the substitution table, never the node's `ty` in place. Comparing
+        // the raw types here used to fall through every branch below and
+        // return the node unchanged — so codegen, which reads `ty` directly,
+        // saw e.g. `List<t0>` land in a `List<Str>` slot and panicked on "no
+        // widening". Resolving both sides first, and writing the resolved
+        // type back onto every path out of this function, is what keeps a
+        // `TypedExpr::ty` trustworthy once lowering has moved past it.
+        let from = self.lookup(&lowered.item.ty);
+        let target = self.lookup(target);
+        // `Never` (a `return`/`panic`-typed expression, which produces no
+        // value on the path that reaches here) must keep reading `Never`
+        // regardless of `target` — codegen and block-typing downstream both
+        // key off that to know the node never falls through, and rewriting
+        // it to `target` would claim a value is produced where none is.
+        if from == Type::Never {
+            return Ok(lowered);
+        }
+        if from == target {
+            lowered.item.ty = target;
             return Ok(lowered);
         }
         // A non-lossy numeric promotion into a wider declared slot — see
@@ -1267,15 +1288,21 @@ impl TypeChecker {
         // each call site because `lower_widen` is already the single funnel
         // every such value passes through (struct/variant fields, list
         // elements, annotations, declared return types).
-        if widens_to(&from, target) {
+        if widens_to(&from, &target) {
             let span = lowered.span;
             return Ok(Spanned::from(
                 TypedExpr { id: 0, ty: target.clone(), kind: TypedExprKind::Coerce(Box::new(lowered)) },
                 span,
             ));
         }
-        let Type::Union(members) = target else { return Ok(lowered); };
-        let Some(tag) = members.iter().position(|m| *m == from) else { return Ok(lowered); };
+        let Type::Union(members) = &target else {
+            lowered.item.ty = from;
+            return Ok(lowered);
+        };
+        let Some(tag) = members.iter().position(|m| *m == from) else {
+            lowered.item.ty = from;
+            return Ok(lowered);
+        };
         let span = lowered.span;
         if matches!(from, Type::Union(_)) {
             return Err(Spanned::from(TypeError {
@@ -3456,6 +3483,8 @@ impl TypeChecker {
             Token::True           => (TypedExprKind::BoolLit(true),  Type::Bool),
             Token::False          => (TypedExprKind::BoolLit(false), Type::Bool),
             Token::None           => (TypedExprKind::NoneLit,      Type::None),
+            Token::Inf            => (TypedExprKind::FloatLit(f64::INFINITY), Type::Float),
+            Token::Nan            => (TypedExprKind::FloatLit(f64::NAN),      Type::Float),
             // A bound value takes priority; otherwise this might be a
             // nullary enum variant used without call syntax (`Red` for
             // `data Color is Red | ...`) — see `infer_bare_variant`.

@@ -21,6 +21,13 @@ pub enum LexerError {
     UnexpectedCharacter,
     UnterminatedString,
     InvalidNumber,
+    /// An escape the lexer has no meaning for. This used to silently keep
+    /// the escaped character (`"\q"` was `"q"`), which made a wrong `repr`
+    /// unobservable — see `crate::notation`.
+    InvalidEscape,
+    /// `\u{...}` that isn't a hex scalar value froglang can hold: empty, too
+    /// long, unterminated, or a surrogate.
+    InvalidUnicodeEscape,
 }
 
 impl std::fmt::Display for LexerError {
@@ -29,6 +36,8 @@ impl std::fmt::Display for LexerError {
             LexerError::UnexpectedCharacter => write!(f, "unexpected character"),
             LexerError::UnterminatedString  => write!(f, "unterminated string literal"),
             LexerError::InvalidNumber       => write!(f, "invalid number literal"),
+            LexerError::InvalidEscape       => write!(f, "unknown escape sequence in string literal (known: \\n \\t \\r \\\\ \\\" \\0 \\u{{...}})"),
+            LexerError::InvalidUnicodeEscape => write!(f, "invalid unicode escape — expected \\u{{...}} with 1-6 hex digits"),
         }
     }
 }
@@ -176,6 +185,26 @@ impl<'a> Lexer<'a> {
                 }
                 float = true;
                 n.push(self.advance().unwrap());
+            } else if c == &'e' || c == &'E' {
+                // An exponent, but only when one actually follows: `e` is a
+                // name character, so `1e100` and `1e-3` are one float while
+                // `1 else x` and a hypothetical `1eggs` must keep their `e`
+                // for `read_name`. Two characters of lookahead, since the
+                // sign may sit between the `e` and the first digit.
+                let mut lookahead = self.input.clone();
+                lookahead.next();
+                let signed = matches!(lookahead.peek(), Some('+') | Some('-'));
+                if signed { lookahead.next(); }
+                if !matches!(lookahead.peek(), Some(d) if d.is_numeric()) {
+                    break;
+                }
+                float = true;
+                n.push(self.advance().unwrap());             // 'e'
+                if signed { n.push(self.advance().unwrap()); }
+                while matches!(self.input.peek(), Some(d) if d.is_numeric()) {
+                    n.push(self.advance().unwrap());
+                }
+                break;      // the exponent ends the literal
             } else {
                 break;
             }
@@ -189,25 +218,65 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The body of a `\u{...}` escape, with the `\u` already consumed. 1–6
+    /// hex digits, the range `char` itself accepts — a surrogate or a value
+    /// past `char::MAX` is rejected rather than replaced, since a silent
+    /// substitution is the failure this escape exists to remove.
+    fn read_unicode_escape(&mut self) -> Result<char, LexerError> {
+        if self.advance() != Some('{') {
+            return Err(LexerError::InvalidUnicodeEscape);
+        }
+        let mut digits = String::new();
+        loop {
+            match self.advance() {
+                Some('}') => break,
+                Some(c) if c.is_ascii_hexdigit() && digits.len() < 6 => digits.push(c),
+                Some(_) => return Err(LexerError::InvalidUnicodeEscape),
+                None => return Err(LexerError::UnterminatedString),
+            }
+        }
+        u32::from_str_radix(&digits, 16).ok()
+            .and_then(char::from_u32)
+            .ok_or(LexerError::InvalidUnicodeEscape)
+    }
+
     fn read_string(&mut self) -> Result<String, LexerError> {
         let mut s = String::new();
+        // A bad escape doesn't abandon the literal: the scan runs to the
+        // closing quote and reports the first error afterwards. Returning
+        // early would leave the lexer positioned *inside* the string, so
+        // one mistyped escape would cascade into an unterminated-string
+        // error plus whatever its remaining characters happened to lex as.
+        let mut error: Option<LexerError> = None;
         while let Some(c) = self.input.peek() {
             if *c == '"' {
                 self.advance();      // consume the closing "
-                return Ok(s);
+                return match error { Some(e) => Err(e), None => Ok(s) };
             }
             let ch = self.advance().unwrap();   // safe, just peeked
             if ch == '\\' {
                 let escaped = self.advance().ok_or(LexerError::UnterminatedString)?;
-                s.push(match escaped {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    '\\' => '\\',
-                    '"' => '"',
-                    '0' => '\0',
-                    other => other, // unknown escape: keep the literal character
-                });
+                let decoded = match escaped {
+                    'n' => Ok('\n'),
+                    't' => Ok('\t'),
+                    'r' => Ok('\r'),
+                    '\\' => Ok('\\'),
+                    '"' => Ok('"'),
+                    '0' => Ok('\0'),
+                    'u' => self.read_unicode_escape(),
+                    // An unknown escape used to keep the literal character,
+                    // which is the mechanism that made a mis-escaped `repr`
+                    // silent (`\u{7}` read back as `u{7}`). It is a lex
+                    // error now — see `crate::notation`.
+                    _ => Err(LexerError::InvalidEscape),
+                };
+                match decoded {
+                    Ok(c) => s.push(c),
+                    // Unterminated input can't be resynced past, so it ends
+                    // the scan; a malformed escape only records.
+                    Err(LexerError::UnterminatedString) => return Err(LexerError::UnterminatedString),
+                    Err(e) => { error.get_or_insert(e); },
+                }
             } else {
                 s.push(ch);
             }
@@ -268,6 +337,85 @@ mod tests {
             Token::Float(0.123),
             Token::Float(100.0),
         ]);
+    }
+
+    /// plans/DATA.md stage 2: `print(1e100)` emitted a form the lexer
+    /// couldn't read back. Note `2e5` is a `Float` even with no decimal
+    /// point — an exponent is what makes it one.
+    #[test]
+    fn test_exponent_literals() {
+        let input = "1e100 1E5 1.5e-3 2e+2 0e0";
+        let (spans, errors) = lex_and_collect(input);
+        assert!(errors.is_empty(), "{:?}", errors);
+        let tokens: Vec<_> = spans.into_iter().map(|s| s.item).collect();
+        assert_eq!(tokens, vec![
+            Token::Float(1e100),
+            Token::Float(1e5),
+            Token::Float(1.5e-3),
+            Token::Float(2e2),
+            Token::Float(0.0),
+        ]);
+    }
+
+    /// `e` is a name character, so the exponent scan has to be sure one
+    /// really follows before it consumes anything — otherwise a keyword or
+    /// identifier butted against a number loses its first letter.
+    #[test]
+    fn test_e_is_only_an_exponent_when_digits_follow() {
+        let (spans, errors) = lex_and_collect("1 else 2 exit");
+        assert!(errors.is_empty(), "{:?}", errors);
+        let tokens: Vec<_> = spans.into_iter().map(|s| s.item).collect();
+        assert_eq!(tokens, vec![
+            Token::Int(1),
+            Token::Else,
+            Token::Int(2),
+            Token::Identifier("exit".to_string()),
+        ]);
+        // `1e` with nothing usable after it is a number and a name, not an
+        // error and not a silently-truncated float.
+        let (spans, errors) = lex_and_collect("1e");
+        assert!(errors.is_empty(), "{:?}", errors);
+        let tokens: Vec<_> = spans.into_iter().map(|s| s.item).collect();
+        assert_eq!(tokens, vec![Token::Int(1), Token::Identifier("e".to_string())]);
+    }
+
+    #[test]
+    fn test_inf_and_nan_literals() {
+        let (spans, errors) = lex_and_collect("inf nan -inf");
+        assert!(errors.is_empty(), "{:?}", errors);
+        let tokens: Vec<_> = spans.into_iter().map(|s| s.item).collect();
+        assert_eq!(tokens, vec![Token::Inf, Token::Nan, Token::Minus, Token::Inf]);
+    }
+
+    #[test]
+    fn test_unicode_escape() {
+        let (spans, errors) = lex_and_collect(r#""a\u{7}b" "\u{1F438}" "\u{0}""#);
+        assert!(errors.is_empty(), "{:?}", errors);
+        let tokens: Vec<_> = spans.into_iter().map(|s| s.item).collect();
+        assert_eq!(tokens, vec![
+            Token::String("a\u{7}b".to_string()),
+            Token::String("🐸".to_string()),
+            Token::String("\0".to_string()),
+        ]);
+    }
+
+    /// An unknown escape used to keep the escaped character, so `"\q"` was
+    /// `"q"` — the mechanism that let a mis-escaped `repr` be silently
+    /// wrong. It is an error now.
+    #[test]
+    fn test_unknown_escape_is_an_error() {
+        let (_, errors) = lex_and_collect(r#""a\qb""#);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].item, LexerError::InvalidEscape);
+    }
+
+    #[test]
+    fn test_malformed_unicode_escape_is_an_error() {
+        for input in [r#""\u7}""#, r#""\u{}""#, r#""\u{zz}""#, r#""\u{D800}""#, r#""\u{1234567}""#] {
+            let (_, errors) = lex_and_collect(input);
+            assert_eq!(errors.len(), 1, "{}", input);
+            assert_eq!(errors[0].item, LexerError::InvalidUnicodeEscape, "{}", input);
+        }
     }
 
     #[test]

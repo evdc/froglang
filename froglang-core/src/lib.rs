@@ -8,6 +8,7 @@ pub mod utils;
 pub mod codegen;
 pub mod runtime;
 pub mod state;
+pub mod notation;
 pub mod host;
 pub mod stdlib;
 

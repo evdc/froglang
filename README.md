@@ -48,7 +48,7 @@ let f: (Int -> Int) = n -> n * 2
 ```
 
 **Supported expression forms:**
-- Literals: `Int`, `Float`, `Bool` (`true`/`false`), `Str`, `none`
+- Literals: `Int`, `Float` (including `1e100`, `inf`, `nan`), `Bool` (`true`/`false`), `Str`, `none`
 - Arithmetic / comparison / logical operators with correct precedence
 - Unary `-` and `not`
 - Let bindings with optional type annotation: `let x: Int = 5`

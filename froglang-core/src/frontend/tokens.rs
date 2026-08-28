@@ -34,6 +34,17 @@ pub enum Token {
     #[lex("none")]
     None,
 
+    /// The two non-finite floats, as lowercase keyword literals parallel to
+    /// `none`/`true`/`false`. `1.0/0.0` has always *printed* `inf`, with no
+    /// way to write it back — a hole in the notation (plans/DATA.md stage
+    /// 2). `-inf` falls out of unary minus, so it needs no token of its own.
+    #[prefix(Grammar::literal)]
+    #[lex("inf")]
+    Inf,
+    #[prefix(Grammar::literal)]
+    #[lex("nan")]
+    Nan,
+
     #[infix(Grammar::binary, Precedence::Term)]
     #[lex("+")]
     Plus,

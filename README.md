@@ -13,7 +13,7 @@ Inspirations include Go (but better usability) and Lua.
 >> let greeting = "hello " + "world"
 "hello world" :: Str
 >> [1, 2, 3]
-[1, 2, 3] :: List(Int)
+[1, 2, 3] :: List<Int>
 ```
 
 ---
@@ -73,14 +73,14 @@ let f: (Int -> Int) = n -> n * 2
 ## Type system
 
 Bidirectional type checker with unification, over a dedicated type-expression grammar
-(`List(T)`, unions, optionals, function types are spellable in every annotation site).
+(`List<T>`, unions, optionals, function types are spellable in every annotation site).
 
 **Primitive types:** `Int`, `Float`, `Bool`, `Str`, `None`, `Never` (the bottom type — the
 type of `return`, `panic`, and any expression that never produces a value)
 
 **Compound types:**
 - `(T1, T2, ...) -> R` — function types, inferred for lambdas, checked against annotations
-- `List(T)` — homogeneous GC-managed lists
+- `List<T>` — homogeneous GC-managed lists
 - Type variables with optional trait bounds
 - `T1 | T2` — sum / union types
 - `T?` — sugar for `T | None`
@@ -242,7 +242,7 @@ let (value, _) = state.eval(r#"shout("hi")"#)?;
 ```
 
 Parameter and return types must implement `FromFrog`/`ToFrog`
-(`froglang_core::host`) — implemented for `Int`/`Float`/`Bool`/`None`/`Str`/`List(T)` today;
+(`froglang_core::host`) — implemented for `Int`/`Float`/`Bool`/`None`/`Str`/`List<T>` today;
 structs and unions are on the ABI but not yet wired up on the Rust marshalling side.
 
 ---
@@ -262,7 +262,7 @@ let mut state = FrogState::with_stdlib()?;
 The CLI (`cargo run`, `cargo run -- run ...`) always uses `with_stdlib()`.
 
 **`len`** is the one exception to "everything is a host function": `len(xs)` / `xs.len()` works
-on any `List(T)` or `Str` and needs no registration at all, because it's a hardcoded builtin
+on any `List<T>` or `Str` and needs no registration at all, because it's a hardcoded builtin
 (alongside `push`/`print`) rather than a host function — the type system has no generics yet, so
 a *host* function can't be polymorphic over `T` the way `len` needs to be.
 
@@ -275,13 +275,13 @@ clusters — full Unicode segmentation is out of scope for a minimal stdlib.
 | Function | Signature | Notes |
 |---|---|---|
 | `slice(s, start, end)` | `(Str, Int, Int) -> Str \| ErrMsg` | byte range `[start, end)`; errors instead of panicking on an out-of-range or non-char-boundary split |
-| `split(s, sep)` | `(Str, Str) -> List(Str)` | |
-| `join(items, sep)` | `(List(Str), Str) -> Str` | `["a","b","c"].join(" ")`, not Python's backwards `sep.join(items)` |
+| `split(s, sep)` | `(Str, Str) -> List<Str>` | |
+| `join(items, sep)` | `(List<Str>, Str) -> Str` | `["a","b","c"].join(" ")`, not Python's backwards `sep.join(items)` |
 | `trim(s)` | `Str -> Str` | |
 | `to_upper(s)` / `to_lower(s)` | `Str -> Str` | |
 | `contains(s, pat)` / `starts_with(s, pat)` / `ends_with(s, pat)` | `(Str, Str) -> Bool` | |
 | `index_of(s, pat)` | `(Str, Str) -> Int \| ErrMsg` | first byte offset, or `Err` if absent |
-| `chars(s)` | `Str -> List(Str)` | one codepoint per element |
+| `chars(s)` | `Str -> List<Str>` | one codepoint per element |
 | `to_int(s)` / `to_float(s)` / `to_bool(s)` | `Str -> Int\|ErrMsg` / `Str -> Float\|ErrMsg` / `Str -> Bool\|ErrMsg` | |
 | `int_to_str(n)` / `float_to_str(f)` / `bool_to_str(b)` | `_ -> Str` | infallible |
 
@@ -321,7 +321,7 @@ choice: a `Result<T, E>` whose `Ok` is `()` isn't representable in today's marsh
 it rather than routing around it with a placeholder.
 
 **Not yet built**: `Dict`/`Map` and generic `map`/`filter`/`fold` both need real generics
-(`List(T)` is a compiler-special-cased "builtin hack", not user-definable yet — see `roadmap.md`);
+(`List<T>` is a compiler-special-cased "builtin hack", not user-definable yet — see `roadmap.md`);
 frog already has `for`/list-comprehension syntax covering much of what `map`/`filter` would buy in
 the meantime. Struct/nominal-union marshalling beyond `ErrMsg`'s one fixed shape, and host
 functions that mutate their arguments, are embedding-API gaps (`plans/EMBEDDING.md`), not stdlib
@@ -404,7 +404,7 @@ Roughly in priority order:
 - ~~`FrogState::builder()`~~ — **done, see `plans/EMBEDDING.md`**: host Rust functions are
   registered before the JIT module is created (`JITBuilder::symbol` only accepts new symbols
   at construction), then installed into the type checker's scope, so froglang code can call
-  back into the host with full type-checker support. Covers scalars/`Str`/`List(T)` today;
+  back into the host with full type-checker support. Covers scalars/`Str`/`List<T>` today;
   struct/union marshalling and generic host functions are listed as follow-ups there.
 - ~~Minimal stdlib~~ — **done for strings/file IO, see "Standard library" above**:
   `FrogState::with_stdlib()`, `Result<T, E>` ↔ `T | E` marshalling (`ToFrog for Result<T, E>`

@@ -406,7 +406,7 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
 }
 
 /// Materialize `start..end` (end-exclusive) as a freshly-allocated
-/// `List(Int)`. `end <= start` yields an empty list, matching `frog_list_slice`'s
+/// `List<Int>`. `end <= start` yields an empty list, matching `frog_list_slice`'s
 /// "never errors, just clamps" convention rather than `frog_list_get`'s.
 #[no_mangle]
 pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {

@@ -117,7 +117,7 @@ impl FrogCtx {
         crate::runtime::gc::frog_str_as_str(w as *const crate::runtime::gc::FrogStr)
     }
 
-    /// Allocate a `List(T)` of `stride`-wide elements (`stride == 1` for
+    /// Allocate a `List<T>` of `stride`-wide elements (`stride == 1` for
     /// every non-struct `T` — see `FrogList`'s doc comment in `gc.rs`) from
     /// a flat, already-wire-formatted `i64` buffer, and root the result.
     pub fn alloc_list(&mut self, elems: &[i64], stride: usize, ptr_mask: u64) -> i64 {

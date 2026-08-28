@@ -209,3 +209,80 @@ fn an_alias_inherits_the_targets_mut_parameters() {
         print(ys)";
     assert_eq!(common::run(src), "[1, 9]\n");
 }
+
+// ── Recursion ────────────────────────────────────────────────────────────────
+//
+// A function could only call itself when it was *fully* annotated, because
+// that was the only case `lower_assign` pre-bound the name for. Generalization
+// happens exactly when the annotations run out, so "generic" and "recursive"
+// were mutually exclusive — which made the recursive case
+// `monomorphize_generics` and `rewrite_call_sites` are written to handle
+// unreachable. A not-fully-annotated function is now pre-bound to a
+// placeholder built from fresh vars, so its body can call it at one type
+// (monomorphic recursion) and the result is generalized afterwards.
+
+/// The plain case: no annotations at all, one recursive call. This used to
+/// be "Unbound variable fact".
+#[test]
+fn an_unannotated_function_can_call_itself() {
+    let src = "\
+        func fact(n) = if n <= 1 then 1 else n * fact(n - 1)\n\
+        print(fact(5))";
+    assert_eq!(common::run(src), "120\n");
+}
+
+/// A let-bound lambda is generalized by the same value-restriction rule as a
+/// `func`, so it gets the same pre-bind and can recurse too.
+#[test]
+fn a_let_bound_lambda_can_call_itself() {
+    let src = "\
+        let fib = [n] -> if n < 2 then n else fib(n - 1) + fib(n - 2)\n\
+        print(fib(10))";
+    assert_eq!(common::run(src), "55\n");
+}
+
+/// Recursive *and* generic: the parameter `x` is never constrained, so this
+/// generalizes to one binder and monomorphizes into two bodies, each of whose
+/// recursive calls must resolve to its own instantiation rather than to the
+/// stripped template.
+#[test]
+fn a_recursive_generic_is_monomorphized_at_every_instantiation() {
+    let src = "\
+        func count(x, n: Int) = if n == 0 then 0 else 1 + count(x, n - 1)\n\
+        print(count(\"a\", 3))\n\
+        print(count(1, 2))";
+    assert_eq!(common::run(src), "3\n2\n");
+}
+
+/// The pre-bind must not cost the declaration its polymorphism: the
+/// placeholder is in scope while the body is checked, so an environment scan
+/// that saw it would find every one of the function's own vars "captured" and
+/// generalize nothing.
+#[test]
+fn the_recursion_prebind_does_not_stop_a_function_generalizing() {
+    let src = "\
+        func id(x) = x\n\
+        print(id(1))\n\
+        print(id(\"s\"))\n\
+        print(id(2.5))";
+    assert_eq!(common::run(src), "1\ns\n2.5\n");
+}
+
+/// Polymorphic recursion — self-calls at two *different* types within one
+/// body — is undecidable to infer, so it is reported rather than guessed at.
+/// The pre-bind is what makes this reachable at all (before it, the name was
+/// simply unbound); the placeholder binds `x` at the first self-call's type,
+/// and the second one then fails the ordinary argument check, which reports
+/// it more precisely than `lower_assign`'s own whole-signature backstop
+/// would. Asserted as "rejected, naming the two types" rather than on one
+/// exact message, since which of the two guards fires first is not the point.
+#[test]
+fn recursion_at_two_different_types_is_rejected() {
+    let src = "\
+        func f(x, n: Int) = if n == 0 then 0 else f(\"s\", n - 1) + f(1, n - 1)\n\
+        print(f(1, 2))";
+    let out = common::run_raw(src);
+    assert_ne!(out.status, Some(0), "expected a type error, got: {}", out.stdout);
+    let reported = format!("{}{}", out.stdout, out.stderr);
+    assert!(reported.contains("Int") && reported.contains("Str"), "{}", reported);
+}

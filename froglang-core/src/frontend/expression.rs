@@ -101,7 +101,7 @@ pub struct SliceExpr {
 }
 
 /// `start..end` used as a standalone expression (not as an index): both
-/// bounds are required, and it eagerly materializes a `List(Int)`.
+/// bounds are required, and it eagerly materializes a `List<Int>`.
 /// See `SliceExpr` for the `target[start..end]` form, which allows either
 /// bound to be omitted.
 #[derive(Debug, Clone, PartialEq)]
@@ -190,7 +190,7 @@ pub struct Pattern {
     /// `variant`'s name-based lookup (`resolve_type_name`) entirely. That
     /// lookup can only resolve a bare nominal/primitive name, but `variant`
     /// there is `Type::to_string()`'s *display* form, which for a compound
-    /// member (`List(Int)`, a function type, a nested union) isn't a valid
+    /// member (`List<Int>`, a function type, a nested union) isn't a valid
     /// name at all (surface `is`-pattern syntax can't spell one either —
     /// `Grammar::pattern` only ever parses a single identifier) — so
     /// resolving it back by name was a lossy round-trip through `Display`,

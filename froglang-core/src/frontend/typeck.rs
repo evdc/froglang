@@ -10,7 +10,6 @@ use crate::frontend::{
 };
 use crate::frontend::type_expr::TypeExpr;
 use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
-use crate::utils::format_vec;
 
 /// Reserved name for the builtin `panic` alias that `!` desugars to.
 /// Contains `!`, which the lexer never produces inside an identifier, so
@@ -27,7 +26,7 @@ type TypeResult = Result<Type, Spanned<TypeError>>;
 
 /// Traits constrain type variables. A type must implement a trait to be bound
 /// to a TypeVar that carries that bound.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Trait {
     Num,   // Int, Float — arithmetic operators
     Eq,    // Int, Float, Bool, Str — == and !=
@@ -92,6 +91,63 @@ pub enum Type {
     Never,
 }
 
+/// The canonical order `Type::normalize` sorts a union's members into — and
+/// therefore **the order that assigns every union member its runtime tag**,
+/// since a member's index in the normalized list is what `lower_widen`,
+/// `codegen::union_dispatch_cases` and `pack_union_member` all agree to call
+/// it by.
+///
+/// Written out by hand, and deliberately not `#[derive]`d, for two reasons:
+///
+///  * A derived `Ord` orders by *variant declaration order*, so tidying the
+///    `enum` above would silently re-tag every union in the language. The
+///    explicit `rank` below can only change when someone edits these numbers,
+///    which is a visible, deliberate act.
+///  * It used to be `Display`'s job — `sort_by_cached_key(|t| t.to_string())`
+///    — which coupled the tag assignment to the *diagnostics* rendering, so
+///    making an error message read better re-tagged unions as a side effect.
+///    That coupling is what `TRAITS.md` Stage 1 warns about for `mangle_type`,
+///    and it applied here just as much.
+///
+/// Any total, deterministic order works; this one keeps unions reading in a
+/// sensible order (scalars first, in "how you'd list them" order, then the
+/// composites). Note it is also allocation-free, unlike the string sort it
+/// replaces.
+impl Ord for Type {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        /// Stable per-variant number. Never reuse or reorder these; append.
+        fn rank(t: &Type) -> u8 {
+            match t {
+                Type::Int      => 0,
+                Type::Float    => 1,
+                Type::Bool     => 2,
+                Type::Str      => 3,
+                Type::None     => 4,
+                Type::Never    => 5,
+                Type::Named    { .. } => 6,
+                Type::Union    (..)   => 7,
+                Type::Function { .. } => 8,
+                Type::TypeVar  { .. } => 9,
+            }
+        }
+        rank(self).cmp(&rank(other)).then_with(|| match (self, other) {
+            (Type::Named { name: n1, args: a1 }, Type::Named { name: n2, args: a2 }) =>
+                n1.cmp(n2).then_with(|| a1.cmp(a2)),
+            (Type::Union(v1), Type::Union(v2)) => v1.cmp(v2),
+            (Type::Function { params: p1, result: r1 }, Type::Function { params: p2, result: r2 }) =>
+                p1.cmp(p2).then_with(|| r1.cmp(r2)),
+            (Type::TypeVar { name: n1, bounds: b1 }, Type::TypeVar { name: n2, bounds: b2 }) =>
+                n1.cmp(n2).then_with(|| b1.cmp(b2)),
+            // Same rank, no fields: the two are the same scalar.
+            _ => std::cmp::Ordering::Equal,
+        })
+    }
+}
+
+impl PartialOrd for Type {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
 /// The `List` type constructor's name, as it appears in `Type::Named`.
 pub const LIST_NAME: &str = "List";
 
@@ -124,27 +180,6 @@ impl Type {
     pub fn as_struct_name(&self) -> Option<&str> {
         match self {
             Type::Named { name, .. } if name != LIST_NAME => Some(name.as_str()),
-            _ => None,
-        }
-    }
-
-    /// The `StructDefs`/codegen `structs` lookup key for this struct type:
-    /// its bare name for a non-generic struct, or (`TRAITS.md` Stage 3a) a
-    /// mangled key encoding its concrete type arguments for a generic
-    /// instantiation — reusing `Display`'s existing `Name(Arg1, Arg2)`
-    /// rendering for a non-empty-`args` `Named`, since it's already exactly
-    /// the distinct, stable-per-instantiation string this needs. `None`
-    /// for anything that isn't a struct (mirrors `as_struct_name`, which
-    /// this is the "layout lookup key" counterpart of — `as_struct_name`
-    /// stays the bare declared name, used wherever identity/printing wants
-    /// it, e.g. `codegen::print_value`'s prefix). A generic struct's
-    /// concrete layout is only ever registered in `StructDefs` under this
-    /// key by `TypeChecker::materialize_struct`, so any codegen lookup by
-    /// `struct_key` assumes typeck already ran to completion over the
-    /// whole program (true by the time codegen starts).
-    pub fn struct_key(&self) -> Option<String> {
-        match self {
-            Type::Named { name, .. } if name != LIST_NAME => Some(self.to_string()),
             _ => None,
         }
     }
@@ -241,10 +276,11 @@ impl Type {
                 if seen.len() > 1 {
                     seen.retain(|t| *t != Type::Never);
                 }
-                // 3. Sort canonically by display string (stable, readable).
-                // `sort_by_cached_key` renders each element's key once, not
-                // on every comparison the sort makes.
-                seen.sort_by_cached_key(|t| t.to_string());
+                // 3. Sort into the canonical order — which is what assigns
+                // each member its runtime tag, so it is `Ord for Type`'s
+                // explicitly-numbered order and no longer `Display`'s. See
+                // that impl for why the two must not be the same thing.
+                seen.sort();
                 match seen.len() {
                     0 => Type::None,
                     1 => seen.remove(0),
@@ -256,6 +292,20 @@ impl Type {
     }
 }
 
+/// Types as **source syntax** — every one of the ~120 diagnostics that names
+/// a type renders it through here, so what it prints has to be something the
+/// reader could type back into an annotation.
+///
+/// That was not true before `TRAITS.md` Stage 3c moved type arguments from
+/// `Name(A, B)` to `Name<A, B>`: errors went on quoting `Pair(Int, Str)` and
+/// `[Int]`, neither of which the parser accepts any more, and a function type
+/// rendered as `[Int] -> Int` — indistinguishable from a list of `Int`
+/// applied to an arrow. `typeck`'s own round-trip test is what keeps the two
+/// sides from drifting again.
+///
+/// The single deliberate exception is `TypeVar`: there is no source syntax
+/// for an inference variable, and `~t0` at least reads as "not something you
+/// wrote". Closed types — everything the round-trip test covers — are exact.
 impl Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -264,8 +314,14 @@ impl Display for Type {
             Type::Bool   => write!(f, "Bool"),
             Type::Str    => write!(f, "Str"),
             Type::None   => write!(f, "None"),
-            Type::Function { params, result } =>
-                write!(f, "{} -> {}", format_vec(params), result),
+            // Parenthesised, matching `Grammar::type_atom`'s only spelling of
+            // a function type. The parens are load-bearing rather than
+            // decorative: without them `Int | Str -> Bool` reads as a union
+            // of `Int` and `Str -> Bool` on the way back in.
+            Type::Function { params, result } => {
+                let ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+                write!(f, "({} -> {})", ps.join(", "), result)
+            },
             Type::TypeVar { name, bounds } => {
                 if bounds.is_empty() {
                     write!(f, "~{}", name)
@@ -277,13 +333,13 @@ impl Display for Type {
                     write!(f, "~{}:{}", name, bs)
                 }
             },
-            Type::Named { name, args } if name == LIST_NAME => {
-                write!(f, "[{}]", args.first().expect("List always has exactly one arg"))
-            }
             Type::Named { name, args } if args.is_empty() => write!(f, "{}", name),
+            // `List<Int>` falls out of this arm like any other applied
+            // constructor — it needs no special case now that the rendering
+            // and the grammar agree.
             Type::Named { name, args } => {
                 let strs: Vec<String> = args.iter().map(|t| t.to_string()).collect();
-                write!(f, "{}({})", name, strs.join(", "))
+                write!(f, "{}<{}>", name, strs.join(", "))
             }
             Type::Union(variants) => {
                 let strs: Vec<String> = variants.iter().map(|t| format!("{}", t)).collect();
@@ -327,7 +383,27 @@ pub fn numeric_join(t1: &Type, t2: &Type) -> Option<Type> {
 /// declaration index instead (`"0"`, `"1"`, ...). This is always
 /// unambiguous with a real named field: a lexed identifier can never be
 /// all-digits (`is_positional_fields` relies on that same fact).
-pub type StructDefs = HashMap<String, Vec<(String, Type)>>;
+/// Every struct field list as *declared* — the template, keyed by the bare
+/// declared name. For a non-generic struct that is already the concrete
+/// layout; for a `data Pair<A, B>(...)` it still carries the binder
+/// placeholder `TypeVar`s and is only useful once substituted
+/// (`TypeChecker::materialize_struct`/`instantiate_struct`).
+///
+/// Separate from `StructDefs` because the two answer different questions and
+/// used to share one map keyed by strings, where "is `Pair` a declared struct
+/// name?" and "what is `Pair<Int, Str>`'s layout?" were distinguished only by
+/// whether the key happened to be a bare name or a rendered type.
+pub type StructTemplates = HashMap<String, Vec<(String, Type)>>;
+
+/// Concrete field layout per struct *type*, in declaration order — what
+/// codegen flattens a value with. Keyed by the `Type` itself, so a generic
+/// struct's instantiations (`Pair<Int, Str>` vs `Pair<Str, Int>`) are
+/// distinct entries with no rendering step in between: this used to be keyed
+/// by `Type::struct_key()`, i.e. by `Display`, which both coupled the layout
+/// table to the diagnostics rendering and made every lookup allocate a
+/// `String` on codegen's hottest path (`struct_fields` is recursive and runs
+/// per leaf).
+pub type StructDefs = HashMap<Type, Vec<(String, Type)>>;
 
 /// The stored field-name key for field `i`: its declared name if named,
 /// or its index (stringified) if positional — see `StructDefs`.
@@ -592,6 +668,17 @@ impl ScopeStack {
     fn bound_types(&self) -> impl Iterator<Item = &Type> {
         self.bindings.values().map(|b| &b.ty)
     }
+
+    /// `bound_types`, minus the binding named `skip` — for `generalize`,
+    /// which must not see the declaration it is generalizing. Ordinarily
+    /// that binding simply isn't in scope yet; the exception is a function
+    /// pre-bound to a placeholder so its own body can call it
+    /// (`lower_assign`'s recursion pre-bind), where every var of the
+    /// placeholder would otherwise read as "already free in the
+    /// environment" and block generalization completely.
+    fn bound_types_except<'a>(&'a self, skip: &'a str) -> impl Iterator<Item = &'a Type> {
+        self.bindings.iter().filter(move |(n, _)| n.as_str() != skip).map(|(_, b)| &b.ty)
+    }
 }
 
 pub struct TypeChecker {
@@ -605,6 +692,12 @@ pub struct TypeChecker {
     /// visible for the rest of the program, including from later
     /// independent blocks. A known simplification, not a hard limit.
     struct_defs: StructDefs,
+    /// Declared field templates, keyed by bare name — see `StructTemplates`.
+    /// Registered by `hoist_data_decls` and never scoped/popped, same as
+    /// `struct_defs`. Also the authoritative answer to "is this name a
+    /// declared struct?", which `struct_defs` can no longer give now that it
+    /// is keyed by type.
+    struct_templates: StructTemplates,
     /// `TRAITS.md` Stage 3a: declared `<A, B>` binder names for a generic
     /// `data` declaration, keyed by its plain name — populated in
     /// `hoist_data_decls`, holding each binder's *fresh placeholder
@@ -742,6 +835,7 @@ pub struct TypeCheckerCheckpoint {
     substitutions: HashMap<String, Type>,
     next_id: u32,
     struct_defs: StructDefs,
+    struct_templates: StructTemplates,
     struct_type_params: HashMap<String, Vec<String>>,
     union_defs: UnionDefs,
     union_names: HashMap<Vec<Type>, String>,
@@ -770,11 +864,11 @@ impl TypeChecker {
     }
 
     pub fn empty() -> Self {
-        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
     }
 
     /// Check whether a concrete type implements the given trait. Only makes
@@ -812,7 +906,7 @@ impl TypeChecker {
             // `check_comparable`, with a span, rather than here: "not `Eq`"
             // would be the wrong reason.
             Type::Union(variants) => variants.iter().all(|v| self.type_implements_rec(v, tr, seen)),
-            // `List(T)` is `Eq` iff `T` is. The comparison is structural —
+            // `List<T>` is `Eq` iff `T` is. The comparison is structural —
             // lengths, then elements pairwise — not identity, which is what
             // anyone coming from Python expects `[1, 2] == [1, 2]` to mean.
             // It cannot be desugared into a fixed conjunction the way a
@@ -871,10 +965,9 @@ impl TypeChecker {
     /// `materialize_struct`'s read-only counterpart: this instantiation's
     /// field types, with the declared binders substituted by `args`. Kept
     /// separate because `type_implements` runs behind `&self` and must not
-    /// register anything under `struct_key` as a side effect of *asking a
-    /// question*.
+    /// register a layout as a side effect of *asking a question*.
     fn struct_field_types(&self, name: &str, args: &[Type]) -> Vec<Type> {
-        let template = match self.struct_defs.get(name) {
+        let template = match self.struct_templates.get(name) {
             Some(fields) => fields,
             None => return Vec::new(),
         };
@@ -967,7 +1060,7 @@ impl TypeChecker {
     /// with non-empty `args`) it substitutes `args` into the generic
     /// template positionally, keyed by `struct_type_params[name]`'s
     /// placeholder `TypeVar` names, and — the load-bearing part —
-    /// registers the result into `struct_defs` under `resolved.struct_key()`
+    /// registers the result into `struct_defs` under `resolved` itself
     /// (memoized: a repeat lookup of the same instantiation just returns
     /// the cached entry). That registration is what lets
     /// `codegen::struct_fields` (and `field_slice_range`/`print_value`,
@@ -978,20 +1071,19 @@ impl TypeChecker {
     /// (the construction-site counterpart, which registers the same way).
     fn materialize_struct(&mut self, resolved: &Type) -> Vec<(String, Type)> {
         let Type::Named { name, args } = resolved else { return Vec::new() };
-        if args.is_empty() {
-            return self.struct_defs.get(name).cloned().unwrap_or_default();
-        }
-        let key = resolved.struct_key().expect("Named with a non-List name always has a struct_key");
-        if let Some(existing) = self.struct_defs.get(&key) {
+        if let Some(existing) = self.struct_defs.get(resolved) {
             return existing.clone();
         }
-        let template = self.struct_defs.get(name).cloned().unwrap_or_default();
+        let template = self.struct_templates.get(name).cloned().unwrap_or_default();
+        // A non-generic struct's template *is* its layout, and
+        // `hoist_data_decls` already registered it under this same key.
+        if args.is_empty() { return template; }
         let binder_names = self.struct_type_params.get(name).cloned().unwrap_or_default();
         let mapping: HashMap<String, Type> = binder_names.into_iter().zip(args.iter().cloned()).collect();
         let concrete: Vec<(String, Type)> = template.into_iter()
             .map(|(fname, fty)| (fname, fty.substitute(&mapping)))
             .collect();
-        self.struct_defs.insert(key, concrete.clone());
+        self.struct_defs.insert(resolved.clone(), concrete.clone());
         concrete
     }
 
@@ -1011,7 +1103,7 @@ impl TypeChecker {
     /// `args`. A non-generic struct (or an unregistered name) just returns
     /// its ordinary field list and no binder vars.
     fn instantiate_struct(&mut self, name: &str) -> (Vec<(String, Type)>, Vec<Type>) {
-        let field_defs = self.struct_defs.get(name).cloned().unwrap_or_default();
+        let field_defs = self.struct_templates.get(name).cloned().unwrap_or_default();
         let binder_names = match self.struct_type_params.get(name) {
             Some(b) if !b.is_empty() => b.clone(),
             _ => return (field_defs, Vec::new()),
@@ -1101,13 +1193,26 @@ impl TypeChecker {
     /// disconnect it from what it's meant to stay linked to. Called
     /// *before* the binding being generalized is itself inserted, so the
     /// environment scan doesn't see it.
-    fn generalize(&self, ty: &Type) -> Vec<(String, Vec<Trait>)> {
+    ///
+    /// `self_name` names the binding being generalized when it *is* already
+    /// in scope — a function pre-bound to a placeholder type so its own body
+    /// could call it (`lower_assign`'s recursion pre-bind). Its placeholder
+    /// resolves to the very type being generalized, so leaving it in the
+    /// scan would make every one of `ty`'s vars look environment-captured
+    /// and generalize nothing at all: `func id(x) = x` would stop being
+    /// generic the moment it became capable of recursion.
+    fn generalize(&self, ty: &Type, self_name: Option<&str>) -> Vec<(String, Vec<Trait>)> {
         let mut ty_vars = Vec::new();
         self.free_vars(ty, &mut ty_vars);
         if ty_vars.is_empty() { return Vec::new(); }
         let mut env_vars = Vec::new();
-        for bound in self.ctx.bound_types() {
-            self.free_vars(bound, &mut env_vars);
+        match self_name {
+            Some(skip) => for bound in self.ctx.bound_types_except(skip) {
+                self.free_vars(bound, &mut env_vars);
+            },
+            None => for bound in self.ctx.bound_types() {
+                self.free_vars(bound, &mut env_vars);
+            },
         }
         ty_vars.into_iter().filter(|(n, _)| !env_vars.iter().any(|(en, _)| en == n)).collect()
     }
@@ -1118,6 +1223,7 @@ impl TypeChecker {
             substitutions: self.substitutions.clone(),
             next_id: self.next_id,
             struct_defs: self.struct_defs.clone(),
+            struct_templates: self.struct_templates.clone(),
             struct_type_params: self.struct_type_params.clone(),
             union_defs: self.union_defs.clone(),
             union_names: self.union_names.clone(),
@@ -1136,6 +1242,7 @@ impl TypeChecker {
         self.substitutions = cp.substitutions;
         self.next_id = cp.next_id;
         self.struct_defs = cp.struct_defs;
+        self.struct_templates = cp.struct_templates;
         self.struct_type_params = cp.struct_type_params;
         self.union_defs = cp.union_defs;
         self.union_names = cp.union_names;
@@ -1251,7 +1358,7 @@ impl TypeChecker {
             "Bool"  => Some(Type::Bool),
             "Str"   => Some(Type::Str),
             "None"  => Some(Type::None),
-            _ if self.struct_defs.contains_key(name) => Some(Type::strukt(name)),
+            _ if self.struct_templates.contains_key(name) => Some(Type::strukt(name)),
             _ if self.union_defs.contains_key(name)  => Some(self.union_defs[name].ty.clone()),
             _ => None,
         }
@@ -1353,17 +1460,17 @@ impl TypeChecker {
     ///
     /// 1. **A lambda literal against a `Function` type** — the parameters
     ///    take their types from the expectation rather than becoming fresh
-    ///    variables, so `let f: Function(Int, Int) = [x] -> x + 1` types
+    ///    variables, so `let f: (Int -> Int) = [x] -> x + 1` types
     ///    `x` without an annotation on the lambda itself.
     /// 2. **A list literal against a `List` type** — the expected *element*
     ///    type is pushed into each element (recursively, so
-    ///    `List(List(Int))` works too). Bottom-up can't type either of the
+    ///    `List<List<Int>>` works too). Bottom-up can't type either of the
     ///    two cases an annotation exists to resolve:
-    ///      `let xs: List(Str) = []`          — bare `[]` synthesizes
+    ///      `let xs: List<Str> = []`          — bare `[]` synthesizes
     ///                                          `List(~t0)`, and `is_subtype`
     ///                                          can't see through the `List`
     ///                                          to bind it
-    ///      `let xs: List(Int | Str) = [1, "a"]`
+    ///      `let xs: List<Int | Str> = [1, "a"]`
     ///                                        — the elements only agree once
     ///                                          each is widened to the
     ///                                          annotated union, which the
@@ -1432,7 +1539,8 @@ impl TypeChecker {
                 let resolved = self.lookup(&lowered.item.ty);
                 let accepted = self.is_subtype(&resolved, &expected)
                     || widens_to(&resolved, &expected)
-                    || (matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, &expected));
+                    || (matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, &expected))
+                    || self.unify_with_one_union_member(&resolved, &expected);
                 if !accepted {
                     return Err(Spanned::from(TypeError {
                         msg: format!("Expected {} got {}", expected, resolved)
@@ -1646,7 +1754,7 @@ impl TypeChecker {
     fn hoist_data_decls(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
         for s in stmts {
             if let Expression::DataDecl(d) = &s.item {
-                if self.struct_defs.contains_key(&d.name) || self.union_defs.contains_key(&d.name) {
+                if self.struct_templates.contains_key(&d.name) || self.union_defs.contains_key(&d.name) {
                     return Err(Spanned::from(TypeError {
                         msg: format!("'{}' is already declared", d.name)
                     }, s.span));
@@ -1667,7 +1775,8 @@ impl TypeChecker {
                     }, s.span));
                 }
                 if d.variants.is_empty() {
-                    self.struct_defs.insert(d.name.clone(), Vec::new());
+                    self.struct_templates.insert(d.name.clone(), Vec::new());
+                    self.struct_defs.insert(Type::strukt(&d.name), Vec::new());
                     if !d.type_params.is_empty() {
                         let tvar_names: Vec<String> = d.type_params.iter()
                             .map(|_| match self.fresh_var() {
@@ -1691,7 +1800,11 @@ impl TypeChecker {
                     let mut member_types: Vec<Type> = d.variants.iter()
                         .map(|v| Type::strukt(format!("{}.{}", d.name, v.name)))
                         .collect();
-                    member_types.sort_by_cached_key(|t| t.to_string());
+                    // The same canonical order `normalize` uses — these
+                    // marker types bypass it (they are built already
+                    // flattened and deduplicated) but must still agree with
+                    // it about member position, which is the tag.
+                    member_types.sort();
                     let ty = Type::Union(member_types.clone());
                     self.union_names.insert(member_types, d.name.clone());
                     self.union_defs.insert(d.name.clone(), UnionDef { common: Vec::new(), variants: Vec::new(), ty });
@@ -1722,7 +1835,14 @@ impl TypeChecker {
                 }
                 self.type_param_scope = HashMap::new();
                 if d.variants.is_empty() {
-                    self.struct_defs.insert(d.name.clone(), fields);
+                    // The template always; the concrete layout too when the
+                    // declaration is non-generic, where the two are the same
+                    // list. A generic declaration's layouts are registered per
+                    // instantiation by `materialize_struct` instead.
+                    self.struct_templates.insert(d.name.clone(), fields.clone());
+                    if d.type_params.is_empty() {
+                        self.struct_defs.insert(Type::strukt(&d.name), fields);
+                    }
                 } else {
                     let mut seen_variants: HashMap<String, Span> = HashMap::new();
                     let mut variants = Vec::with_capacity(d.variants.len());
@@ -1753,7 +1873,11 @@ impl TypeChecker {
                     for (vn, vfields) in &variants {
                         let mut flat = fields.clone();
                         flat.extend(vfields.clone());
-                        self.struct_defs.insert(format!("{}.{}", d.name, vn), flat);
+                        // A nominal union's variant marker struct is never
+                        // generic, so template and layout coincide.
+                        let vkey = format!("{}.{}", d.name, vn);
+                        self.struct_templates.insert(vkey.clone(), flat.clone());
+                        self.struct_defs.insert(Type::strukt(&vkey), flat);
                     }
                     let def = self.union_defs.get_mut(&d.name).expect("registered in the first pass, above");
                     def.common = fields;
@@ -1795,7 +1919,7 @@ impl TypeChecker {
     }
 
     /// DFS over the struct field-type graph, following only direct
-    /// `Type::Struct` fields (a `List(Struct(_))` field is fine — a list is
+    /// `Type::Struct` fields (a `List<SomeStruct>` field is fine — a list is
     /// a heap pointer, not inline storage, so it can't create an
     /// infinite-size cycle the way a direct field can). A `Type::Union`
     /// field is always fine too — a nominal union's member is a single
@@ -1811,7 +1935,7 @@ impl TypeChecker {
             }, span));
         }
         path.push(name.to_string());
-        if let Some(fields) = self.struct_defs.get(name).cloned() {
+        if let Some(fields) = self.struct_templates.get(name).cloned() {
             for (_, fty) in &fields {
                 if let Some(inner) = fty.as_struct_name() {
                     self.check_struct_acyclic(inner, path, span)?;
@@ -1879,7 +2003,9 @@ impl TypeChecker {
             let value = self.check_and_lower(value_expr)?;
             let resolved_value_ty = self.lookup(&value.item.ty);
             let resolved_field_ty = self.lookup(&field_ty);
-            if !(widens_to(&resolved_value_ty, &resolved_field_ty) || self.unify(&value.item.ty, &field_ty)) {
+            if !(widens_to(&resolved_value_ty, &resolved_field_ty)
+                || self.unify(&value.item.ty, &field_ty)
+                || self.unify_with_one_union_member(&value.item.ty, &field_ty)) {
                 return Err(Spanned::from(TypeError {
                     msg: format!("Field '{}' of {} expects {}, got {}", fname, kind_name, resolved_field_ty, resolved_value_ty)
                 }, value_span));
@@ -2101,7 +2227,7 @@ impl TypeChecker {
         // directly rather than re-deriving it from `variant`, which for a
         // synthesized pattern is only `Type::to_string()`'s *display* form
         // and may not be a resolvable (or even parseable) type name at all,
-        // e.g. `List(Int)`. See `Pattern::resolved_member`'s doc comment.
+        // e.g. `List<Int>`. See `Pattern::resolved_member`'s doc comment.
         let (idx, member_ty) = if let Some(idx) = pattern.resolved_member {
             let member_ty = members.get(idx).cloned().ok_or_else(|| Spanned::from(TypeError {
                 msg: format!("internal error: resolved_member index {} out of range for {}", idx, Type::Union(members.to_vec()))
@@ -2136,6 +2262,8 @@ impl TypeChecker {
         if self.is_subtype(&resolved, expected) {
             Ok(resolved)
         } else if matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, expected) {
+            Ok(self.lookup(&resolved))
+        } else if self.unify_with_one_union_member(&resolved, expected) {
             Ok(self.lookup(&resolved))
         } else {
             Err(Spanned::from(TypeError {
@@ -2477,7 +2605,7 @@ impl TypeChecker {
             },
             // Structural unification for named type constructors — invariant
             // in every argument position (`TRAITS.md` Part 4, "Variance"):
-            // `List(Int)` does not unify with `List(Int | Str)` in either
+            // `List<Int>` does not unify with `List<Int | Str>` in either
             // direction, since a list's runtime layout (stride, ptr_mask)
             // depends on its element type and differs between them. Same
             // constructor name and arity is required; a zero-arg `Named`
@@ -2493,6 +2621,56 @@ impl TypeChecker {
                     && a1.iter().zip(a2.iter()).all(|(l, r)| self.unify(l, r))
             },
             _ => false,
+        }
+    }
+
+    /// The last resort when a value is being checked against an *expected*
+    /// union type and plain `unify` has already said no: unify it with the
+    /// one member it fits.
+    ///
+    /// `unify`'s own `(_, Type::Union(variants))` arm accepts a concrete
+    /// type only by *equality* with some member, and deliberately binds
+    /// nothing (see `join_types`, which depends on that). Equality is too
+    /// weak for two cases that are otherwise unreachable:
+    ///
+    ///   `data Box<A>(v: A | Str)` / `Box(v=1)` — the member is the binder
+    ///       `~t1`, so nothing is equal to `Int` and the instantiation that
+    ///       would make it fit is exactly what has to be discovered here;
+    ///   `let x: List<Str> | Int = []` — `[]` synthesizes `List(~t0)`, which
+    ///       is equal to no member either, though it unifies with one.
+    ///
+    /// Directional on purpose: this is only ever right where one side is an
+    /// expectation imposed on the other (an annotation, a declared field, a
+    /// return slot). It must not be reachable from `join_types`, where the
+    /// two types are peers and binding one side's variable to the other's
+    /// member would pin a variable the program never constrained.
+    ///
+    /// Each member is tried against a snapshot of `substitutions` and rolled
+    /// back, so a failed attempt leaves nothing behind. Exactly one member
+    /// must fit: `let x: List<Int> | List<Str> = []` fits two, and guessing
+    /// between them would silently pick a runtime tag, so it is left to fail
+    /// as "not accepted" and be annotated properly.
+    fn unify_with_one_union_member(&mut self, actual: &Type, expected: &Type) -> bool {
+        let Type::Union(members) = self.lookup(expected) else { return false };
+        let snapshot = self.substitutions.clone();
+        let mut winner: Option<HashMap<String, Type>> = None;
+        for member in &members {
+            if self.unify(actual, member) {
+                // Take the bindings this member produced and put the clean
+                // snapshot back, so the next member starts from the same
+                // state this one did.
+                let produced = std::mem::replace(&mut self.substitutions, snapshot.clone());
+                if winner.is_some() {
+                    return false;      // ambiguous; `substitutions` is already the snapshot
+                }
+                winner = Some(produced);
+            } else {
+                self.substitutions = snapshot.clone();
+            }
+        }
+        match winner {
+            Some(produced) => { self.substitutions = produced; true },
+            None => false,
         }
     }
 
@@ -2781,9 +2959,6 @@ impl TypeChecker {
     pub fn monomorphize_generics(&mut self, typed: &mut Spanned<TypedExpr>) -> Result<(), Spanned<TypeError>> {
         if self.generic_templates.is_empty() { return Ok(()); }
 
-        let mut seen: HashMap<String, Vec<(Type, Span)>> = HashMap::new();
-        self.collect_generic_var_types(typed, &mut seen);
-
         let mut stmts: Vec<Spanned<TypedExpr>> = match std::mem::replace(&mut typed.item.kind, TypedExprKind::IntLit(0)) {
             TypedExprKind::Block(s) => s,
             other => vec![Spanned::from(TypedExpr { id: 0, ty: typed.item.ty.clone(), kind: other }, typed.span)],
@@ -2834,12 +3009,33 @@ impl TypeChecker {
         // `TypeVar` until `idpair$Int` is built, and only that clone knows
         // it needs `id$Int`. So each body emitted below is re-scanned and
         // whatever it newly asks for goes back on the worklist.
+        // Seeded from the statements that will actually be *compiled* —
+        // after the strip above, never from the whole pre-strip tree. A
+        // reference inside a generic declaration's own body is a reference
+        // from code that is about to be thrown away: its type is still that
+        // declaration's abstract binder, so seeding from it emitted a body
+        // with un-substituted binder `TypeVar`s under a name like `id$Vt4`
+        // — dead code that `codegen::cl_type` silently laid out as `I64`,
+        // and a junk symbol permanently occupying `emitted_instantiations`.
+        // The only correct source for such a reference is the *clone* the
+        // fixed-point loop makes, where the binder is concrete.
+        let mut seen: HashMap<String, Vec<(Type, Span)>> = HashMap::new();
+        for s in stmts.iter() { self.collect_generic_var_types(s, &mut seen); }
+        if let Some(t) = tail.as_ref() { self.collect_generic_var_types(t, &mut seen); }
+
         let mut mangled_for: HashMap<(String, Type), String> = HashMap::new();
         let mut work: Vec<(String, Type, Span)> = seen.iter()
             .flat_map(|(name, occurrences)| {
                 occurrences.iter().map(|(ty, span)| (name.clone(), ty.clone(), *span))
             })
             .collect();
+        // `seen` is a `HashMap`, so its iteration order varies run to run and
+        // the emitted instantiations came out in a different order each time —
+        // same program, different module layout, and nothing reproducible to
+        // diff when something goes wrong. Sorting by (name, type) makes the
+        // output a function of the program alone. `work` is drained from the
+        // back, so sort descending to emit in ascending order.
+        work.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
         while let Some((name, concrete, span)) = work.pop() {
             let Some(template) = self.generic_templates.get(&name).cloned() else { continue };
@@ -2879,9 +3075,14 @@ impl TypeChecker {
             // contains finally names a real instantiation. Queue those.
             let mut nested: HashMap<String, Vec<(Type, Span)>> = HashMap::new();
             self.collect_generic_var_types(&new_body, &mut nested);
-            for (n, occurrences) in nested {
-                for (ty, sp) in occurrences { work.push((n.clone(), ty, sp)); }
-            }
+            // Sorted for the same reason the initial seeding is — see there.
+            let mut queued: Vec<(String, Type, Span)> = nested.into_iter()
+                .flat_map(|(n, occurrences)| {
+                    occurrences.into_iter().map(move |(ty, sp)| (n.clone(), ty, sp))
+                })
+                .collect();
+            queued.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+            work.extend(queued);
 
             let fn_ty = Type::Function {
                 params: new_params.iter().map(|(_, t, _)| t.clone()).collect(),
@@ -3063,118 +3264,146 @@ impl TypeChecker {
         }
     }
 
+    /// Apply `f` to every `Var` node in `expr`, giving it that node's name
+    /// (mutably) and its stored type. The single place the typed AST's
+    /// shape is enumerated for a `Var`-renaming pass — `rewrite_call_sites`
+    /// and `rename_var` are both wrappers, and adding a `TypedExprKind`
+    /// variant should break exactly this match rather than silently skip a
+    /// subtree in one pass but not the other.
+    ///
+    /// Note `Assign`/`Function`/`ForLoop` etc. expose only their
+    /// sub-expressions: a *binding* occurrence of a name is not a `Var` and
+    /// is deliberately out of reach here. Every caller rewrites references,
+    /// never declarations.
+    fn walk_vars_mut(expr: &mut Spanned<TypedExpr>, f: &mut impl FnMut(&mut String, &Type)) {
+        // Destructured so the name and the type are two disjoint borrows of
+        // `expr.item` rather than two overlapping ones.
+        let TypedExpr { ty, kind, .. } = &mut expr.item;
+        if let TypedExprKind::Var(name) = kind {
+            f(name, ty);
+        }
+        match kind {
+            TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)
+            | TypedExprKind::StrLit(_) | TypedExprKind::NoneLit | TypedExprKind::Var(_) => {},
+
+            TypedExprKind::Unary { expr: inner, .. } => Self::walk_vars_mut(inner, f),
+
+            TypedExprKind::Binary { left, right, .. } => {
+                Self::walk_vars_mut(left, f);
+                Self::walk_vars_mut(right, f);
+            },
+
+            TypedExprKind::Conditional { cond, true_branch, false_branch } => {
+                Self::walk_vars_mut(cond, f);
+                Self::walk_vars_mut(true_branch, f);
+                if let Some(fb) = false_branch { Self::walk_vars_mut(fb, f); }
+            },
+
+            TypedExprKind::Assign { value, .. } => Self::walk_vars_mut(value, f),
+
+            TypedExprKind::Function { body, .. } => Self::walk_vars_mut(body, f),
+
+            TypedExprKind::Call { callable, args, .. } => {
+                Self::walk_vars_mut(callable, f);
+                for a in args.iter_mut() { Self::walk_vars_mut(a, f); }
+            },
+
+            TypedExprKind::Index { target, index } => {
+                Self::walk_vars_mut(target, f);
+                Self::walk_vars_mut(index, f);
+            },
+
+            TypedExprKind::Slice { target, start, end } => {
+                Self::walk_vars_mut(target, f);
+                if let Some(s) = start { Self::walk_vars_mut(s, f); }
+                if let Some(e) = end { Self::walk_vars_mut(e, f); }
+            },
+
+            TypedExprKind::Range { start, end } => {
+                Self::walk_vars_mut(start, f);
+                Self::walk_vars_mut(end, f);
+            },
+
+            TypedExprKind::List(elems) => {
+                for e in elems.iter_mut() { Self::walk_vars_mut(e, f); }
+            },
+
+            TypedExprKind::Block(stmts) => {
+                for s in stmts.iter_mut() { Self::walk_vars_mut(s, f); }
+            },
+
+            TypedExprKind::ForLoop { iterable, cond, body, .. } => {
+                Self::walk_vars_mut(iterable, f);
+                if let Some(c) = cond { Self::walk_vars_mut(c, f); }
+                Self::walk_vars_mut(body, f);
+            },
+
+            TypedExprKind::Comprehension { iterable, cond, body, .. } => {
+                Self::walk_vars_mut(iterable, f);
+                if let Some(c) = cond { Self::walk_vars_mut(c, f); }
+                Self::walk_vars_mut(body, f);
+            },
+
+            TypedExprKind::StructInit { fields, .. } => {
+                for (_, v) in fields.iter_mut() { Self::walk_vars_mut(v, f); }
+            },
+
+            TypedExprKind::FieldAccess { target, .. } => Self::walk_vars_mut(target, f),
+            TypedExprKind::PlaceAssign { path, value, .. } => {
+                for seg in path.iter_mut() {
+                    if let PlaceSeg::Index { index, .. } = seg {
+                        Self::walk_vars_mut(index, f);
+                    }
+                }
+                Self::walk_vars_mut(value, f);
+            },
+
+            TypedExprKind::VariantInit { fields, .. } => {
+                for (_, v) in fields.iter_mut() { Self::walk_vars_mut(v, f); }
+            },
+
+            TypedExprKind::IsVariant { target, .. } => Self::walk_vars_mut(target, f),
+            TypedExprKind::VariantField { target, .. } => Self::walk_vars_mut(target, f),
+
+            TypedExprKind::Return(value) => {
+                if let Some(v) = value { Self::walk_vars_mut(v, f); }
+            },
+
+            TypedExprKind::Widen { value, .. } => Self::walk_vars_mut(value, f),
+            TypedExprKind::Narrow { value, .. } => Self::walk_vars_mut(value, f),
+            TypedExprKind::TypeTag { target, .. } => Self::walk_vars_mut(target, f),
+            TypedExprKind::Truthy(value) => Self::walk_vars_mut(value, f),
+            TypedExprKind::Coerce(value) => Self::walk_vars_mut(value, f),
+        }
+    }
+
     /// Rewrite every `Var(name)` reference to a generalized name into its
     /// mangled instantiation name, per `table` (built by
     /// `monomorphize_generics` from the exact `(name, concrete
     /// whole-function type)` pairs it just compiled, or found already
-    /// compiled in an earlier entry). Walks the same node shapes as
-    /// `collect_generic_var_types`; run over every top-level statement
+    /// compiled in an earlier entry). Run over every top-level statement
     /// *including* the newly-cloned instantiation bodies themselves, so a
     /// recursive call inside a generic's own body — which resolves to the
     /// same concrete type as the instantiation it lives in — is rewritten
     /// too.
     fn rewrite_call_sites(&self, expr: &mut Spanned<TypedExpr>, table: &HashMap<(String, Type), String>) {
-        if let TypedExprKind::Var(name) = &mut expr.item.kind {
-            if self.generic_templates.contains_key(name.as_str()) {
-                let resolved = self.lookup(&expr.item.ty);
-                if let Some(mangled) = table.get(&(name.clone(), resolved)) {
-                    *name = mangled.clone();
-                }
+        Self::walk_vars_mut(expr, &mut |name, ty| {
+            if !self.generic_templates.contains_key(name.as_str()) { return; }
+            let resolved = self.lookup(ty);
+            if let Some(mangled) = table.get(&(name.clone(), resolved)) {
+                *name = mangled.clone();
             }
-        }
-        match &mut expr.item.kind {
-            TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)
-            | TypedExprKind::StrLit(_) | TypedExprKind::NoneLit | TypedExprKind::Var(_) => {},
+        });
+    }
 
-            TypedExprKind::Unary { expr: inner, .. } => self.rewrite_call_sites(inner, table),
-
-            TypedExprKind::Binary { left, right, .. } => {
-                self.rewrite_call_sites(left, table);
-                self.rewrite_call_sites(right, table);
-            },
-
-            TypedExprKind::Conditional { cond, true_branch, false_branch } => {
-                self.rewrite_call_sites(cond, table);
-                self.rewrite_call_sites(true_branch, table);
-                if let Some(fb) = false_branch { self.rewrite_call_sites(fb, table); }
-            },
-
-            TypedExprKind::Assign { value, .. } => self.rewrite_call_sites(value, table),
-
-            TypedExprKind::Function { body, .. } => self.rewrite_call_sites(body, table),
-
-            TypedExprKind::Call { callable, args, .. } => {
-                self.rewrite_call_sites(callable, table);
-                for a in args.iter_mut() { self.rewrite_call_sites(a, table); }
-            },
-
-            TypedExprKind::Index { target, index } => {
-                self.rewrite_call_sites(target, table);
-                self.rewrite_call_sites(index, table);
-            },
-
-            TypedExprKind::Slice { target, start, end } => {
-                self.rewrite_call_sites(target, table);
-                if let Some(s) = start { self.rewrite_call_sites(s, table); }
-                if let Some(e) = end { self.rewrite_call_sites(e, table); }
-            },
-
-            TypedExprKind::Range { start, end } => {
-                self.rewrite_call_sites(start, table);
-                self.rewrite_call_sites(end, table);
-            },
-
-            TypedExprKind::List(elems) => {
-                for e in elems.iter_mut() { self.rewrite_call_sites(e, table); }
-            },
-
-            TypedExprKind::Block(stmts) => {
-                for s in stmts.iter_mut() { self.rewrite_call_sites(s, table); }
-            },
-
-            TypedExprKind::ForLoop { iterable, cond, body, .. } => {
-                self.rewrite_call_sites(iterable, table);
-                if let Some(c) = cond { self.rewrite_call_sites(c, table); }
-                self.rewrite_call_sites(body, table);
-            },
-
-            TypedExprKind::Comprehension { iterable, cond, body, .. } => {
-                self.rewrite_call_sites(iterable, table);
-                if let Some(c) = cond { self.rewrite_call_sites(c, table); }
-                self.rewrite_call_sites(body, table);
-            },
-
-            TypedExprKind::StructInit { fields, .. } => {
-                for (_, v) in fields.iter_mut() { self.rewrite_call_sites(v, table); }
-            },
-
-            TypedExprKind::FieldAccess { target, .. } => self.rewrite_call_sites(target, table),
-            TypedExprKind::PlaceAssign { path, value, .. } => {
-                for seg in path.iter_mut() {
-                    if let PlaceSeg::Index { index, .. } = seg {
-                        self.rewrite_call_sites(index, table);
-                    }
-                }
-                self.rewrite_call_sites(value, table);
-            },
-
-            TypedExprKind::VariantInit { fields, .. } => {
-                for (_, v) in fields.iter_mut() { self.rewrite_call_sites(v, table); }
-            },
-
-            TypedExprKind::IsVariant { target, .. } => self.rewrite_call_sites(target, table),
-            TypedExprKind::VariantField { target, .. } => self.rewrite_call_sites(target, table),
-
-            TypedExprKind::Return(value) => {
-                if let Some(v) = value { self.rewrite_call_sites(v, table); }
-            },
-
-            TypedExprKind::Widen { value, .. } => self.rewrite_call_sites(value, table),
-            TypedExprKind::Narrow { value, .. } => self.rewrite_call_sites(value, table),
-            TypedExprKind::TypeTag { target, .. } => self.rewrite_call_sites(target, table),
-            TypedExprKind::Truthy(value) => self.rewrite_call_sites(value, table),
-            TypedExprKind::Coerce(value) => self.rewrite_call_sites(value, table),
-        }
+    /// Rename every `Var(from)` reference in `expr` to `to`. Used for
+    /// exactly one thing: undoing `lower_assign`'s recursion pre-bind when
+    /// the declaration turns out monomorphic and keeps its source name —
+    /// see the call site for why no shadowing analysis is needed.
+    fn rename_var(expr: &mut Spanned<TypedExpr>, from: &str, to: &str) {
+        Self::walk_vars_mut(expr, &mut |name, _| {
+            if name == from { *name = to.to_string(); }
+        });
     }
 
     /// Walk `declared` and `concrete` in lockstep (same shape by
@@ -3350,7 +3579,7 @@ impl TypeChecker {
     /// The field list codegen will actually walk for `ty`, with a generic
     /// struct's type arguments already substituted in — the read-only
     /// counterpart of `materialize_struct`, for callers that only have
-    /// `&self`. The registered `struct_key` layout is preferred when it
+    /// `&self`. The registered concrete layout is preferred when it
     /// exists (`materialize_struct` may already have cached it); otherwise
     /// the bare-name template's binder `TypeVar`s are substituted
     /// positionally from `args`, the same way `materialize_struct` does it.
@@ -3360,12 +3589,10 @@ impl TypeChecker {
     fn substituted_struct_fields(&self, ty: &Type) -> Option<Vec<(String, Type)>> {
         let Type::Named { name, args } = ty else { return None };
         if ty.as_struct_name().is_none() { return None }
-        if let Some(key) = ty.struct_key() {
-            if let Some(fields) = self.struct_defs.get(&key) {
-                return Some(fields.clone());
-            }
+        if let Some(fields) = self.struct_defs.get(ty) {
+            return Some(fields.clone());
         }
-        let template = self.struct_defs.get(name)?;
+        let template = self.struct_templates.get(name)?;
         if args.is_empty() { return Some(template.clone()) }
         let binder_names = self.struct_type_params.get(name).cloned().unwrap_or_default();
         let mapping: HashMap<String, Type> = binder_names.into_iter().zip(args.iter().cloned()).collect();
@@ -3888,18 +4115,93 @@ impl TypeChecker {
                             // recursive call with a `mut` argument
                             // (`lower_call`) needs it before this function's
                             // own body finishes checking, not after.
+                            // A not-fully-annotated function gets pre-bound
+                            // too, to a *placeholder* built from fresh vars
+                            // where the annotations run out — one per
+                            // parameter plus one for the result. Without it
+                            // such a function could not be recursive at all
+                            // (`func fact(n) = ... fact(n - 1)` was "Unbound
+                            // variable fact"), which also made the recursive
+                            // case `monomorphize_generics` is written to
+                            // handle unreachable. The placeholder is bound
+                            // with *zero* binders, so a call inside the body
+                            // uses it at one type: monomorphic recursion,
+                            // the decidable half. `unify_placeholder` below
+                            // ties it to what the body actually inferred.
+                            //
+                            // The template symbol has to be minted here,
+                            // before the body is checked, so that a
+                            // recursive `Var` resolves to *this*
+                            // declaration's symbol the same way an external
+                            // reference does — decided in scope, at lowering
+                            // time, which is the whole point of
+                            // `Binding::symbol`. If the function turns out
+                            // monomorphic after all, `rename_var` below
+                            // puts the source name back.
+                            let mut recursion_prebind: Option<(String, Type)> = None;
                             if let Expression::Function(func) = &a.value.item {
-                                if func.return_type.is_some() && func.params.iter().all(|p| p.ty.is_some()) {
-                                    let param_tys: Result<Vec<Type>, _> = func.params.iter()
-                                        .map(|p| self.resolve_type_expr(p.ty.as_ref().expect("all params annotated — checked above")))
-                                        .collect();
-                                    let ret_ty = self.resolve_type_expr(func.return_type.as_ref().expect("return type present — checked above"))?;
-                                    let func_ty = Type::Function { params: param_tys?, result: Box::new(ret_ty) };
-                                    self.ctx.insert_mut(name.clone(), func_ty, mutable);
-                                    self.func_mut_params.insert(name.clone(), func.params.iter().map(|p| p.mutable).collect());
+                                let fully_annotated = func.return_type.is_some()
+                                    && func.params.iter().all(|p| p.ty.is_some());
+                                let mut param_tys = Vec::with_capacity(func.params.len());
+                                for p in &func.params {
+                                    param_tys.push(match &p.ty {
+                                        Some(t) => self.resolve_type_expr(t)?,
+                                        None    => self.fresh_var(),
+                                    });
                                 }
+                                let ret_ty = match &func.return_type {
+                                    Some(t) => self.resolve_type_expr(t)?,
+                                    None    => self.fresh_var(),
+                                };
+                                let func_ty = Type::Function { params: param_tys, result: Box::new(ret_ty) };
+                                if fully_annotated {
+                                    self.ctx.insert_mut(name.clone(), func_ty, mutable);
+                                } else if !mutable {
+                                    let sym = format!("{}#{}", name, self.next_id);
+                                    self.next_id += 1;
+                                    self.ctx.insert_generalized(name.clone(), func_ty.clone(), Vec::new(), Some(sym.clone()));
+                                    recursion_prebind = Some((sym, func_ty));
+                                }
+                                // `func_mut_params` is pre-bound alongside
+                                // for the same reason: a recursive call with
+                                // a `mut` argument (`lower_call`) needs it
+                                // before this function's own body finishes
+                                // checking, not after.
+                                self.func_mut_params.insert(name.clone(), func.params.iter().map(|p| p.mutable).collect());
                             }
-                            let value = self.check_and_lower(*a.value)?;
+                            let mut value = self.check_and_lower(*a.value)?;
+                            // Tie the placeholder the body called back to
+                            // the signature the body actually has. This can
+                            // only fail if a recursive call disagreed with
+                            // the declaration — polymorphic recursion, which
+                            // is undecidable to infer and so is reported
+                            // rather than guessed at.
+                            if let Some((_, placeholder)) = &recursion_prebind {
+                                let placeholder = placeholder.clone();
+                                if !self.unify(&placeholder, &value.item.ty) {
+                                    return Err(Spanned::from(TypeError {
+                                        msg: format!(
+                                            "recursive calls to '{}' must all be at the same type — it is used as {} but defined as {}; \
+                                             annotate its parameters and return type to say which you mean",
+                                            name, self.lookup(&placeholder), self.lookup(&value.item.ty),
+                                        )
+                                    }, span));
+                                }
+                                // A recursive call was typed against the
+                                // placeholder, so its `Var`/`Call` nodes
+                                // carry placeholder vars that only the unify
+                                // above pins down — and `unify` writes to
+                                // `substitutions`, never into a node's `ty`.
+                                // Resolve them here, while the subtree that
+                                // has them is still in hand. A generic
+                                // declaration would get this again from
+                                // `monomorphize_generics`; a monomorphic one
+                                // is never walked by that pass at all (it
+                                // returns early when nothing is generic),
+                                // which is how `fact`'s `~t3` return slot
+                                // reached codegen as an unresolved var.
+                                self.substitute_types_deep(&mut value, &HashMap::new());
+                            }
                             let ty = self.lookup(&value.item.ty);
                             // The value restriction (`TRAITS.md` Stage 2):
                             // generalize exactly a syntactic function value
@@ -3918,7 +4220,10 @@ impl TypeChecker {
                             // stack — must keep using `name`.
                             let mut decl_name = name.clone();
                             if !mutable && is_fn_value {
-                                let binders = self.generalize(&ty);
+                                // `name` is in scope here whenever the
+                                // recursion pre-bind ran, so tell
+                                // `generalize` to look past it.
+                                let binders = self.generalize(&ty, recursion_prebind.as_ref().map(|_| name.as_str()));
                                 // Only a *genuinely* polymorphic binding
                                 // (non-empty binders) needs the codegen
                                 // gate to watch it — a monomorphic func
@@ -3941,8 +4246,22 @@ impl TypeChecker {
                                     // references already lowered against
                                     // the first one keep pointing at it.
                                     if let TypedExprKind::Function { params, return_type, body } = &value.item.kind {
-                                        let sym = format!("{}#{}", name, self.next_id);
-                                        self.next_id += 1;
+                                        // Reuse the symbol the recursion
+                                        // pre-bind already minted, so a
+                                        // recursive `Var` inside `body` —
+                                        // lowered under that symbol — names
+                                        // this very template. Only a
+                                        // declaration that never got one
+                                        // (`mut`, which is never
+                                        // generalized) mints here instead.
+                                        let sym = match &recursion_prebind {
+                                            Some((sym, _)) => sym.clone(),
+                                            None => {
+                                                let sym = format!("{}#{}", name, self.next_id);
+                                                self.next_id += 1;
+                                                sym
+                                            },
+                                        };
                                         self.generic_templates.insert(sym.clone(), GenericTemplate {
                                             binders: binders.clone(),
                                             declared_ty: ty.clone(),
@@ -3951,6 +4270,24 @@ impl TypeChecker {
                                             body: (**body).clone(),
                                         });
                                         symbol = Some(sym);
+                                    }
+                                }
+                                if symbol.is_none() {
+                                    // Generalization found no binders, so
+                                    // this declaration is monomorphic after
+                                    // all and keeps its source name — but
+                                    // the body was lowered against the
+                                    // pre-bind's symbol. Put the name back.
+                                    // Safe without any shadowing analysis:
+                                    // `name#N` is not a spellable
+                                    // identifier, so the only `Var` nodes
+                                    // carrying it are the ones scope
+                                    // resolution created for this
+                                    // declaration. A local that shadowed
+                                    // `name` inside the body lowered to
+                                    // `Var(name)` and is untouched.
+                                    if let Some((sym, _)) = &recursion_prebind {
+                                        Self::rename_var(&mut value, sym, &name);
                                     }
                                 }
                                 self.ctx.insert_generalized(name.clone(), ty.clone(), binders, symbol.clone());
@@ -4028,7 +4365,7 @@ impl TypeChecker {
         // return type the body is *checked* against it, which both
         // widens its tail value into a union-typed slot and pushes
         // the type down into a list literal
-        // (`func f(): List(Str) = []`); without one it's
+        // (`func f(): List<Str> = []`); without one it's
         // synthesized and unified with the `return`s below.
         let body = self.in_scope(|t| {
             // Unlike `with_context`, each parameter binds with its own
@@ -4093,7 +4430,7 @@ impl TypeChecker {
         // function-call path, by checking whether the callee name is
         // a registered struct.
         let struct_name = c.callable.item.get_identifier()
-            .filter(|n| self.struct_defs.contains_key(*n))
+            .filter(|n| self.struct_templates.contains_key(*n))
             .map(|n| n.to_string());
         // Enum variant construction: `Circle(r=4)` (bare, unique
         // owner) or `Shape.Circle(r=4)` (qualified) — same syntactic
@@ -4106,9 +4443,9 @@ impl TypeChecker {
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "print"
         );
-        // `push` is a builtin mutating operation on `List(T)`, polymorphic
+        // `push` is a builtin mutating operation on `List<T>`, polymorphic
         // over `T` — like `print`, it can't be a monomorphic
-        // `default_context()` entry (there's no generics system; `List(T)`
+        // `default_context()` entry (there's no generics system; `List<T>`
         // is already a special-cased "builtin hack" per roadmap.md), so it
         // special-cases on the callee's literal name the same way `print`
         // does, rather than being a resolvable binding.
@@ -4116,7 +4453,7 @@ impl TypeChecker {
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "push"
         );
-        // `len` is a builtin read-only query on `List(T)` or `Str`,
+        // `len` is a builtin read-only query on `List<T>` or `Str`,
         // polymorphic over `T` the same way `push` is — same reason it
         // can't be a `default_context()` entry (a TypeVar there would get
         // permanently bound by the first call site, not re-instantiated
@@ -4125,7 +4462,7 @@ impl TypeChecker {
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "len"
         );
-        // `get` is a builtin bounds-checked read on `List(T)`, polymorphic
+        // `get` is a builtin bounds-checked read on `List<T>`, polymorphic
         // over `T` for the same reason `len`/`push` are — but unlike them
         // it can't be a plain synthesized `Function` type, since its result
         // isn't just `T`, it's `T | IndexError` (the stdlib's `get`-specific
@@ -4154,7 +4491,7 @@ impl TypeChecker {
                 let args: Vec<Type> = arg_vars.iter().map(|v| self.lookup(v)).collect();
                 let resolved = Type::Named { name: name.clone(), args };
                 // Registers this concrete instantiation's layout into
-                // `struct_defs` (keyed by `Type::struct_key`) even if the
+                // `struct_defs` (keyed by the `Type` itself) even if the
                 // program never reads a field back — codegen needs the
                 // full layout regardless (e.g. for GC slot masks).
                 self.materialize_struct(&resolved);
@@ -4285,9 +4622,11 @@ impl TypeChecker {
         let v_lowered = self.check_and_lower(v_arg)?;
         let resolved_argt = self.lookup(&v_lowered.item.ty);
         let resolved_elem = self.lookup(elem_ty);
-        if !widens_to(&resolved_argt, &resolved_elem) && !self.unify(&v_lowered.item.ty, elem_ty) {
+        if !widens_to(&resolved_argt, &resolved_elem)
+            && !self.unify(&v_lowered.item.ty, elem_ty)
+            && !self.unify_with_one_union_member(&v_lowered.item.ty, elem_ty) {
             return Err(Spanned::from(TypeError {
-                msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_elem)
+                msg: format!("Can't unify {} and {}", resolved_argt, resolved_elem)
             }, v_span));
         }
         let v_widened = self.lower_widen(v_lowered, elem_ty)?;
@@ -4565,9 +4904,11 @@ impl TypeChecker {
         let resolved_argt  = self.lookup(&lowered.item.ty);
         let resolved_param = self.lookup(param);
         // Allow implicit widening coercions at call sites (e.g. Int→Float).
-        if !widens_to(&resolved_argt, &resolved_param) && !self.unify(&lowered.item.ty, param) {
+        if !widens_to(&resolved_argt, &resolved_param)
+            && !self.unify(&lowered.item.ty, param)
+            && !self.unify_with_one_union_member(&lowered.item.ty, param) {
             return Err(Spanned::from(TypeError {
-                msg: format!("Can't unify {:?} and {:?}", resolved_argt, resolved_param)
+                msg: format!("Can't unify {} and {}", resolved_argt, resolved_param)
             }, arg_span));
         }
         let widened = self.lower_widen(lowered, param)?;
@@ -5701,7 +6042,7 @@ impl TypeChecker {
                     }
                     return Ok(Type::Named { name: name.clone(), args: arg_types });
                 }
-                if arg_types.is_empty() && (self.struct_defs.contains_key(name) || self.union_defs.contains_key(name)) {
+                if arg_types.is_empty() && (self.struct_templates.contains_key(name) || self.union_defs.contains_key(name)) {
                     return self.resolve_type_name(name)
                         .ok_or_else(|| Spanned::from(TypeError { msg: format!("Unknown type '{}'", name) }, span));
                 }
@@ -5751,8 +6092,64 @@ mod helper_tests {
 
     #[test]
     fn normalize_flattens_nested_unions() {
+        // Member order is `Ord for Type`'s (Int, Float, Bool, Str, ...), not
+        // the alphabetical-by-`Display` order this used to assert — see that
+        // impl for why the canonical order is no longer a rendering.
         let nested = union(vec![Type::Int, union(vec![Type::Str, Type::Bool])]);
-        assert_eq!(nested.normalize(), union(vec![Type::Bool, Type::Int, Type::Str]));
+        assert_eq!(nested.normalize(), union(vec![Type::Int, Type::Bool, Type::Str]));
+    }
+
+    /// The canonical order is what assigns runtime tags, so pin it directly
+    /// rather than only through whatever `normalize` happens to produce.
+    #[test]
+    fn canonical_order_is_scalars_first_then_composites() {
+        let mut ts = vec![
+            Type::list(Type::Int),
+            tvar("t0"),
+            Type::Str,
+            Type::Never,
+            Type::Int,
+            union(vec![Type::Int, Type::Str]),
+            Type::None,
+            Type::Bool,
+            Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) },
+            Type::Float,
+        ];
+        ts.sort();
+        assert_eq!(ts, vec![
+            Type::Int,
+            Type::Float,
+            Type::Bool,
+            Type::Str,
+            Type::None,
+            Type::Never,
+            Type::list(Type::Int),
+            union(vec![Type::Int, Type::Str]),
+            Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) },
+            tvar("t0"),
+        ]);
+    }
+
+    /// Two `Named`s at the same rank order by name first, then by argument —
+    /// so two instantiations of one generic stay adjacent and in a stable
+    /// order regardless of how the program mentions them.
+    #[test]
+    fn named_types_order_by_name_then_arguments() {
+        let mut ts = vec![
+            Type::list(Type::Str),
+            Type::strukt("Point"),
+            Type::list(Type::Int),
+            Type::Named { name: "Pair".to_string(), args: vec![Type::Int, Type::Str] },
+            Type::Named { name: "Pair".to_string(), args: vec![Type::Int, Type::Int] },
+        ];
+        ts.sort();
+        assert_eq!(ts, vec![
+            Type::list(Type::Int),
+            Type::list(Type::Str),
+            Type::Named { name: "Pair".to_string(), args: vec![Type::Int, Type::Int] },
+            Type::Named { name: "Pair".to_string(), args: vec![Type::Int, Type::Str] },
+            Type::strukt("Point"),
+        ]);
     }
 
     #[test]
@@ -5852,6 +6249,101 @@ mod helper_tests {
             tc.lookup(&Type::list(union(vec![Type::Str, tvar("t0")]))),
             Type::list(union(vec![Type::Int, Type::Str])),
         );
+    }
+
+    // ── Display round-trips through the parser ───────────────────────────────
+    //
+    // The counterpart of `notation`'s `read(repr(x)) == x` for values, and it
+    // exists for the same reason: `Display` and the grammar are two halves of
+    // one agreement, and nothing had been holding them to it. `TRAITS.md`
+    // Stage 3c moved type arguments to `Name<A, B>` and every diagnostic went
+    // on printing `Pair(Int, Str)` and `[Int]` — unparseable, and silently so,
+    // because no test rendered a type and read it back.
+    //
+    // Written as a round-trip rather than as expected strings so the two
+    // sides cannot drift without a failure here. Anything added to `Display`
+    // belongs in `TYPES_THAT_ROUND_TRIP` in the same change.
+
+    /// Parse `text` as a type annotation and resolve it, the way a real
+    /// `let x: T = ...` would — `Parser` for the syntax, `resolve_type_expr`
+    /// for the `TypeExpr` -> `Type` step.
+    fn parse_and_resolve(tc: &mut TypeChecker, text: &str) -> Type {
+        use crate::frontend::expression::Expression;
+        use crate::frontend::parser::Parser;
+        let ast = Parser::parse(&format!("let x: {} = 0", text))
+            .unwrap_or_else(|e| panic!("{}: parse error: {:?}", text, e));
+        let stmts = match ast.item {
+            Expression::Block(s) => s,
+            other => vec![Spanned::from(other, ast.span)],
+        };
+        let ann = match &stmts[0].item {
+            Expression::Assign(a) => a.typ.as_ref().expect("annotation present").clone(),
+            other => panic!("{}: expected an assignment, got {:?}", text, other),
+        };
+        tc.resolve_type_expr(&ann)
+            .unwrap_or_else(|e| panic!("{}: could not resolve: {:?}", text, e))
+    }
+
+    /// Every closed type shape `Display` can produce. `TypeVar` is excluded
+    /// on purpose — `~t0` has no source syntax, which is the one documented
+    /// exception on `Display for Type`.
+    fn types_that_round_trip() -> Vec<Type> {
+        let pair = |a: Type, b: Type| Type::Named { name: "Pair".to_string(), args: vec![a, b] };
+        vec![
+            Type::Int, Type::Float, Type::Bool, Type::Str, Type::None,
+            Type::strukt("Point"),
+            Type::list(Type::Int),
+            Type::list(Type::list(Type::Str)),
+            pair(Type::Int, Type::Str),
+            pair(Type::Int, Type::list(Type::Str)),
+            Type::list(pair(Type::Int, Type::Bool)),
+            union(vec![Type::Int, Type::Str]).normalize(),
+            union(vec![Type::Int, Type::None]).normalize(),
+            union(vec![Type::Int, Type::list(Type::Str)]).normalize(),
+            Type::list(union(vec![Type::Int, Type::Str]).normalize()),
+            Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) },
+            Type::Function { params: vec![Type::Int, Type::Str], result: Box::new(Type::Bool) },
+            // A function type inside a union is exactly the case the parens
+            // around `->` exist for.
+            union(vec![
+                Type::Str,
+                Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) },
+            ]).normalize(),
+        ]
+    }
+
+    #[test]
+    fn every_rendered_type_parses_back_to_itself() {
+        let mut tc = TypeChecker::new();
+        // `Point` and `Pair<A, B>` have to exist as declared names before an
+        // annotation mentioning them resolves.
+        tc.struct_templates.insert("Point".to_string(), Vec::new());
+        tc.struct_defs.insert(Type::strukt("Point"), Vec::new());
+        tc.struct_templates.insert("Pair".to_string(), Vec::new());
+        tc.struct_type_params.insert("Pair".to_string(), vec!["A".to_string(), "B".to_string()]);
+
+        for ty in types_that_round_trip() {
+            let rendered = ty.to_string();
+            let parsed = parse_and_resolve(&mut tc, &rendered);
+            assert_eq!(parsed, ty, "rendered as {:?}, parsed back as {}", rendered, parsed);
+        }
+    }
+
+    /// The specific spellings Stage 3c broke, pinned as literals as well —
+    /// the round-trip above would still pass if both sides moved together to
+    /// something nobody wants to read.
+    #[test]
+    fn rendered_types_use_the_current_source_syntax() {
+        assert_eq!(Type::list(Type::Int).to_string(), "List<Int>");
+        assert_eq!(
+            Type::Named { name: "Pair".to_string(), args: vec![Type::Int, Type::Str] }.to_string(),
+            "Pair<Int, Str>",
+        );
+        assert_eq!(
+            Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) }.to_string(),
+            "(Int -> Int)",
+        );
+        assert_eq!(union(vec![Type::Int, Type::Str]).normalize().to_string(), "Int | Str");
     }
 
     // ── widens_to / numeric_join ─────────────────────────────────────────────

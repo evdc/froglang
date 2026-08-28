@@ -3,7 +3,7 @@
 //! Built entirely on the embedding API (`plans/EMBEDDING.md`): every
 //! function here is either a `#[frog_fn]` host function registered through
 //! `FrogStateBuilder`, or (for the handful of things that need real
-//! polymorphism over `List(T)`, e.g. `len`) a hardcoded builtin living
+//! polymorphism over `List<T>`, e.g. `len`) a hardcoded builtin living
 //! alongside `push` in `frontend/typeck.rs`/`codegen/mod.rs` rather than
 //! here.
 
@@ -48,7 +48,7 @@ pub fn install(builder: FrogStateBuilder) -> FrogStateBuilder {
     let builder = builder.prelude("error ErrMsg(msg: Str)");
     // `get`'s error member — like `len`/`push`, `get` itself is a hardcoded
     // builtin in `typeck.rs`/`codegen/mod.rs` (it needs real polymorphism
-    // over `List(T)`), but unlike them it returns a union, so it needs an
+    // over `List<T>`), but unlike them it returns a union, so it needs an
     // `Error`-providing type declared before it's usable — same reasoning
     // as `ErrMsg` above.
     let builder = builder.prelude("error IndexError(index: Int, len: Int)");

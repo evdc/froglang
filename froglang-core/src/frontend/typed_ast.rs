@@ -118,10 +118,10 @@ pub enum TypedExprKind {
     /// (`target[..end]`, `target[start..]`, `target[..]`).
     Slice { target: TypedExprRef, start: Option<TypedExprRef>, end: Option<TypedExprRef> },
 
-    /// `start..end` — standalone range, eagerly materialized as `List(Int)`.
+    /// `start..end` — standalone range, eagerly materialized as `List<Int>`.
     Range { start: TypedExprRef, end: TypedExprRef },
 
-    /// Homogeneous list (parsed as `[a, b, c]`, inferred as `List(T)`).
+    /// Homogeneous list (parsed as `[a, b, c]`, inferred as `List<T>`).
     List(Vec<Spanned<TypedExpr>>),
 
     Block(Vec<Spanned<TypedExpr>>),

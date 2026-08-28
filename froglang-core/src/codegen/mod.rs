@@ -162,15 +162,19 @@ pub fn union_is_inline(members: &[Type], structs: &StructDefs) -> bool {
 /// already rejected by `hoist_data_decls`, so the `seen` set here is a
 /// belt-and-braces terminator rather than the thing doing the work.
 fn union_is_recursive(members: &[Type], structs: &StructDefs) -> bool {
-    fn reaches(target: &[Type], ty: &Type, structs: &StructDefs, seen: &mut Vec<String>) -> bool {
+    fn reaches(target: &[Type], ty: &Type, structs: &StructDefs, seen: &mut Vec<Type>) -> bool {
         // `as_struct_name` returns `None` for `List` (it excludes it by
         // construction), so a `List(Tree)` field is never recursed into —
         // it's a pointer regardless of element type, so it breaks the
         // cycle, same as before `Type::Named` collapsed `List`/`Struct`.
-        if let Some(name) = ty.as_struct_name() {
-            if seen.iter().any(|s| s == name) { return false; }
-            seen.push(name.to_string());
-            let hit = structs.get(name).is_some_and(|fields| {
+        if ty.as_struct_name().is_some() {
+            // Cycle detection is over the *type*, not the bare name: two
+            // instantiations of one generic struct share a name but are
+            // different layouts, and treating the second as "already seen"
+            // would cut the walk short.
+            if seen.iter().any(|s| s == ty) { return false; }
+            seen.push(ty.clone());
+            let hit = structs.get(ty).is_some_and(|fields| {
                 fields.iter().any(|(_, f)| reaches(target, f, structs, seen))
             });
             seen.pop();
@@ -516,14 +520,14 @@ fn gc_mask<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> i64 {
 /// rather than nested, e.g. `Company{ceo: Person{name, age}}` flattens to
 /// `[("ceo.name", Str), ("ceo.age", Int)]`.
 pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
-    if let Some(key) = ty.struct_key() {
+    if ty.is_struct() {
         // A generic instantiation's concrete layout (`TRAITS.md` Stage 3a)
-        // is registered under this same key by
+        // is registered under this same key — the `Type` itself — by
         // `TypeChecker::materialize_struct`/`instantiate_struct` while
-        // typeck runs — by the time codegen calls this, every
+        // typeck runs, so by the time codegen calls this, every
         // instantiation appearing anywhere in the typed program is
         // already present.
-        let fields = structs.get(&key).cloned().unwrap_or_default();
+        let fields = structs.get(ty).cloned().unwrap_or_default();
         let mut out = Vec::new();
         for (fname, fty) in fields {
             for (sub_path, sub_ty) in struct_fields(&fty, structs) {
@@ -1241,8 +1245,7 @@ fn print_list(elem_ty: &Type, list_val: Value, bcx: &mut FunctionBuilder, ctx: &
 fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
     if let Some(name) = ty.as_struct_name() {
         print_fragment(&format!("{}(", name), bcx, ctx);
-        let key = ty.struct_key().expect("as_struct_name Some implies struct_key Some");
-        let fields = ctx.structs.get(&key).expect("known struct in codegen");
+        let fields = ctx.structs.get(ty).expect("known struct in codegen");
         // A positionally-declared ("tuple struct") field has no
         // source-level name — `field_name_or_positional` gave it its
         // index instead (`is_positional_fields`) — so print it bare
@@ -1651,8 +1654,7 @@ fn eq_union_body(members: &[Type], l: &[Value], r: &[Value], bcx: &mut FunctionB
 /// there is nothing to be gained by branching per field.
 fn eq_value(ty: &Type, l: &[Value], r: &[Value], cursor: &mut usize, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
     if ty.is_struct() {
-        let key = ty.struct_key().expect("is_struct implies struct_key Some");
-        let fields = ctx.structs.get(&key).expect("known struct in codegen").clone();
+        let fields = ctx.structs.get(ty).expect("known struct in codegen").clone();
         let mut acc: Option<Value> = None;
         for (_, field_ty) in &fields {
             let sub = eq_value(field_ty, l, r, cursor, bcx, ctx);
@@ -2559,7 +2561,7 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         return vec![bcx.ins().iconst(types::I64, 0)];
     }
 
-    // `len(xs)` / `xs.len()` — `List(T)`/`Str`, polymorphic over `T` per
+    // `len(xs)` / `xs.len()` — `List<T>`/`Str`, polymorphic over `T` per
     // typeck's `finish_len`. No `func_ids` entry backs "len" either, so
     // this is dispatched on the argument's concrete type the same way
     // `print` dispatches on its own — reusing `frog_list_len`/`frog_str_len`,
@@ -3078,8 +3080,7 @@ fn enum_field_leaf_types(enum_name: &str, variant: Option<&str>, field: &str, st
 fn field_slice_range(struct_ty: &Type, field: &str, structs: &StructDefs) -> (usize, usize) {
     let name = struct_ty.as_struct_name()
         .unwrap_or_else(|| unreachable!("field_slice_range called on non-struct type {:?}", struct_ty));
-    let key = struct_ty.struct_key().expect("as_struct_name Some implies struct_key Some");
-    let decl_fields = structs.get(&key).cloned().unwrap_or_default();
+    let decl_fields = structs.get(struct_ty).cloned().unwrap_or_default();
     let mut offset = 0;
     for (fname, fty) in &decl_fields {
         let leaf_count = struct_fields(fty, structs).len();

@@ -7,7 +7,7 @@
 //! only codegen still knows the static element type. The runtime sees a
 //! pointer and a stride, and would compare a `Str` element by address.
 //!
-//! The trait side lives in `test_typeck.rs`: `List(T)` is `Eq` iff `T` is.
+//! The trait side lives in `test_typeck.rs`: `List<T>` is `Eq` iff `T` is.
 
 use froglang_core::state::{FrogState, FrogValue};
 

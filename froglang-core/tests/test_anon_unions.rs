@@ -335,3 +335,54 @@ fn test_indexing_a_scalar_union_list_allocating_between_reads() {
          total"
     ), 4000000 + 4000002 + 4000004 + 3);
 }
+
+// ── Checking a value into a union whose member is not a literal match ────────
+//
+// `unify`'s concrete-vs-union arm accepts a member only by *equality* and
+// binds nothing, which left two shapes uncheckable: a union member that is a
+// generic struct's own binder, and a member a value merely *unifies* with
+// (an empty list literal, whose element type is still a variable). Every site
+// that checks a value against an expected type now falls back to unifying it
+// with the one union member it fits.
+
+#[test]
+fn an_empty_list_literal_widens_into_a_union_with_a_list_member() {
+    // `[]` synthesizes `List(~t0)`, which equals no member of
+    // `List<Str> | Int` but unifies with exactly one. Discriminated by
+    // `is Int` rather than a `List<...>` pattern, which is a separate
+    // pre-existing gap — see `test_list_member_round_trips`.
+    assert_eq!(
+        compile_and_run("let x: List<Str> | Int = []\nif x is Int then 0 else 1"),
+        1,
+    );
+}
+
+#[test]
+fn a_union_annotated_slot_still_accepts_each_ordinary_member() {
+    // The fallback must not have displaced the plain paths: an ordinary
+    // member still goes through `unify`'s own equality arm.
+    assert_eq!(compile_and_run("let y: List<Str> | Int = 5\nif y is Int then 0 else 1"), 0);
+    assert_eq!(compile_and_run("let z: List<Str> | Int = [\"a\"]\nif z is Int then 0 else 1"), 1);
+}
+
+#[test]
+fn ambiguous_membership_is_rejected_rather_than_guessed() {
+    // `[]` unifies with *both* members, and picking one would silently pick a
+    // runtime tag, so this has to fail rather than choose.
+    let err = type_error("let x: List<Int> | List<Str> = []\nx");
+    assert!(err.contains("Expected"), "{}", err);
+}
+
+#[test]
+fn a_generic_structs_union_field_accepts_a_value_that_pins_the_binder() {
+    // `data Box<A>(v: A | Str)` — `Int` equals neither `Str` nor the binder
+    // `~t`, but unifies with the binder, which is what fixes `A = Int`.
+    let src = "\
+        data Box<A>(v: A | Str)\n\
+        let b = Box(v=1)\n\
+        match b.v {\n\
+        is Int(n) then n\n\
+        is Str(_) then -1\n\
+        }";
+    assert_eq!(compile_and_run(src), 1);
+}

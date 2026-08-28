@@ -22,7 +22,7 @@
 //! make `s[len(s) - 1]` silently wrong on any non-ASCII input. `chars`
 //! below is the character-level escape hatch, returning codepoints (not
 //! grapheme clusters — full Unicode segmentation is out of scope for a
-//! minimal stdlib) as a `List(Str)`.
+//! minimal stdlib) as a `List<Str>`.
 
 use crate::frog_fn;
 use crate::state::FrogStateBuilder;

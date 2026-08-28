@@ -10,7 +10,7 @@
 // the four annotation sites — `func` params, `func` return types, and `data`
 // fields — never went through the expression parser at all, they called
 // `Parser::identifier()` directly, so an annotation had to be a single bare
-// identifier. `AST | ParseError`, `Str?`, and even `List(Int)` were
+// identifier. `AST | ParseError`, `Str?`, and even `List<Int>` were
 // unspellable there.
 //
 // A type is not an expression and does not want the expression grammar's
@@ -29,7 +29,7 @@ pub type TypeExprRef = Box<Spanned<TypeExpr>>;
 pub enum TypeExpr {
     /// `Int`, `Str`, `Shape` — a bare type name.
     Name(String),
-    /// `List(Int)` — a named type applied to arguments. Parsed generally;
+    /// `List<Int>` — a named type applied to arguments. Parsed generally;
     /// which names actually accept arguments is a resolution-time question.
     Apply(String, Vec<Spanned<TypeExpr>>),
     /// `A | B | C`. Always at least two members — a one-member union is
@@ -47,13 +47,16 @@ impl fmt::Display for TypeExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypeExpr::Name(name) => write!(f, "{}", name),
+            // `Name<A, B>`, matching `Grammar::type_atom` — and `Type`'s own
+            // `Display`, which this has to agree with since the two render
+            // the same annotations at different stages of the pipeline.
             TypeExpr::Apply(name, args) => {
-                write!(f, "{}(", name)?;
+                write!(f, "{}<", name)?;
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 { write!(f, ", ")?; }
                     write!(f, "{}", a.item)?;
                 }
-                write!(f, ")")
+                write!(f, ">")
             }
             TypeExpr::Union(members) => {
                 for (i, m) in members.iter().enumerate() {

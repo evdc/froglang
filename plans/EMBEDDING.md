@@ -1,7 +1,7 @@
 # Host-function embedding API
 
 Status: **implemented** (2026-08-24) — `FrogState::builder()`, `#[frog_fn]`,
-`froglang_core::host::{HostFn, FromFrog, ToFrog}`. Scalars, `Str`, and `List(T)` marshal today;
+`froglang_core::host::{HostFn, FromFrog, ToFrog}`. Scalars, `Str`, and `List<T>` marshal today;
 structs/unions/`Result<T, E>` are deferred (see "What's deferred" at the end) even though the
 codegen ABI itself already handles them uniformly.
 
@@ -154,7 +154,7 @@ discipline `RuntimeRoots` uses, generalized to an incrementally-growing set.
 
 `tests/test_host_fns.rs` — scalar round trip; `Str` in and out with an explicit
 `heap.force_collect()` between allocation and read-back to prove the result was rooted, not just
-lucky; `List(Int)` round trip; a host call with the wrong argument type produces a clean
+lucky; `List<Int>` round trip; a host call with the wrong argument type produces a clean
 `FrogError::Type`, not a codegen panic; registering a reserved name (`print`) or the same name
 twice is rejected at `build()`; a host function that allocates three `Str`s before writing any of
 them into `out` (exercising `FrogCtx::scope`'s incremental rooting) round-trips correctly. All
@@ -165,7 +165,7 @@ that nothing regressed for a caller that never touches the builder.
 ## What's deferred
 
 Scope was deliberately cut down from the original design's "full type surface including structs
-and unions" to what's implemented today (scalars, `Str`, `List(T)`), because the marshalling
+and unions" to what's implemented today (scalars, `Str`, `List<T>`), because the marshalling
 complexity for the rest turned out to be real, not incidental:
 
 - **`Result<T, E>` ↔ `T | E`.** Packing a Rust `Result` into an inline union's tagged-pointer

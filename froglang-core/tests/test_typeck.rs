@@ -304,7 +304,7 @@ fn test_conditional_branch_mismatch_produces_union() {
         Some(bool_lit(false))  // Bool
     ));
     let res = t.infer(&cond).unwrap();
-    assert_eq!(res, Type::Union(vec![Type::Bool, Type::Int]));
+    assert_eq!(res, Type::Union(vec![Type::Int, Type::Bool]));
 }
 
 #[test]
@@ -754,10 +754,10 @@ fn test_infer_num_lambda() {
 #[test]
 fn test_union_from_conditional() {
     let mut t = TypeChecker::new();
-    // if true then 1 else false  →  Bool | Int (see the note on
+    // if true then 1 else false  →  Int | Bool (see the note on
     // `test_conditional_branch_mismatch_produces_union` for why not `Str`)
     let cond = spanned(Expression::conditional(bool_lit(true), int(1), Some(bool_lit(false))));
-    assert_eq!(t.infer(&cond).unwrap(), Type::Union(vec![Type::Bool, Type::Int]));
+    assert_eq!(t.infer(&cond).unwrap(), Type::Union(vec![Type::Int, Type::Bool]));
 }
 
 #[test]
@@ -791,12 +791,13 @@ fn test_union_order_independent() {
 
 #[test]
 fn test_union_flatten_nested() {
-    // Int | (Str | Bool)  →  Bool | Int | Str  (flattened + sorted)
+    // Int | (Str | Bool)  →  Int | Bool | Str  (flattened + sorted into
+    // `Ord for Type`'s canonical order, which is what assigns the tags)
     let u = Type::Union(vec![
         Type::Int,
         Type::Union(vec![Type::Str, Type::Bool]),
     ]).normalize();
-    assert_eq!(u, Type::Union(vec![Type::Bool, Type::Int, Type::Str]));
+    assert_eq!(u, Type::Union(vec![Type::Int, Type::Bool, Type::Str]));
 }
 
 #[test]
@@ -813,11 +814,11 @@ fn test_union_dedup_to_scalar() {
 
 #[test]
 fn test_union_triple_dedup() {
-    // Bool | Int | Str | Bool | Int  →  Bool | Int | Str
+    // Bool | Int | Str | Bool | Int  →  Int | Bool | Str
     let u = Type::Union(vec![
         Type::Bool, Type::Int, Type::Str, Type::Bool, Type::Int,
     ]).normalize();
-    assert_eq!(u, Type::Union(vec![Type::Bool, Type::Int, Type::Str]));
+    assert_eq!(u, Type::Union(vec![Type::Int, Type::Bool, Type::Str]));
 }
 
 // --- Union subtyping ---
@@ -1013,15 +1014,15 @@ fn test_union_num_satisfies_arithmetic() {
     // Int | Float satisfies Num, so (Int|Float) + 2 is valid → Int | Float
     let ty = infer_src("(if true then 1 else 1.0) + 2").unwrap();
     // `Conditional`'s branch join normalizes (like every other join site),
-    // so member order is canonical (sorted by Display), not branch order.
-    assert_eq!(ty, Type::Union(vec![Type::Float, Type::Int]));
+    // so member order is canonical (`Ord for Type`), not branch order.
+    assert_eq!(ty, Type::Union(vec![Type::Int, Type::Float]));
 }
 
 #[test]
 fn test_union_num_both_operands() {
     // Both operands are Int|Float — result is the same union
     let ty = infer_src("(if true then 1 else 1.0) * (if false then 2 else 2.0)").unwrap();
-    assert_eq!(ty, Type::Union(vec![Type::Float, Type::Int]));
+    assert_eq!(ty, Type::Union(vec![Type::Int, Type::Float]));
 }
 
 #[test]
@@ -1367,7 +1368,7 @@ fn a_type_repeated_across_sibling_fields_is_not_recursive() {
 
 // ── structural equality on lists and unions ──────────────────────────────────
 
-/// `List(T)` is `Eq` when `T` is — what anyone coming from Python expects
+/// `List<T>` is `Eq` when `T` is — what anyone coming from Python expects
 /// `[1, 2] == [1, 2]` to mean. It used to be a flat "requires Eq, got
 /// [Int]".
 #[test]

@@ -8,11 +8,26 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::liveness;
-use crate::frontend::tokens::{Spanned, Token};
+use crate::frontend::tokens::{Span, Spanned, Token};
 use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
 use crate::runtime::{ffi, gc};
 use crate::runtime::gc::{FrogList, FrogVariant};
+
+/// One entry per top-level `func`/lambda declared by `compile_entry`'s Pass
+/// 1 — `plans/DATA.md` Stage 3's "fn-ptr → span" table. Keyed by declaration
+/// order, not by address: nothing here needs a binary search today, since
+/// the only consumer so far is `FrogState::source_map`, a linear lookup by
+/// name or entry. `entry_id` is the same number `compile_entry` mangles into
+/// the JIT symbol (`{name}__frogfn{entry_id}`) — pair it with
+/// `FrogState::entry_sources` to recover the actual source text and
+/// filename this declaration came from.
+#[derive(Debug, Clone)]
+pub struct FnSourceInfo {
+    pub name: String,
+    pub span: Span,
+    pub entry_id: usize,
+}
 
 pub struct Codegen {
     pub module: JITModule,
@@ -24,6 +39,11 @@ pub struct Codegen {
     /// calling convention instead of a plain Cranelift call. See
     /// `plans/EMBEDDING.md`.
     host_fns: std::collections::HashSet<String>,
+    /// `plans/DATA.md` Stage 3's source map — one entry per top-level
+    /// `func`/lambda ever declared, across every entry. Append-only within
+    /// an entry; a failed entry truncates back via `restore_source_map`,
+    /// mirroring `func_ids`' own checkpoint/restore pair.
+    source_map: Vec<FnSourceInfo>,
 }
 
 /// Per-function-compilation context threaded through `compile_expr`.
@@ -1187,8 +1207,19 @@ fn print_list(elem_ty: &Type, list_val: Value, bcx: &mut FunctionBuilder, ctx: &
         let raw = bcx.ins().load(types::I64, heap_mem(), addr, 0);
         elem_vals.push(from_i64_repr(bcx, lty, raw));
     }
-    // No GC rooting of the loaded leaves: printing allocates nothing, so
-    // there is no collection point between the loads and their last use.
+    // Root every leaf before it is used, exactly as `compile_for_loop`'s
+    // identical element read does. Nothing `print_value` emits allocates
+    // today, so no collection can actually happen between these loads and
+    // their last use — but "which callees allocate" is not a judgement this
+    // site is allowed to make: `declare_gc_value`'s invariant is
+    // whole-program ("every SSA value whose static type is a GC-scannable
+    // column is declared"), precisely so that teaching printing to allocate
+    // later — `repr`, which has to build a `Str`, is the obvious candidate —
+    // cannot silently turn a live `Str`/`List` element pointer into a
+    // use-after-free. Declaring a value that is never live across a
+    // safepoint costs nothing: Cranelift omits it from every stack map.
+    let elem_leaf_tys: Vec<Type> = elem_leafs.iter().map(|(_, t)| t.clone()).collect();
+    declare_gc_leaves(bcx, &elem_vals, &elem_leaf_tys);
     let mut cursor = 0;
     print_value(elem_ty, &elem_vals, &mut cursor, bcx, ctx);
 
@@ -1504,8 +1535,12 @@ fn eq_list(elem_ty: &Type, lv: Value, rv: Value, bcx: &mut FunctionBuilder, ctx:
             out.push(from_i64_repr(bcx, lty, raw));
         }
     }
-    // No GC rooting of the loaded leaves: comparing allocates nothing, so
-    // there is no collection point between the loads and their last use.
+    // Root both operands' leaves before either is used — see `print_list`'s
+    // identical declaration for why this is not a per-site judgement about
+    // whether `eq_value`'s callees happen to allocate.
+    let elem_leaf_tys: Vec<Type> = elem_leafs.iter().map(|(_, t)| t.clone()).collect();
+    declare_gc_leaves(bcx, &l_vals, &elem_leaf_tys);
+    declare_gc_leaves(bcx, &r_vals, &elem_leaf_tys);
     let mut cursor = 0;
     let eq = eq_value(elem_ty, &l_vals, &r_vals, &mut cursor, bcx, ctx);
 
@@ -3210,6 +3245,24 @@ impl Codegen {
         self.func_ids = snapshot;
     }
 
+    /// Snapshot `source_map`'s length before a `compile_entry` call that
+    /// might panic partway through — pair with `restore_source_map` on
+    /// failure, same discipline as `checkpoint_func_ids`. Append-only, so a
+    /// length is enough; no need to clone the whole `Vec`.
+    pub fn checkpoint_source_map(&self) -> usize {
+        self.source_map.len()
+    }
+
+    pub fn restore_source_map(&mut self, len: usize) {
+        self.source_map.truncate(len);
+    }
+
+    /// The `plans/DATA.md` Stage 3 source map: every top-level `func`/lambda
+    /// declared across every entry so far, in declaration order.
+    pub fn source_map(&self) -> &[FnSourceInfo] {
+        &self.source_map
+    }
+
     /// Replace `builder_ctx` with a fresh one. `FunctionBuilder::new` asserts
     /// its `FunctionBuilderContext` is empty, and it's only ever emptied by
     /// `FunctionBuilder::finalize` — which a `compile_entry` call that panics
@@ -3380,6 +3433,7 @@ impl Codegen {
             func_ids,
             builder_ctx: FunctionBuilderContext::new(),
             host_fns,
+            source_map: Vec::new(),
         })
     }
 
@@ -3716,6 +3770,7 @@ impl Codegen {
                         .declare_function(&mangled, Linkage::Local, &sig)
                         .unwrap_or_else(|e| panic!("declare_function '{}' failed: {}", mangled, e));
                     self.func_ids.insert(name.clone(), func_id);
+                    self.source_map.push(FnSourceInfo { name: name.clone(), span: stmt.span, entry_id });
                 }
             }
         }

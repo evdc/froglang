@@ -167,8 +167,35 @@ impl Type {
                 name: name.clone(),
                 args: args.iter().map(|a| a.substitute(bindings)).collect(),
             },
-            Type::Union(variants) => Type::Union(variants.iter().map(|v| v.substitute(bindings)).collect()),
+            Type::Union(variants) => Type::renormalize(variants, variants.iter().map(|v| v.substitute(bindings)).collect()),
             _ => self.clone(),
+        }
+    }
+
+    /// Rebuild a `Type::Union` from members that a resolution or
+    /// substitution pass has just rewritten, re-running `normalize` iff
+    /// anything actually changed.
+    ///
+    /// A union's canonical form is load-bearing, not cosmetic: `normalize`
+    /// flattens, deduplicates and sorts the member list, and a member's
+    /// *position* in that list is the runtime tag every representation
+    /// agrees on (`TypeChecker::lower_widen`'s `position`, and
+    /// `codegen`'s `union_dispatch_cases`/`pack_union_member`). Mapping over
+    /// the members without re-normalizing can break that: `Str | ~t0` is
+    /// sorted, but resolving `~t0` to `Int` leaves `[Str, Int]`, which
+    /// mis-tags against — and compares unequal to — the canonical
+    /// `Int | Str` the same union would have had if written out.
+    ///
+    /// Skipping the work when nothing was rewritten matters: `lookup` runs
+    /// constantly during inference, and `normalize` renders every member
+    /// through `Display` to build its sort key. A member list no pass
+    /// touched is already canonical by construction, so there is nothing to
+    /// redo.
+    fn renormalize(original: &[Type], rewritten: Vec<Type>) -> Type {
+        if rewritten == original {
+            Type::Union(rewritten)
+        } else {
+            Type::Union(rewritten).normalize()
         }
     }
 
@@ -1283,6 +1310,13 @@ impl TypeChecker {
             lowered.item.ty = target;
             return Ok(lowered);
         }
+        // Every remaining path either returns `lowered` as it stands or
+        // wraps it in a `Coerce`/`Widen`, so resolve its type once, here,
+        // rather than on each of those paths — the wrapped node is just as
+        // much a node codegen reads `ty` off as the returned one is, and a
+        // `Widen` whose payload still claims `List<~t0>` is the same stale
+        // type the resolution above exists to remove.
+        lowered.item.ty = from.clone();
         // A non-lossy numeric promotion into a wider declared slot — see
         // `TypedExprKind::Coerce`. This has to happen here rather than at
         // each call site because `lower_widen` is already the single funnel
@@ -1295,14 +1329,8 @@ impl TypeChecker {
                 span,
             ));
         }
-        let Type::Union(members) = &target else {
-            lowered.item.ty = from;
-            return Ok(lowered);
-        };
-        let Some(tag) = members.iter().position(|m| *m == from) else {
-            lowered.item.ty = from;
-            return Ok(lowered);
-        };
+        let Type::Union(members) = &target else { return Ok(lowered) };
+        let Some(tag) = members.iter().position(|m| *m == from) else { return Ok(lowered) };
         let span = lowered.span;
         if matches!(from, Type::Union(_)) {
             return Err(Spanned::from(TypeError {
@@ -2284,7 +2312,7 @@ impl TypeChecker {
                 name: name.clone(),
                 args: args.iter().map(|a| self.lookup(a)).collect(),
             },
-            Type::Union(variants)  => Type::Union(variants.iter().map(|t| self.lookup(t)).collect()),
+            Type::Union(variants)  => Type::renormalize(variants, variants.iter().map(|t| self.lookup(t)).collect()),
             _ => ty.clone(),
         }
     }
@@ -5756,6 +5784,73 @@ mod helper_tests {
         assert_eq!(
             Type::list(Type::Int).normalize(),
             Type::list(Type::Int),
+        );
+    }
+
+    // ── Type::renormalize (canonical form survives resolution) ───────────────
+    //
+    // `normalize` is only ever run where a union is *built*. Both passes that
+    // rewrite an existing union's members in place — `Type::substitute` and
+    // `TypeChecker::lookup` — can turn a canonical member list into a
+    // non-canonical one, and a member's index in that list is the runtime tag
+    // (`lower_widen`, `codegen::union_dispatch_cases`). These pin that they
+    // re-canonicalize.
+
+    fn tvar(name: &str) -> Type { Type::TypeVar { name: name.to_string(), bounds: vec![] } }
+
+    #[test]
+    fn substitute_recanonicalizes_a_union_whose_member_order_it_changed() {
+        // `Str | ~t0` is canonical as written (`Display` sorts "Str" before
+        // "~t0"), but binding `~t0` to `Int` makes it `[Str, Int]` — which
+        // must come back as the canonical `Int | Str`, or this same union
+        // spelled out longhand would disagree with it about every tag.
+        let before = union(vec![Type::Str, tvar("t0")]).normalize();
+        assert_eq!(before, union(vec![Type::Str, tvar("t0")]), "premise: already canonical");
+
+        let bindings: HashMap<String, Type> = [("t0".to_string(), Type::Int)].into_iter().collect();
+        assert_eq!(before.substitute(&bindings), union(vec![Type::Int, Type::Str]));
+    }
+
+    #[test]
+    fn substitute_collapses_a_union_a_binding_made_redundant() {
+        // Two members that resolve to the same type are one member, and a
+        // one-member union is not a union at all — the same rule `normalize`
+        // applies at construction.
+        let bindings: HashMap<String, Type> = [("t0".to_string(), Type::Str)].into_iter().collect();
+        assert_eq!(union(vec![Type::Str, tvar("t0")]).substitute(&bindings), Type::Str);
+    }
+
+    #[test]
+    fn substitute_leaves_an_untouched_union_exactly_as_it_found_it() {
+        // The fast path: nothing was rewritten, so nothing needs re-sorting.
+        let bindings: HashMap<String, Type> = [("t9".to_string(), Type::Int)].into_iter().collect();
+        let u = union(vec![Type::Int, Type::Str]);
+        assert_eq!(u.clone().substitute(&bindings), u);
+    }
+
+    #[test]
+    fn lookup_recanonicalizes_a_union_whose_member_order_it_changed() {
+        // `lookup`'s half of the same rule — it resolves through
+        // `substitutions` rather than an explicit mapping, but rewrites
+        // members exactly the same way.
+        let mut tc = TypeChecker::empty();
+        tc.substitutions.insert("t0".to_string(), Type::Int);
+        assert_eq!(
+            tc.lookup(&union(vec![Type::Str, tvar("t0")])),
+            union(vec![Type::Int, Type::Str]),
+        );
+    }
+
+    #[test]
+    fn lookup_recanonicalizes_a_union_nested_inside_another_type() {
+        // The rewrite is structural, so the hazard reaches a union that is a
+        // list's element type or a function's parameter just as much as a
+        // top-level one.
+        let mut tc = TypeChecker::empty();
+        tc.substitutions.insert("t0".to_string(), Type::Int);
+        assert_eq!(
+            tc.lookup(&Type::list(union(vec![Type::Str, tvar("t0")]))),
+            Type::list(union(vec![Type::Int, Type::Str])),
         );
     }
 

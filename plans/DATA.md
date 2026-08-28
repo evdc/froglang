@@ -1,7 +1,7 @@
 # Data, Notation, and Annotations
 
-Status: **design**, with Stages 0 and 2 done and Stage 1's `print` half done. Everything
-from Stage 3 on is a sketch; the *decisions* table is the part meant to be stable.
+Status: **design**, with Stages 0, 2, and 3 done and Stage 1's `print` half done. Everything
+from Stage 4 on is a sketch; the *decisions* table is the part meant to be stable.
 
 This supersedes the roadmap's "Annotations, and auto-deriving trait implementations" bullet and
 the "sketching JSON/etc serde" section, and answers the reflection question posed there.
@@ -140,7 +140,7 @@ tier and the interop tier; the syntax changes are deliberately last.
 | 0 | **done** — List printing into the codegen walk | everything | — |
 | 1 | **`print` half done** — `print` / `repr` split; `Show`+`Eq` totality | the law | 0 |
 | 2 | **done** — float and string notation fixes | the law | — |
-| 3 | Source map: fn-ptr → span | diagnostics, function printing | — |
+| 3 | **done** — Source map: fn-ptr → span, rustc-style error rendering | diagnostics (function printing still blocked on function values existing) | — |
 | 4 | `Sink` (implemented by `StrBuf`) | every serializer | — |
 | 5 | `repr` / `read` at the typed-AST layer; the property test | Tier 1 | 1, 2, 4 |
 | 6 | Annotations: syntax, typed declarations, validation | Tier 2, host-side libs | — |
@@ -323,7 +323,7 @@ parse behaviour and round-trips (it prints `inf`).
 
 ---
 
-## Stage 3 — source map
+## Stage 3 — source map — **done**
 
 A static fn-ptr → span table, built at compile time, plus `FrogState` retaining entry sources.
 
@@ -339,6 +339,47 @@ rendering (the roadmap's top usability item), and ERRORS.md phase 7's error retu
 would require printing the closure's substituted captures, which needs every captured value to be
 `Show` and gets worse once specialization gives one lambda several bodies. Hence: functions have
 no `Show`, `print` shows them in `<...>`, `repr` rejects them.
+
+### What it took
+
+Built the source-map *infrastructure* and spent it on the one consumer that was actually ready:
+rustc-style span rendering of type errors. `print`'s `<func ... @ repl:3:12>` form stays blocked
+on function values existing at all — Stage 1's status note ("Function values can't be used as
+values at all yet ... so there is nothing to print") turned out to still be exactly true;
+`validate_codegen_constraints` (`typeck.rs`) statically rejects any function-typed value from
+reaching codegen, so there is still no runtime closure value for a source-map lookup to describe.
+That part of the plan's premise ("closure values already carry a function pointer") was aspirational,
+not a description of what exists — worth recording so the next reader doesn't go looking for it.
+
+What does exist now, and what it's for:
+
+- **`codegen::Codegen::source_map()`** — a `Vec<FnSourceInfo { name, span, entry_id }>`, appended
+  to by `compile_entry`'s existing Pass 1 (the pass that already declares a `FuncId` per top-level
+  `func`/lambda) at zero extra walks. Checkpointed and truncated on a failed entry exactly like
+  `func_ids` already was — same reasoning, same shape, so a rolled-back entry never leaves a stale
+  source-map row pointing at code that was never defined.
+- **`state::FrogState::entry_sources`** — one `EntrySource { filename, source }` per successful
+  `eval`/`eval_file` call, indexed by the same `entry_id` `FnSourceInfo` and the JIT symbol mangling
+  (`{name}__frogfn{entry_id}`) already used. A failed entry doesn't push one, matching
+  `entry_count`'s own "only success consumes a number" rule.
+- **`diagnostics::render_span`** — the actual payoff: `FrogError::Type`'s three construction sites
+  in `eval_with_base` (the ones that used to do `e.to_string()` on a `Spanned<TypeError>`, which
+  rendered as a bare `(line:col .. line:col)\tTypeError { msg: ".." }` Debug dump, span and all,
+  and threw the source line away entirely) now render a rustc-shaped snippet: the offending source
+  line, gutter, and a caret under the exact span. `FrogState` didn't retain `src` at the point an
+  error was formatted before this — `entry_sources` (above) is what makes it available there, one
+  reason the two land together instead of source-map first, rendering later.
+
+One thing the plan didn't call: **`Position::line`/`.col` are 0-indexed** (`Lexer::current_line`
+starts at `0`), not 1-indexed as the doc comments elsewhere loosely implied. `render_span` is the
+first consumer to print a line number for a human, so it's the first place that had to get this
+right — it converts on the way out (`+ 1`) rather than changing the lexer's internal convention,
+which every existing span-comparison test already depends on.
+
+Not done, deliberately: wiring `render_span` into `FrogError::Parse` (never actually constructed
+today — `modules::resolve_source` folds parse errors into `FrogError::Module` before `eval_with_base`
+ever sees one) or into `FrogError::Codegen` (a panic message, no span to render). Revisit either if
+that changes.
 
 ---
 

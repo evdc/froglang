@@ -145,6 +145,20 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+// ── Source map ───────────────────────────────────────────────────────────────
+
+/// The filename and source text `eval`/`eval_file` compiled as one entry —
+/// `plans/DATA.md` Stage 3's "`FrogState` retaining entry sources". Indexed
+/// by `entry_id` (`FrogState::entry_sources[entry_id]`), the same number
+/// `Codegen::source_map`'s `FnSourceInfo::entry_id` refers back to, and the
+/// same number mangled into that entry's JIT symbols
+/// (`{name}__frogfn{entry_id}` in `codegen::Codegen::compile_entry`).
+#[derive(Debug, Clone)]
+pub struct EntrySource {
+    pub filename: String,
+    pub source: String,
+}
+
 // ── FrogState ─────────────────────────────────────────────────────────────────
 
 /// An independent froglang interpreter instance.
@@ -162,6 +176,22 @@ pub struct FrogState {
     pub env_types:    HashMap<String, Type>,
     pub string_arena: Vec<Vec<u8>>,
     pub entry_count:  usize,
+    /// One entry per successful `eval`/`eval_file` call, in `entry_id`
+    /// order — see `EntrySource`. A failed entry (type error, codegen panic)
+    /// never gets one, matching `entry_count`'s own "only successful entries
+    /// consume a number" behavior below.
+    pub entry_sources: Vec<EntrySource>,
+}
+
+impl FrogState {
+    /// Look up which entry a `Codegen::source_map` `FnSourceInfo` came from
+    /// — `plans/DATA.md` Stage 3. `None` only if `entry_id` is somehow out
+    /// of range, which shouldn't happen: every `FnSourceInfo` is pushed by a
+    /// `compile_entry` call whose `entry_id` becomes a valid
+    /// `entry_sources` index the moment that same call succeeds.
+    pub fn entry_source(&self, entry_id: usize) -> Option<&EntrySource> {
+        self.entry_sources.get(entry_id)
+    }
 }
 
 impl FrogState {
@@ -241,6 +271,10 @@ impl FrogState {
     }
 
     fn eval_with_base(&mut self, src: &str, base_path: &Path) -> Result<(FrogValue, Type), FrogError> {
+        // Captured up front so every `FrogError::Type` render below can name
+        // where the offending span actually lives — `plans/DATA.md` Stage 3.
+        let filename = base_path.display().to_string();
+
         let stmts = modules::resolve_source(src, base_path).map_err(|e| FrogError::Module(e.to_string()))?;
         let span = match (stmts.first(), stmts.last()) {
             (Some(first), Some(last)) => first.span.merge(last.span),
@@ -253,12 +287,12 @@ impl FrogState {
             Ok(t) => t,
             Err(e) => {
                 self.tc.restore(cp);
-                return Err(FrogError::Type(e.to_string()));
+                return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
             }
         };
         if let Err(e) = self.tc.validate_codegen_constraints(&typed) {
             self.tc.restore(cp);
-            return Err(FrogError::Type(e.to_string()));
+            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
         }
         // `TRAITS.md` Stage 3b: real monomorphization. Clones and
         // specializes every generic call site's declaration into a
@@ -269,7 +303,7 @@ impl FrogState {
         // rejecting a second concrete type the way Stage 2's gate did.
         if let Err(e) = self.tc.monomorphize_generics(&mut typed) {
             self.tc.restore(cp);
-            return Err(FrogError::Type(e.to_string()));
+            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
         }
         // Stamp every node with a fresh id — including whatever
         // `monomorphize_generics` just cloned in, which starts out
@@ -292,6 +326,10 @@ impl FrogState {
         // a permanently broken `FrogState` (see `Codegen::reset_builder_ctx`
         // for why the panic itself would otherwise corrupt reusable state).
         let func_ids_snap = self.codegen.checkpoint_func_ids();
+        // `plans/DATA.md` Stage 3: `compile_entry`'s Pass 1 appends to
+        // `Codegen::source_map` before Pass 2 can panic, so a failed entry
+        // must roll that back too, same reasoning as `func_ids_snap`.
+        let source_map_snap = self.codegen.checkpoint_source_map();
         let entry_count = self.entry_count;
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.codegen.compile_entry(
@@ -309,11 +347,16 @@ impl FrogState {
             Ok(pair) => pair,
             Err(panic_payload) => {
                 self.codegen.restore_func_ids(func_ids_snap);
+                self.codegen.restore_source_map(source_map_snap);
                 self.codegen.reset_builder_ctx();
                 self.tc.restore(cp);
                 return Err(FrogError::Codegen(panic_message(&*panic_payload)));
             }
         };
+        // `entry_sources[entry_count]` now lines up with every
+        // `FnSourceInfo::entry_id == entry_count` this call just pushed —
+        // both are keyed by the same `entry_count` captured above.
+        self.entry_sources.push(EntrySource { filename, source: src.to_string() });
         self.entry_count += 1;
 
         let ptr = self.codegen.module.get_finalized_function(main_id);
@@ -456,6 +499,7 @@ impl FrogStateBuilder {
             env_types:    HashMap::new(),
             string_arena: Vec::new(),
             entry_count:  0,
+            entry_sources: Vec::new(),
         };
 
         // Host `data` types, if any, before anything references them.

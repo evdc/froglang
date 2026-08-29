@@ -26,6 +26,11 @@ const UNWRAP_PANIC_NAME: &str = "panic!builtin";
 /// the type grammar or in unification.
 const SELF_BINDER: &str = "Self";
 
+/// Prefix of the placeholder callee symbol a member call through a
+/// type-parameter bound carries between lowering and monomorphization —
+/// see `pending_member_symbol`.
+const PENDING_MEMBER_PREFIX: &str = "#member$";
+
 #[derive(Debug)]
 pub struct TypeError {
     pub msg: String
@@ -2226,6 +2231,22 @@ impl TypeChecker {
         format!("{}${}", type_key, member)
     }
 
+    /// The placeholder callee a member call through a type-parameter bound
+    /// carries until monomorphization can name a real impl —
+    /// `#member$Shape$area`. Built from the same unproducible `$` separator
+    /// `member_symbol` uses, behind a leading `#` that no source name and no
+    /// member symbol can start with, so a leftover is recognizable rather
+    /// than mistakable for a function someone declared.
+    fn pending_member_symbol(trait_name: &str, member: &str) -> String {
+        format!("{}{}${}", PENDING_MEMBER_PREFIX, trait_name, member)
+    }
+
+    /// `pending_member_symbol`'s inverse: `(trait, member)`, or `None` if
+    /// this is an ordinary name.
+    fn parse_pending_member(name: &str) -> Option<(&str, &str)> {
+        name.strip_prefix(PENDING_MEMBER_PREFIX)?.split_once('$')
+    }
+
     /// Rewrite every occurrence of the bare name `Self` in a type annotation
     /// to `type_name`.
     ///
@@ -4040,6 +4061,14 @@ impl TypeChecker {
 
         if let Some(t) = tail { stmts.push(t); }
 
+        // Every binder is substituted by now, in the entry's own statements
+        // and in every body emitted above, so a member call made through a
+        // bound finally knows which impl it meant.
+        for s in stmts.iter_mut() {
+            let span = s.span;
+            self.resolve_bound_members(s, span)?;
+        }
+
         for s in stmts.iter_mut() { self.rewrite_call_sites(s, &mangled_for); }
 
         typed.item.ty = stmts.last().map(|s| s.item.ty.clone()).unwrap_or(Type::None);
@@ -4329,6 +4358,55 @@ impl TypeChecker {
                 *name = mangled.clone();
             }
         });
+    }
+
+    /// Replace every pending member callee (`lower_bound_member_call`) in
+    /// `expr` with the compiled symbol of the impl it now names.
+    ///
+    /// Run by `monomorphize_generics` once every instantiation has been
+    /// emitted and every binder substituted, so each pending callee's own
+    /// function type carries a *concrete* `Self` in its first parameter —
+    /// which is the whole reason nothing had to be recorded on the side.
+    /// From there it is the same `(type key, member)` lookup an ordinary
+    /// member call does at lowering time, just later.
+    ///
+    /// A lookup that fails here is a bug rather than a user error — the
+    /// declared bound is checked at every call site, so a type reaching this
+    /// point implements the trait — but it is reported rather than
+    /// `expect`ed, since the alternative is a pending symbol reaching
+    /// codegen as an unknown function.
+    fn resolve_bound_members(&self, expr: &mut Spanned<TypedExpr>, span: Span) -> Result<(), Spanned<TypeError>> {
+        let mut failure: Option<String> = None;
+        Self::walk_vars_mut(expr, &mut |name, ty| {
+            if failure.is_some() { return; }
+            let Some((trait_name, member)) = Self::parse_pending_member(name) else { return };
+            let (trait_name, member) = (trait_name.to_string(), member.to_string());
+            let self_ty = match self.lookup(ty) {
+                Type::Function { params, .. } if !params.is_empty() => params[0].clone(),
+                _ => {
+                    failure = Some(format!("'{}.{}' lost its receiver type before monomorphization", trait_name, member));
+                    return;
+                }
+            };
+            let Some(key) = Self::grant_key(&self_ty) else {
+                failure = Some(format!(
+                    "'{}' stayed abstract as {}, so '{}.{}' has no impl to call — give the call site a concrete type",
+                    trait_name, self_ty, trait_name, member,
+                ));
+                return;
+            };
+            match self.member_index.get(&(key, member.clone())) {
+                Some((owner, symbol)) if owner == &trait_name => *name = symbol.clone(),
+                Some((owner, _)) => failure = Some(format!(
+                    "{} implements '{}' from trait '{}', not '{}'", self_ty, member, owner, trait_name)),
+                None => failure = Some(format!(
+                    "{} doesn't implement '{}.{}'", self_ty, trait_name, member)),
+            }
+        });
+        match failure {
+            Some(msg) => Err(Spanned::from(TypeError { msg }, span)),
+            None => Ok(()),
+        }
     }
 
     /// Rename every `Var(from)` reference in `expr` to `to`. Used for
@@ -6131,6 +6209,119 @@ impl TypeChecker {
         Ok(Some(arms))
     }
 
+    /// Lower `x.member(...)` where `x`'s type is a *bounded type parameter*
+    /// — `func f<T: Shape>(x: T) = x.area()` — and `trait_name` is the bound
+    /// that declares `member`.
+    ///
+    /// Every other member call resolves to an impl's compiled symbol right
+    /// here, by looking `(type key, member)` up in `member_index`. This one
+    /// cannot: `T` is not a type yet, and does not become one until
+    /// `monomorphize_generics` clones this body per instantiation. So the
+    /// call is checked against the *trait's* signature with `Self` standing
+    /// for `T` — which is exactly what the bound licenses, and what makes
+    /// the arity, argument, and result types checkable once at the
+    /// declaration rather than once per instantiation — and its callee is
+    /// left as a pending symbol (`pending_member_symbol`) carrying the trait
+    /// and member name.
+    ///
+    /// The receiver's own type rides along in the callee node's function
+    /// type, so no side table is needed: `substitute_types_deep` rewrites
+    /// that type like any other when the clone's binders are substituted,
+    /// and `resolve_bound_members` then reads the now-concrete `Self` back
+    /// out of it and writes the real symbol in. A pending symbol that
+    /// somehow survived to codegen would be an unknown function, so
+    /// `monomorphize_generics` checks for leftovers rather than trusting it.
+    fn lower_bound_member_call(
+        &mut self,
+        trait_name: &str,
+        member: &str,
+        target: Spanned<TypedExpr>,
+        self_ty: Type,
+        root_name: Option<String>,
+        rest_args: Vec<Spanned<Expression>>,
+        target_span: Span,
+        callee_span: Span,
+        span: Span,
+    ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let sig = self.traits.get(trait_name)
+            .and_then(|d| d.members.iter().find(|m| m.name == member))
+            .cloned()
+            .expect("caller found this member on this trait");
+        // `Self` -> the binder variable. The stored signature is a template
+        // and must never be unified against directly (see `TraitMemberSig`);
+        // substituting first is what keeps one instantiation's `Self` out of
+        // every other's.
+        let subst = HashMap::from([(SELF_BINDER.to_string(), self_ty.clone())]);
+        let params: Vec<(String, Type, bool)> = sig.params.iter()
+            .map(|(n, t, m)| (n.clone(), t.substitute(&subst), *m))
+            .collect();
+        let result = sig.return_type.substitute(&subst);
+        // A member whose first parameter isn't `Self` has nothing to
+        // dispatch on — it is the zero-`Self` shape, called by name or
+        // through the prefix form, not on a receiver.
+        if !sig.params.first().map(|(_, t, _)| Self::mentions_self(t)).unwrap_or(false) {
+            return Err(Spanned::from(TypeError {
+                msg: format!(
+                    "'{}.{}' takes no Self parameter, so it can't be called on a value — call it as '{}.{}(...)' and annotate the expected type",
+                    trait_name, member, trait_name, member
+                )
+            }, span));
+        }
+        if rest_args.len() != params.len() - 1 {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Wrong number of arguments, expected {}, got {}", params.len() - 1, rest_args.len())
+            }, callee_span));
+        }
+        let mut_first = params[0].2;
+        // Same receiver exemption as a concrete member call: no `mut` marker
+        // at the dot call site, but the root still has to be a mutable
+        // binding.
+        if mut_first {
+            let root = root_name.clone().ok_or_else(|| Spanned::from(TypeError {
+                msg: "the receiver of a mutating method must be a plain mutable binding, not an expression".to_string()
+            }, target_span))?;
+            match self.ctx.is_mutable(&root) {
+                None => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not declared", root)
+                }, target_span)),
+                Some(false) => return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to call a mutating method on it", root, root)
+                }, target_span)),
+                Some(true) => {},
+            }
+        }
+
+        let fn_ty = Type::Function {
+            params: params.iter().map(|(_, t, _)| t.clone()).collect(),
+            result: Box::new(result.clone()),
+        };
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: fn_ty,
+            kind: TypedExprKind::Var(Self::pending_member_symbol(trait_name, member)),
+        }, callee_span);
+
+        let mut args = Vec::with_capacity(params.len());
+        let mut mut_args = Vec::with_capacity(params.len());
+        let mut all_roots: Vec<Option<(String, Span)>> = Vec::with_capacity(params.len());
+        all_roots.push(root_name.map(|n| (n, target_span)));
+        args.push(self.lower_widen(target, &params[0].1)?);
+        mut_args.push(mut_first);
+        for (i, (arg, (_, param, declared))) in rest_args.into_iter().zip(params[1..].iter()).enumerate() {
+            let (lowered, is_mut, root) = self.lower_call_arg(i + 1, arg, param, Some(*declared))?;
+            args.push(lowered);
+            mut_args.push(is_mut);
+            all_roots.push(root);
+        }
+        self.check_mut_exclusivity(&mut_args, &all_roots)?;
+
+        let ty = self.lookup(&result);
+        Ok(Spanned::from(TypedExpr {
+            id: 0, ty,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args, mut_args },
+        }, span))
+    }
+
     fn lower_ufcs_call(&mut self, fa: FieldAccessExpr, rest_args: Vec<Spanned<Expression>>, callee_span: Span, span: Span, expect_trait: Option<String>) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let target_span = fa.target.span;
         // Captured before the target is lowered — only a bare identifier
@@ -6196,23 +6387,30 @@ impl TypeChecker {
         }
 
         // A member call on a *bounded type parameter* — `func f<T: Shape>(x: T) = x.area()`.
-        // Not supported: member resolution happens at lowering time and picks
-        // a concrete impl symbol, but `T` is only made concrete later, by
-        // `monomorphize_generics` substituting into an already-lowered body.
-        // Making this work needs a deferred call that monomorphization
-        // re-resolves — a real mechanism, not a missing line — so it is named
-        // here rather than surfacing as "no such field on ~t0:Shape".
+        // There is no impl to name yet: `T` only becomes concrete later,
+        // when `monomorphize_generics` substitutes into this already-lowered
+        // body. So the call is checked here against the *trait's* signature
+        // with `Self` standing for `T`, and its callee is left as a pending
+        // symbol that monomorphization resolves once `T` is a real type —
+        // see `lower_bound_member_call`.
         if member_hit.is_none() {
             if let Type::TypeVar { bounds, .. } = &resolved {
+                let bounds = bounds.clone();
                 if let Some(tr) = bounds.iter().find(|b| self.traits.get(&b.to_string())
                     .map(|d| d.members.iter().any(|m| m.name == field)).unwrap_or(false))
                 {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!(
-                            "calling trait member '{}' through the bound '{}' on a type parameter isn't supported yet — take a concrete type, or call it where the type is known",
-                            field, tr
-                        )
-                    }, span));
+                    let trait_name = tr.to_string();
+                    if let Some(want) = &expect_trait {
+                        if want != &trait_name {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!("type parameter bounded by '{}' doesn't implement '{}.{}'", trait_name, want, field)
+                            }, span));
+                        }
+                    }
+                    return self.lower_bound_member_call(
+                        &trait_name, &field, target, resolved.clone(), root_name,
+                        rest_args, target_span, callee_span, span,
+                    );
                 }
             }
         }

@@ -543,21 +543,161 @@ print(Box(v=3).v)
 }
 
 #[test]
-fn calling_a_member_through_a_bound_is_reported_as_unsupported() {
-    // The one thing bounds don't yet buy: member resolution picks a concrete
-    // impl symbol at lowering time, but a type parameter is only made
-    // concrete later, by monomorphization substituting into an
-    // already-lowered body. Named rather than left as a confusing
-    // "no such field on ~t0:Shape".
+fn a_member_is_called_through_a_bound() {
+    // What a bound buys, beyond documentation: the body is checked once
+    // against the *trait's* signature, and monomorphization picks the impl
+    // per instantiation. `report` is one declaration compiled twice here.
+    let src = r#"
+trait Shape {
+    func area(s: Self): Int
+}
+data Circle(r: Int) provides Shape { func area(c: Circle): Int = c.r * c.r }
+provides Shape for Int { func area(n: Int): Int = n }
+
+func report<T: Shape>(x: T): Int = x.area()
+print(report(Circle(r=3)))
+print(report(7))
+"#;
+    assert_eq!(run(src), "9\n7\n");
+}
+
+#[test]
+fn a_bound_member_call_takes_arguments_and_may_return_self() {
+    let src = r#"
+trait Scalable {
+    func scale(s: Self, k: Int): Self
+}
+data Vec(x: Int) provides Scalable {
+    func scale(v: Vec, k: Int): Vec = Vec(x = v.x * k)
+}
+func twice<T: Scalable>(x: T): T = x.scale(2).scale(3)
+print(twice(Vec(x=2)).x)
+"#;
+    assert_eq!(run(src), "12\n");
+}
+
+#[test]
+fn a_bound_member_call_reaches_a_default_body() {
+    // The impl that omitted `name` and the impl that overrode it are both
+    // reached through the same generic — the default is specialized per
+    // implementing type, so there is a symbol to resolve to either way.
+    let src = r#"
+trait Named {
+    func area(s: Self): Int
+    func name(s: Self): Str = "thing"
+}
+data Vec(x: Int) provides Named {
+    func area(v: Vec): Int = v.x
+    func name(v: Vec): Str = "vec"
+}
+data Len(n: Int) provides Named {
+    func area(l: Len): Int = l.n
+}
+func label<T: Named>(x: T): Str = x.name()
+print(label(Vec(x=1)))
+print(label(Len(n=1)))
+"#;
+    assert_eq!(run(src), "vec\nthing\n");
+}
+
+#[test]
+fn a_generic_calling_another_generic_resolves_both_members() {
+    // The nested case: `outer`'s own binder is only concrete once *its*
+    // instantiation is emitted, and that is what makes `inner`'s member call
+    // resolvable. The fixed point in `monomorphize_generics` is what gets
+    // there; resolution runs after it, over everything it emitted.
+    let src = r#"
+trait Shape {
+    func area(s: Self): Int
+}
+data Circle(r: Int) provides Shape { func area(c: Circle): Int = c.r * c.r }
+func inner<T: Shape>(x: T): Int = x.area()
+func outer<T: Shape>(x: T): Int = inner(x) + x.area()
+print(outer(Circle(r=3)))
+"#;
+    assert_eq!(run(src), "18\n");
+}
+
+#[test]
+fn a_mutating_member_is_called_through_a_bound() {
+    // The receiver exemption (`TRAITS.md` Part 2) applies here too: no `mut`
+    // marker at the dot call, but the root still has to be mutable — and the
+    // copy-out reaches the caller's binding through the generic.
+    let src = r#"
+trait Counter {
+    func bump(mut s: Self): Int
+}
+data C(n: Int) provides Counter {
+    func bump(mut c: C): Int = { c.n = c.n + 1; c.n }
+}
+func go<T: Counter>(mut x: T): Int = x.bump() + x.bump()
+mut c = C(n=0)
+print(go(mut c))
+print(c.n)
+"#;
+    assert_eq!(run(src), "3\n2\n");
+}
+
+#[test]
+fn a_generic_declared_but_never_called_needs_no_impl_to_resolve() {
+    // Nothing is instantiated, so nothing is resolved — the declaration is
+    // stripped before codegen like any other uninstantiated generic, and no
+    // pending callee survives it.
+    let src = r#"
+trait Shape { func area(s: Self): Int }
+func report<T: Shape>(x: T): Int = x.area()
+print(1)
+"#;
+    assert_eq!(run(src), "1\n");
+}
+
+#[test]
+fn a_member_the_bound_doesnt_declare_is_not_found() {
+    let src = "\
+        trait Shape { func area(s: Self): Int }\n\
+        func report<T: Shape>(x: T): Int = x.perimeter()\n\
+        report(1)";
+    assert!(
+        type_error(src).contains("no function 'perimeter'"),
+        "unexpected: {}", type_error(src)
+    );
+}
+
+#[test]
+fn an_unbounded_type_parameter_has_no_members() {
+    let src = "\
+        trait Shape { func area(s: Self): Int }\n\
+        func report<T>(x: T): Int = x.area()\n\
+        report(1)";
+    assert!(
+        type_error(src).contains("no function 'area'"),
+        "unexpected: {}", type_error(src)
+    );
+}
+
+#[test]
+fn a_bound_member_call_is_arity_checked_at_the_declaration() {
+    // Checked once, against the trait's signature — not once per
+    // instantiation, and not left to whichever impl happens to be compiled.
+    let src = "\
+        trait Scalable { func scale(s: Self, k: Int): Self }\n\
+        func twice<T: Scalable>(x: T): T = x.scale()\n\
+        print(1)";
+    assert!(
+        type_error(src).contains("expected 1, got 0"),
+        "unexpected: {}", type_error(src)
+    );
+}
+
+#[test]
+fn a_type_that_doesnt_satisfy_the_bound_is_rejected_at_the_call() {
     let src = "\
         trait Shape { func area(s: Self): Int }\n\
         data Circle(r: Int) provides Shape { func area(c: Circle): Int = c.r }\n\
         func report<T: Shape>(x: T): Int = x.area()\n\
-        report(Circle(r=1))";
-    assert!(
-        type_error(src).contains("through the bound 'Shape' on a type parameter isn't supported yet"),
-        "unexpected: {}", type_error(src)
-    );
+        report(1)";
+    let msg = type_error(src);
+    assert!(msg.contains("Shape"), "unexpected: {}", msg);
 }
 
 #[test]

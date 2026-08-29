@@ -149,6 +149,10 @@ mutated operand visible, and the receiver is the least hidden position there is.
 once inferred (`func twice<T>(x: T): T = x + x` is rejected, naming the missing `<T: Num>`),
 since a caller reads the signature and not the body.
 
+A bound is also what lets a generic *call* the trait's members: `func report<T: Shape>(x: T):
+Int = x.area()` is checked once against `Shape`'s own signature, and each instantiation
+resolves `area` to that type's impl — including impls declared after the generic itself.
+
 Unlike the structural traits above, `Error` is granted only by a `provides Error` clause on
 a `data` declaration, or the `error X(...)` shorthand for `data X(...) provides Error` — it
 marks "this type can flow into `?`/`!`/`catch`", not "this type happens to look a certain
@@ -442,12 +446,10 @@ Roughly in priority order:
   error return traces. `lower_match`'s guard-clause cloning also has a known exponential-size
   bug to fix alongside phase 6.
 - ~~**User-defined traits and impls**~~ — **done, see "Traits" above** (`plans/TRAITS.md`
-  Stage 5). Still missing from the trait system: operators desugaring to member calls
-  (so `data Vec2 provides Num` can't give you `+`), structural `Show` and therefore
-  `Error.message`, and **calling a member through a bound** — `func f<T: Shape>(x: T) = x.area()`
-  is rejected by name, because resolution picks a concrete symbol at lowering time while a
-  type parameter only becomes concrete during monomorphization. That last one is the
-  prerequisite for a generic stdlib written against traits.
+  Stage 5), including calling a member through a bound (`func f<T: Shape>(x: T) = x.area()`).
+  Still missing from the trait system: operators desugaring to member calls (so
+  `data Vec2 provides Num` can't give you `+`), structural `Show` and therefore
+  `Error.message`, and impls for generic types (`data Box<A> provides Shape`).
 - **Qualified variant names in type position** — `ParseError.UnexpectedEof` isn't yet
   spellable in a `TypeExpr` annotation, nor resolvable as an `is`/`match` pattern nested
   inside a further anonymous union.

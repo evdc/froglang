@@ -448,6 +448,27 @@ fn test_trait_declared_implemented_and_called_in_three_separate_entries() {
     assert_eq!(int(&v), 36);
 }
 
+/// A generic bounded by a trait is lowered once, at its declaration, with
+/// its member calls left pending — so the impl it eventually resolves to may
+/// be declared at a *later* prompt than the generic itself, and each call
+/// resolves against whatever the registry says when that call is compiled.
+#[test]
+fn test_a_bounded_generic_resolves_members_against_impls_declared_after_it() {
+    let mut s = FrogState::new();
+    s.eval("trait Shape { func area(s: Self): Int }").unwrap();
+    s.eval("func report<T: Shape>(x: T): Int = x.area()").unwrap();
+    // Declared after the generic that calls it.
+    s.eval("data Circle(r: Int) provides Shape { func area(c: Circle): Int = c.r * c.r }").unwrap();
+    let (v, _) = s.eval("report(Circle(r=6))").unwrap();
+    assert_eq!(int(&v), 36);
+    // A second implementing type, later still: the same declaration is
+    // instantiated again, against an impl that didn't exist at either the
+    // declaration or the first call.
+    s.eval("provides Shape for Int { func area(n: Int): Int = n + 1 }").unwrap();
+    let (v, _) = s.eval("report(7)").unwrap();
+    assert_eq!(int(&v), 8);
+}
+
 /// A failed entry must leave the trait registries exactly as they were —
 /// `TypeCheckerCheckpoint` covers them alongside `provides` and `struct_defs`,
 /// so a rejected impl can be corrected and retried at the next prompt.

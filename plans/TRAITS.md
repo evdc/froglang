@@ -1114,7 +1114,7 @@ turned out not to be needed.
    that exclusion it monomorphized to whichever type called it first — precisely what writing the
    binder says it doesn't do.
 
-#### Bounds: what `<T: Bound>` buys, and what it doesn't yet
+#### Bounds: what `<T: Bound>` buys
 
 `<A, B: Ord + Eq>` parses on both `func` and `data`, and a declared bound rides on the binder's own
 `TypeVar` (the only place `unify`/`type_implements` look). The open question "how much bound
@@ -1122,14 +1122,30 @@ inference?" is answered the second way it proposed: **infer, then require the in
 written.** `func twice<T>(x: T): T = x + x` is rejected naming the missing `<T: Num>`; a
 declared-but-unused bound is fine, since callers read the signature and not the body.
 
-**Not supported: calling a trait member *through* a bound** — `func f<T: Shape>(x: T) = x.area()`.
-Member resolution happens at lowering time and writes a concrete impl symbol into the typed AST, but
-a type parameter only becomes concrete later, when `monomorphize_generics` substitutes into an
-already-lowered body. Making it work needs a deferred member call that monomorphization re-resolves
-after substitution — a real mechanism, not a missing line — so it is reported as unsupported, by
-name, rather than surfacing as "no such field on `~t0:Shape`". This is the first thing to build if
-bounded generics are wanted for more than documentation, and it is a prerequisite for a generic
-stdlib written against traits.
+**Calling a trait member *through* a bound** — `func f<T: Shape>(x: T) = x.area()` — works, and
+is what makes a bound more than documentation. It was the one piece of Stage 5 that shipped after
+the rest, because it is the one place the "resolution is a hash lookup" story doesn't hold: every
+other member call ends at lowering time with a concrete impl symbol written into the typed AST, and
+a type parameter has no concrete type until `monomorphize_generics` substitutes into an
+already-lowered body.
+
+The mechanism is a **pending callee**, and it is smaller than expected. `lower_bound_member_call`
+checks the call against the *trait's* signature with `Self` standing for the binder — so arity,
+argument types, and the result type are checked once, at the declaration, not once per
+instantiation — and emits an ordinary `Call` whose callee is `Var("#member$Shape$area")`, typed with
+that substituted signature. Nothing is recorded on the side: the receiver's type rides in the
+callee's own function type, so `substitute_types_deep` rewrites it along with every other type when
+a clone's binders are substituted. `resolve_bound_members` then runs once at the end of
+`monomorphize_generics` — after the fixed point, so nested generics are concrete too — reads the
+now-concrete `Self` back out of the callee's first parameter, and does the same `(type key, member)`
+`member_index` lookup an ordinary member call does at lowering time, just later. Codegen is again
+untouched; it sees a `Call` to a symbol.
+
+Two consequences worth stating. The impl may be declared *after* the generic that calls it, even at
+a later REPL entry, since resolution happens per instantiation against the registry as it then
+stands. And a failed lookup there is a compiler bug rather than a user error — the bound is checked
+at every call site — so it is reported rather than `expect`ed, because the alternative is a pending
+symbol reaching codegen as an unknown function.
 
 Also rejected explicitly, on 3a's precedent: **an impl for a generic type** (`data Box<A> provides
 Shape { ... }`). A member would have to be generic over the type's binders, which are not in scope in

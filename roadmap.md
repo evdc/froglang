@@ -9,7 +9,8 @@
     - The `provides`/impl duality is resolved: one `provides` keyword, inline on `data` or standalone (`provides T for Int { ... }`), with a body
     - Members live in the impl's namespace, not the global one — so there is no function overloading anywhere
     - `x.f(y)` resolves field → member → free function; all three steps work, each a hash lookup
-    - Still missing: operators desugaring to member calls (so no user `provides Num`), structural `Show`/`Error.message`, and calling a member *through* a bound (`func f<T: Shape>(x: T) = x.area()`) — the last one gates a generic stdlib written against traits
+    - Bounded generics call trait members (`func f<T: Shape>(x: T) = x.area()`), resolved per instantiation during monomorphization — so a generic stdlib written against traits is now unblocked
+    - Still missing: operators desugaring to member calls (so no user `provides Num`), structural `Show`/`Error.message`, and impls for generic types
 - Annotations, and auto-deriving trait implementations (macros/comptime?)
 - Structured concurrency
 

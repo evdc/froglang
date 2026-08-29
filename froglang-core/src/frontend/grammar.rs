@@ -1,4 +1,4 @@
-use crate::frontend::{expression::{DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, MatchArm, MatchExpr, Mutability, Parameter, Pattern, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
+use crate::frontend::{expression::{DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, ImplDeclExpr, MatchArm, MatchExpr, Mutability, Parameter, Pattern, TraitDeclExpr, TraitMemberDecl, TypeParam, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
 
 /// Result of parsing a type annotation. Parallel to `ParseResult`, but over
 /// the type grammar (`crate::frontend::type_expr`) rather than `Expression`.
@@ -201,7 +201,47 @@ impl Grammar {
     /// Parse a named function declaration: `func name(p1: T1, p2: T2, ...): RetType = body`
     /// Desugars to an assignment: `name = (p1, p2, ...) -> body`
     pub fn func_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let (name_tok, type_params, params, return_type) = Self::func_signature(parser)?;
+
+        parser.consume(Token::Assign)?;
+        parser.skip_newlines();
+        let body = parser.expression(Precedence::Assign)?;
+        let body_span = body.span;
+
+        let func_expr = Spanned::from(
+            Expression::generic_function(params, body, return_type, type_params),
+            body_span,
+        );
+        let name_expr = name_tok.map(Expression::literal);
+
+        Ok(Spanned {
+            span: token.span.merge(body_span),
+            // A named `func` declaration binds like `let` — immutable, not
+            // reassignable — matching an ordinary `let f = x -> ...`.
+            item: Expression::assign(name_expr, None, func_expr, Some(Mutability::Immutable)),
+        })
+    }
+
+    /// Everything of a `func` declaration up to (but not including) its
+    /// `= body`: the name, the parenthesized parameter list, and the
+    /// optional `: ReturnType`.
+    ///
+    /// Split out for `trait_decl`, whose members are exactly this with the
+    /// body made optional (`TRAITS.md` Stage 5) — a member signature and a
+    /// function declaration must not be allowed to drift apart in what they
+    /// accept, since an impl's members are parsed by `func_decl` and checked
+    /// against signatures parsed here.
+    fn func_signature(parser: &mut Parser)
+        -> Result<(Spanned<Token>, Vec<TypeParam>, Vec<Parameter>, Option<Spanned<TypeExpr>>), Spanned<ParseError>>
+    {
         let name_tok = parser.identifier()?;
+        // `func max<T: Ord>(...)` — binders sit between the name and the
+        // parameter list, where nothing else can start, so no ambiguity.
+        let type_params = if parser.check(&Token::Lt) {
+            Self::type_param_list(parser)?.0
+        } else {
+            Vec::new()
+        };
         parser.consume(Token::LeftParen)?;
 
         let mut params = Vec::new();
@@ -240,22 +280,60 @@ impl Grammar {
             None
         };
 
-        parser.consume(Token::Assign)?;
-        parser.skip_newlines();
-        let body = parser.expression(Precedence::Assign)?;
-        let body_span = body.span;
+        Ok((name_tok, type_params, params, return_type))
+    }
 
-        let func_expr = Spanned::from(
-            Expression::function_with_return(params, body, return_type),
-            body_span,
-        );
-        let name_expr = name_tok.map(Expression::literal);
+    /// `trait Name { func a(s: Self): T ... }` — `TRAITS.md` Stage 5.
+    ///
+    /// The brace block is optional: `trait Marker` and `trait Marker { }`
+    /// both declare a member-less marker, which is the shape `Error` and
+    /// `Linear` have and the one most user traits start as. Unlike
+    /// `block_expr`, an empty body is legal here for exactly that reason.
+    ///
+    /// Members are signatures, optionally with `= default_body`. Nothing but
+    /// `func` may appear in the block — a trait is an interface, not a
+    /// namespace for constants.
+    pub fn trait_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let name_tok = parser.identifier()?;
+        let name = match &name_tok.item {
+            Token::Identifier(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        let mut end = name_tok.span;
+
+        let mut members = Vec::new();
+        if parser.check(&Token::LeftBrace) {
+            parser.advance()?;
+            parser.skip_newlines_and_semicolons();
+            while !parser.check(&Token::RightBrace) && !parser.check(&Token::EOF) {
+                parser.consume(Token::Func)?;
+                let (member_tok, member_binders, params, return_type) = Self::func_signature(parser)?;
+                if !member_binders.is_empty() {
+                    // A member is already generic over `Self`; a second
+                    // binder would need per-member schemes that nothing
+                    // downstream carries yet.
+                    return Err(member_tok.map(|t| ParseError::ExpectedButFound(Token::LeftParen, t)));
+                }
+                let member_name = match &member_tok.item {
+                    Token::Identifier(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                let default = if parser.check(&Token::Assign) {
+                    parser.advance()?;
+                    parser.skip_newlines();
+                    Some(Box::new(parser.expression(Precedence::Assign)?))
+                } else {
+                    None
+                };
+                members.push(TraitMemberDecl { name: member_name, params, return_type, default });
+                parser.skip_newlines_and_semicolons();
+            }
+            end = parser.consume(Token::RightBrace)?.span;
+        }
 
         Ok(Spanned {
-            span: token.span.merge(body_span),
-            // A named `func` declaration binds like `let` — immutable, not
-            // reassignable — matching an ordinary `let f = x -> ...`.
-            item: Expression::assign(name_expr, None, func_expr, Some(Mutability::Immutable)),
+            span: token.span.merge(end),
+            item: Expression::TraitDecl(TraitDeclExpr { name, members }),
         })
     }
 
@@ -459,15 +537,32 @@ impl Grammar {
     /// per `TRAITS.md`'s "Bounds" section). Assumes the opening `<` has not
     /// yet been consumed; returns the names in declared order and the
     /// closing `>`'s span.
-    fn type_param_list(parser: &mut Parser) -> Result<(Vec<String>, Span), Spanned<ParseError>> {
+    fn type_param_list(parser: &mut Parser) -> Result<(Vec<TypeParam>, Span), Spanned<ParseError>> {
         parser.consume(Token::Lt)?;
-        let mut names = Vec::new();
+        let mut params = Vec::new();
         loop {
             let tok = parser.identifier()?;
-            match &tok.item {
-                Token::Identifier(s) => names.push(s.clone()),
+            let name = match &tok.item {
+                Token::Identifier(s) => s.clone(),
                 _ => unreachable!("Parser::identifier only returns Token::Identifier"),
+            };
+            // `T: Ord + Eq` — inline bounds, with `where` deliberately not
+            // offered (`TRAITS.md` Part 4 keeps it as an overflow valve for
+            // later, and nothing needs it yet).
+            let mut bounds = Vec::new();
+            if parser.check(&Token::Colon) {
+                parser.advance()?;
+                loop {
+                    let b = parser.identifier()?;
+                    match &b.item {
+                        Token::Identifier(s) => bounds.push(s.clone()),
+                        _ => unreachable!("Parser::identifier only returns Token::Identifier"),
+                    }
+                    if parser.check(&Token::Plus) { parser.advance()?; continue; }
+                    break;
+                }
             }
+            params.push(TypeParam { name, bounds });
             if parser.check(&Token::Comma) {
                 parser.advance()?;
                 continue;
@@ -475,7 +570,7 @@ impl Grammar {
             break;
         }
         let closing = Self::expect_close_angle(parser)?;
-        Ok((names, closing))
+        Ok((params, closing))
     }
 
     /// `Name`, `Name<A, B>`, `(T)`, or `(A, B -> C)`.
@@ -805,9 +900,71 @@ impl Grammar {
             provides.push("Error".to_string());
         }
 
+        // The inline impl body — `data Circle(r: Float) provides Shape { ... }`.
+        // Only meaningful after a `provides` clause; without one there is no
+        // trait for the members to belong to, and a bare `{` would otherwise
+        // be silently accepted here and then fail far away.
+        let mut members = Vec::new();
+        if parser.check(&Token::LeftBrace) {
+            if provides.is_empty() {
+                return Err(parser.current_token.clone()
+                    .map(|t| ParseError::ExpectedButFound(Token::Provides, t)));
+            }
+            let (ms, closing) = Self::impl_body(parser)?;
+            members = ms;
+            end = closing;
+        }
+
         Ok(Spanned {
             span: token.span.merge(end),
-            item: Expression::DataDecl(DataDeclExpr { name, type_params, fields, variants, provides })
+            item: Expression::DataDecl(DataDeclExpr { name, type_params, fields, variants, provides, members })
+        })
+    }
+
+    /// `{ func a(...) = ..., func b(...) = ... }` — the member list shared by
+    /// both impl positions. Members are parsed by `func_decl` verbatim, so an
+    /// impl member and a top-level function are the same syntax; that is what
+    /// lets `expand_impls` compile a member by simply renaming its `Assign`
+    /// and letting the ordinary lowering path handle it.
+    fn impl_body(parser: &mut Parser) -> Result<(Vec<Spanned<Expression>>, Span), Spanned<ParseError>> {
+        parser.consume(Token::LeftBrace)?;
+        parser.skip_newlines_and_semicolons();
+        let mut members = Vec::new();
+        while !parser.check(&Token::RightBrace) && !parser.check(&Token::EOF) {
+            let func_tok = parser.consume(Token::Func)?;
+            members.push(Self::func_decl(parser, func_tok)?);
+            parser.skip_newlines_and_semicolons();
+        }
+        let closing = parser.consume(Token::RightBrace)?.span;
+        Ok((members, closing))
+    }
+
+    /// `provides Trait for Type { ... }` — the standalone impl, for a type
+    /// whose declaration you don't own (a primitive, or one from another
+    /// module).
+    ///
+    /// Spelled with `provides` leading rather than `Int provides Shape {...}`
+    /// so it can be a prefix rule: the alternative would need `provides` as
+    /// an infix operator in expression position, where a bare type name is
+    /// not an expression to begin with. `for` is reused positionally and
+    /// needs no lexer change.
+    pub fn impl_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let mut traits = Vec::new();
+        loop {
+            let trait_tok = parser.identifier()?;
+            match &trait_tok.item {
+                Token::Identifier(s) => traits.push(s.clone()),
+                _ => unreachable!(),
+            }
+            if parser.check(&Token::Comma) { parser.advance()?; continue; }
+            break;
+        }
+        parser.consume(Token::For)?;
+        let self_ty = Self::type_expr(parser)?;
+        let (members, closing) = Self::impl_body(parser)?;
+        Ok(Spanned {
+            span: token.span.merge(closing),
+            item: Expression::ImplDecl(ImplDeclExpr { traits, self_ty, members }),
         })
     }
 

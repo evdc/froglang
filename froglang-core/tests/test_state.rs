@@ -433,3 +433,34 @@ fn test_using_a_function_literal_as_a_value_is_a_type_error() {
         }
     }
 }
+
+// ── Traits across entries (`plans/TRAITS.md` Stage 5) ────────────────────
+
+/// A trait, its impl, and a call to a member may each land in a different
+/// entry. The registries backing them (`traits`, `impls`, `member_index`)
+/// persist across entries the way `struct_defs` and `ctx` already do.
+#[test]
+fn test_trait_declared_implemented_and_called_in_three_separate_entries() {
+    let mut s = FrogState::new();
+    s.eval("trait Shape { func area(s: Self): Int }").unwrap();
+    s.eval("data Circle(r: Int) provides Shape { func area(c: Circle): Int = c.r * c.r }").unwrap();
+    let (v, _) = s.eval("Circle(r=6).area()").unwrap();
+    assert_eq!(int(&v), 36);
+}
+
+/// A failed entry must leave the trait registries exactly as they were —
+/// `TypeCheckerCheckpoint` covers them alongside `provides` and `struct_defs`,
+/// so a rejected impl can be corrected and retried at the next prompt.
+#[test]
+fn test_a_rejected_impl_leaves_the_registries_clean_and_can_be_retried() {
+    let mut s = FrogState::new();
+    s.eval("trait Shape { func area(s: Self): Int }").unwrap();
+    // Wrong return type: rejected during `expand_impls`, after the data
+    // declaration in the same entry was already hoisted.
+    assert!(s.eval("data Circle(r: Int) provides Shape { func area(c: Circle): Str = \"x\" }").is_err());
+    // The same declaration, corrected, must now be accepted — nothing from
+    // the failed attempt may still be registered.
+    s.eval("data Circle(r: Int) provides Shape { func area(c: Circle): Int = c.r }").unwrap();
+    let (v, _) = s.eval("Circle(r=4).area()").unwrap();
+    assert_eq!(int(&v), 4);
+}

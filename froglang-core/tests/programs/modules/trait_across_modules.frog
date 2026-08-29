@@ -1,0 +1,7 @@
+import "./shapes.frog" { Shape, Circle }
+
+data Sq(w: Int) provides Shape {
+    func area(s: Sq): Int = s.w
+}
+
+Circle(r=3).doubled() + Sq(w=4).area() + Shape.area(Circle(r=2))

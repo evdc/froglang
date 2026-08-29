@@ -1,0 +1,17 @@
+func bump(): Int = 1
+
+trait Shape {
+    func area(s: Self): Int
+    // A default body's own `let` must not leak into the *next* member's
+    // default body — where `bump` is this module's function and has to keep
+    // being mangled to reach it.
+    func shifted(s: Self): Int = {
+        let bump = 100
+        bump
+    }
+    func doubled(s: Self): Int = s.area() * 2 + bump() - 1
+}
+
+data Circle(r: Int) provides Shape {
+    func area(c: Circle): Int = c.r * c.r
+}

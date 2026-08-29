@@ -140,3 +140,19 @@ fn test_no_imports_unaffected() {
     std::fs::remove_file(&entry).ok();
     assert_eq!(result, 42);
 }
+
+/// A trait declared in one module, implemented there *and* in the importing
+/// module, then used both ways (`TRAITS.md` Stage 5).
+///
+/// The point of the test is that a trait name is module-scoped like a type
+/// name — so it gets mangled in `collect_names_in`/`rewrite`, and every
+/// `provides` clause and prefix form has to follow it — while *impls* stay
+/// globally coherent, which they do for free once the names are unique.
+/// `Circle(r=3).doubled()` exercises a default body across a module boundary
+/// too: 9*2 + 4 + 4 = 26. It also pins the scoping *between* two default
+/// bodies: `shifted`'s `let bump` must not stop `doubled`'s `bump()` from
+/// being mangled to the module's own function.
+#[test]
+fn test_trait_across_modules() {
+    assert_eq!(run_module_entry("trait_across_modules.frog"), 26);
+}

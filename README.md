@@ -89,16 +89,65 @@ type of `return`, `panic`, and any expression that never produces a value)
   structs (`Shape.Circle`, `Shape.Rectangle`) plus a closed union alias `Shape`; this is
   froglang's *only* sum-type mechanism — there is no separate enum construct
 
-**Trait-bounded polymorphism:**
+**Built-in traits:**
 
-| Trait   | Satisfying types              | Operators                   |
-|---------|--------------------------------|------------------------------|
-| `Num`   | `Int`, `Float`                | `+` `-` `*` `/` unary `-`  |
-| `Eq`    | `Int`, `Float`, `Bool`, `Str` | `==` `!=`                   |
-| `Ord`   | `Int`, `Float`, `Str`         | `<` `>` `<=` `>=`          |
-| `Error` | granted, not structural        | `?`, `!`, `catch`           |
+| Trait    | Satisfying types              | What it gives                 |
+|----------|--------------------------------|-------------------------------|
+| `Num`    | `Int`, `Float`                | `+` `-` `*` `/` unary `-`    |
+| `Eq`     | structural: any value type     | `==` `!=`                     |
+| `Ord`    | `Int`, `Float`, `Str`         | `<` `>` `<=` `>=`            |
+| `Error`  | granted, not structural        | `?`, `!`, `catch`             |
+| `Linear` | granted, not structural        | "can't be aliased" (checked)  |
+
+These are ordinary entries in the same trait registry a `trait` declaration lands in, so
+`provides` accepts any of them alongside your own — but their behaviour is a compiler
+intrinsic, so they can be *granted*, not implemented with a body. (`Truthy`, which decides
+what `if x` means for a non-`Bool`, deliberately stays compiler-internal: making it
+implementable would let any impl redefine control flow.)
 
 Bound propagation: `x -> x + x` infers as `(Num t) => t -> t`.
+
+## Traits
+
+See `plans/TRAITS.md`. Members are plain functions with an explicit `Self` parameter — not
+methods with a receiver, which is what lets `compare(a: Self, b: Self)` and `zero(): Self`
+be members at all. They live in their impl's namespace, so nothing is overloaded.
+
+```
+trait Shape {
+    func area(s: Self): Int
+    func doubled(s: Self): Int = s.area() * 2      // default body
+}
+
+data Circle(r: Int) provides Shape {               // inline impl
+    func area(c: Circle): Int = c.r * c.r
+}
+
+provides Shape for Int {                           // standalone, for a type you don't own
+    func area(n: Int): Int = n
+}
+
+Circle(r=3).area()          // dot form
+Shape.area(Circle(r=3))     // prefix form, trait-qualified
+Circle(r=3).doubled()       // default body, specialized per implementing type
+```
+
+**`x.f(args)` resolves in a fixed order**: a *field* `f` of `typeof(x)`, then a *member* `f`
+of an impl for `typeof(x)`, then a global `func f` whose first parameter accepts `typeof(x)`.
+Fields always win, so no existing program changes meaning when a trait is introduced. Each
+step is a hash lookup, never a search — the ambiguities that would make it one (two impls of
+one trait for one type; two traits declaring one member name for one type) are rejected at
+the impl, where the error can name both, rather than at the call site.
+
+Calling a member on a **union** is legal iff every member implements it, and compiles to the
+same dispatch `match` that `?`/`catch` build. Calling a member on a **`mut` receiver** needs
+no call-site marker (`c.bump()`, not `mut c.bump()`) — the marker exists to make a hidden
+mutated operand visible, and the receiver is the least hidden position there is.
+
+**Type parameters** take optional bounds: `func twice<T: Num>(x: T): T = x + x`, and
+`data Box<A: Eq>(v: A)`. Bounds are still *inferred* from the body; writing them is required
+once inferred (`func twice<T>(x: T): T = x + x` is rejected, naming the missing `<T: Num>`),
+since a caller reads the signature and not the body.
 
 Unlike the structural traits above, `Error` is granted only by a `provides Error` clause on
 a `data` declaration, or the `error X(...)` shorthand for `data X(...) provides Error` — it
@@ -392,9 +441,13 @@ Roughly in priority order:
   check without a full `match`, the `Truthy` trait for condition-position coercion, and
   error return traces. `lower_match`'s guard-clause cloning also has a known exponential-size
   bug to fix alongside phase 6.
-- **User-defined traits and impls** — `trait Foo { ... }`, `impl Foo for MyType`, and
-  explicit `T: Trait` bounds in function signatures. `Error` is currently the only
-  user-grantable trait, via `provides`.
+- ~~**User-defined traits and impls**~~ — **done, see "Traits" above** (`plans/TRAITS.md`
+  Stage 5). Still missing from the trait system: operators desugaring to member calls
+  (so `data Vec2 provides Num` can't give you `+`), structural `Show` and therefore
+  `Error.message`, and **calling a member through a bound** — `func f<T: Shape>(x: T) = x.area()`
+  is rejected by name, because resolution picks a concrete symbol at lowering time while a
+  type parameter only becomes concrete during monomorphization. That last one is the
+  prerequisite for a generic stdlib written against traits.
 - **Qualified variant names in type position** — `ParseError.UnexpectedEof` isn't yet
   spellable in a `TypeExpr` annotation, nor resolvable as an `is`/`match` pattern nested
   inside a further anonymous union.

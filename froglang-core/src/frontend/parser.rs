@@ -311,6 +311,16 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Both statement separators, as `Grammar::block_expr`'s own loop treats
+    /// them — for constructs with a brace-delimited list of declarations
+    /// (`Grammar::trait_decl`) that need the same tolerance without
+    /// `block_expr`'s expression semantics.
+    pub fn skip_newlines_and_semicolons(&mut self) {
+        while self.check(&Token::Newline) || self.check(&Token::Semicolon) {
+            let _ = self.advance();
+        }
+    }
+
     /// Snapshot parser state (current token + lexer position) for a later
     /// `restore` — a general one-token(-or-more)-of-lookahead-with-rollback
     /// primitive, e.g. for `Grammar::field_list`'s "was that identifier a

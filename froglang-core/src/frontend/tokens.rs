@@ -150,6 +150,11 @@ pub enum Token {
     #[lex("error")]
     Error,
 
+    #[prefix(Grammar::trait_decl)]
+    #[lex("trait")]
+    Trait,
+
+    #[prefix(Grammar::impl_decl)]
     #[lex("provides")]
     Provides,
 

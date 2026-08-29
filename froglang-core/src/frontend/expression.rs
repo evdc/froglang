@@ -72,7 +72,23 @@ pub struct Parameter {
 pub struct FunctionExpr {
     pub params: Vec<Parameter>,
     pub body: ExprRef,
-    pub return_type: Option<Spanned<TypeExpr>>
+    pub return_type: Option<Spanned<TypeExpr>>,
+    /// `<T, U: Ord + Eq>` binders declared after a `func`'s name —
+    /// `TRAITS.md` Part 4, "Bounds". Empty for a lambda (which has no room
+    /// for them) and for every `func` that doesn't write any: generalization
+    /// infers the binder set either way (`TRAITS.md` Stage 3b), so what this
+    /// adds is the *bounds*, and a checked claim that the inferred set is no
+    /// larger than the written one.
+    pub type_params: Vec<TypeParam>,
+}
+
+/// One declared type parameter: its name, and the trait names bounding it.
+/// Bounds are kept as written (`Vec<String>`) rather than resolved here —
+/// only the type checker knows which names are traits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name:   String,
+    pub bounds: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,10 +182,67 @@ pub struct DataDeclExpr {
     /// happens in `TypeChecker::hoist_data_decls`, which mints one fresh
     /// placeholder per name and resolves `fields`'s `TypeExpr`s against
     /// them.
-    pub type_params: Vec<String>,
+    pub type_params: Vec<TypeParam>,
     pub fields:   Vec<FieldDecl>,
     pub variants: Vec<VariantDecl>,
     pub provides: Vec<String>,
+    /// The `{ ... }` impl body, if one followed the `provides` clause —
+    /// ordinary `Assign(name, Function)` member declarations. Empty for
+    /// every declaration that is a bare grant (`provides Error`) or has no
+    /// `provides` at all. `TypeChecker::expand_impls` lifts these into an
+    /// `ImplDeclExpr` so the inline and standalone forms register
+    /// identically.
+    pub members: Vec<Spanned<Expression>>,
+}
+
+/// One member of a `trait` declaration: `func area(s: Self): Float`, or
+/// `func name(s: Self): Str = "shape"` with a default body.
+///
+/// Deliberately the same shape as a `func` declaration minus the mandatory
+/// `= body` — trait members are plain functions with an explicit `Self`-typed
+/// parameter, not methods with a receiver (`TRAITS.md` Part 1). That is what
+/// lets `compare(a: Self, b: Self)` and `zero(): Self` be members at all, and
+/// it's why `params` is an ordinary `Vec<Parameter>` with no special first
+/// element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMemberDecl {
+    pub name:        String,
+    pub params:      Vec<Parameter>,
+    pub return_type: Option<Spanned<TypeExpr>>,
+    /// The default body, if this member declared one. `None` means every
+    /// implementation must supply it.
+    pub default:     Option<ExprRef>,
+}
+
+/// `trait Name { ... }` — `TRAITS.md` Stage 5. A trait with no members is a
+/// marker (the shape `Error` and `Linear` have), and both `trait Marker` and
+/// `trait Marker { }` spell it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitDeclExpr {
+    pub name:    String,
+    pub members: Vec<TraitMemberDecl>,
+}
+
+/// An implementation of one or more traits for one type — `TRAITS.md`
+/// Stage 5's "`provides` clause with a body", in either of its two
+/// positions:
+///
+/// ```text
+/// data Circle(r: Float) provides Shape { func area(c: Circle) = ... }
+/// provides Shape for Int { func area(n: Int) = 0.0 }
+/// ```
+///
+/// The inline form is desugared into this node by
+/// `TypeChecker::expand_impls`, so there is exactly one registration path
+/// rather than two. `traits` is a list because the inline form can grant
+/// several at once; `members` are ordinary `Assign(name, Function)` nodes,
+/// parsed by `Grammar::func_decl` verbatim, and are partitioned across the
+/// listed traits by which one declares each name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplDeclExpr {
+    pub traits:  Vec<String>,
+    pub self_ty: Spanned<TypeExpr>,
+    pub members: Vec<Spanned<Expression>>,
 }
 
 /// A pattern matched against an enum value: `Circle(r)`, `Shape.Circle(r)`,
@@ -278,6 +351,16 @@ pub enum Expression {
     /// match on it directly instead of a match-inside-a-match.
     Comprehension(ExprRef),
     DataDecl(DataDeclExpr),
+    /// `trait Name { ... }` — `TRAITS.md` Stage 5. Hoisted and registered by
+    /// `TypeChecker::hoist_trait_decls` before anything else is checked (the
+    /// same pre-pass treatment `data` gets), and lowers to nothing: a trait
+    /// declaration is a fact about the type system, not a value.
+    TraitDecl(TraitDeclExpr),
+    /// `provides Trait for Type { ... }` — a standalone impl, and (after
+    /// `TypeChecker::expand_impls`) also what an inline `data ... provides
+    /// T { ... }` body becomes. Replaced during expansion by its member
+    /// functions under mangled symbols, so it never reaches lowering.
+    ImplDecl(ImplDeclExpr),
     FieldAccess(FieldAccessExpr),
     Import(ImportExpr),
     Match(MatchExpr),
@@ -338,11 +421,17 @@ impl Expression {
     }
 
     pub fn function(params: Vec<Parameter>, body: Spanned<Expression>) -> Expression {
-        Expression::Function(FunctionExpr { params, body: Box::new(body), return_type: None })
+        Expression::Function(FunctionExpr { params, body: Box::new(body), return_type: None, type_params: Vec::new() })
     }
 
     pub fn function_with_return(params: Vec<Parameter>, body: Spanned<Expression>, return_type: Option<Spanned<TypeExpr>>) -> Expression {
-        Expression::Function(FunctionExpr { params, body: Box::new(body), return_type })
+        Expression::Function(FunctionExpr { params, body: Box::new(body), return_type, type_params: Vec::new() })
+    }
+
+    /// `function_with_return` plus declared `<T: Bound>` binders — the
+    /// `func name<...>(...)` form (`TRAITS.md` Part 4, "Bounds").
+    pub fn generic_function(params: Vec<Parameter>, body: Spanned<Expression>, return_type: Option<Spanned<TypeExpr>>, type_params: Vec<TypeParam>) -> Expression {
+        Expression::Function(FunctionExpr { params, body: Box::new(body), return_type, type_params })
     }
 
     pub fn call(func: Spanned<Expression>, args: Vec<Spanned<Expression>>) -> Expression {
@@ -549,6 +638,34 @@ impl fmt::Display for Expression {
                     }
                 }
                 Ok(())
+            }
+
+            Expression::TraitDecl(t) => {
+                write!(f, "trait {} {{", t.name)?;
+                for (i, m) in t.members.iter().enumerate() {
+                    if i > 0 { write!(f, ";")?; }
+                    write!(f, " func {}(", m.name)?;
+                    for (j, p) in m.params.iter().enumerate() {
+                        if j > 0 { write!(f, ", ")?; }
+                        match &p.ty {
+                            Some(ty) => write!(f, "{}: {}", p.name, ty.item)?,
+                            None => write!(f, "{}", p.name)?,
+                        }
+                    }
+                    write!(f, ")")?;
+                    if let Some(rt) = &m.return_type { write!(f, ": {}", rt.item)?; }
+                    if let Some(d) = &m.default { write!(f, " = {}", d.item)?; }
+                }
+                write!(f, " }}")
+            }
+
+            Expression::ImplDecl(i) => {
+                write!(f, "provides {} for {} {{", i.traits.join(", "), i.self_ty.item)?;
+                for (n, m) in i.members.iter().enumerate() {
+                    if n > 0 { write!(f, ";")?; }
+                    write!(f, " {}", m.item)?;
+                }
+                write!(f, " }}")
             }
 
             Expression::FieldAccess(fa) => {

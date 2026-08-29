@@ -1,9 +1,12 @@
 # Traits, Generics, and Methods
 
-Status: **in progress**. Stages 0-2 (`Implementation plan`, below) are implemented — UFCS,
-`Type::Named`, and type schemes/instantiation. Nothing past that is. Syntax past this point is
-still a sketch and should be expected to change; the *decisions* in "Foundational choices" are
-the part meant to be stable, since they are the ones that are expensive to revisit later.
+Status: **in progress**. Stages 0-3 and 5 are implemented — UFCS, `Type::Named`, type schemes,
+generic syntax and monomorphization, and user-facing `trait`/`provides` declarations with member
+resolution. Stage 4 (a real stdlib) is half done; Stage 6 is half done (the builtin traits are now
+registry entries; operator desugaring and structural derivation are not); Stage 7 is untouched.
+Each stage's own section below records what it actually needed, which is often not what it was
+planned to need. The *decisions* in "Foundational choices" are the part meant to be stable, since
+they are the ones that are expensive to revisit later.
 
 This supersedes the roadmap's "Traits/interfaces, explicit-style" and "User-definable generics"
 bullets, and answers both the duality that bullet flags between `provides` and impl blocks and
@@ -1039,23 +1042,130 @@ Stage 1 is scheduled to remove.
 writable; this stage is what proves they worked. Note there is *no* user-callable `len` today, so
 this is also the first stage that makes the language usable for ordinary programs.
 
-### Stage 5 — Traits
+### Stage 5 — Traits — **done**
 
 `trait` declarations with function members and default bodies; `Self` resolution; `provides` blocks
 in both positions; namespaced member registration; resolution step 2; trait-qualified prefix form;
-zero-`Self` resolution by expected type; the global coherence check; `Error` gains `message`.
+zero-`Self` resolution by expected type; the global coherence check. Landed together with the
+*declaration* half of Stage 6 (below) and with explicit `<T: Bound>` binders, which is where Part 4's
+"Bounds" section finally became syntax.
 
 Deliberately after stage 4: traits are only strictly required for *bounded* generics, and the five
-builtin bounds cover the stdlib's first hundred functions. If stage 4 completes without hitting a
-bound it cannot express, that is information worth having before writing this stage.
+builtin bounds cover the stdlib's first hundred functions. (Stage 4 is only half done — strings and
+file IO shipped, `map`/`filter`/`fold`/`Dict` did not — and nothing in it turned out to want a bound
+this stage can't express, so the ordering held.)
 
-### Stage 6 — Prelude traits and structural derivation
+**`Error` did *not* gain `message`**, contrary to this stage's original list. Part 5 wants it with a
+*structural* default, and a structural default needs `Show`, which is Stage 6's derivation work —
+the half deliberately not taken here. `Error` stays the zero-member marker it was.
 
-`Trait` becomes open; `Num`/`Eq`/`Ord`/`Error` become prelude declarations; `Truthy` stays
-internal; operators desugar to member calls; primitive impls stay codegen intrinsics; structural
-`Eq`/`Ord`/`Show` for `data` with explicit-override-replaces-the-impl; field-recursive checking.
+#### The standalone impl form
 
-Benchmarks gate this stage — `fib` especially, via the criterion suite.
+`provides Trait for Type { ... }`, a `provides`-led prefix rule. The alternative shape this document
+sketched — `Int provides Shape { ... }`, matching the inline form's word order — would need
+`provides` as an *infix* operator in expression position, where a bare type name isn't an expression
+to begin with. `for` is reused positionally and needed no lexer change.
+
+Both forms produce one `ImplDeclExpr` and go through one `register_impl`, so the inline body is not
+a second code path: `TypeChecker::expand_impls` lifts a `data ... provides T { ... }` body into the
+same node before anything is registered.
+
+#### What the plan got right, and the one thing it over-engineered
+
+**Right**: "Where the seam is" held exactly. An impl member is renamed to a mangled symbol
+(`Circle$area`) and spliced into the statement list as an ordinary `Assign(name, Function)`; the
+existing `lower_assign` compiles it, and **codegen was not touched at all** — not one line, across the
+whole stage. Resolution step 2 is a `member_index` lookup inserted into `lower_ufcs_call` between
+steps 1 and 3.
+
+Members are spliced *in place*, where the impl block is written, rather than hoisted: froglang
+requires declaration before use everywhere else (`func a() = b()` with `b` below is an error today),
+and an impl behaving differently would have been a special case with nothing to recommend it. The
+visible consequence is that a trait's default body can only call members declared *before* it in the
+same trait.
+
+**Over-engineered**: default bodies. The plan routed them through `generic_templates` and
+`monomorphize_generics`, on the reasoning that `Self` is a binder so a default body is a generic
+declaration — true, and it flagged this as the riskiest piece. It is also unnecessary. Every
+implementing type is already known at *registration* time, so `specialize_default` just clones the
+body, rewrites `Self` to the implementing type in the signature, and emits it under that impl's
+symbol. One copy per implementing type is exactly what monomorphizing it would have produced, and
+per-instantiation checking falls out for free — with no template to keep, no worklist, and no
+fixed point. The risk the plan budgeted for never materialized because the mechanism it was for
+turned out not to be needed.
+
+#### Two things the plan didn't anticipate
+
+1. **A union member call needs *bind-less* patterns, not reconstructed values.** Dispatching
+   `u.area()` over a union reuses exactly the machinery `?`/`!`/`catch` already have —
+   `union_entries` for the per-member arms, `lower_match_lowered` for an already-lowered subject, so
+   the receiver is still evaluated once. But an arm body built from `union_entries`' reconstructed
+   `whole_value` **recurses forever**: reconstructing a variant yields the *union* type again
+   (variants are boxed into it), so the arm re-enters the same dispatch. The fix is to bind nothing
+   and let flow narrowing (ERRORS.md Phase 6) retype the receiver's own name to the member type —
+   which `lower_match_lowered` applies only to an arm with no field binds. That in turn means the
+   receiver has to *be* a plain binding; an expression receiver is rejected with the fix in the
+   message rather than mis-dispatched.
+2. **Explicit binders have to be scoped in `lower_assign`, not `lower_function`.** The recursion
+   pre-bind resolves a declaration's annotations *before* the function is lowered, so both halves
+   must see the same binder variables or a recursive call is typed against a different `T` than the
+   body. Relatedly, `fully_annotated` (which pre-binds monomorphically) had to learn to exclude a
+   declaration with written binders: `func twice<T: Num>(x: T): T` is fully annotated, and without
+   that exclusion it monomorphized to whichever type called it first — precisely what writing the
+   binder says it doesn't do.
+
+#### Bounds: what `<T: Bound>` buys, and what it doesn't yet
+
+`<A, B: Ord + Eq>` parses on both `func` and `data`, and a declared bound rides on the binder's own
+`TypeVar` (the only place `unify`/`type_implements` look). The open question "how much bound
+inference?" is answered the second way it proposed: **infer, then require the inferred bounds to be
+written.** `func twice<T>(x: T): T = x + x` is rejected naming the missing `<T: Num>`; a
+declared-but-unused bound is fine, since callers read the signature and not the body.
+
+**Not supported: calling a trait member *through* a bound** — `func f<T: Shape>(x: T) = x.area()`.
+Member resolution happens at lowering time and writes a concrete impl symbol into the typed AST, but
+a type parameter only becomes concrete later, when `monomorphize_generics` substitutes into an
+already-lowered body. Making it work needs a deferred member call that monomorphization re-resolves
+after substitution — a real mechanism, not a missing line — so it is reported as unsupported, by
+name, rather than surfacing as "no such field on `~t0:Shape`". This is the first thing to build if
+bounded generics are wanted for more than documentation, and it is a prerequisite for a generic
+stdlib written against traits.
+
+Also rejected explicitly, on 3a's precedent: **an impl for a generic type** (`data Box<A> provides
+Shape { ... }`). A member would have to be generic over the type's binders, which are not in scope in
+an impl body and have no syntax there.
+
+#### A pre-existing bug this stage surfaced but did not fix
+
+Flow narrowing over a union whose variants carry `Float` payloads panics in the Cranelift verifier
+(`data Sh is Circle(r: Float) | Sq(w: Float)` + a bindless `is Circle` arm). Reproduced on the
+unmodified tree with no trait machinery involved, so it is not this stage's; the `Int` shape of the
+same program is fine. Union member dispatch inherits it, since narrowing is what it rides on.
+
+### Stage 6 — Prelude traits and structural derivation — **half done**
+
+Split, deliberately, along the line the benchmark caveat draws.
+
+**Done, with Stage 5**: `Trait` is open — it gained a `User(String)` variant rather than becoming a
+fully interned name, which keeps the five built-ins as constructors that the operator and coercion
+paths (`join_operand_types`, `check_condition`, `linear::check`) still match on directly, while every
+`provides` clause and bound annotation travels one path. `Num`/`Eq`/`Ord`/`Error`/`Linear` are
+ordinary entries in `TypeChecker.traits`, seeded by `initial_traits()` from both `new()` and
+`empty()` — the same shape `initial_struct_type_params` already used for `List`. Seeded as *data*
+rather than as prelude source: `FrogState::new()` has no builder prelude to inject into and most of
+the test suite uses it, so a source prelude would have had to become unconditional (the risk Stage 3c
+flagged and skipped) and would cost a full parse+JIT per construction for declarations that emit no
+code. `Truthy` is deliberately absent from the registry, and says so when named
+(`provides Truthy` reports what it actually is, not "unknown trait").
+
+**Not done, and still gated on benchmarks**: operators desugaring to member calls, `Num` implementable
+by user types (`data Vec2 provides Num` giving `+`), structural `Eq`/`Ord`/`Show` derivation with
+explicit-override-replaces-the-impl, and therefore `Error::message`. `+`/`==`/`<` keep
+`join_operand_types` and `compile_binary`'s inline Cranelift path untouched, so nothing in Stage 5
+could regress `fib` — and nothing did.
+
+A built-in trait can be *granted* (`provides Error`) but not implemented with a body; the error says
+why, since its behaviour is an intrinsic rather than a member.
 
 ### Stage 7 — Capabilities
 

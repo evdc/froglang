@@ -96,6 +96,19 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
                 Ok(())
             }
             Expression::Assign(a) => { walk(&a.target.item, path)?; walk(&a.value.item, path) }
+            // A trait's default bodies are the only expressions it holds,
+            // and an `import` inside one is as illegal as inside any other
+            // function body.
+            Expression::TraitDecl(t) => {
+                for m in &t.members {
+                    if let Some(d) = &m.default { walk(&d.item, path)?; }
+                }
+                Ok(())
+            }
+            Expression::ImplDecl(i) => {
+                for m in &i.members { walk(&m.item, path)?; }
+                Ok(())
+            }
             Expression::Function(f) => walk(&f.body.item, path),
             Expression::Call(c) => {
                 walk(&c.callable.item, path)?;
@@ -412,6 +425,17 @@ fn collect_names_in(expr: &Expression, names: &mut HashSet<String>) {
                 names.insert(v.name.clone());
             }
         }
+        // A trait name is module-scoped exactly like a type name — it is
+        // what a `provides` clause in another module has to be able to
+        // name. Note this arm is *required*, not optional: the `_ => {}`
+        // below would otherwise skip it silently and the trait would keep
+        // its unmangled name while every reference to it got rewritten.
+        Expression::TraitDecl(t) => { names.insert(t.name.clone()); }
+        // An impl contributes no module-level name: its members are only ever
+        // reachable through the mangled symbols `expand_impls` renames them
+        // to, never under their own name. Mangling the trait/type it names is
+        // `rewrite`'s job, below.
+        Expression::ImplDecl(_) => {}
         Expression::Block(stmts) | Expression::Tuple(stmts) => {
             for s in stmts { collect_names_in(&s.item, names); }
         }
@@ -463,13 +487,26 @@ fn rewrite_type_expr(
     qualified: &HashMap<String, HashMap<String, String>>,
 ) {
     for name in ty.item.names_mut() {
-        let replacement = match name.split_once('.') {
-            Some((alias, member)) => qualified.get(alias).and_then(|m| m.get(member)),
-            None => subst.get(name.as_str()),
-        };
-        if let Some(mangled) = replacement {
-            *name = mangled.clone();
-        }
+        rewrite_name(name, subst, qualified);
+    }
+}
+
+/// Resolve one declaration-namespace name — a type name inside an
+/// annotation, or a trait name in a `provides` clause — against this
+/// module's substitutions, resolving a dotted `alias.Member` through
+/// `qualified` first. Factored out of `rewrite_type_expr` so `provides`
+/// gets identical treatment without the type-grammar walk it doesn't need.
+fn rewrite_name(
+    name: &mut String,
+    subst: &HashMap<String, String>,
+    qualified: &HashMap<String, HashMap<String, String>>,
+) {
+    let replacement = match name.split_once('.') {
+        Some((alias, member)) => qualified.get(alias).and_then(|m| m.get(member)),
+        None => subst.get(name.as_str()),
+    };
+    if let Some(mangled) = replacement {
+        *name = mangled.clone();
     }
 }
 
@@ -643,6 +680,56 @@ fn rewrite(
                 for p in &mut v.fields {
                     rewrite_type_expr(&mut p.ty, subst, qualified);
                 }
+            }
+            // A `provides` clause names traits, which are module-scoped
+            // (`collect_names_in`) — so `provides shapes.Drawable` and a
+            // same-file `provides Drawable` both have to reach the mangled
+            // declaration. Routed through the same dotted-name resolution
+            // `rewrite_type_expr` uses, since a trait name is spelled like
+            // a type name. Impls stay globally coherent for free: mangling
+            // makes the names unique, so one global registry needs no
+            // module exception (`TRAITS.md`, "Coherence").
+            for name in &mut d.provides {
+                rewrite_name(name, subst, qualified);
+            }
+            for m in &mut d.members {
+                rewrite(&mut m.item, subst, qualified, shadow, true);
+            }
+        }
+
+        Expression::TraitDecl(t) => {
+            if !track_let_shadow {
+                if let Some(mangled) = subst.get(&t.name) {
+                    t.name = mangled.clone();
+                }
+            }
+            for m in &mut t.members {
+                for p in &mut m.params {
+                    if let Some(ty) = &mut p.ty { rewrite_type_expr(ty, subst, qualified); }
+                }
+                if let Some(rt) = &mut m.return_type { rewrite_type_expr(rt, subst, qualified); }
+                // A default body is a function body: its own scope, so
+                // `let` bindings inside it shadow rather than rename —
+                // matching the `Function` arm above, including the fresh set
+                // seeded with the member's own parameters. Fresh per member:
+                // sharing one set would let a `let` in one default body
+                // suppress mangling for that name in the next member's.
+                if let Some(d) = &mut m.default {
+                    let mut inner_shadow: HashSet<String> =
+                        m.params.iter().map(|p| p.name.clone()).collect();
+                    rewrite(&mut d.item, subst, qualified, &mut inner_shadow, true);
+                }
+            }
+        }
+
+        Expression::ImplDecl(i) => {
+            for name in &mut i.traits {
+                rewrite_name(name, subst, qualified);
+            }
+            rewrite_type_expr(&mut i.self_ty, subst, qualified);
+            // Member bodies are function bodies: their own scope.
+            for m in &mut i.members {
+                rewrite(&mut m.item, subst, qualified, shadow, true);
             }
         }
 

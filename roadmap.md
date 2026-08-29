@@ -5,17 +5,18 @@
   - done: payload-less variants are unboxed to an immediate tag (`(tag << 1) | 1`, low bit distinguishes them from 8-aligned pointers — see gc.rs "Immediate (unboxed) values")
 - Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value (~4M mallocs); after inlining heap access and un-boxing shadow frames it is at 182ms vs 31ms for the same program in Rust, and `malloc`/`free`/`memset` plus the mark phase are ~half of what's left. Secondary: pool/free-list the fixed-size GC blocks, and make shadow frames cheaper than an FFI push/pop + zeroing per call.
 - Error handling, errors as values + early-return sugar, etc — builds on enums (Result/Option as compiler-known enums)
-- Traits/interfaces, generics, and methods — designed in `plans/TRAITS.md`, decisions settled
-    - The `provides`/impl duality is resolved: one `provides` keyword, inline on `data` or standalone, with a body
+- Traits/interfaces, generics, and methods — designed in `plans/TRAITS.md`; **Stages 0-3 and 5 shipped**
+    - The `provides`/impl duality is resolved: one `provides` keyword, inline on `data` or standalone (`provides T for Int { ... }`), with a body
     - Members live in the impl's namespace, not the global one — so there is no function overloading anywhere
-    - `x.f(y)` resolves field → member → free function; UFCS over free functions ships first, on its own
+    - `x.f(y)` resolves field → member → free function; all three steps work, each a hash lookup
+    - Still missing: operators desugaring to member calls (so no user `provides Num`), structural `Show`/`Error.message`, and calling a member *through* a bound (`func f<T: Shape>(x: T) = x.area()`) — the last one gates a generic stdlib written against traits
 - Annotations, and auto-deriving trait implementations (macros/comptime?)
 - Structured concurrency
 
 What it takes to get from here to self-hosting compiler
 - User-definable generics (List(T) is a builtin hack)
 - a Dict/Map type (which could be stdlib but I would give it blessed `{key=val}` syntax as it's ubiquitous)
-- Traits/interfaces generalized beyond Error, user definable
+- ~~Traits/interfaces generalized beyond Error, user definable~~ — done (`plans/TRAITS.md` Stage 5)
 - stdlib with file IO, string functions, etc.
 - an AOT compile path, swapping Cranelift JIT for cranelift-object, linking against the runtime etc.
 

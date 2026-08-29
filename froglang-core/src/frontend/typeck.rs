@@ -3,8 +3,9 @@ use std::{collections::HashMap, fmt::Display, vec};
 use crate::frontend::{
     expression::{
         AnnotatedExpr, AssignExpr, BinaryExpr, CallExpr, ConditionalExpr, Expression,
-        FieldAccessExpr, ForLoopExpr, FunctionExpr, IndexExpr, IsPatternExpr, LiteralExpr,
-        MatchArm, Mutability, Pattern, RangeExpr, SliceExpr, UnaryExpr,
+        FieldAccessExpr, ForLoopExpr, FunctionExpr, IndexExpr, IsPatternExpr,
+        LiteralExpr, MatchArm, Mutability, Parameter, Pattern, RangeExpr, SliceExpr,
+        TraitMemberDecl, UnaryExpr,
     },
     tokens::{Span, Spanned, Token},
 };
@@ -16,6 +17,14 @@ use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind, TypedExprRe
 /// no user-written name can ever collide with or shadow it. See
 /// `TypeChecker::default_context` and `build_unwrap_arms`.
 const UNWRAP_PANIC_NAME: &str = "panic!builtin";
+
+/// The type-variable name `Self` resolves to inside a `trait` declaration
+/// (`TRAITS.md` Stage 5). A trait member's signature is a template over one
+/// binder, and this is that binder — `resolve_type_name` finds it through
+/// `type_param_scope`, the same mechanism a generic `data` declaration's
+/// `<A, B>` binders already use, so `Self` needs no special case anywhere in
+/// the type grammar or in unification.
+const SELF_BINDER: &str = "Self";
 
 #[derive(Debug)]
 pub struct TypeError {
@@ -56,6 +65,23 @@ pub enum Trait {
     /// aliasing" checks are the whole point of granting it; the variant here
     /// is just what lets a `data` declaration state the fact.
     Linear,
+    /// A trait declared in source by `trait Name { ... }` (`TRAITS.md`
+    /// Stage 5). Carries its own name because there is no fixed set of
+    /// them — this is what "`Trait` becomes an open interned name rather
+    /// than a closed enum" (Part 5) buys, without disturbing the five
+    /// variants above, which stay distinct so the operator/coercion paths
+    /// that consult them (`join_operand_types`, `check_condition`,
+    /// `linear::check`) keep matching on a constructor rather than a
+    /// string.
+    ///
+    /// Every trait — built-in or user-declared — has an entry in
+    /// `TypeChecker.traits`; the built-in five carry `TraitDef.builtin =
+    /// Some(..)` and map back to their own variant here, so there is one
+    /// registry and one `provides` path rather than two parallel systems.
+    /// Like `Error`/`Linear`, a user trait is never structural: it is
+    /// granted only by `provides`, recorded in `TypeChecker.provides`, and
+    /// consulted through `type_implements`.
+    User(String),
 }
 
 impl Display for Trait {
@@ -67,8 +93,78 @@ impl Display for Trait {
             Trait::Error  => write!(f, "Error"),
             Trait::Truthy => write!(f, "Truthy"),
             Trait::Linear => write!(f, "Linear"),
+            Trait::User(name) => write!(f, "{}", name),
         }
     }
+}
+
+/// One trait declaration, built-in or user-written (`TRAITS.md` Stage 5).
+///
+/// `TypeChecker.traits` holds one of these per trait name, and it is the
+/// single answer to "is this a trait?" — `provides` clauses, bound
+/// annotations, and the `Trait.member(x)` prefix form all resolve through
+/// it. `builtin` is what makes the five hardcoded traits *entries in this
+/// registry* rather than a second, parallel mechanism: a built-in trait's
+/// name maps back to its own `Trait` variant, so the operator and coercion
+/// paths keep matching on `Trait::Num`/`Trait::Eq`/... exactly as before,
+/// while `provides Num` and `provides MyTrait` travel one code path.
+///
+/// This is TRAITS.md Part 5's "the builtins become ordinary declarations",
+/// implemented as seeded data (`initial_traits`) rather than as prelude
+/// *source*: `FrogState::new()` has no builder prelude to inject into, and
+/// most of the test suite uses it, so seeding the registry directly is what
+/// makes the builtins unconditionally present at no parse cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitDef {
+    pub name: String,
+    /// `Some(t)` for one of the five built-ins, whose membership is decided
+    /// structurally or by intrinsic (`type_implements_rec`'s primitive
+    /// fallback); `None` for a user trait, which is granted only by
+    /// `provides`.
+    pub builtin: Option<Trait>,
+    /// The trait's members, in declaration order. Empty for a marker trait
+    /// — which all five built-ins are here (their operator behaviour is an
+    /// intrinsic, not a member; see `TRAITS.md` Part 5's note that operator
+    /// desugaring is a separate stage).
+    pub members: Vec<TraitMemberSig>,
+}
+
+/// One trait member's resolved signature.
+///
+/// Parameter and return types are stored *unsubstituted*, still mentioning
+/// `Self` as `Type::TypeVar { name: SELF_BINDER, .. }` — this is a template,
+/// not a checkable type. An impl or a call site substitutes `Self` for the
+/// concrete implementing type before anything unifies against it; these
+/// stored types must never be unified directly, or one impl's `Self` would
+/// bind the shared `substitutions` entry for every other's. That is exactly
+/// the per-use-fresh discipline `instantiate` already imposes on a scheme's
+/// binders, applied to the one binder every member has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMemberSig {
+    pub name: String,
+    /// `(name, type, is_mut)`, matching `TypedExprKind::Function`'s own
+    /// parameter shape.
+    pub params: Vec<(String, Type, bool)>,
+    pub return_type: Type,
+    /// The member exactly as written, kept alongside the resolved types.
+    ///
+    /// Two things need the *source* form rather than the resolved one, and
+    /// both would otherwise need a `Type` -> `TypeExpr` inverse that doesn't
+    /// exist. First, an impl member may omit an annotation
+    /// (`func area(c) = ...`), and the honest way to fill it in is to copy
+    /// this declaration's own `TypeExpr` with `Self` rewritten to the
+    /// implementing type — exact, and no round-trip through `Display`.
+    /// Second, a default body is re-checked per implementing type, so it has
+    /// to survive past the entry that declared it (a trait declared at one
+    /// REPL prompt is implemented at the next).
+    pub decl: TraitMemberDecl,
+}
+
+impl TraitMemberSig {
+    /// Whether the declaration supplied a default body — what impl
+    /// registration consults to decide whether an omitted member is an
+    /// error.
+    pub fn has_default(&self) -> bool { self.decl.default.is_some() }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -760,6 +856,39 @@ pub struct TypeChecker {
     /// uses for a union member (`"Shape.Circle"`) or the bare name for a
     /// plain struct. Consulted only by `type_implements`.
     provides: HashMap<String, Vec<Trait>>,
+    /// Every trait that exists, by name — the five built-ins seeded by
+    /// `initial_traits`, plus every user `trait Name { ... }` declaration
+    /// (`TRAITS.md` Stage 5). This is the *declaration* table; `provides`
+    /// above is the *grant* table, and the two are deliberately separate:
+    /// a trait can be declared and implemented by nothing.
+    ///
+    /// Membership here is what `resolve_trait_name` consults, so it is the
+    /// only thing standing between a `provides` clause and an unknown-trait
+    /// error — replacing the hardcoded `"Error"`/`"Linear"` match this
+    /// field superseded.
+    traits: HashMap<String, TraitDef>,
+    /// Every registered impl, keyed by `(trait name, type key)` — the pair
+    /// TRAITS.md's "Coherence" section says must be unique program-wide.
+    /// Froglang sees every declaration through one `FrogState`, so this map
+    /// *is* the coherence check: a second insert under the same key is the
+    /// error, and there are no orphan rules to write.
+    ///
+    /// The value is `member name -> compiled symbol` (`Circle$area`) — the
+    /// symbol `expand_impls` renamed the member's declaration to, and the
+    /// one a resolved call site names in the typed AST.
+    impls: HashMap<(String, String), HashMap<String, String>>,
+    /// Resolution step 2's index: `(type key, member name)` -> `(trait,
+    /// symbol)`. A hash lookup, never a search — which is only possible
+    /// because the *other* ambiguity (two traits declaring the same member
+    /// name for one type) is rejected at registration, where the error can
+    /// name the two impls, rather than at the call site, where it could only
+    /// name the call.
+    member_index: HashMap<(String, String), (String, String)>,
+    /// Every trait that declares a member of this name. Used by the
+    /// `Trait.member(x)` prefix form and by zero-`Self` resolution, whose
+    /// search is narrow by construction: only over traits declaring *that*
+    /// name, typically one.
+    member_traits: HashMap<String, Vec<String>>,
     /// Named function -> which of its parameters are `mut`
     /// (`MUTABILITY.md`), in declaration order. `Type::Function` itself
     /// carries no mutability — "a `mut` parameter does not escape" is the
@@ -853,6 +982,10 @@ pub struct TypeCheckerCheckpoint {
     variant_owners: HashMap<String, Vec<String>>,
     return_types: Vec<Type>,
     provides: HashMap<String, Vec<Trait>>,
+    traits: HashMap<String, TraitDef>,
+    impls: HashMap<(String, String), HashMap<String, String>>,
+    member_index: HashMap<(String, String), (String, String)>,
+    member_traits: HashMap<String, Vec<String>>,
     func_mut_params: HashMap<String, Vec<bool>>,
     generic_instantiations: HashMap<String, std::collections::HashSet<Type>>,
     generic_templates: HashMap<String, GenericTemplate>,
@@ -874,12 +1007,55 @@ impl TypeChecker {
         m
     }
 
+    /// `traits`' initial contents: the five built-in traits, as ordinary
+    /// registry entries (`TRAITS.md` Part 5, "Prelude traits"). Seeded from
+    /// both `new()` and `empty()`, exactly like `initial_struct_type_params`
+    /// seeds `List`, so *every* `TypeChecker` has them — including the ones
+    /// behind `FrogState::new()`, which has no builder prelude to inject
+    /// into and which most of the test suite uses.
+    ///
+    /// `Truthy` is deliberately absent, and that absence is load-bearing:
+    /// Part 5's "`Truthy` exception" keeps it a compiler-internal coercion
+    /// relation consulted by `check_condition`, not a callable interface, so
+    /// making it implementable would let any impl redefine what `if x`
+    /// means. `resolve_trait_name` reports that specifically rather than
+    /// letting it fall through to a bare "unknown trait".
+    fn initial_traits() -> HashMap<String, TraitDef> {
+        let mut m = HashMap::new();
+        for t in [Trait::Num, Trait::Eq, Trait::Ord, Trait::Error, Trait::Linear] {
+            let name = t.to_string();
+            m.insert(name.clone(), TraitDef { name, builtin: Some(t), members: Vec::new() });
+        }
+        m
+    }
+
+    /// A trait name as written in source (`provides Error`, `<T: Ord>`,
+    /// `trait Shape`) resolved to the `Trait` the checker reasons with.
+    ///
+    /// The single string -> `Trait` conversion in the crate; it replaced a
+    /// hardcoded `match name { "Error" => .., "Linear" => .., _ => err }`,
+    /// which was why only two of the five traits were ever spellable.
+    /// `Err` carries the message to report, so the `Truthy` case can explain
+    /// itself instead of claiming the trait doesn't exist.
+    pub(crate) fn resolve_trait_name(&self, name: &str) -> Result<Trait, String> {
+        if let Some(def) = self.traits.get(name) {
+            return Ok(def.builtin.clone().unwrap_or_else(|| Trait::User(name.to_string())));
+        }
+        if name == "Truthy" {
+            return Err(
+                "'Truthy' is a compiler-internal coercion relation (what `if x` means for a \
+                 non-Bool), not an implementable trait".to_string()
+            );
+        }
+        Err(format!("Unknown trait '{}'", name))
+    }
+
     pub fn empty() -> Self {
-        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
     }
 
     /// Check whether a concrete type implements the given trait. Only makes
@@ -925,6 +1101,12 @@ impl TypeChecker {
             // `check_comparable`, with a span, rather than here: "not `Eq`"
             // would be the wrong reason.
             Type::Union(variants) => variants.iter().all(|v| self.type_implements_rec(v, tr, seen)),
+            // `Error`, `Linear`, and every user-declared trait are *granted*,
+            // never structural — a deliberate design choice, not a gap
+            // (`ERRORS.md`, "Why a trait and not an open union"). One arm for
+            // all three, covering primitives as well as named types, because
+            // `provides Shape for Int` is a legitimate standalone impl.
+            _ if matches!(tr, Trait::Error | Trait::Linear | Trait::User(_)) => self.granted(ty, tr),
             // `List<T>` is `Eq` iff `T` is. The comparison is structural —
             // lengths, then elements pairwise — not identity, which is what
             // anyone coming from Python expects `[1, 2] == [1, 2]` to mean.
@@ -963,12 +1145,6 @@ impl TypeChecker {
                 seen.pop();
                 ok
             },
-            // `Error` and `Linear` are both granted, not structural — see
-            // `provides`.
-            Type::Named { name, args } if args.is_empty() && name != LIST_NAME
-                && (*tr == Trait::Error || *tr == Trait::Linear) => {
-                self.provides.get(name).map(|ts| ts.contains(tr)).unwrap_or(false)
-            },
             _ => match tr {
                 Trait::Num    => matches!(ty, Type::Int | Type::Float),
                 // `None` is `Eq` so an optional is: `Int | None` satisfies
@@ -977,10 +1153,42 @@ impl TypeChecker {
                 // exactly one value.
                 Trait::Eq     => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None),
                 Trait::Ord    => matches!(ty, Type::Int | Type::Float | Type::Str),
-                Trait::Error  => false,
                 Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None) || ty.is_list(),
-                Trait::Linear => false,
+                // Handled by the granted arm above, before any of this.
+                Trait::Error | Trait::Linear | Trait::User(_) => false,
             }
+        }
+    }
+
+    /// Is `tr` granted to `ty` by a `provides` clause?
+    ///
+    /// Keyed by `grant_key`, so a generic declaration's grant covers every
+    /// instantiation: `provides` states a property of the *declaration*, and
+    /// `Box<Int>` is not separately grantable from `Box<Str>`.
+    fn granted(&self, ty: &Type, tr: &Trait) -> bool {
+        match Self::grant_key(ty) {
+            Some(key) => self.provides.get(&key).map(|ts| ts.contains(tr)).unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// The `provides`/impl table key for a type: its declared name.
+    ///
+    /// Type arguments are deliberately dropped (`Box<Int>` and `Box<Str>`
+    /// share `Box`'s key), and primitives get their own name so a standalone
+    /// `provides Shape for Int` has somewhere to land. `None` for a type that
+    /// cannot carry a grant at all — an anonymous union (whose membership is
+    /// decided by the all-variants rule instead), a function type, an
+    /// unresolved variable, `Never`.
+    fn grant_key(ty: &Type) -> Option<String> {
+        match ty {
+            Type::Named { name, .. } => Some(name.clone()),
+            Type::Int   => Some("Int".to_string()),
+            Type::Float => Some("Float".to_string()),
+            Type::Bool  => Some("Bool".to_string()),
+            Type::Str   => Some("Str".to_string()),
+            Type::None  => Some("None".to_string()),
+            _ => None,
         }
     }
 
@@ -1252,6 +1460,10 @@ impl TypeChecker {
             variant_owners: self.variant_owners.clone(),
             return_types: self.return_types.clone(),
             provides: self.provides.clone(),
+            traits: self.traits.clone(),
+            impls: self.impls.clone(),
+            member_index: self.member_index.clone(),
+            member_traits: self.member_traits.clone(),
             func_mut_params: self.func_mut_params.clone(),
             generic_instantiations: self.generic_instantiations.clone(),
             generic_templates: self.generic_templates.clone(),
@@ -1271,6 +1483,10 @@ impl TypeChecker {
         self.variant_owners = cp.variant_owners;
         self.return_types = cp.return_types;
         self.provides = cp.provides;
+        self.traits = cp.traits;
+        self.impls = cp.impls;
+        self.member_index = cp.member_index;
+        self.member_traits = cp.member_traits;
         self.generic_instantiations = cp.generic_instantiations;
         self.generic_templates = cp.generic_templates;
         self.emitted_instantiations = cp.emitted_instantiations;
@@ -1545,6 +1761,17 @@ impl TypeChecker {
         }
 
         match (expr.item, &expected) {
+            // A zero-`Self` member — `zero()`, or `Zero.zero()` — names no
+            // value to dispatch on, so the expected type is what picks the
+            // impl (`TRAITS.md` Part 1, "The prefix form"). This is the whole
+            // reason members are plain functions rather than methods with a
+            // receiver: a receiver model cannot express `zero(): Self` at
+            // all.
+            (Expression::Call(c), _) if self.zero_self_target(&c).is_some() => {
+                let (want_trait, member) = self.zero_self_target(&c).expect("just checked");
+                let lowered = self.lower_zero_self_call(c, &want_trait, &member, &expected, span)?;
+                self.lower_widen(lowered, &expected)
+            },
             (Expression::Tuple(elems), _) if expected.as_list_elem().is_some() => {
                 let elem_ty = expected.as_list_elem().expect("checked above").clone();
                 let mut items = Vec::with_capacity(elems.len());
@@ -1571,6 +1798,88 @@ impl TypeChecker {
                 self.lower_widen(lowered, &expected)
             },
         }
+    }
+
+    /// If this call names a trait member with nothing to dispatch on, say
+    /// which trait (if the prefix form named one) and which member.
+    ///
+    /// Two spellings, both requiring that the name is *not* an ordinary
+    /// binding: a bare `zero()` where `zero` is some trait's member and no
+    /// function of that name is in scope, and the trait-qualified
+    /// `Zero.zero()`. Anything else is `None` and lowers normally.
+    fn zero_self_target(&self, c: &CallExpr) -> Option<(Option<String>, String)> {
+        match &c.callable.item {
+            Expression::Literal(_) => {
+                let name = c.callable.item.get_identifier()?;
+                if self.ctx.contains_key(name) { return None; }
+                // Only a member with nothing to dispatch on may claim the bare
+                // name; a member with a `Self` parameter dispatches on that
+                // argument, and stealing the name here would shadow builtins
+                // and struct construction that happen to share it.
+                let owners = self.member_traits.get(name)?;
+                if !owners.iter().any(|t| self.is_zero_self_member(t, name)) { return None; }
+                Some((None, name.to_string()))
+            }
+            Expression::FieldAccess(fa) => {
+                let trait_name = fa.target.item.get_identifier()?;
+                // Only the no-Self-argument case comes here; the ordinary
+                // prefix form dispatches on its first argument and is handled
+                // by `lower_trait_prefix_call`.
+                if !self.is_zero_self_member(trait_name, &fa.field) { return None; }
+                Some((Some(trait_name.to_string()), fa.field.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Does `trait_name` declare `member` with no `Self` in its first
+    /// parameter — the shape that has nothing to dispatch on?
+    fn is_zero_self_member(&self, trait_name: &str, member: &str) -> bool {
+        let Some(def) = self.traits.get(trait_name) else { return false };
+        let Some(sig) = def.members.iter().find(|m| m.name == member) else { return false };
+        !sig.params.first().map(|(_, ty, _)| Self::mentions_self(ty)).unwrap_or(false)
+    }
+
+    /// Resolve a zero-`Self` member call against the expected type and lower
+    /// it as an ordinary call to that impl's symbol.
+    fn lower_zero_self_call(
+        &mut self,
+        c: CallExpr,
+        want_trait: &Option<String>,
+        member: &str,
+        expected: &Type,
+        span: Span,
+    ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let named = match want_trait {
+            Some(t) => format!("'{}.{}'", t, member),
+            None => format!("'{}'", member),
+        };
+        // No usable expectation — an unresolved variable, a function type, a
+        // union. TRAITS.md commits to exactly this error rather than to
+        // inference heroics: a good message beats an ambiguity report listing
+        // every candidate.
+        let Some(key) = Self::grant_key(expected) else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("cannot infer which {} is meant; annotate the expected type", named)
+            }, span));
+        };
+        let Some((owner, symbol)) = self.member_index.get(&(key, member.to_string())).cloned() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("{} doesn't implement {}", expected, named)
+            }, span));
+        };
+        if let Some(want) = want_trait {
+            if &owner != want {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("{} implements '{}' from trait '{}', not '{}'", expected, member, owner, want)
+                }, span));
+            }
+        }
+        let callee = Spanned::from(
+            Expression::literal(Token::Identifier(symbol)),
+            c.callable.span,
+        );
+        self.check_and_lower(Spanned::from(Expression::call(callee, c.args), span))
     }
 
     /// Partitions an already-known union subject type into one
@@ -1773,7 +2082,598 @@ impl TypeChecker {
     /// every field list to concrete `Type`s; (3) check the resulting
     /// field-type graph for direct/transitive self-reference, which would
     /// make an unboxed struct infinite size.
+    /// The `Self` type for a trait's member signatures: one bounded type
+    /// variable, bound by the trait itself. Bounding it is not decoration —
+    /// it is what makes a default body checkable, since the body may call
+    /// the trait's *other* members on `Self` and the bound is what says it
+    /// may.
+    fn self_type(trait_name: &str) -> Type {
+        Type::TypeVar { name: SELF_BINDER.to_string(), bounds: vec![Trait::User(trait_name.to_string())] }
+    }
+
+    /// First of the two trait-hoisting passes: register every `trait Name`
+    /// in this statement list under its name, with no members yet.
+    ///
+    /// Split from `hoist_trait_members` because the three declaration forms
+    /// are mutually referential and only this order terminates:
+    /// a `data X provides Shape` (resolved by `hoist_data_decls`) needs
+    /// `Shape` to *exist*, while `Shape`'s own member signatures may mention
+    /// `X`. Registering names first, then data, then signatures, breaks the
+    /// cycle without a fixed point — the same two-pass shape
+    /// `hoist_data_decls` already uses internally for mutually recursive
+    /// `data` declarations.
+    fn hoist_trait_names(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
+        for s in stmts {
+            if let Expression::TraitDecl(t) = &s.item {
+                if self.traits.contains_key(&t.name) {
+                    // Names the built-in case explicitly: redeclaring `Eq`
+                    // is a different mistake from redeclaring your own
+                    // trait, and the generic message would send the reader
+                    // looking for a declaration that isn't in their source.
+                    let msg = if self.traits[&t.name].builtin.is_some() {
+                        format!("'{}' is a built-in trait and can't be redeclared", t.name)
+                    } else {
+                        format!("trait '{}' is already declared", t.name)
+                    };
+                    return Err(Spanned::from(TypeError { msg }, s.span));
+                }
+                if self.struct_templates.contains_key(&t.name) || self.union_defs.contains_key(&t.name) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("'{}' is already declared as a type", t.name)
+                    }, s.span));
+                }
+                self.traits.insert(t.name.clone(), TraitDef {
+                    name: t.name.clone(), builtin: None, members: Vec::new(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Second trait-hoisting pass: resolve each member's signature, now that
+    /// every trait name *and* every `data` name in this list is registered.
+    ///
+    /// Signatures are stored as templates over `Self` (see `TraitMemberSig`);
+    /// `type_param_scope` is what makes the bare name `Self` resolve, and it
+    /// is restored immediately afterward so it can't leak into an ordinary
+    /// annotation — same discipline as a generic `data` declaration's
+    /// binders in `hoist_data_decls`.
+    ///
+    /// *Restored*, not cleared: a declaration nested in a generic function's
+    /// body is hoisted with that function's `<T>` binders already installed
+    /// (`lower_assign`), and dropping them would make `T` unknown for the
+    /// rest of the body.
+    fn hoist_trait_members(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
+        let outer = self.type_param_scope.clone();
+        for s in stmts {
+            let Expression::TraitDecl(t) = &s.item else { continue };
+            let self_ty = Self::self_type(&t.name);
+            let mut members: Vec<TraitMemberSig> = Vec::with_capacity(t.members.len());
+            for m in &t.members {
+                if members.iter().any(|prev| prev.name == m.name) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Member '{}' is declared twice in trait {}", m.name, t.name)
+                    }, s.span));
+                }
+                self.type_param_scope = HashMap::from([(SELF_BINDER.to_string(), self_ty.clone())]);
+                let mut params = Vec::with_capacity(m.params.len());
+                let mut resolve_err = None;
+                for p in &m.params {
+                    let Some(ann) = &p.ty else {
+                        resolve_err = Some(TypeError {
+                            msg: format!(
+                                "Parameter '{}' of trait member '{}.{}' needs a type annotation — a trait member is a signature, so nothing can infer it",
+                                p.name, t.name, m.name
+                            )
+                        });
+                        break;
+                    };
+                    match self.resolve_type_expr(ann) {
+                        Ok(ty) => params.push((p.name.clone(), ty, p.mutable)),
+                        Err(e) => { self.type_param_scope = outer.clone(); return Err(e); }
+                    }
+                }
+                if let Some(msg) = resolve_err {
+                    self.type_param_scope = outer.clone();
+                    return Err(Spanned::from(msg, s.span));
+                }
+                let return_type = match &m.return_type {
+                    Some(rt) => match self.resolve_type_expr(rt) {
+                        Ok(ty) => ty,
+                        Err(e) => { self.type_param_scope = outer.clone(); return Err(e); }
+                    },
+                    None => Type::None,
+                };
+                self.type_param_scope = outer.clone();
+
+                // A member that mentions `Self` nowhere is a free function
+                // that happens to be written inside a trait: nothing can
+                // dispatch it, and no impl could vary it. Rejecting it here
+                // is the difference between a confusing "can't infer which
+                // impl" at some later call site and an error at the
+                // declaration that caused it.
+                let mentions_self = params.iter().any(|(_, ty, _)| Self::mentions_self(ty))
+                    || Self::mentions_self(&return_type);
+                if !mentions_self {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!(
+                            "Trait member '{}.{}' mentions Self nowhere in its signature — nothing could dispatch it; declare it as an ordinary func instead",
+                            t.name, m.name
+                        )
+                    }, s.span));
+                }
+
+                members.push(TraitMemberSig {
+                    name: m.name.clone(), params, return_type, decl: m.clone(),
+                });
+            }
+            self.traits.get_mut(&t.name)
+                .expect("registered by hoist_trait_names")
+                .members = members;
+        }
+        Ok(())
+    }
+
+    /// The compiled symbol an impl member is declared under: `Circle$area`.
+    ///
+    /// `$` is the same separator `mangle_type` uses for generic
+    /// instantiations and, like it, is unproducible by the lexer — so a
+    /// member symbol can never collide with a user-written name. This is
+    /// TRAITS.md's "Where the seam is" in one line: member resolution ends
+    /// with the type checker writing this string into the typed AST, and
+    /// codegen keeps doing the string lookup it already did.
+    fn member_symbol(type_key: &str, member: &str) -> String {
+        format!("{}${}", type_key, member)
+    }
+
+    /// Rewrite every occurrence of the bare name `Self` in a type annotation
+    /// to `type_name`.
+    ///
+    /// Used to specialize a trait member's declared `TypeExpr` for one impl
+    /// — both when filling in an annotation the impl omitted and when
+    /// letting an impl member write `Self` itself. Legal for every type an
+    /// impl can target, since `grant_key`'s answer is always a spellable
+    /// type name (a declared `data` name, or a primitive's).
+    fn substitute_self_expr(ty: &mut Spanned<TypeExpr>, type_name: &str) {
+        for name in ty.item.names_mut() {
+            if name == SELF_BINDER { *name = type_name.to_string(); }
+        }
+    }
+
+    /// Expand and register every impl in this statement list — `TRAITS.md`
+    /// Stage 5's registration pass, run after both hoists so it can see
+    /// every trait *and* every type this entry declares.
+    ///
+    /// Each impl is replaced, in place, by its member functions renamed to
+    /// their mangled symbols. In place matters: froglang requires
+    /// declaration before use everywhere else (`func a() = b()` with `b`
+    /// declared below is an error today), and an impl behaving differently
+    /// would be a special case with nothing to recommend it. So an impl's
+    /// members become callable exactly where the impl block is written.
+    ///
+    /// The members themselves need no new compilation path — they are
+    /// ordinary `Assign(name, Function)` nodes under a different name, and
+    /// the existing `lower_assign` handles them, including generalization.
+    fn expand_impls(&mut self, stmts: &mut Vec<Spanned<Expression>>) -> Result<(), Spanned<TypeError>> {
+        if !stmts.iter().any(|s| matches!(&s.item,
+            Expression::ImplDecl(_) | Expression::DataDecl(_))) {
+            return Ok(());
+        }
+        let mut out: Vec<Spanned<Expression>> = Vec::with_capacity(stmts.len());
+        for s in std::mem::take(stmts) {
+            let span = s.span;
+            match s.item {
+                Expression::ImplDecl(i) => {
+                    let self_ty = self.resolve_type_expr(&i.self_ty)?;
+                    let members = self.register_impl(&i.traits, &self_ty, i.members, span)?;
+                    out.extend(members);
+                }
+                Expression::DataDecl(mut d) => {
+                    let members = std::mem::take(&mut d.members);
+                    // The *resolved* type, not `Type::strukt(&d.name)`: for a
+                    // nominal union those differ, and a member declared
+                    // `(s: Sh)` resolves to the union, so checking it against
+                    // a struct type by that name could never succeed.
+                    let self_ty = if d.variants.is_empty() {
+                        Type::strukt(&d.name)
+                    } else {
+                        self.union_defs.get(&d.name).map(|u| u.ty.clone())
+                            .unwrap_or_else(|| Type::strukt(&d.name))
+                    };
+                    let provides = d.provides.clone();
+                    out.push(Spanned::from(Expression::DataDecl(d), span));
+                    if !provides.is_empty() {
+                        let lowered = self.register_impl(&provides, &self_ty, members, span)?;
+                        out.extend(lowered);
+                    }
+                }
+                other => out.push(Spanned::from(other, span)),
+            }
+        }
+        *stmts = out;
+        Ok(())
+    }
+
+    /// The `member_index`/`impls`/`provides` keys an impl for `self_ty` must
+    /// be registered under: a nominal union's variants, or the type's own key
+    /// for everything else.
+    fn impl_index_keys(&self, self_ty: &Type, type_key: &str) -> Vec<String> {
+        match self_ty {
+            Type::Union(members) => {
+                let keys: Vec<String> = members.iter().filter_map(Self::grant_key).collect();
+                if keys.len() == members.len() { keys } else { vec![type_key.to_string()] }
+            }
+            _ => vec![type_key.to_string()],
+        }
+    }
+
+    /// Register one impl of `traits` for `self_ty`, returning its member
+    /// declarations renamed to their compiled symbols.
+    ///
+    /// Every rule TRAITS.md states about impls is enforced here rather than
+    /// at any call site, which is what keeps resolution step 2 a lookup:
+    /// coherence (one impl per `(trait, type)`), member partitioning across
+    /// the listed traits, member-name collision between two traits on one
+    /// type, signature conformance, and missing members.
+    fn register_impl(
+        &mut self,
+        traits: &[String],
+        self_ty: &Type,
+        members: Vec<Spanned<Expression>>,
+        span: Span,
+    ) -> Result<Vec<Spanned<Expression>>, Spanned<TypeError>> {
+        let err = |msg: String| Spanned::from(TypeError { msg }, span);
+
+        // A nominal union resolves to `Type::Union`, which `grant_key` has no
+        // answer for — its declared name is the one `Self` can be spelled as,
+        // and the one its members' symbols are named for.
+        let key = match self_ty {
+            Type::Union(members) => self.union_names.get(members).cloned(),
+            _ => Self::grant_key(self_ty),
+        };
+        let Some(type_key) = key else {
+            return Err(err(format!(
+                "'{}' can't implement a trait — only a declared type or a primitive can", self_ty
+            )));
+        };
+        if !members.is_empty()
+            && (matches!(self_ty, Type::Named { args, .. } if !args.is_empty())
+                || self.struct_type_params.get(&type_key).map(|p| !p.is_empty()).unwrap_or(false))
+        {
+            // A member of a generic type's impl would have to be generic over
+            // that type's binders, which are not in scope in an impl body and
+            // have no syntax there. Rejected explicitly rather than
+            // mistyped — the same call `hoist_data_decls` makes about generic
+            // unions (`TRAITS.md` Stage 3a). A bare marker grant supplies no
+            // members, so it has nothing to be generic over and stays legal.
+            return Err(err(format!(
+                "'{}' is generic; implementing a trait for a generic type isn't supported yet", type_key
+            )));
+        }
+
+        // Resolve the listed traits. A built-in among them is not itself a
+        // problem — it can be granted alongside a trait that does have a
+        // body — so the body check waits until the members are partitioned,
+        // where it can see whether one was actually meant for the built-in.
+        let mut defs: Vec<TraitDef> = Vec::with_capacity(traits.len());
+        for name in traits {
+            // Resolved for its rejections — an unknown name, or `Truthy`,
+            // which explains itself. The `Trait` value is recovered per-def
+            // below, when the grant is recorded.
+            self.resolve_trait_name(name).map_err(&err)?;
+            defs.push(self.traits.get(name).expect("resolve_trait_name found it").clone());
+        }
+
+        // Partition the supplied members across the listed traits, by which
+        // one declares each name. TRAITS.md Part 1 spends its whole design on
+        // avoiding overload resolution; this is the one place two traits can
+        // still collide, and it is answered here, at the declaration.
+        let mut owner_of: HashMap<String, String> = HashMap::new();
+        for def in &defs {
+            for m in &def.members {
+                if let Some(prev) = owner_of.insert(m.name.clone(), def.name.clone()) {
+                    return Err(err(format!(
+                        "'{}' declares member '{}' and so does '{}' — one type can't implement both for the same member name",
+                        prev, m.name, def.name
+                    )));
+                }
+            }
+        }
+
+        let mut supplied: HashMap<String, Spanned<Expression>> = HashMap::new();
+        for m in members {
+            let Some(name) = Self::impl_member_name(&m) else {
+                return Err(Spanned::from(TypeError {
+                    msg: "an impl body may contain only `func` member declarations".to_string()
+                }, m.span));
+            };
+            if !owner_of.contains_key(&name) {
+                // A built-in declares no members, so nothing supplied can
+                // belong to one — but if the only trait it could have been
+                // meant for is built-in, say why rather than reporting a
+                // member name that no listing could ever accept.
+                if let Some(b) = defs.iter().find(|d| d.builtin.is_some()) {
+                    if defs.iter().all(|d| d.builtin.is_some()) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("'{}' is a built-in trait: its behaviour is a compiler intrinsic, so it can be granted but not implemented with a body", b.name)
+                        }, m.span));
+                    }
+                }
+                let listed: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+                return Err(Spanned::from(TypeError {
+                    msg: format!("'{}' is not a member of {}", name, listed.join(" or "))
+                }, m.span));
+            }
+            if supplied.insert(name.clone(), m).is_some() {
+                return Err(err(format!("member '{}' is supplied twice in this impl", name)));
+            }
+        }
+
+        // The keys this impl is *reachable* under. For everything but a
+        // nominal union that is the type's own key. A union has no
+        // `Type::Struct` of its own — a value of it is always one of its
+        // variants, and both `union_member_arms` and `granted` ask under the
+        // variant's key — so registering under the alias name alone would
+        // index the impl somewhere no call site ever looks.
+        let index_keys = self.impl_index_keys(self_ty, &type_key);
+
+        // Coherence and the step-2 index. Both checked before anything is
+        // written, so a rejected impl leaves no half-registration behind.
+        for def in &defs {
+            for key in &index_keys {
+                if self.impls.contains_key(&(def.name.clone(), key.clone())) {
+                    return Err(err(format!(
+                        "'{}' already implements '{}' — one impl per trait per type", key, def.name
+                    )));
+                }
+                for m in &def.members {
+                    if let Some((other_trait, _)) = self.member_index.get(&(key.clone(), m.name.clone())) {
+                        return Err(err(format!(
+                            "'{}' already has a member '{}' from trait '{}'; '{}' can't also provide it",
+                            key, m.name, other_trait, def.name
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for def in &defs {
+            let mut symbols: HashMap<String, String> = HashMap::new();
+            for m in &def.members {
+                // One symbol per member, named for the declared type even
+                // when it is indexed under several variant keys: the member
+                // takes the union itself, so there is one body to call.
+                let symbol = Self::member_symbol(&type_key, &m.name);
+                match supplied.remove(&m.name) {
+                    Some(decl) => {
+                        let renamed = self.check_impl_member(decl, m, self_ty, &type_key, &symbol)?;
+                        out.push(renamed);
+                    }
+                    None if m.has_default() => {
+                        out.push(self.specialize_default(m, &type_key, &symbol, span)?);
+                    }
+                    None => {
+                        return Err(err(format!(
+                            "'{}' provides '{}' but doesn't implement member '{}'",
+                            type_key, def.name, m.name
+                        )));
+                    }
+                }
+                symbols.insert(m.name.clone(), symbol.clone());
+                for key in &index_keys {
+                    self.member_index.insert(
+                        (key.clone(), m.name.clone()),
+                        (def.name.clone(), symbol.clone()),
+                    );
+                }
+                let owners = self.member_traits.entry(m.name.clone()).or_default();
+                if !owners.contains(&def.name) { owners.push(def.name.clone()); }
+            }
+            // The grant itself. A marker trait's `provides` already went
+            // through `hoist_data_decls`; a standalone impl's has not, and
+            // re-granting is harmless either way since `type_implements` only
+            // asks for membership.
+            let tr = self.resolve_trait_name(&def.name).map_err(&err)?;
+            for key in &index_keys {
+                self.impls.insert((def.name.clone(), key.clone()), symbols.clone());
+                let granted = self.provides.entry(key.clone()).or_default();
+                if !granted.contains(&tr) { granted.push(tr.clone()); }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Build the member declaration for a default body this impl didn't
+    /// override: the trait's own body, with every `Self` in its signature
+    /// rewritten to the implementing type, under this impl's symbol.
+    ///
+    /// This is monomorphization by construction rather than by machinery.
+    /// `Self` is a binder, so a default body *is* a generic declaration over
+    /// one parameter, and one specialized copy per implementing type is
+    /// exactly what monomorphizing it would emit — but every implementing
+    /// type is already known here, at registration, so there is nothing to
+    /// discover later and no template to keep. Per-instantiation checking
+    /// falls out too: the body is re-checked against each concrete `Self`,
+    /// which is the trade `CONCURRENCY.md` and `TRAITS.md` both already take
+    /// for generics.
+    ///
+    /// Known limit, shared with every other declaration in the language: a
+    /// default body that calls a member declared *after* it in the same
+    /// trait won't resolve, because froglang requires declaration before use
+    /// and these are spliced in declaration order. Order the trait's members
+    /// so callees come first.
+    fn specialize_default(
+        &mut self,
+        sig: &TraitMemberSig,
+        type_key: &str,
+        symbol: &str,
+        span: Span,
+    ) -> Result<Spanned<Expression>, Spanned<TypeError>> {
+        let default = sig.decl.default.clone().expect("caller checked has_default");
+        let mut params = Vec::with_capacity(sig.decl.params.len());
+        for p in &sig.decl.params {
+            let mut ty = p.ty.clone().ok_or_else(|| Spanned::from(TypeError {
+                msg: format!("Parameter '{}' of trait member '{}' needs a type annotation", p.name, sig.name)
+            }, span))?;
+            Self::substitute_self_expr(&mut ty, type_key);
+            params.push(Parameter { name: p.name.clone(), ty: Some(ty), mutable: p.mutable });
+        }
+        let return_type = sig.decl.return_type.clone().map(|mut rt| {
+            Self::substitute_self_expr(&mut rt, type_key);
+            rt
+        });
+        let func = Spanned::from(
+            Expression::function_with_return(params, *default, return_type),
+            span,
+        );
+        Ok(Spanned::from(
+            Expression::assign(
+                Spanned::from(Expression::literal(Token::Identifier(symbol.to_string())), span),
+                None,
+                func,
+                Some(Mutability::Immutable),
+            ),
+            span,
+        ))
+    }
+
+    /// The declared name of an impl-body member, or `None` if the statement
+    /// isn't a `func` declaration at all.
+    fn impl_member_name(stmt: &Spanned<Expression>) -> Option<String> {
+        match &stmt.item {
+            Expression::Assign(a) if matches!(&a.value.item, Expression::Function(_)) =>
+                a.target.item.get_identifier().map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Check one supplied member against its trait signature and rename it to
+    /// its compiled symbol.
+    ///
+    /// Omitted annotations are filled in from the trait's own declaration
+    /// with `Self` rewritten to the implementing type — so
+    /// `func area(c) = ...` is legal and means exactly what the signature
+    /// says, and `func area(c: Self) = ...` is legal too. Supplied
+    /// annotations are resolved and checked for equality against the
+    /// signature; anything else would let an impl silently narrow or widen
+    /// the interface every call site was type-checked against.
+    fn check_impl_member(
+        &mut self,
+        decl: Spanned<Expression>,
+        sig: &TraitMemberSig,
+        self_ty: &Type,
+        type_key: &str,
+        symbol: &str,
+    ) -> Result<Spanned<Expression>, Spanned<TypeError>> {
+        let span = decl.span;
+        let err = |msg: String| Spanned::from(TypeError { msg }, span);
+        let Expression::Assign(mut a) = decl.item else { unreachable!("checked by impl_member_name") };
+        let Expression::Function(f) = &mut a.value.item else { unreachable!("checked by impl_member_name") };
+
+        if f.params.len() != sig.params.len() {
+            return Err(err(format!(
+                "member '{}' takes {} parameter(s), but trait declares {}",
+                sig.name, f.params.len(), sig.params.len()
+            )));
+        }
+
+        let subst = HashMap::from([(SELF_BINDER.to_string(), self_ty.clone())]);
+        for (i, p) in f.params.iter_mut().enumerate() {
+            let (_, declared, declared_mut) = &sig.params[i];
+            let expected = declared.substitute(&subst);
+            match &p.ty {
+                Some(_) => {
+                    let mut ann = p.ty.clone().expect("just matched Some");
+                    Self::substitute_self_expr(&mut ann, type_key);
+                    let got = self.resolve_type_expr(&ann)?;
+                    if got != expected {
+                        return Err(err(format!(
+                            "parameter '{}' of member '{}' is declared {}, but the trait says {}",
+                            p.name, sig.name, got, expected
+                        )));
+                    }
+                    p.ty = Some(ann);
+                }
+                None => {
+                    // Fill it in from the trait's own annotation, specialized
+                    // to this impl — exact, and it keeps the lowering path
+                    // that follows entirely ordinary.
+                    let Some(mut ann) = sig.decl.params[i].ty.clone() else {
+                        return Err(err(format!(
+                            "parameter '{}' of member '{}' needs a type annotation", p.name, sig.name
+                        )));
+                    };
+                    Self::substitute_self_expr(&mut ann, type_key);
+                    p.ty = Some(ann);
+                }
+            }
+            if p.mutable != *declared_mut {
+                return Err(err(format!(
+                    "parameter '{}' of member '{}' is declared {}mut, but the trait says {}mut",
+                    p.name, sig.name,
+                    if p.mutable { "" } else { "not " },
+                    if *declared_mut { "" } else { "not " },
+                )));
+            }
+        }
+
+        let expected_ret = sig.return_type.substitute(&subst);
+        match &f.return_type {
+            Some(_) => {
+                let mut ann = f.return_type.clone().expect("just matched Some");
+                Self::substitute_self_expr(&mut ann, type_key);
+                let got = self.resolve_type_expr(&ann)?;
+                if got != expected_ret {
+                    return Err(err(format!(
+                        "member '{}' returns {}, but the trait says {}", sig.name, got, expected_ret
+                    )));
+                }
+                f.return_type = Some(ann);
+            }
+            None => {
+                if let Some(mut ann) = sig.decl.return_type.clone() {
+                    Self::substitute_self_expr(&mut ann, type_key);
+                    f.return_type = Some(ann);
+                }
+            }
+        }
+
+        // The rename. From here it is an ordinary function declaration under
+        // a name no source text can spell.
+        a.target = Box::new(Spanned::from(
+            Expression::literal(Token::Identifier(symbol.to_string())),
+            a.target.span,
+        ));
+        Ok(Spanned::from(Expression::Assign(a), span))
+    }
+
+    /// Resolve a written bound list (`T: Ord + Eq`) to `Trait`s.
+    fn resolve_bounds(&self, names: &[String], span: Span) -> Result<Vec<Trait>, Spanned<TypeError>> {
+        let mut out = Vec::with_capacity(names.len());
+        for n in names {
+            let tr = self.resolve_trait_name(n)
+                .map_err(|msg| Spanned::from(TypeError { msg }, span))?;
+            if !out.contains(&tr) { out.push(tr); }
+        }
+        Ok(out)
+    }
+
+    /// Does this type mention the `Self` binder anywhere, however deeply
+    /// (`List<Self>`, `Self | None`, `(Self) -> Int`)?
+    fn mentions_self(ty: &Type) -> bool {
+        match ty {
+            Type::TypeVar { name, .. } => name == SELF_BINDER,
+            Type::Named { args, .. } => args.iter().any(Self::mentions_self),
+            Type::Union(members) => members.iter().any(Self::mentions_self),
+            Type::Function { params, result } =>
+                params.iter().any(Self::mentions_self) || Self::mentions_self(result),
+            _ => false,
+        }
+    }
+
     fn hoist_data_decls(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
+        let outer = self.type_param_scope.clone();
         for s in stmts {
             if let Expression::DataDecl(d) = &s.item {
                 if self.struct_templates.contains_key(&d.name) || self.union_defs.contains_key(&d.name) {
@@ -1792,7 +2692,8 @@ impl TypeChecker {
                     return Err(Spanned::from(TypeError {
                         msg: format!(
                             "generic unions aren't supported yet — '{}' declares both <{}> and 'is' variants",
-                            d.name, d.type_params.join(", ")
+                            d.name,
+                            d.type_params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
                         )
                     }, s.span));
                 }
@@ -1841,15 +2742,23 @@ impl TypeChecker {
                 // `resolve_type_name` consults `type_param_scope` before
                 // its ordinary lookup. Cleared right after, so it never
                 // leaks into another decl's fields (or, later, into
-                // ordinary `check_and_lower` type annotations).
-                self.type_param_scope = if d.type_params.is_empty() {
-                    HashMap::new()
-                } else {
+                // ordinary `check_and_lower` type annotations) — and any
+                // scope this pass was entered with is put back once the whole
+                // list is hoisted, below.
+                self.type_param_scope = HashMap::new();
+                if !d.type_params.is_empty() {
                     let tvar_names = self.struct_type_params.get(&d.name).cloned().unwrap_or_default();
-                    d.type_params.iter().cloned()
-                        .zip(tvar_names.into_iter().map(|name| Type::TypeVar { name, bounds: vec![] }))
-                        .collect()
-                };
+                    let mut scope = HashMap::new();
+                    for (tp, tvar) in d.type_params.iter().zip(tvar_names) {
+                        // Declared bounds ride on the placeholder variable
+                        // itself (`TRAITS.md` Part 4) — `unify` and
+                        // `type_implements` only ever consult a `TypeVar`'s
+                        // own `bounds`, so there is nowhere else to put them.
+                        let bounds = self.resolve_bounds(&tp.bounds, s.span)?;
+                        scope.insert(tp.name.clone(), Type::TypeVar { name: tvar, bounds });
+                    }
+                    self.type_param_scope = scope;
+                }
                 let mut fields = Vec::with_capacity(d.fields.len());
                 for (i, p) in d.fields.iter().enumerate() {
                     let ty = self.resolve_type_expr(&p.ty)?;
@@ -1909,12 +2818,9 @@ impl TypeChecker {
                 if !d.provides.is_empty() {
                     let mut traits = Vec::with_capacity(d.provides.len());
                     for name in &d.provides {
-                        match name.as_str() {
-                            "Error" => traits.push(Trait::Error),
-                            "Linear" => traits.push(Trait::Linear),
-                            other => return Err(Spanned::from(TypeError {
-                                msg: format!("Unknown trait '{}' in provides clause", other)
-                            }, s.span)),
+                        match self.resolve_trait_name(name) {
+                            Ok(t) => traits.push(t),
+                            Err(msg) => return Err(Spanned::from(TypeError { msg }, s.span)),
                         }
                     }
                     // A union's `provides` grants every variant the trait
@@ -1933,6 +2839,9 @@ impl TypeChecker {
                 }
             }
         }
+        // Whatever binders were in scope around these declarations — a
+        // generic function's, when a `data` is declared inside its body.
+        self.type_param_scope = outer;
         for s in stmts {
             if let Expression::DataDecl(d) = &s.item {
                 self.check_struct_acyclic(&d.name, &mut Vec::new(), s.span)?;
@@ -2747,12 +3656,15 @@ impl TypeChecker {
     ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let span = expr.span;
         match expr.item {
-            Expression::Block(stmts) => {
+            Expression::Block(mut stmts) => {
+                self.hoist_trait_names(&stmts)?;
                 self.hoist_data_decls(&stmts)?;
+                self.hoist_trait_members(&stmts)?;
+                self.expand_impls(&mut stmts)?;
                 let mut lowered = Vec::with_capacity(stmts.len());
                 let mut ty = Type::None;
                 for s in stmts {
-                    if matches!(s.item, Expression::DataDecl(_)) { continue; }
+                    if matches!(s.item, Expression::DataDecl(_) | Expression::TraitDecl(_)) { continue; }
                     let t = self.check_and_lower(s)?;
                     ty = t.item.ty.clone();
                     lowered.push(t);
@@ -3730,6 +4642,13 @@ impl TypeChecker {
             Expression::Comprehension(inner) => self.lower_comprehension(inner, span),
             // Handled entirely by `hoist_data_decls` — never reaches codegen.
             Expression::DataDecl(_) => Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::IntLit(0) }, span)),
+            // Likewise handled entirely by `hoist_trait_names`/
+            // `hoist_trait_members`. A trait declaration is a fact about the
+            // type system; it produces no value and emits no code.
+            Expression::TraitDecl(_) => Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::IntLit(0) }, span)),
+            Expression::ImplDecl(_) => unreachable!(
+                "Expression::ImplDecl is replaced by its member declarations in TypeChecker::expand_impls, which runs before any statement is lowered"
+            ),
             Expression::FieldAccess(fa)      => self.lower_field_access(fa, span),
             Expression::Match(m)             => self.lower_match(m.subject, m.arms, m.default, span),
             Expression::IsPattern(ip)        => self.lower_is_pattern(ip, span),
@@ -4162,8 +5081,37 @@ impl TypeChecker {
                             // monomorphic after all, `rename_var` below
                             // puts the source name back.
                             let mut recursion_prebind: Option<(String, Type)> = None;
+                            // Declared `<T: Bound>` binders (`TRAITS.md`
+                            // Part 4) go in scope here rather than inside
+                            // `lower_function`, because the recursion
+                            // pre-bind below resolves this declaration's
+                            // annotations *before* the function itself is
+                            // lowered — so both halves have to see the same
+                            // binder variables, or a recursive call would be
+                            // typed against a different `T` than the body.
+                            // Added onto the enclosing scope (not replacing
+                            // it) so a generic nested inside another still
+                            // sees the outer binders; restored below.
+                            let saved_type_params = self.type_param_scope.clone();
+                            let mut declared_binders: Vec<(String, Vec<Trait>, Type)> = Vec::new();
                             if let Expression::Function(func) = &a.value.item {
-                                let fully_annotated = func.return_type.is_some()
+                                for tp in &func.type_params {
+                                    let bounds = self.resolve_bounds(&tp.bounds, span)?;
+                                    let var = self.fresh_bounded_var(bounds.clone());
+                                    self.type_param_scope.insert(tp.name.clone(), var.clone());
+                                    declared_binders.push((tp.name.clone(), bounds, var));
+                                }
+                            }
+                            if let Expression::Function(func) = &a.value.item {
+                                // Explicit `<T>` binders mean the writer
+                                // *intends* a scheme, so a fully annotated
+                                // generic declaration must still generalize —
+                                // otherwise `func twice<T: Num>(x: T): T`
+                                // would monomorphize to whichever type called
+                                // it first, which is exactly what writing the
+                                // binder says it doesn't do.
+                                let fully_annotated = func.type_params.is_empty()
+                                    && func.return_type.is_some()
                                     && func.params.iter().all(|p| p.ty.is_some());
                                 let mut param_tys = Vec::with_capacity(func.params.len());
                                 for p in &func.params {
@@ -4192,7 +5140,36 @@ impl TypeChecker {
                                 // checking, not after.
                                 self.func_mut_params.insert(name.clone(), func.params.iter().map(|p| p.mutable).collect());
                             }
-                            let mut value = self.check_and_lower(*a.value)?;
+                            let lowered = self.check_and_lower(*a.value);
+                            self.type_param_scope = saved_type_params;
+                            let mut value = lowered?;
+
+                            // The declared bounds must cover the inferred
+                            // ones. Inference already derives what a body
+                            // needs (`generalize` always has); what writing
+                            // the binders adds is the claim that the
+                            // *signature* says so, and this is where that
+                            // claim is checked — TRAITS.md's "infer, then
+                            // require the inferred bounds to be written". A
+                            // declared-but-unused bound is fine; an
+                            // undeclared-but-required one is not, because
+                            // callers read the signature, not the body.
+                            for (binder, declared, var) in &declared_binders {
+                                let Type::TypeVar { bounds: inferred, .. } = self.lookup(var) else { continue };
+                                for b in &inferred {
+                                    if !declared.contains(b) {
+                                        return Err(Spanned::from(TypeError {
+                                            msg: format!(
+                                                "type parameter '{}' of '{}' is used as {}, but is declared without that bound — write <{}: {}>",
+                                                binder, name, b, binder,
+                                                declared.iter().map(|d| d.to_string())
+                                                    .chain(std::iter::once(b.to_string()))
+                                                    .collect::<Vec<_>>().join(" + ")
+                                            )
+                                        }, span));
+                                    }
+                                }
+                            }
                             // Tie the placeholder the body called back to
                             // the signature the body actually has. This can
                             // only fail if a recursive call disagreed with
@@ -4446,6 +5423,20 @@ impl TypeChecker {
         // `func_mut_params` up by.
         let callee_name = c.callable.item.get_identifier().map(|s| s.to_string());
 
+        // A zero-`Self` member reached here means there was no expected type
+        // to resolve it against — `lower_expected` intercepts the cases where
+        // there is one. Say so, rather than letting it surface as an unbound
+        // variable, which would name the symptom and not the fix.
+        if let Some((want_trait, member)) = self.zero_self_target(&c) {
+            let named = match &want_trait {
+                Some(t) => format!("'{}.{}'", t, member),
+                None => format!("'{}'", member),
+            };
+            return Err(Spanned::from(TypeError {
+                msg: format!("cannot infer which {} is meant; annotate the expected type", named)
+            }, span));
+        }
+
         // Struct construction: `Person(name="Alice", age=42)` looks
         // like an ordinary call syntactically (there's no dedicated
         // construction grammar — see `Grammar::data_decl`'s doc
@@ -4606,10 +5597,26 @@ impl TypeChecker {
         } else if matches!(&c.callable.item, Expression::FieldAccess(_)) {
             // `x.f(args)` where `f` isn't a struct/union field of
             // `typeof(x)` — resolved by `lower_ufcs_call` per
-            // `TRAITS.md` Part 1 (steps 1 and 3; step 2, trait members,
-            // doesn't exist yet).
+            // `TRAITS.md` Part 1's three steps.
             let Expression::FieldAccess(fa) = c.callable.item else { unreachable!("matched above") };
-            return self.lower_ufcs_call(fa, c.args, callee_span, span);
+
+            // ...unless the "receiver" is a trait name, in which case this is
+            // the prefix form `Ord.compare(a, b)`, not a dot call at all. It
+            // has to be caught *before* the target is lowered, since a trait
+            // name is not a value and would die as an unbound variable.
+            //
+            // The prefix form is trait-qualified rather than type-qualified
+            // (`Ord.compare`, never `Money.compare`) because that is the form
+            // a zero-`Self` member like `zero(): Self` can be spelled in at
+            // all — see `TRAITS.md` Part 1, "The prefix form".
+            if let Some(trait_name) = fa.target.item.get_identifier()
+                .filter(|n| self.traits.contains_key(*n))
+                .map(|n| n.to_string())
+            {
+                return self.lower_trait_prefix_call(&trait_name, fa.field, c.args, callee_span, span);
+            }
+
+            return self.lower_ufcs_call(fa, c.args, callee_span, span, None);
         } else {
             let callable = self.check_and_lower(*c.callable)?;
             return self.finish_call(callable, callee_name, c.args, callee_span, span);
@@ -4987,7 +5994,144 @@ impl TypeChecker {
     /// step-3 branches below reuse that single `TypedExpr` rather than
     /// re-lowering the raw expression, since the target may have side
     /// effects (`get_list().push(x)` must call `get_list()` once).
-    fn lower_ufcs_call(&mut self, fa: FieldAccessExpr, rest_args: Vec<Spanned<Expression>>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+    /// `Trait.member(args)` — the prefix form (`TRAITS.md` Part 1).
+    ///
+    /// Rewritten into the dot form over its first argument and handed to
+    /// `lower_ufcs_call`, with `expect_trait` set so that naming the wrong
+    /// trait is an error rather than a silent call to whichever impl happens
+    /// to own that member name. The rewrite is exact for every member with a
+    /// `Self` parameter, which is all of them today: a zero-`Self` member has
+    /// no argument to dispatch on and is resolved by expected type instead
+    /// (`TRAITS.md` Stage 5's zero-`Self` case), reported here rather than
+    /// mis-resolved.
+    fn lower_trait_prefix_call(
+        &mut self,
+        trait_name: &str,
+        member: String,
+        args: Vec<Spanned<Expression>>,
+        callee_span: Span,
+        span: Span,
+    ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let def = self.traits.get(trait_name).expect("caller checked membership");
+        let Some(sig) = def.members.iter().find(|m| m.name == member) else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("trait '{}' has no member '{}'", trait_name, member)
+            }, callee_span));
+        };
+        let dispatch_on_first = sig.params.first()
+            .map(|(_, ty, _)| Self::mentions_self(ty))
+            .unwrap_or(false);
+        if !dispatch_on_first {
+            return Err(Spanned::from(TypeError {
+                msg: format!(
+                    "'{}.{}' takes no Self argument to dispatch on; resolving it from the expected return type isn't supported yet",
+                    trait_name, member
+                )
+            }, callee_span));
+        }
+        let mut args = args.into_iter();
+        let Some(receiver) = args.next() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("'{}.{}' needs at least one argument", trait_name, member)
+            }, callee_span));
+        };
+        let fa = FieldAccessExpr { target: Box::new(receiver), field: member };
+        self.lower_ufcs_call(fa, args.collect(), callee_span, span, Some(trait_name.to_string()))
+    }
+
+    /// The dispatch arms for a member call on a union, or `None` if this
+    /// isn't one — because some member has no impl of `member`, or because
+    /// two members implement it from *different* traits, which would make
+    /// `u.f()` mean two unrelated things depending on the runtime tag.
+    ///
+    /// Returning `None` rather than erroring lets the caller fall through to
+    /// step 3, so a free function taking the whole union still wins where one
+    /// exists and the error, when there is none, is the ordinary "no such
+    /// member or function" one.
+    ///
+    /// `expect_trait` is the prefix form's named trait, checked here rather
+    /// than at the caller: the arms are built and returned, so the caller's
+    /// own check is past by then, and each arm re-lowers as an *unqualified*
+    /// call that would silently accept whatever impl owns the name.
+    fn union_member_arms(
+        &mut self,
+        resolved: &Type,
+        member: &str,
+        rest_args: &[Spanned<Expression>],
+        narrow_target: Option<&str>,
+        expect_trait: Option<&str>,
+        subject_span: Span,
+        span: Span,
+    ) -> Result<Option<Vec<MatchArm>>, Spanned<TypeError>> {
+        let entries = self.union_entries(resolved, subject_span, span)?;
+        if entries.is_empty() { return Ok(None); }
+        let mut owner: Option<String> = None;
+        for e in &entries {
+            let hit = Self::grant_key(&e.ty)
+                .and_then(|key| self.member_index.get(&(key, member.to_string())).cloned());
+            match (hit, &owner) {
+                (None, _) => return Ok(None),
+                (Some((tr, _)), None) => owner = Some(tr),
+                (Some((tr, _)), Some(prev)) if &tr != prev => return Ok(None),
+                (Some(_), Some(_)) => {}
+            }
+        }
+        if let (Some(want), Some(owner)) = (expect_trait, &owner) {
+            if owner != want {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("{} implements '{}' from trait '{}', not '{}'", resolved, member, owner, want)
+                }, span));
+            }
+        }
+        // Each arm's receiver has to be the *narrowed* binding, not
+        // `union_entries`' reconstructed value: reconstructing a variant
+        // yields the union type again (variants are boxed into it), so the
+        // arm body would re-enter this same dispatch forever. Narrowing is
+        // what gives the arm a receiver typed at the member — and it only
+        // works on a name, so a receiver that isn't a plain binding is
+        // rejected with the fix rather than mis-dispatched.
+        let Some(recv) = narrow_target else {
+            return Err(Spanned::from(TypeError {
+                msg: format!(
+                    "calling '{}' on a union needs the receiver to be a plain binding, so each member can be narrowed — bind it first, e.g. `let x = ...` then `x.{}(...)`",
+                    member, member
+                )
+            }, subject_span));
+        };
+        let mut arms = Vec::with_capacity(entries.len());
+        for e in entries {
+            // `rest_args` is cloned per arm, so a side-effecting argument is
+            // *written* once per member but still *runs* once — only the
+            // matching arm executes. Same duplication `lower_match`'s guard
+            // clauses already accept.
+            let callee = Spanned::from(
+                Expression::field_access(
+                    Spanned::from(Expression::literal(Token::Identifier(recv.to_string())), span),
+                    member.to_string(),
+                ),
+                span,
+            );
+            let body = Expression::call(callee, rest_args.to_vec());
+            arms.push(MatchArm {
+                pattern: Pattern {
+                    path: None,
+                    variant: e.pattern_variant,
+                    // Deliberately bind-less: `lower_match_lowered` applies
+                    // flow narrowing only to an arm that binds no fields
+                    // (binding fields is the *other* way to read a variant),
+                    // and narrowing the receiver's own name is exactly what
+                    // this dispatch needs.
+                    binds: Vec::new(),
+                    resolved_member: e.member_idx,
+                },
+                guard: None,
+                body: Box::new(Spanned::from(body, span)),
+            });
+        }
+        Ok(Some(arms))
+    }
+
+    fn lower_ufcs_call(&mut self, fa: FieldAccessExpr, rest_args: Vec<Spanned<Expression>>, callee_span: Span, span: Span, expect_trait: Option<String>) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let target_span = fa.target.span;
         // Captured before the target is lowered — only a bare identifier
         // can be the root of a `mut` receiver, same restriction ordinary
@@ -5010,14 +6154,91 @@ impl TypeChecker {
             return self.finish_call(callable, None, rest_args, callee_span, span);
         }
 
-        // Step 3: no such field — a global `func` whose first parameter
-        // accepts `typeof(target)`, rewritten to `f(target, ...rest_args)`.
+        // Step 2 (`TRAITS.md` Part 1): a trait member implemented for
+        // `typeof(target)`. A hash lookup on `(type key, member name)`, never
+        // a search — the two ambiguities that would make it one (a duplicate
+        // `(trait, type)` impl, and two traits declaring the same member for
+        // one type) are both rejected at registration, in `register_impl`.
+        //
+        // Looked up here, ahead of the `len`/`push`/`get` builtins below,
+        // so a user type can name a member `len` and mean it. `List`/`Str`
+        // have no impls, so those builtins are unaffected.
         let field = fa.field;
+        let member_hit: Option<(String, String)> = Self::grant_key(&resolved)
+            .and_then(|key| self.member_index.get(&(key, field.clone())).cloned());
+        // From here on `callee` is what gets looked up and named in the typed
+        // AST — a member's compiled symbol, or the plain function name for
+        // step 3 — while `field` stays what the user wrote, for diagnostics.
+        let callee = match &member_hit {
+            Some((_, symbol)) => symbol.clone(),
+            None => field.clone(),
+        };
+        // Step 2, union case: a member call on a union is legal iff *every*
+        // member implements it, from the same trait — the same
+        // "union satisfies a trait iff every member does" rule
+        // `type_implements` already applies, and the exact parallel of
+        // `lower_field_access` accepting `u.f` only for a common field.
+        //
+        // It desugars into the dispatch `match` that `?`/`!`/`catch` already
+        // build from the same two pieces: `union_entries` reconstructs each
+        // member's value from bound fields, and `lower_match_lowered` takes
+        // the *already-lowered* subject, so the receiver is still evaluated
+        // exactly once. Each arm re-lowers the call against its own narrowed
+        // member type, which is what makes step 2 pick that member's impl.
+        if member_hit.is_none() && matches!(&resolved, Type::Union(_)) {
+            let narrow_target = root_name.clone().filter(|n| self.ctx.contains_key(n));
+            if let Some(arms) = self.union_member_arms(
+                &resolved, &field, &rest_args, narrow_target.as_deref(),
+                expect_trait.as_deref(), target_span, span
+            )? {
+                return self.lower_match_lowered(target, narrow_target, target_span, arms, None, span);
+            }
+        }
+
+        // A member call on a *bounded type parameter* — `func f<T: Shape>(x: T) = x.area()`.
+        // Not supported: member resolution happens at lowering time and picks
+        // a concrete impl symbol, but `T` is only made concrete later, by
+        // `monomorphize_generics` substituting into an already-lowered body.
+        // Making this work needs a deferred call that monomorphization
+        // re-resolves — a real mechanism, not a missing line — so it is named
+        // here rather than surfacing as "no such field on ~t0:Shape".
+        if member_hit.is_none() {
+            if let Type::TypeVar { bounds, .. } = &resolved {
+                if let Some(tr) = bounds.iter().find(|b| self.traits.get(&b.to_string())
+                    .map(|d| d.members.iter().any(|m| m.name == field)).unwrap_or(false))
+                {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!(
+                            "calling trait member '{}' through the bound '{}' on a type parameter isn't supported yet — take a concrete type, or call it where the type is known",
+                            field, tr
+                        )
+                    }, span));
+                }
+            }
+        }
+
+        // The prefix form named a specific trait; honour it rather than
+        // dispatching to whatever impl owns this member name.
+        if let Some(want) = &expect_trait {
+            match &member_hit {
+                Some((owner, _)) if owner == want => {}
+                Some((owner, _)) => return Err(Spanned::from(TypeError {
+                    msg: format!("{} implements '{}' from trait '{}', not '{}'", resolved, field, owner, want)
+                }, span)),
+                None => return Err(Spanned::from(TypeError {
+                    msg: format!("{} doesn't implement '{}.{}'", resolved, want, field)
+                }, span)),
+            }
+        }
+
+        // Step 3: no such field or member — a global `func` whose first
+        // parameter accepts `typeof(target)`, rewritten to
+        // `f(target, ...rest_args)`.
 
         // `len` has no `ctx` entry either (`finish_len`'s comment) — same
         // special-casing as `push` below, minus any `mut` handling since
         // `len` doesn't mutate its receiver.
-        if field == "len" {
+        if member_hit.is_none() && field == "len" {
             if !rest_args.is_empty() {
                 return Err(Spanned::from(TypeError {
                     msg: format!("Wrong number of arguments, expected 0, got {}", rest_args.len())
@@ -5030,7 +6251,7 @@ impl TypeChecker {
         // it's polymorphic over `T` with no generics system to express
         // that), so it's special-cased here the same way `lower_call`
         // special-cases it, with the receiver's `mut` marker exempted.
-        if field == "push" {
+        if member_hit.is_none() && field == "push" {
             if rest_args.len() != 1 {
                 return Err(Spanned::from(TypeError {
                     msg: format!("Wrong number of arguments, expected 1, got {}", rest_args.len())
@@ -5054,7 +6275,7 @@ impl TypeChecker {
 
         // `get` has no `ctx` entry either, same reasoning as `len`/`push`
         // above — see `finish_get_ufcs`.
-        if field == "get" {
+        if member_hit.is_none() && field == "get" {
             if rest_args.len() != 1 {
                 return Err(Spanned::from(TypeError {
                     msg: format!("Wrong number of arguments, expected 1, got {}", rest_args.len())
@@ -5064,7 +6285,7 @@ impl TypeChecker {
             return self.finish_get_ufcs(target, i_arg, span);
         }
 
-        let Some(func_ty) = self.ctx.get(&field).cloned() else {
+        let Some(func_ty) = self.ctx.get(&callee).cloned() else {
             return Err(Spanned::from(TypeError {
                 msg: format!("{} has no field '{}', and there's no function '{}' to call as a method", resolved, field, field)
             }, span));
@@ -5076,7 +6297,7 @@ impl TypeChecker {
         // this a generic free function's first parameter would bind
         // permanently to whichever type dot-called it first, via the
         // mutating `unify` a few lines down.
-        let binders = self.ctx.binders(&field).expect("just found by get").to_vec();
+        let binders = self.ctx.binders(&callee).expect("just found by get").to_vec();
         let func_ty = self.instantiate(&func_ty, &binders);
         let func_ty = self.lookup(&func_ty);
         let Type::Function { params, result } = func_ty.clone() else {
@@ -5101,7 +6322,7 @@ impl TypeChecker {
             }, callee_span));
         }
 
-        let declared_mut = self.func_mut_params.get(&field).cloned();
+        let declared_mut = self.func_mut_params.get(&callee).cloned();
         let mut_first = declared_mut.as_ref().and_then(|d| d.first()).copied().unwrap_or(false);
 
         // Receiver exemption (`TRAITS.md` Part 2, `MUTABILITY.md`'s
@@ -5130,7 +6351,7 @@ impl TypeChecker {
         // `lower_literal`'s generalized-declaration rename, which this
         // path would otherwise skip, leaving a dot-called generic
         // unresolvable at monomorphization time.
-        let callee_sym = self.ctx.symbol(&field).map(str::to_string).unwrap_or_else(|| field.clone());
+        let callee_sym = self.ctx.symbol(&callee).map(str::to_string).unwrap_or_else(|| callee.clone());
         let callable = Spanned::from(TypedExpr { id: 0, ty: func_ty, kind: TypedExprKind::Var(callee_sym) }, callee_span);
 
         let mut args = Vec::with_capacity(rest_args.len() + 1);
@@ -5197,12 +6418,15 @@ impl TypeChecker {
     // `check_and_lower_entry`) on a *nested* block, since the
     // top-level program/REPL entry goes through
     // `check_and_lower_entry` instead, which does not scope.
-    fn lower_block(&mut self, stmts: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+    fn lower_block(&mut self, mut stmts: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        self.hoist_trait_names(&stmts)?;
         self.hoist_data_decls(&stmts)?;
+        self.hoist_trait_members(&stmts)?;
+        self.expand_impls(&mut stmts)?;
         let lowered = self.in_scope(|t| -> Result<Vec<Spanned<TypedExpr>>, Spanned<TypeError>> {
             let mut lowered = Vec::with_capacity(stmts.len());
             for s in stmts {
-                if matches!(s.item, Expression::DataDecl(_)) { continue; }
+                if matches!(s.item, Expression::DataDecl(_) | Expression::TraitDecl(_)) { continue; }
                 lowered.push(t.check_and_lower(s)?);
             }
             Ok(lowered)
@@ -5354,6 +6578,26 @@ impl TypeChecker {
         let target_span = fa.target.span;
         let target = self.check_and_lower(*fa.target)?;
         let resolved = self.lookup(&target.item.ty);
+        // A member read as a value, not called. Froglang has no runtime
+        // representation of a function at all (`TRAITS.md` Stage 3's
+        // follow-up), so this can only ever be a call whose parentheses were
+        // left off — say that, rather than "no such field", which names the
+        // symptom instead of the fix.
+        // Gated on the field genuinely being absent: step 1 wins
+        // unconditionally, so a member that shares a field's name must not
+        // change what `p.n` means.
+        if self.field_type_of(&resolved, &fa.field).is_none() {
+            if let Some((owner, _)) = Self::grant_key(&resolved)
+                .and_then(|k| self.member_index.get(&(k, fa.field.clone())))
+            {
+                return Err(Spanned::from(TypeError {
+                    msg: format!(
+                        "'{}' is a member of trait '{}', not a field — call it: x.{}(...)",
+                        fa.field, owner, fa.field
+                    )
+                }, span));
+            }
+        }
         let (kind, ty) = if resolved.as_struct_name().is_some() {
             let field_ty = self.materialize_struct(&resolved).into_iter()
                 .find(|(n, _)| *n == fa.field)

@@ -141,7 +141,7 @@ tier and the interop tier; the syntax changes are deliberately last.
 | 1 | **`print` half done** — `print` / `repr` split; `Show`+`Eq` totality | the law | 0 |
 | 2 | **done** — float and string notation fixes | the law | — |
 | 3 | **done** — Source map: fn-ptr → span, rustc-style error rendering | diagnostics (function printing still blocked on function values existing) | — |
-| 4 | `Sink` (implemented by `StrBuf`) | every serializer | — |
+| 4 | `Sink` (implemented by `StrBuf`) — **`Linear`'s enforcement now exists** (`TRAITS.md` Part 7), `Sink` itself doesn't | every serializer | — |
 | 5 | `repr` / `read` at the typed-AST layer; the property test | Tier 1 | 1, 2, 4 |
 | 6 | Annotations: syntax, typed declarations, validation | Tier 2, host-side libs | — |
 | 7 | Host exposure of the declaration table | ORM/DB use case | 6 |
@@ -387,6 +387,12 @@ that changes.
 
 Not currently on `roadmap.md` or in any plan. It is the real gate on Stage 5 and Stage 8, and it
 is worth listing as its own item rather than discovering it inside them.
+
+**Prerequisite partly cleared**: `Linear`'s enforcement (`TRAITS.md` Part 7) is implemented and
+tested — as a built-in `Trait::Linear` variant, not a prelude declaration (TRAITS.md Stage 5, the
+general `trait` machinery `Sink`'s own `trait Sink { ... }` declaration below still needs, doesn't
+exist yet). See `TRAITS.md` Part 7's own status note for what that bought and what it didn't.
+`Sink` itself — the trait declaration, `StrBuf`, `write_stdout`/file rewiring — is still unstarted.
 
 ### `StrBuf` is not the primitive here — `Sink` is
 

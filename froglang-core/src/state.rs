@@ -6,6 +6,7 @@ use crate::frontend::parser::ParseError;
 use crate::frontend::modules;
 use crate::frontend::typeck::{Type, TypeChecker};
 use crate::frontend::tokens::Spanned;
+use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
 use crate::frontend::expression::Expression;
 use crate::runtime::gc::{GcHeap, ACTIVE_HEAP};
 use crate::runtime;
@@ -312,6 +313,21 @@ impl FrogState {
         // monomorphization, not before, so newly-inserted instantiation
         // bodies get real ids too.
         crate::frontend::liveness::number_nodes(&mut typed);
+
+        // `TRAITS.md` Part 7: `Linear` violations are type errors, and must
+        // be caught here — before codegen, which has no way to report a
+        // clean `Spanned<TypeError>` (it only ever panics on a bad tree).
+        {
+            let stmts: &[Spanned<TypedExpr>] = match &typed.item.kind {
+                TypedExprKind::Block(s) => s.as_slice(),
+                _ => std::slice::from_ref(&typed),
+            };
+            let prior_exit_live: crate::frontend::liveness::NameSet = self.env_types.keys().cloned().collect();
+            if let Err(e) = crate::frontend::linear::check(stmts, &prior_exit_live, &self.tc) {
+                self.tc.restore(cp);
+                return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
+            }
+        }
 
         let result_ty = typed.item.ty.clone();
 

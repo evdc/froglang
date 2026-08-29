@@ -46,6 +46,16 @@ pub enum Trait {
     /// does" rule: `if user_result` (a `User | DbError`) fails to compile
     /// with no special-casing of `Error` needed here at all.
     Truthy,
+    /// Marker trait for resource identity (`TRAITS.md` Part 7) — structurally
+    /// identical to `Error` above: no members, never structural, granted only
+    /// per-struct-name by a `provides Linear` clause and consulted only
+    /// through `type_implements`. A built-in variant for now rather than a
+    /// prelude declaration (TRAITS.md Stage 5 doesn't exist yet), added ahead
+    /// of `DATA.md` Stage 4's `Sink`, which needs it. See `frontend::linear`
+    /// for the enforcement this trait exists to drive — the "no accidental
+    /// aliasing" checks are the whole point of granting it; the variant here
+    /// is just what lets a `data` declaration state the fact.
+    Linear,
 }
 
 impl Display for Trait {
@@ -56,6 +66,7 @@ impl Display for Trait {
             Trait::Ord    => write!(f, "Ord"),
             Trait::Error  => write!(f, "Error"),
             Trait::Truthy => write!(f, "Truthy"),
+            Trait::Linear => write!(f, "Linear"),
         }
     }
 }
@@ -878,6 +889,14 @@ impl TypeChecker {
         self.type_implements_rec(ty, tr, &mut Vec::new())
     }
 
+    /// `type_implements(ty, Trait::Linear)`, exposed for `frontend::linear`
+    /// — the one external consumer of trait membership this module has
+    /// today, kept as a narrow named accessor rather than widening
+    /// `type_implements` itself to `pub(crate)`.
+    pub(crate) fn implements_linear(&self, ty: &Type) -> bool {
+        self.type_implements(ty, &Trait::Linear)
+    }
+
     /// `type_implements`'s body, carrying the set of struct types already
     /// being examined further up this recursion.
     ///
@@ -944,8 +963,10 @@ impl TypeChecker {
                 seen.pop();
                 ok
             },
-            // `Error` is granted, not structural — see `provides`.
-            Type::Named { name, args } if args.is_empty() && name != LIST_NAME && *tr == Trait::Error => {
+            // `Error` and `Linear` are both granted, not structural — see
+            // `provides`.
+            Type::Named { name, args } if args.is_empty() && name != LIST_NAME
+                && (*tr == Trait::Error || *tr == Trait::Linear) => {
                 self.provides.get(name).map(|ts| ts.contains(tr)).unwrap_or(false)
             },
             _ => match tr {
@@ -958,6 +979,7 @@ impl TypeChecker {
                 Trait::Ord    => matches!(ty, Type::Int | Type::Float | Type::Str),
                 Trait::Error  => false,
                 Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None) || ty.is_list(),
+                Trait::Linear => false,
             }
         }
     }
@@ -1889,6 +1911,7 @@ impl TypeChecker {
                     for name in &d.provides {
                         match name.as_str() {
                             "Error" => traits.push(Trait::Error),
+                            "Linear" => traits.push(Trait::Linear),
                             other => return Err(Spanned::from(TypeError {
                                 msg: format!("Unknown trait '{}' in provides clause", other)
                             }, s.span)),

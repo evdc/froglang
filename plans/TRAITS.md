@@ -573,7 +573,50 @@ ambient instance chosen at runtime is the one case monomorphization cannot erase
 
 ---
 
-# Part 7 — `Linear`: a marker trait for resource identity
+# Part 7 — `Linear`: a marker trait for resource identity — **built-in-trait stage done**
+
+Shipped ahead of TRAITS.md's own Stage 5/6 (prelude traits), as a built-in
+`Trait::Linear` variant structurally identical to `Trait::Error` — same
+`provides`-only grant, same `type_implements` shape, no prelude/trait-body
+machinery involved. `frontend::linear::check` is the enforcement: both rules
+below ("The check itself") are implemented and tested
+(`tests/test_linear.rs`), riding on `liveness::analyze_body`/`analyze_entry`'s
+existing `Ownership` exactly as this section always said, run as its own pass
+in `FrogState::eval_with_base` right after `liveness::number_nodes` and before
+codegen — so a violation is a clean `Spanned<TypeError>` with a real span, not
+a codegen panic.
+
+Two things this section didn't anticipate, both about what "a `Copy`-classified
+read" actually includes once real code is checked against it:
+
+- **A function's own `mut` parameter is *always* `Copy`-classified**, every
+  time it's read — `exit_live` includes it unconditionally so its final value
+  can be copied out at every return, which has nothing to do with aliasing.
+  Un-exempted, this would make `mut self` — the pattern this whole section is
+  building toward — impossible to write at all. `frontend::linear::Ctx::
+  mut_exempt` exempts a function's own `mut` parameters from rule 1 for the
+  whole body; the existing `mut`-exclusivity check (`TypeChecker::lower_call`)
+  is what makes that sound (no other argument can alias it in).
+- **A `PlaceAssign`'s own root is the same situation, narrower**: `o.x = o.x + 1`
+  reads `o` read-modify-write, which `liveness.rs` already keeps live across
+  the write (`root` is "never killed") — not a second reference, just one
+  binding read then rewritten. Exempted the same way, scoped to just that
+  statement's own subexpressions (`walk`'s `suppress` parameter).
+
+Not done, and flagged as a known gap in `frontend::linear`'s own doc comment
+rather than solved here: **a top-level/REPL-entry `Linear` binding can never
+pass rule 1 at all**, including its own only read. `FrogState` treats every
+prior top-level binding as live forever (so a later REPL entry can still
+reference it), which is exactly the condition rule 1 exists to reject —
+sound, but unusably strict above function-body scope. Revisit once `DATA.md`
+Stage 4 has a real top-level `Sink` consumer to design the cross-entry
+consumption story against; inside a function body (the realistic `Sink`/
+`mut self` shape) both rules work as intended today.
+
+Also not done, matching this section's own scope: the "registering `Sink`
+without `Linear` is an error" coherence check ("No supertraits needed",
+below) — there's no `Sink` trait yet for it to guard, so nothing to wire up.
+
 
 Motivated by `DATA.md`'s `Sink`, but not specific to it — see below for other customers.
 

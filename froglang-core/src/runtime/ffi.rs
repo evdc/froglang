@@ -16,7 +16,7 @@ where
     } else {
         GC_HEAP.with(|h| {
             let mut borrowed = h.borrow_mut();
-            f(&mut *borrowed)
+            f(&mut borrowed)
         })
     }
 }
@@ -28,7 +28,7 @@ pub extern "C" fn frog_alloc_str(data: i64, len: i64) -> i64 {
     let _jit_frame = crate::jit_frame_guard!();
     with_heap(|heap| {
         heap.maybe_collect();
-        heap.alloc_str(data as *const u8, len as usize) as i64
+        heap.alloc_str(unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) }) as i64
     })
 }
 
@@ -58,7 +58,7 @@ pub extern "C" fn frog_str_concat(a: i64, b: i64) -> i64 {
 
     with_heap(|heap| {
         heap.maybe_collect();
-        heap.alloc_str(buf.as_ptr(), total_len) as i64
+        heap.alloc_str(&buf) as i64
     })
 }
 
@@ -148,17 +148,17 @@ pub extern "C" fn frog_str_println(s: i64) {
 
 #[no_mangle]
 pub extern "C" fn frog_int_println(n: i64) {
-    print!("{n}\n");
+    println!("{n}");
 }
 
 #[no_mangle]
 pub extern "C" fn frog_float_println(n: f64) {
-    print!("{}\n", crate::notation::float_repr(n));
+    println!("{}", crate::notation::float_repr(n));
 }
 
 #[no_mangle]
 pub extern "C" fn frog_bool_println(b: i8) {
-    print!("{}\n", b != 0);
+    println!("{}", b != 0);
 }
 
 #[no_mangle]
@@ -385,7 +385,13 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
                 // plain global-allocator block of `new_cap` slots, which is
                 // what `free_obj` later recycles at that same size.
                 let old_cap = (*list_ptr).cap as usize;
+                // `cap` is a `u32`; doubling past that would silently
+                // truncate and leave the list claiming capacity it doesn't
+                // have. There is no error path out of JIT code, so abort.
                 let new_cap = old_cap * 2;
+                if new_cap > u32::MAX as usize {
+                    frog_abort(format_args!("list grew past the maximum length of {} elements", u32::MAX));
+                }
                 let old_layout = Layout::array::<i64>(old_cap).expect("list realloc layout");
                 let new_size = new_cap * std::mem::size_of::<i64>();
                 let new_data = std::alloc::realloc(
@@ -393,6 +399,10 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
                     old_layout,
                     new_size,
                 ) as *mut i64;
+                if new_data.is_null() {
+                    std::alloc::handle_alloc_error(
+                        Layout::array::<i64>(new_cap).expect("list realloc layout"));
+                }
                 (*list_ptr).data = new_data;
                 (*list_ptr).cap = new_cap as u32;
                 heap.bytes_allocated += (new_cap - old_cap) * std::mem::size_of::<i64>();
@@ -473,6 +483,28 @@ pub extern "C" fn frog_variant_set(variant: i64, slot: i64, val: i64) {
         let ptr = variant as *mut FrogVariant;
         let data = (ptr as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
         *data.add(slot as usize) = val;
+    }
+}
+
+/// `FROG_COW_VERIFY`'s check: called from the write barrier's *unshared*
+/// path (`codegen::emit_unshare`), only in a build whose codegen saw the env
+/// var set. Aborts if `w` turns out to be reachable by more than one live
+/// reference despite not being marked shared — i.e. an aliasing site failed
+/// to mark, which is the one failure mode copy-on-write actually has.
+///
+/// See `GcHeap::count_refs` for why this is worth the cost, and
+/// MUTABILITY.md Stage 7.
+#[no_mangle]
+pub extern "C" fn frog_cow_verify(w: i64) {
+    let _jit_frame = crate::jit_frame_guard!();
+    if !super::gc::is_heap_ptr(w) { return; }
+    let refs = with_heap(|heap| heap.count_refs(super::gc::heap_ptr(w)));
+    if refs > 1 {
+        frog_abort(format_args!(
+            "FROG_COW_VERIFY: about to mutate {:#x} in place, but {} live references reach it \
+             — an aliasing site failed to set the shared bit (MUTABILITY.md Stage 7)",
+            w, refs,
+        ));
     }
 }
 

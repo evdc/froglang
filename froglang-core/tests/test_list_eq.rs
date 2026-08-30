@@ -130,9 +130,8 @@ fn a_list_typed_struct_field_compares_structurally() {
 
 #[test]
 fn a_list_comparison_works_in_condition_position() {
-    assert_eq!(
+    assert!(
         eval_bool("let xs = [1, 2]\nif xs == [1, 2] then true else false"),
-        true,
     );
 }
 

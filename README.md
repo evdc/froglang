@@ -384,7 +384,7 @@ gaps.
 
 ## Benchmarks
 
-`benches/run_comparisons.sh [fib|orders|all]` runs each benchmark in froglang and
+`benches/run_comparisons.sh [fib|orders|life|words|all]` runs each benchmark in froglang and
 in Rust, Go, Python, LuaJIT and Lua, and prints wall-clock time per language.
 Every implementation is a line-by-line translation of the froglang one, and all
 of them must print the same result — a differing row means one of them is wrong.
@@ -399,6 +399,26 @@ of them must print the same result — a differing row means one of them is wron
   and the GC. The other four implementations have no equivalent of `?`/
   `catch`, but since the error branch is never actually taken on this data,
   all five implementations must still print the same total.
+- **`life`** — Conway's Game of Life on a 48x48 grid for 40 generations,
+  over a `List<List<Int>>`. Every inner-loop read is a double index and each
+  generation rebuilds the whole grid from nested comprehensions, so this
+  covers the nested-list layout `orders` never touches. Writing it is what
+  turned up the copy-on-write work (MUTABILITY.md Stage 7): passing the grid
+  to a function used to deep-copy it, which made this benchmark ~80x slower
+  than it needed to be and hid three value-semantics bugs behind the cost of
+  fixing them.
+- **`words`** — builds a 400-word document from a fixed vocabulary, splits
+  it back apart and folds over the words, 800 times. The only benchmark that
+  allocates `Str`s, so it is the one that covers variable-size GC objects,
+  byte-wise string comparison, and the `Str` stdlib (`split`/`join`/
+  `to_upper`/`starts_with`) — which, being host functions, means it also
+  covers the embedding boundary in a hot loop.
+
+To profile any of them, `FROG_JIT_SYMBOLS=syms.txt` makes codegen write out
+where each compiled function landed, and `benches/symbolize.py syms.txt
+prof.txt` attributes a `sample`/`perf` profile's addresses back to froglang
+function names — without it a profile of a froglang program is entirely
+`??? (in <unknown binary>)`.
 
 nb. the result times change often, do not record them here, they are likely to go stale.
 In general froglang should be within ~2x of LuaJIT, otherwise we are doing something Wrong

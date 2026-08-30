@@ -213,9 +213,9 @@ fn test_float_list_roundtrips() {
 fn test_bool_list_roundtrips() {
     let bits = compile_and_run("[true, false, true]");
     assert_eq!(frog_list_len(bits), 3);
-    assert_eq!(frog_list_get(bits, 0, 0) != 0, true);
-    assert_eq!(frog_list_get(bits, 1, 0) != 0, false);
-    assert_eq!(frog_list_get(bits, 2, 0) != 0, true);
+    assert!(frog_list_get(bits, 0, 0) != 0);
+    assert!(!(frog_list_get(bits, 1, 0) != 0));
+    assert!(frog_list_get(bits, 2, 0) != 0);
 }
 
 // ── list indexing ────────────────────────────────────────────────────────────

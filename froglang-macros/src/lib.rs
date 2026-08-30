@@ -102,6 +102,11 @@ fn _frog_fn(f: ItemFn) -> syn::Result<TokenStream> {
     let expanded = quote! {
         #f
 
+        // The shim is a JIT call target, not a Rust API: its three raw
+        // pointers are supplied by generated code that upholds their
+        // validity (see `HostFn`), and marking it `unsafe` would only move
+        // the obligation somewhere no human writes.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[no_mangle]
         pub extern "C" fn #shim_ident(
             __frog_ctx: *mut ::froglang_core::runtime::host::FrogCtx,

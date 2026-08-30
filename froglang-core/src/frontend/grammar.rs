@@ -30,7 +30,7 @@ impl Grammar {
 
     pub fn literal(_parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
         // a literal expression has the same span as its token
-        Ok(token.map(|t| Expression::literal(t)))
+        Ok(token.map(Expression::literal))
     }
 
     pub fn unary(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
@@ -368,7 +368,7 @@ impl Grammar {
                 match &lit.token {
                     Token::Identifier(name) => vec![name],
                     _ => {
-                        let msg = format!("Expected identifier for argument, got {}", &left.item);
+                        let msg = format!("Expected identifier for argument, got {}", left.item);
                         return Err(left.to(ParseError::Other(msg)))
                     }
                 }
@@ -380,19 +380,19 @@ impl Grammar {
                         match &lit.token {
                             Token::Identifier(name) => res.push(name),
                             _ => {
-                                let msg = format!("Expected identifier for argument, got {}", &lit.token);
+                                let msg = format!("Expected identifier for argument, got {}", lit.token);
                                 return Err(Spanned::from(ParseError::Other(msg), arg.span))
                             }
                         }
                     } else {
-                        let msg = format!("Expected identifier for argument, got {}", &arg.item);
+                        let msg = format!("Expected identifier for argument, got {}", arg.item);
                         return Err(Spanned::from(ParseError::Other(msg), arg.span))
                     }
                 }
                 res
             },
             _ => {
-                let msg = format!("Expected identifier for argument, got {}", &left.item);
+                let msg = format!("Expected identifier for argument, got {}", left.item);
                 return Err(left.to(ParseError::Other(msg)))
             }
         };

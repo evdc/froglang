@@ -3,7 +3,16 @@
 - Enums / variants, common fields, matching expressions (e.g. via `if x is Circle(r) then ...`) — done: `data X is A | B(...)`, `match`, `is`, boxed+tagged GC representation, exhaustiveness checking
   - follow-ups: structural `==` on enums, named/nested pattern binds, multi-line leading-`|` variant lists
   - done: payload-less variants are unboxed to an immediate tag (`(tag << 1) | 1`, low bit distinguishes them from 8-aligned pointers — see gc.rs "Immediate (unboxed) values")
-- Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value (~4M mallocs); after inlining heap access and un-boxing shadow frames it is at 182ms vs 31ms for the same program in Rust, and `malloc`/`free`/`memset` plus the mark phase are ~half of what's left. Secondary: pool/free-list the fixed-size GC blocks, and make shadow frames cheaper than an FFI push/pop + zeroing per call.
+- Perf: copy-on-write for lists — **done**, MUTABILITY.md Stage 7. A `List` binding is marked
+  `shared` where a second live path to it is created and copied only at a write, instead of being
+  deep-copied at every aliasing read. `benches/life.frog` 2054ms -> 27ms; `benches/words.frog`
+  108ms -> 97ms; `orders` unchanged (it never paid the cost). It also closed three value-semantics
+  bugs eager copying could not afford to fix — a list extracted from a list, from a `for`-loop
+  binding, or from a struct field was aliased, not copied, so pushing to it mutated the container.
+  `FROG_COW_VERIFY=1` re-derives the sharing answer from the heap at every write barrier.
+- Perf: **inlining.** With calls out of line, `benches/orders.frog` spends ~30% in one-line functions (`modn` 20%, `checked_gross` 8%) that Rust/Go erase. Hand-inlining two call sites takes orders from 54.8ms to 45.1ms, so a small-leaf-function inliner is worth roughly 20% there.
+- Perf: functions can't reference top-level `let` bindings — typeck accepts it, codegen panics with `unbound variable in codegen: <name>`. Both `life.frog` and `words.frog` had to thread constants through as parameters to work around it. Either implement the capture or reject it in typeck with a real error.
+- Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value. Secondary: the `#[frog_fn]` boundary converts every `Str` argument into an owned Rust `String` (`__frog_shim_starts_with` is 14% of `benches/words.frog`) — taking `&str` would remove a copy per call.
 - Error handling, errors as values + early-return sugar, etc — builds on enums (Result/Option as compiler-known enums)
 - Traits/interfaces, generics, and methods — designed in `plans/TRAITS.md`; **Stages 0-3 and 5 shipped**
     - The `provides`/impl duality is resolved: one `provides` keyword, inline on `data` or standalone (`provides T for Int { ... }`), with a body

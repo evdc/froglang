@@ -5,6 +5,8 @@
 #   ./benches/run_comparisons.sh            # every benchmark
 #   ./benches/run_comparisons.sh fib        # naive recursive fib(35)
 #   ./benches/run_comparisons.sh orders     # struct/enum/list order pipeline
+#   ./benches/run_comparisons.sh life       # nested lists, Game of Life
+#   ./benches/run_comparisons.sh words      # strings, split/join/compare
 #
 # Languages checked: froglang (Cranelift JIT), Rust (-O3), Go (gc), Python 3,
 # LuaJIT, Lua.  Missing runtimes/compilers are skipped with a note.
@@ -38,6 +40,16 @@ fi
 ORDERS_FROG="$BENCH_DIR/orders.frog"
 ORDERS_ITEMS=$(sed -n 's/.*for i in 0\.\.\([0-9]*\) do Item.*/\1/p' "$ORDERS_FROG")
 ORDERS_ROUNDS=$(sed -n 's/.*for round in 0\.\.\([0-9]*\) do.*/\1/p' "$ORDERS_FROG")
+
+# Same single-source-of-truth trick for life's grid size and generation
+# count — see life.frog.
+LIFE_FROG="$BENCH_DIR/life.frog"
+LIFE_SIZE=$(sed -n 's/^let size = \([0-9]*\).*/\1/p' "$LIFE_FROG")
+LIFE_GENS=$(sed -n 's/^let generations = \([0-9]*\).*/\1/p' "$LIFE_FROG")
+
+WORDS_FROG="$BENCH_DIR/words.frog"
+WORDS_PER_DOC=$(sed -n 's/^let words_per_doc = \([0-9]*\).*/\1/p' "$WORDS_FROG")
+WORDS_ROUNDS=$(sed -n 's/^let rounds = \([0-9]*\).*/\1/p' "$WORDS_FROG")
 
 # Run one command, printing result, wall time, and whatever the program wrote
 # to stderr (its own timing, for those that report one).
@@ -86,6 +98,10 @@ FIB_RUST=$(build_rust "$BENCH_DIR/fib_native.rs")
 FIB_GO=$(build_go "$BENCH_DIR/fib.go")
 ORDERS_RUST=$(build_rust "$BENCH_DIR/orders_native.rs")
 ORDERS_GO=$(build_go "$BENCH_DIR/orders.go")
+LIFE_RUST=$(build_rust "$BENCH_DIR/life.rs")
+LIFE_GO=$(build_go "$BENCH_DIR/life.go")
+WORDS_RUST=$(build_rust "$BENCH_DIR/words.rs")
+WORDS_GO=$(build_go "$BENCH_DIR/words.go")
 
 echo "  cargo build --release ..."
 FROG_BIN=""
@@ -162,11 +178,59 @@ bench_orders() {
     echo "  All implementations must print the same result; a differing row is a bug."
 }
 
+# ── life ───────────────────────────────────────────────────────────────────────
+bench_life() {
+    local n="$LIFE_SIZE" g="$LIFE_GENS"
+
+    echo ""
+    echo "=== life — ${n}x${n} grid x $g generations: nested lists, indexing ==="
+    echo ""
+
+    if [[ -n "$FROG_BIN" ]]; then
+        run_timed "froglang (Cranelift JIT)" "$FROG_BIN" run "$LIFE_FROG"
+    else
+        printf "  %-26s  (build failed)\n" "froglang (Cranelift JIT)"
+    fi
+    [[ -n "$LIFE_RUST" ]] && run_timed "Rust -O3"         "$LIFE_RUST" "$n" "$g"
+    [[ -n "$LIFE_GO"   ]] && run_timed "Go (gc, default)" "$LIFE_GO"   "$n" "$g"
+    have python3 && run_timed "Python 3"    python3 "$BENCH_DIR/life.py"  "$n" "$g"
+    have luajit  && run_timed "LuaJIT"      luajit  "$BENCH_DIR/life.lua" "$n" "$g"
+    have lua     && run_timed "Lua (plain)" lua     "$BENCH_DIR/life.lua" "$n" "$g"
+
+    echo ""
+    echo "  All implementations must print the same result; a differing row is a bug."
+}
+
+# ── words ──────────────────────────────────────────────────────────────────────
+bench_words() {
+    local w="$WORDS_PER_DOC" r="$WORDS_ROUNDS"
+
+    echo ""
+    echo "=== words — $w words x $r rounds: strings, split/join/compare ==="
+    echo ""
+
+    if [[ -n "$FROG_BIN" ]]; then
+        run_timed "froglang (Cranelift JIT)" "$FROG_BIN" run "$WORDS_FROG"
+    else
+        printf "  %-26s  (build failed)\n" "froglang (Cranelift JIT)"
+    fi
+    [[ -n "$WORDS_RUST" ]] && run_timed "Rust -O3"         "$WORDS_RUST" "$w" "$r"
+    [[ -n "$WORDS_GO"   ]] && run_timed "Go (gc, default)" "$WORDS_GO"   "$w" "$r"
+    have python3 && run_timed "Python 3"    python3 "$BENCH_DIR/words.py"  "$w" "$r"
+    have luajit  && run_timed "LuaJIT"      luajit  "$BENCH_DIR/words.lua" "$w" "$r"
+    have lua     && run_timed "Lua (plain)" lua     "$BENCH_DIR/words.lua" "$w" "$r"
+
+    echo ""
+    echo "  All implementations must print the same result; a differing row is a bug."
+}
+
 case "${1:-all}" in
     fib)    bench_fib ;;
     orders) bench_orders ;;
-    all)    bench_fib; bench_orders ;;
-    *)      echo "usage: $0 [fib|orders|all]" >&2; exit 2 ;;
+    life)   bench_life ;;
+    words)  bench_words ;;
+    all)    bench_fib; bench_orders; bench_life; bench_words ;;
+    *)      echo "usage: $0 [fib|orders|life|words|all]" >&2; exit 2 ;;
 esac
 
 echo ""

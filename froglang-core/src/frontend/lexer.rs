@@ -211,10 +211,10 @@ impl<'a> Lexer<'a> {
         }
         if float {
             let f = n.parse::<f64>().map_err(|_err| LexerError::InvalidNumber)?;
-            return Ok(Token::Float(f));
+            Ok(Token::Float(f))
         } else {
             let i = n.parse::<i64>().map_err(|_err| LexerError::InvalidNumber)?;
-            return Ok(Token::Int(i));
+            Ok(Token::Int(i))
         }
     }
 
@@ -327,13 +327,13 @@ mod tests {
 
     #[test]
     fn test_numbers() {
-        let input = "42 3.14 0.123 100.0";
+        let input = "42 3.25 0.123 100.0";
         let (spans, errors) = lex_and_collect(input);
         assert!(errors.is_empty());
         let tokens: Vec<_> = spans.into_iter().map(|s| s.item).collect();
         assert_eq!(tokens, vec![
             Token::Int(42),
-            Token::Float(3.14),
+            Token::Float(3.25),
             Token::Float(0.123),
             Token::Float(100.0),
         ]);

@@ -610,6 +610,181 @@ a passing stress sweep — the sweep is only as good as the shapes the suite hap
 the revert above demonstrated. Grow `tests/test_gc_roots.rs` with the escape shapes first
 (including un-ignoring the loop one), then measure `discount_for`'s frame again.
 
+### Stage 7: copy-on-write — tier 3, and the elision that makes tier 1 affordable
+
+Stage 6 shipped tiers 1 and 2: an eager deep copy at every `Copy`-classified `List`-typed `Var`
+read, skipped where liveness says `Move`. Tier 3 is the missing piece, and its absence turns out
+not to be only a performance problem — eager copying is expensive enough that Stage 6 had to leave
+a hole in tier 1 to stay affordable, and that hole is a live value-semantics bug.
+
+**What is actually broken.** Reading a leaf back out of a container is not a `Var` node, so it
+never cloned. Stage 6 recorded this and deferred it on the grounds that no surface syntax reached
+it. That was true of place assignment, which requires a bare identifier root, but `mut x = <a
+container read>` reaches it fine. Three shapes, all reproducible before this stage:
+
+```
+mut rows = [[1,2],[3,4]]; mut inner = rows[0]; push(mut inner, 9)
+  → rows becomes [[1,2,9],[3,4]]
+
+mut rows = [[1,2],[3,4]]; for row in rows { mut r = row; push(mut r, 7) }
+  → rows becomes [[1,2,7],[3,4,7]]
+
+data Box(items: List<Int>); let b = Box(items=[1,2]); mut got = b.items; push(mut got, 3)
+  → b.items becomes [1,2,3]
+```
+
+Closing these under eager copying means cloning on every element read, which is exactly the O(n²)
+storm `compile_expr_multi_transient` exists to prevent (Stage 6: `benches/pipeline.rs`'s `lists`
+workload, 5.4ms → 251ms). Under copy-on-write it costs a byte store. **That is the argument for
+this stage** — not only that it is faster, but that it makes the correct thing cheap enough to do.
+
+**What it costs today.** `benches/life.frog` passes a `List<List<Int>>` to a function about nine
+times per cell and never mutates it. Measured 2026-08-29: 78% of the run inside
+`GcHeap::clone_obj`, and removing the clone entirely (unsound, for measurement only) takes it from
+138s to 167ms — an 800x difference on the same checksum. `benches/words.frog` pays about 8% of the
+same cost passing a `List<Str>` vocabulary down; `benches/orders.frog` pays none, which is why this
+stayed invisible until `life` existed.
+
+#### The rule
+
+One bit in `GcHeader`, which has room for it — the struct is 16 bytes today (`*mut GcHeader`,
+`bool`, `ObjKind`) with 6 of padding.
+
+```
+shared = false   on every fresh allocation, and on everything `clone_obj` produces
+shared = true    wherever a second live path to the object is created
+write through a mut root:  if shared { root = clone(root) }  then write
+```
+
+The invariant, stated once:
+
+> **If a heap object is reachable by more than one path that can still be read, its `shared` bit is
+> set.**
+
+The slack is one-directional and that is what makes the scheme tractable: a spuriously set bit
+costs one extra copy, a missed bit is an aliasing bug. Every rule below is therefore allowed to be
+conservative and never has to be precise.
+
+**The trigger is the analysis Stage 6 already computed.** `Ownership::Copy` means "the source name
+is still live after this read", which is precisely "a second path now exists". So the change at
+`codegen::clone_if_owned` is not new analysis — it is the same call site under the same predicate,
+with an O(1) header store in place of an O(n) `frog_clone`. `Move` reads set nothing, so tier 2
+keeps working unchanged, and `push`'s own receiver (always `Move`, via `liveness.rs`'s `Call` arm
+removing a `mut` argument's name from `live_out`) stays allocation-free in a loop.
+
+| program | read | bit | write | result |
+|---|---|---|---|---|
+| `mut a=[..]; let b=a; push(mut a,4)` | `a` Copy | set | copies | `b` intact |
+| `mut a=[..]; mut b=a; push(mut b,4)` (`a` dead after) | `a` Move | none | in place | nothing observes |
+| `let a=[..]; mut b=a; push(mut b,4); print(a)` | `a` Copy | set | copies | `a` intact |
+| `addOne(mut b)` | mut arg → Move | none | in place | copy-out is a no-op rebind |
+| `cell_at(rows,…)` ×9 per cell | `rows` Copy | set (idempotent) | never written | **no copies at all** |
+
+The `mut`-argument row is worth spelling out: `Move` classification does not *clear* an
+already-set bit, which is what keeps `let s = a; addOne(mut a)` correct — `s`'s aliasing set the
+bit earlier, so the callee's `push` copies and the caller receives the copy through copy-out.
+
+#### The write barrier is a two-site surface
+
+This is what keeps the stage small, and it holds for a reason worth recording: **every mutation in
+the language requires a bare identifier root.** `is_push` and `flatten_place` both enforce it, and
+typeck rejects `rows[0][1] = 99` outright ("assignment through more than one list index isn't
+supported yet"). So there are exactly two mutation sites, and at both of them codegen holds the
+root's Cranelift `Variable` and can rebind it:
+
+```
+p = use_var(root)
+if shared(p) { p = frog_clone(p); def_var(root, p) }
+<store>
+```
+
+One well-predicted branch per write, and self-extinguishing: after the first copy the object is
+unique, so the rest of the loop runs barrier-free.
+
+#### Why a shallow bit suffices for nested lists
+
+The bit lives on the outer object and `clone_obj` is deep. Those two facts have to be paired, and
+together they cover every case:
+
+- Write through the outer (`push(mut rows, r)`, `rows[0] = r`) — outer is shared, so the deep copy
+  makes the whole subtree fresh and unique before the write lands.
+- Write through an extracted inner (`mut inner = rows[0]; push(mut inner, 9)`) — the extraction
+  set the bit on the *inner*, so the inner copies and `rows` is untouched.
+- There is no third case, because nested place assignment does not exist.
+
+That second bullet is the new rule: **reading a `List`-typed leaf out of a container sets that
+leaf's bit** — list element read, struct/variant field read, and the `for`-loop element bind. All
+O(1), which is the whole reason this is affordable now and was not before. This is what closes the
+three bugs above.
+
+#### The cliff, accepted
+
+A monotone bit cannot observe that an alias has *died*:
+
+```
+for i in 0..n { let snap = xs; push(mut xs, i) }     // O(n²)
+```
+
+Each iteration re-shares and re-copies even though `snap` is dead at the end of it. Refcounting
+would get this; one bit cannot. Swift has the same cliff. Accepted and documented rather than
+reached for — froglang has a tracing collector, and adding refcounts to recover uniqueness is a far
+larger bargain than this shape justifies. Revisit only if a real program hits it.
+
+#### How to know it's right
+
+The failure mode that matters is a *missed* bit, which is invisible to ordinary tests until some
+program happens to observe a mutation through a stale alias. So, in the same spirit as
+`FROG_GC_STRESS`:
+
+**`FROG_COW_VERIFY`** — at every write barrier, when the object is *not* marked shared, mark from
+every root (the collector's own precise machinery) and count the live references that reach it.
+More than one means a bit was missed; abort naming the site. Far too slow for anything but a test
+run, and it turns "did we cover every aliasing site" from a code-review argument into a suite
+property. Stage 6's reverted GC-root sharing is the cautionary precedent: a stress sweep is only as
+good as the shapes the suite happens to contain.
+
+Two things it took to make this usable, both worth recording because both are traps:
+
+- **Count JIT stack-map slots, not roots.** One top-level binding is rooted three times over — as
+  a rebuilt `env` root, as a slot in `call_jit`'s conservatively scanned out-buffer, and as the JIT
+  value the entry is using — so counting roots made every top-level `xs[i] = v` look aliased.
+  `tests/programs/mut_list_index_assign.frog` is the case that caught it. Reachability still traces
+  from every root; only the count is narrowed.
+- **It is a strong check, not a complete one.** Two bindings holding the *identical* SSA value
+  share one spill slot and count once, so `mut got = b.items` — where the field read yields the
+  same `Value` the struct's leaf holds — is not caught. Deliberately sabotaging
+  `mark_shared_extracted` fires for a list element and a `for`-loop binding but not for that struct
+  field. The behavioural assertions in `tests/test_value_semantics.rs` remain the specification;
+  this catches the class of mistake that would otherwise go unnoticed between them.
+
+The three bugs above and the five table rows go into `tests/test_value_semantics.rs`.
+
+#### Sequencing
+
+1. `shared` in `GcHeader`; `clone_obj` clears it on everything it produces. Inert.
+2. Write barrier at `push` and `PlaceAssign`. Still inert — nothing sets the bit yet.
+3. Flip `clone_if_owned` to mark instead of clone. **COW goes live here.** The existing suite must
+   stay green and the five table rows are added.
+4. Set the bit on container extraction. The three bugs close here — this is the only step that
+   changes the observable behaviour of programs that already run.
+5. `FROG_COW_VERIFY`.
+
+Steps 1 and 2 are provably no-ops, which keeps the semantically risky commit small.
+
+#### Rejected: static elision of the copy instead
+
+The alternative is to keep eager copying but skip it where the destination provably cannot be
+mutated — pass to a non-`mut` parameter without copying, and compensate by copying at `mut` binding
+sites. It is sound, and it fixes `life`. It was rejected because it needs `mutable` plumbed into
+`TypedExprKind::Assign` (9 construction sites, ~23 match sites), it still pays O(n) on every
+`mut x = <existing list>`, and it does nothing for the three extraction bugs — closing those still
+costs a clone per element read. Copy-on-write subsumes it at lower runtime cost.
+
+Worth revisiting later as a *specialization* on top of this: a list type that no reachable code
+ever mutates needs neither the bit nor the barrier. As an escape analysis that is fragile under
+generics and monomorphization, so it belongs on top of a correct dynamic scheme rather than in
+place of one.
+
 Stages 1–4 are frontend work with no runtime component and can land before generics. Stage 6 is
 the one with a dependency in both directions: it needs the liveness analysis, and container
 mutation needs it.

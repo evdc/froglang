@@ -38,6 +38,11 @@ pub struct TypeError {
 
 type TypeResult = Result<Type, Spanned<TypeError>>;
 
+/// A struct/variant constructor's arguments, lowered and paired with the
+/// field each fills — in declared field order, whether the call site wrote
+/// them positionally or by name.
+type RecordArgs = Vec<(String, TypedExprRef)>;
+
 /// Traits constrain type variables. A type must implement a trait to be bound
 /// to a TypeVar that carries that bound.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -997,6 +1002,12 @@ pub struct TypeCheckerCheckpoint {
     emitted_instantiations: std::collections::HashSet<String>,
 }
 
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeChecker {
     /// `struct_type_params`'s initial contents: just `List`, registered at
     /// arity 1 so `resolve_type_expr`'s `TypeExpr::Apply` arm can arity-check
@@ -1709,16 +1720,11 @@ impl TypeChecker {
     ///    type is pushed into each element (recursively, so
     ///    `List<List<Int>>` works too). Bottom-up can't type either of the
     ///    two cases an annotation exists to resolve:
-    ///      `let xs: List<Str> = []`          — bare `[]` synthesizes
-    ///                                          `List(~t0)`, and `is_subtype`
-    ///                                          can't see through the `List`
-    ///                                          to bind it
-    ///      `let xs: List<Int | Str> = [1, "a"]`
-    ///                                        — the elements only agree once
-    ///                                          each is widened to the
-    ///                                          annotated union, which the
-    ///                                          literal's own same-type
-    ///                                          unification rejects first
+    ///    - `let xs: List<Str> = []` — bare `[]` synthesizes `List(~t0)`,
+    ///      and `is_subtype` can't see through the `List` to bind it.
+    ///    - `let xs: List<Int | Str> = [1, "a"]` — the elements only agree
+    ///      once each is widened to the annotated union, which the
+    ///      literal's own same-type unification rejects first.
     /// 3. **Anything else** — synthesize normally, then accept the result
     ///    if it's a subtype of `expected`, a non-lossy numeric promotion
     ///    into it, or an open type variable that unifies with it; and
@@ -1942,6 +1948,38 @@ impl TypeChecker {
         Ok(out)
     }
 
+    /// `union_entries`, plus the precondition `?`, `!` and `catch` share:
+    /// the subject union must have at least one `Error`-providing member,
+    /// or the operator has nothing to do.
+    fn error_arm_entries(&self, op: &str, subject_ty: &Type, subject_span: Span, span: Span) -> Result<Vec<ErrorArmEntry>, Spanned<TypeError>> {
+        let entries = self.union_entries(subject_ty, subject_span, span)?;
+        if !entries.iter().any(|e| e.is_error) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("'{}' requires a union with at least one Error-providing member", op)
+            }, subject_span));
+        }
+        Ok(entries)
+    }
+
+    /// One arm per union member: an `Error`-providing member's body is
+    /// whatever `error_body` makes of its whole (reconstructed) value —
+    /// return it, panic on it, hand it to a handler — and every other
+    /// member passes that value through unchanged.
+    fn error_arms(
+        entries: Vec<ErrorArmEntry>,
+        span: Span,
+        mut error_body: impl FnMut(Expression) -> Spanned<Expression>,
+    ) -> Vec<MatchArm> {
+        entries.into_iter().map(|e| {
+            let body = if e.is_error { error_body(e.whole_value) } else { Spanned::from(e.whole_value, span) };
+            MatchArm {
+                pattern: Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names, resolved_member: e.member_idx },
+                guard: None,
+                body: Box::new(body),
+            }
+        }).collect()
+    }
+
     /// `e?`'s match arms: an `Error`-providing member returns its (whole,
     /// reconstructed) value early; every other member passes its value
     /// through unchanged. The join across arms (`lower_match`'s own
@@ -1950,12 +1988,7 @@ impl TypeChecker {
     /// leaving only the non-`Error` members' union (or a single type, or
     /// `Never` if every member is an `Error`).
     fn build_try_arms(&mut self, subject_ty: &Type, subject_span: Span, span: Span) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
-        let entries = self.union_entries(subject_ty, subject_span, span)?;
-        if !entries.iter().any(|e| e.is_error) {
-            return Err(Spanned::from(TypeError {
-                msg: "'?' requires a union with at least one Error-providing member".to_string()
-            }, subject_span));
-        }
+        let entries = self.error_arm_entries("?", subject_ty, subject_span, span)?;
         let return_ty = self.return_types.last().cloned().ok_or_else(|| Spanned::from(
             TypeError { msg: "'?' used outside of a function".to_string() }, span
         ))?;
@@ -1972,17 +2005,9 @@ impl TypeChecker {
                 }, span));
             }
         }
-        let mut arms = Vec::with_capacity(entries.len());
-        for e in entries {
-            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names, resolved_member: e.member_idx };
-            let body_expr = if e.is_error {
-                Expression::return_value(Some(Spanned::from(e.whole_value, span)))
-            } else {
-                e.whole_value
-            };
-            arms.push(MatchArm { pattern, guard: None, body: Box::new(Spanned::from(body_expr, span)) });
-        }
-        Ok(arms)
+        Ok(Self::error_arms(entries, span, |whole| Spanned::from(
+            Expression::return_value(Some(Spanned::from(whole, span))), span,
+        )))
     }
 
     fn lower_try(&mut self, inner: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2001,25 +2026,12 @@ impl TypeChecker {
     /// being an ordinary function (not a dedicated node) means user code
     /// can call it directly too, not just reach it through `!`.
     fn build_unwrap_arms(&mut self, subject_ty: &Type, subject_span: Span, span: Span) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
-        let entries = self.union_entries(subject_ty, subject_span, span)?;
-        if !entries.iter().any(|e| e.is_error) {
-            return Err(Spanned::from(TypeError {
-                msg: "'!' requires a union with at least one Error-providing member".to_string()
-            }, subject_span));
-        }
-        let mut arms = Vec::with_capacity(entries.len());
-        for e in entries {
-            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names, resolved_member: e.member_idx };
-            let body_expr = if e.is_error {
-                let callee = Spanned::from(Expression::literal(Token::Identifier(UNWRAP_PANIC_NAME.to_string())), span);
-                let msg = Spanned::from(Expression::literal(Token::String("unwrapped an error value with '!'".to_string())), span);
-                Expression::call(callee, vec![msg])
-            } else {
-                e.whole_value
-            };
-            arms.push(MatchArm { pattern, guard: None, body: Box::new(Spanned::from(body_expr, span)) });
-        }
-        Ok(arms)
+        let entries = self.error_arm_entries("!", subject_ty, subject_span, span)?;
+        Ok(Self::error_arms(entries, span, |_whole| {
+            let callee = Spanned::from(Expression::literal(Token::Identifier(UNWRAP_PANIC_NAME.to_string())), span);
+            let msg = Spanned::from(Expression::literal(Token::String("unwrapped an error value with '!'".to_string())), span);
+            Spanned::from(Expression::call(callee, vec![msg]), span)
+        }))
     }
 
     fn lower_unwrap(&mut self, inner: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2037,41 +2049,26 @@ impl TypeChecker {
     /// expression is used as a plain fallback value, cloned into every
     /// `Error` arm, ignoring the matched value entirely.
     fn build_catch_arms(&mut self, subject_ty: &Type, subject_span: Span, handler: &Spanned<Expression>, span: Span) -> Result<Vec<MatchArm>, Spanned<TypeError>> {
-        let entries = self.union_entries(subject_ty, subject_span, span)?;
-        if !entries.iter().any(|e| e.is_error) {
-            return Err(Spanned::from(TypeError {
-                msg: "'catch' requires a union with at least one Error-providing member".to_string()
-            }, subject_span));
-        }
+        let entries = self.error_arm_entries("catch", subject_ty, subject_span, span)?;
         let (handler_bind, handler_body): (Option<String>, Spanned<Expression>) = match &handler.item {
             Expression::Function(f) if f.params.len() == 1 => (Some(f.params[0].name.clone()), (*f.body).clone()),
             _ => (None, handler.clone()),
         };
-        let mut arms = Vec::with_capacity(entries.len());
-        for e in entries {
-            let pattern = Pattern { path: None, variant: e.pattern_variant, binds: e.bind_names, resolved_member: e.member_idx };
-            let body = if e.is_error {
-                match &handler_bind {
-                    None => handler_body.clone(),
-                    Some(bind) => {
-                        let assign = Spanned::from(
-                            Expression::assign(
-                                Spanned::from(Expression::literal(Token::Identifier(bind.clone())), span),
-                                None,
-                                Spanned::from(e.whole_value, span),
-                                Some(Mutability::Immutable),
-                            ),
-                            span,
-                        );
-                        Spanned::from(Expression::Block(vec![assign, handler_body.clone()]), span)
-                    }
-                }
-            } else {
-                Spanned::from(e.whole_value, span)
-            };
-            arms.push(MatchArm { pattern, guard: None, body: Box::new(body) });
-        }
-        Ok(arms)
+        Ok(Self::error_arms(entries, span, |whole| match &handler_bind {
+            None => handler_body.clone(),
+            Some(bind) => {
+                let assign = Spanned::from(
+                    Expression::assign(
+                        Spanned::from(Expression::literal(Token::Identifier(bind.clone())), span),
+                        None,
+                        Spanned::from(whole, span),
+                        Some(Mutability::Immutable),
+                    ),
+                    span,
+                );
+                Spanned::from(Expression::Block(vec![assign, handler_body.clone()]), span)
+            }
+        }))
     }
 
     fn lower_catch(&mut self, value: Spanned<Expression>, handler: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -2080,13 +2077,6 @@ impl TypeChecker {
         self.lower_match_lowered(subject, narrow_target, subject_span, arms, None, span)
     }
 
-    /// Register every `data Name(field: Type, ...)` declaration found
-    /// directly in `stmts` into `self.struct_defs`, in three phases so
-    /// declarations can reference each other regardless of source order:
-    /// (1) register every name, so forward references resolve; (2) resolve
-    /// every field list to concrete `Type`s; (3) check the resulting
-    /// field-type graph for direct/transitive self-reference, which would
-    /// make an unboxed struct infinite size.
     /// The `Self` type for a trait's member signatures: one bounded type
     /// variable, bound by the trait itself. Bounding it is not decoration —
     /// it is what makes a default body checkable, since the body may call
@@ -2693,6 +2683,13 @@ impl TypeChecker {
         }
     }
 
+    /// Register every `data Name(field: Type, ...)` declaration found
+    /// directly in `stmts` into `self.struct_defs`, in three phases so
+    /// declarations can reference each other regardless of source order:
+    /// (1) register every name, so forward references resolve; (2) resolve
+    /// every field list to concrete `Type`s; (3) check the resulting
+    /// field-type graph for direct/transitive self-reference, which would
+    /// make an unboxed struct infinite size.
     fn hoist_data_decls(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
         let outer = self.type_param_scope.clone();
         for s in stmts {
@@ -2919,7 +2916,7 @@ impl TypeChecker {
     /// checked against the declared field type, then widened into it (a
     /// union member gets boxed, an `Int` in a `Float` slot gets a `Coerce`
     /// — see `lower_widen`).
-    fn lower_record_args(&mut self, kind_name: &str, field_defs: &[(String, Type)], args: Vec<Spanned<Expression>>, span: Span) -> Result<Vec<(String, Box<Spanned<TypedExpr>>)>, Spanned<TypeError>> {
+    fn lower_record_args(&mut self, kind_name: &str, field_defs: &[(String, Type)], args: Vec<Spanned<Expression>>, span: Span) -> Result<RecordArgs, Spanned<TypeError>> {
         if is_positional_fields(field_defs) && !field_defs.is_empty() {
             return self.lower_positional_record_args(kind_name, field_defs, args, span);
         }
@@ -2985,7 +2982,7 @@ impl TypeChecker {
     /// required is fixed entirely by how `Kind` was declared
     /// (`Grammar::field_list` already rejected a mixed declaration), never
     /// chosen by the call site.
-    fn lower_positional_record_args(&mut self, kind_name: &str, field_defs: &[(String, Type)], args: Vec<Spanned<Expression>>, span: Span) -> Result<Vec<(String, Box<Spanned<TypedExpr>>)>, Spanned<TypeError>> {
+    fn lower_positional_record_args(&mut self, kind_name: &str, field_defs: &[(String, Type)], args: Vec<Spanned<Expression>>, span: Span) -> Result<RecordArgs, Spanned<TypeError>> {
         if args.len() != field_defs.len() {
             return Err(Spanned::from(TypeError {
                 msg: format!("{} takes {} positional argument(s), got {}", kind_name, field_defs.len(), args.len())
@@ -3214,9 +3211,9 @@ impl TypeChecker {
         let resolved = self.lookup(&actual);
         if self.is_subtype(&resolved, expected) {
             Ok(resolved)
-        } else if matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, expected) {
-            Ok(self.lookup(&resolved))
-        } else if self.unify_with_one_union_member(&resolved, expected) {
+        } else if (matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, expected))
+            || self.unify_with_one_union_member(&resolved, expected)
+        {
             Ok(self.lookup(&resolved))
         } else {
             Err(Spanned::from(TypeError {
@@ -3387,7 +3384,7 @@ impl TypeChecker {
             },
             Type::Function { params, result } => Type::Function {
                 params: params.iter().map(|ty| self.lookup(ty)).collect(),
-                result: Box::new(self.lookup(&result)),
+                result: Box::new(self.lookup(result)),
             },
             Type::Named { name, args } => Type::Named {
                 name: name.clone(),
@@ -3547,14 +3544,14 @@ impl TypeChecker {
             // accept (without binding) if the concrete is a member of the union.
             // This handles e.g. the second operand of `(Int|Float) + 2` after the first
             // operand already bound the operator TypeVar to the union.
-            (_, Type::Union(variants)) => variants.iter().any(|v| t1 == *v),
+            (_, Type::Union(variants)) => variants.contains(&t1),
             // Structural unification for functions.
             (Type::Function { params: p1, result: r1 }, Type::Function { params: p2, result: r2 }) => {
                 if p1.len() != p2.len() {
                     return false;
                 }
                 p1.iter().zip(p2.iter()).all(|(l, r)| self.unify(l, r)) &&
-                self.unify(&r1, &r2)
+                self.unify(r1, r2)
             },
             // Structural unification for named type constructors — invariant
             // in every argument position (`TRAITS.md` Part 4, "Variance"):
@@ -4601,7 +4598,7 @@ impl TypeChecker {
     /// types are still binders at that point.
     fn substituted_struct_fields(&self, ty: &Type) -> Option<Vec<(String, Type)>> {
         let Type::Named { name, args } = ty else { return None };
-        if ty.as_struct_name().is_none() { return None }
+        ty.as_struct_name()?;
         if let Some(fields) = self.struct_defs.get(ty) {
             return Some(fields.clone());
         }
@@ -4717,7 +4714,7 @@ impl TypeChecker {
             Expression::Slice(s)             => self.lower_slice(s, span),
             Expression::Range(r)             => self.lower_range(r, span),
             Expression::ForLoop(fl)          => self.lower_for_loop_expr(fl, span),
-            Expression::Comprehension(inner) => self.lower_comprehension(inner, span),
+            Expression::Comprehension(inner) => self.lower_comprehension(*inner, span),
             // Handled entirely by `hoist_data_decls` — never reaches codegen.
             Expression::DataDecl(_) => Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::IntLit(0) }, span)),
             // Likewise handled entirely by `hoist_trait_names`/
@@ -4728,7 +4725,7 @@ impl TypeChecker {
                 "Expression::ImplDecl is replaced by its member declarations in TypeChecker::expand_impls, which runs before any statement is lowered"
             ),
             Expression::FieldAccess(fa)      => self.lower_field_access(fa, span),
-            Expression::Match(m)             => self.lower_match(m.subject, m.arms, m.default, span),
+            Expression::Match(m)             => self.lower_match(*m.subject, m.arms, m.default, span),
             Expression::IsPattern(ip)        => self.lower_is_pattern(ip, span),
             Expression::Import(_) => unreachable!(
                 "Expression::Import must be resolved and stripped by frontend::modules before typeck ever sees it"
@@ -4874,7 +4871,7 @@ impl TypeChecker {
                 guard: None,
                 body: c.true_branch,
             }];
-            return self.lower_match(ip.subject, arms, c.false_branch, span);
+            return self.lower_match(*ip.subject, arms, c.false_branch, span);
         }
 
         let cond = self.check_and_lower(*c.cond)?;
@@ -6026,6 +6023,26 @@ impl TypeChecker {
     /// A `mut`-marked argument's root may not also be any other
     /// argument's root in the same call (`swap(mut a, mut a)`,
     /// `merge(mut xs, xs)`).
+    /// The receiver exemption (`TRAITS.md` Part 2, `MUTABILITY.md`'s
+    /// amendment): a mutating method takes no `mut` marker at the dot call
+    /// site, so the declaration-site guard that marker would otherwise gate
+    /// — "is this root actually a mutable binding" — is applied here to the
+    /// receiver directly.
+    fn check_mut_receiver(&self, root_name: Option<&str>, target_span: Span) -> Result<(), Spanned<TypeError>> {
+        let root = root_name.ok_or_else(|| Spanned::from(TypeError {
+            msg: "the receiver of a mutating method must be a plain mutable binding, not an expression".to_string()
+        }, target_span))?;
+        match self.ctx.is_mutable(root) {
+            None => Err(Spanned::from(TypeError {
+                msg: format!("'{}' is not declared", root)
+            }, target_span)),
+            Some(false) => Err(Spanned::from(TypeError {
+                msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to call a mutating method on it", root, root)
+            }, target_span)),
+            Some(true) => Ok(()),
+        }
+    }
+
     fn check_mut_exclusivity(&self, mut_args: &[bool], all_roots: &[Option<(String, Span)>]) -> Result<(), Spanned<TypeError>> {
         for (i, is_mut) in mut_args.iter().enumerate() {
             if !is_mut { continue; }
@@ -6277,18 +6294,7 @@ impl TypeChecker {
         // at the dot call site, but the root still has to be a mutable
         // binding.
         if mut_first {
-            let root = root_name.clone().ok_or_else(|| Spanned::from(TypeError {
-                msg: "the receiver of a mutating method must be a plain mutable binding, not an expression".to_string()
-            }, target_span))?;
-            match self.ctx.is_mutable(&root) {
-                None => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not declared", root)
-                }, target_span)),
-                Some(false) => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to call a mutating method on it", root, root)
-                }, target_span)),
-                Some(true) => {},
-            }
+            self.check_mut_receiver(root_name.as_deref(), target_span)?;
         }
 
         let fn_ty = Type::Function {
@@ -6523,24 +6529,8 @@ impl TypeChecker {
         let declared_mut = self.func_mut_params.get(&callee).cloned();
         let mut_first = declared_mut.as_ref().and_then(|d| d.first()).copied().unwrap_or(false);
 
-        // Receiver exemption (`TRAITS.md` Part 2, `MUTABILITY.md`'s
-        // amendment): no `mut` marker is written or required at the dot
-        // call site. The declaration-site guard the marker would
-        // otherwise gate — "is this root actually a mutable binding" —
-        // still applies directly to the receiver.
         if mut_first {
-            let root = root_name.clone().ok_or_else(|| Spanned::from(TypeError {
-                msg: "the receiver of a mutating method must be a plain mutable binding, not an expression".to_string()
-            }, target_span))?;
-            match self.ctx.is_mutable(&root) {
-                None => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not declared", root)
-                }, target_span)),
-                Some(false) => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to call a mutating method on it", root, root)
-                }, target_span)),
-                Some(true) => {},
-            }
+            self.check_mut_receiver(root_name.as_deref(), target_span)?;
         }
 
         // No `check_and_lower` round-trip for the callee name: the
@@ -6759,7 +6749,7 @@ impl TypeChecker {
         Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::ForLoop { var, iterable, cond, body } }, span))
     }
 
-    fn lower_comprehension(&mut self, inner: Box<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+    fn lower_comprehension(&mut self, inner: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let fl = match inner.item {
             Expression::ForLoop(fl) => fl,
             _ => unreachable!("Comprehension always wraps a ForLoop — see Grammar::tuple"),
@@ -6977,8 +6967,8 @@ impl TypeChecker {
     /// the arms after it. `subject` is bound to a temporary first (mirrors
     /// `desugar_struct_eq`) so a side-effecting subject expression is only
     /// evaluated once, not once per arm's tag test.
-    fn lower_match(&mut self, subject: Box<Spanned<Expression>>, arms: Vec<MatchArm>, default: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
-        let (subject, narrow_target, subject_span) = self.lower_match_subject(*subject)?;
+    fn lower_match(&mut self, subject: Spanned<Expression>, arms: Vec<MatchArm>, default: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let (subject, narrow_target, subject_span) = self.lower_match_subject(subject)?;
         self.lower_match_lowered(subject, narrow_target, subject_span, arms, default, span)
     }
 
@@ -6993,7 +6983,7 @@ impl TypeChecker {
     /// then lowering it again inside `lower_match`.
     fn lower_match_subject(&mut self, subject: Spanned<Expression>) -> Result<(Spanned<TypedExpr>, Option<String>, Span), Spanned<TypeError>> {
         let narrow_target = subject.item.get_identifier()
-            .filter(|name| self.ctx.contains_key(*name))
+            .filter(|name| self.ctx.contains_key(name))
             .map(|name| name.to_string());
         let subject_span = subject.span;
         let lowered = self.check_and_lower(subject)?;
@@ -7131,104 +7121,117 @@ impl TypeChecker {
                 bindings.push((name.clone(), narrowed_ty, mutable));
             }
 
-            // A guard's binds must be extracted (the `prelude`) *before*
-            // the guard itself runs — they can't be folded into a single
-            // `base_cond and guard` boolean the way a bindless guard could,
-            // since extraction is a statement, not an expression. So a
-            // guarded arm nests one level deeper: the tag test's true
-            // branch runs the prelude, then re-tests the guard, only
-            // falling through to `tail` (cloned — it's the else of both
-            // the tag test and, on guard failure, the inner check too) if
-            // that also fails.
-            // The arm's pattern binds are visible to its guard and body
-            // only. The immediately-invoked closure that used to guarantee
-            // the restore happened even on an early `?` is now `in_scope`'s
-            // job.
-            let (guard, body) = self.with_context_mut(
-                bindings.iter().cloned(),
-                |t| -> Result<_, Spanned<TypeError>> {
-                    let body = t.check_and_lower(*arm.body)?;
-                    let guard = match arm.guard {
-                        Some(g) => {
-                            let guard_span = g.span;
-                            let lowered = t.check_and_lower(*g)?;
-                            t.check_condition(&lowered.item.ty.clone(), guard_span)?;
-                            Some(t.coerce_truthy(lowered, guard_span))
-                        },
-                        None => None,
-                    };
-                    Ok((guard, body))
-                },
-            )?;
-
-            let true_inner = match guard {
-                None => body,
-                Some(g) => {
-                    let true_ty = body.item.ty.clone();
-                    // `tail` is only ever `None` here once every remaining
-                    // arm/default has been folded in already (the loop runs
-                    // right-to-left) — and the exhaustiveness check
-                    // already rejected a
-                    // non-exhaustive match with no default before lowering
-                    // ever starts, so a missing `tail` at this point means
-                    // this guard's failure path is genuinely unreachable,
-                    // not "produces None". `Never` (not `None`) is the
-                    // correct placeholder: it vanishes from the union join
-                    // below instead of forcing every guarded arm's type to
-                    // widen to `T | None`.
-                    let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::Never);
-                    let result_ty = self.join_types(&true_ty, &false_ty);
-                    // Widen each branch to the joined type when it turned
-                    // out to be a union — mirrors the matching fix in
-                    // `check_and_lower`'s own `Conditional` arm; this
-                    // hand-built `Conditional` needs the same treatment.
-                    let body = self.lower_widen(body, &result_ty)?;
-                    let false_branch = match tail.clone() {
-                        Some(t) => Some(Box::new(self.lower_widen(t, &result_ty)?)),
-                        None => None,
-                    };
-                    Spanned::from(
-                        TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
-                            cond: Box::new(g), true_branch: Box::new(body), false_branch,
-                        } },
-                        span,
-                    )
-                }
-            };
-
-            let true_branch = if prelude.is_empty() {
-                true_inner
-            } else {
-                let inner_ty = true_inner.item.ty.clone();
-                let mut stmts = prelude;
-                stmts.push(true_inner);
-                Spanned::from(TypedExpr { id: 0, ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
-            };
-
-            let true_ty = true_branch.item.ty.clone();
-            // See the matching comment above: a missing `tail` here means
-            // this arm's tag-test-false path is unreachable (the match is
-            // already known exhaustive), not that it produces `None`.
-            let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::Never);
-            let result_ty = self.join_types(&true_ty, &false_ty);
-            // See the matching comment in the guard case above.
-            let true_branch = self.lower_widen(true_branch, &result_ty)?;
-            let false_branch = match tail {
-                Some(t) => Some(Box::new(self.lower_widen(t, &result_ty)?)),
-                None => None,
-            };
-
-            tail = Some(Spanned::from(
-                TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
-                    cond: Box::new(base_cond), true_branch: Box::new(true_branch), false_branch,
-                } },
-                span,
-            ));
+            tail = Some(self.fold_match_arm(arm, prelude, bindings, base_cond, tail, span)?);
         }
 
+        Ok(Self::finish_match_chain(subject_assign, tail, span))
+    }
+
+    /// Fold one already-validated match arm into the right-to-left
+    /// `Conditional` chain that both `lower_match_lowered` and
+    /// `lower_anon_match` build. They differ only in how an arm's pattern
+    /// is checked and extracted — `prelude` (the extraction statements),
+    /// `bindings` (the names it introduces) and `base_cond` (its tag test)
+    /// are that difference, already computed; everything after it is shared.
+    ///
+    /// `tail` is everything to this arm's right, already folded.
+    fn fold_match_arm(
+        &mut self,
+        arm: MatchArm,
+        prelude: Vec<Spanned<TypedExpr>>,
+        bindings: Vec<(String, Type, bool)>,
+        base_cond: Spanned<TypedExpr>,
+        tail: Option<Spanned<TypedExpr>>,
+        span: Span,
+    ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // The arm's pattern binds are visible to its guard and body only.
+        // The immediately-invoked closure that used to guarantee the restore
+        // happened even on an early `?` is now `in_scope`'s job.
+        let (guard, body) = self.with_context_mut(
+            bindings.into_iter(),
+            |t| -> Result<_, Spanned<TypeError>> {
+                let body = t.check_and_lower(*arm.body)?;
+                let guard = match arm.guard {
+                    Some(g) => {
+                        let guard_span = g.span;
+                        let lowered = t.check_and_lower(*g)?;
+                        t.check_condition(&lowered.item.ty.clone(), guard_span)?;
+                        Some(t.coerce_truthy(lowered, guard_span))
+                    },
+                    None => None,
+                };
+                Ok((guard, body))
+            },
+        )?;
+
+        // A guard's binds must be extracted (the `prelude`) *before* the
+        // guard itself runs — they can't be folded into a single
+        // `base_cond and guard` boolean the way a bindless guard could,
+        // since extraction is a statement, not an expression. So a guarded
+        // arm nests one level deeper: the tag test's true branch runs the
+        // prelude, then re-tests the guard, only falling through to `tail`
+        // (cloned — it's the else of both the tag test and, on guard
+        // failure, the inner check too) if that also fails.
+        let true_inner = match guard {
+            None => body,
+            Some(g) => self.joined_conditional(g, body, tail.clone(), span)?,
+        };
+
+        let true_branch = if prelude.is_empty() {
+            true_inner
+        } else {
+            let inner_ty = true_inner.item.ty.clone();
+            let mut stmts = prelude;
+            stmts.push(true_inner);
+            Spanned::from(TypedExpr { id: 0, ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
+        };
+
+        self.joined_conditional(base_cond, true_branch, tail, span)
+    }
+
+    /// A `Conditional` typed as the join of its two branches, with each
+    /// branch widened to that join — the treatment `check_and_lower`'s own
+    /// `Conditional` arm applies, which these hand-built ones need too.
+    ///
+    /// A `None` `false_branch` is `Never`-typed, not `None`-typed: the only
+    /// way `fold_match_arm` reaches this with no tail is when every
+    /// remaining arm has already been folded in (the fold runs
+    /// right-to-left) and the match was checked exhaustive before lowering
+    /// began — so that path is genuinely unreachable. `Never` vanishes from
+    /// the join; `None` would widen every guarded arm's type to `T | None`.
+    fn joined_conditional(
+        &mut self,
+        cond: Spanned<TypedExpr>,
+        true_branch: Spanned<TypedExpr>,
+        false_branch: Option<Spanned<TypedExpr>>,
+        span: Span,
+    ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let true_ty = true_branch.item.ty.clone();
+        let false_ty = false_branch.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::Never);
+        let result_ty = self.join_types(&true_ty, &false_ty);
+        let true_branch = self.lower_widen(true_branch, &result_ty)?;
+        let false_branch = match false_branch {
+            Some(t) => Some(Box::new(self.lower_widen(t, &result_ty)?)),
+            None => None,
+        };
+        Ok(Spanned::from(
+            TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
+                cond: Box::new(cond), true_branch: Box::new(true_branch), false_branch,
+            } },
+            span,
+        ))
+    }
+
+    /// The finished match: bind the subject to its temporary, then run the
+    /// folded conditional chain.
+    fn finish_match_chain(
+        subject_assign: Spanned<TypedExpr>,
+        tail: Option<Spanned<TypedExpr>>,
+        span: Span,
+    ) -> Spanned<TypedExpr> {
         let chain = tail.expect("an empty match with no arms and no default was already rejected as non-exhaustive");
         let chain_ty = chain.item.ty.clone();
-        Ok(Spanned::from(TypedExpr { id: 0, ty: chain_ty, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span))
+        Spanned::from(TypedExpr { id: 0, ty: chain_ty, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span)
     }
 
     /// `lower_match_lowered`'s counterpart for an *anonymous* union subject
@@ -7328,81 +7331,10 @@ impl TypeChecker {
                 }
             }
 
-            // The arm's pattern binds are visible to its guard and body
-            // only. The immediately-invoked closure that used to guarantee
-            // the restore happened even on an early `?` is now `in_scope`'s
-            // job.
-            let (guard, body) = self.with_context_mut(
-                bindings.iter().cloned(),
-                |t| -> Result<_, Spanned<TypeError>> {
-                    let body = t.check_and_lower(*arm.body)?;
-                    let guard = match arm.guard {
-                        Some(g) => {
-                            let guard_span = g.span;
-                            let lowered = t.check_and_lower(*g)?;
-                            t.check_condition(&lowered.item.ty.clone(), guard_span)?;
-                            Some(t.coerce_truthy(lowered, guard_span))
-                        },
-                        None => None,
-                    };
-                    Ok((guard, body))
-                },
-            )?;
-
-            let true_inner = match guard {
-                None => body,
-                Some(g) => {
-                    let true_ty = body.item.ty.clone();
-                    let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::Never);
-                    let result_ty = self.join_types(&true_ty, &false_ty);
-                    // Widen each branch to the joined type when it turned
-                    // out to be a union — mirrors the matching fix in
-                    // `check_and_lower`'s own `Conditional` arm; this
-                    // hand-built `Conditional` needs the same treatment.
-                    let body = self.lower_widen(body, &result_ty)?;
-                    let false_branch = match tail.clone() {
-                        Some(t) => Some(Box::new(self.lower_widen(t, &result_ty)?)),
-                        None => None,
-                    };
-                    Spanned::from(
-                        TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
-                            cond: Box::new(g), true_branch: Box::new(body), false_branch,
-                        } },
-                        span,
-                    )
-                }
-            };
-
-            let true_branch = if prelude.is_empty() {
-                true_inner
-            } else {
-                let inner_ty = true_inner.item.ty.clone();
-                let mut stmts = prelude;
-                stmts.push(true_inner);
-                Spanned::from(TypedExpr { id: 0, ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
-            };
-
-            let true_ty = true_branch.item.ty.clone();
-            let false_ty = tail.as_ref().map(|t| t.item.ty.clone()).unwrap_or(Type::Never);
-            let result_ty = self.join_types(&true_ty, &false_ty);
-            // See the matching comment in the guard case above.
-            let true_branch = self.lower_widen(true_branch, &result_ty)?;
-            let false_branch = match tail {
-                Some(t) => Some(Box::new(self.lower_widen(t, &result_ty)?)),
-                None => None,
-            };
-
-            tail = Some(Spanned::from(
-                TypedExpr { id: 0, ty: result_ty, kind: TypedExprKind::Conditional {
-                    cond: Box::new(base_cond), true_branch: Box::new(true_branch), false_branch,
-                } },
-                span,
-            ));
+            tail = Some(self.fold_match_arm(arm, prelude, bindings, base_cond, tail, span)?);
         }
 
-        let chain = tail.expect("an empty match with no arms and no default was already rejected as non-exhaustive");
-        let chain_ty = chain.item.ty.clone();
-        Ok(Spanned::from(TypedExpr { id: 0, ty: chain_ty, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span))
+        Ok(Self::finish_match_chain(subject_assign, tail, span))
     }
 
     /// Desugar `left == right` / `left != right` (both already lowered, same

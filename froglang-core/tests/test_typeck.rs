@@ -72,7 +72,7 @@ fn test_all_literal_types() {
     let mut t = TypeChecker::new();
 
     assert_eq!(t.infer(&int(42)).unwrap(), Type::Int);
-    assert_eq!(t.infer(&float(3.14)).unwrap(), Type::Float);
+    assert_eq!(t.infer(&float(3.25)).unwrap(), Type::Float);
     assert_eq!(t.infer(&string("hello")).unwrap(), Type::Str);
     assert_eq!(t.infer(&spanned(Expression::literal(Token::True))).unwrap(), Type::Bool);
     assert_eq!(t.infer(&spanned(Expression::literal(Token::False))).unwrap(), Type::Bool);

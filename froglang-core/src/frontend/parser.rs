@@ -238,18 +238,12 @@ impl<'a> Parser<'a> {
         loop {
             match self.lexer.next_token() {
                 Ok(t) => {
-                    match t.item {
-                        Token::EOF | Token::Newline | Token::Comma => { 
-                            self.current_token = t;
-                            break; 
-                        },
-                        _ => (),
-                    };
+                    if matches!(t.item, Token::EOF | Token::Newline | Token::Comma) {
+                        self.current_token = t;
+                        break;
+                    }
                 },
-                Err(err) => { 
-                    let new_err = err.map(|e| ParseError::LexError(e));
-                    self.errors.push(new_err);
-                }
+                Err(err) => self.errors.push(err.map(ParseError::LexError)),
             }
         }
     }
@@ -259,20 +253,9 @@ impl<'a> Parser<'a> {
         // *** If this fn encounters a lexer error, it should skip to the next valid *token*
         // but not to the *end of the expression* aka synchronize. do that at higher level!
         let prev = self.current_token.clone();
-        loop {
-            // println!("token: {}", self.current_token);
-            match self.lexer.next_token() {
-                Ok(t) => {
-                    self.current_token = t;
-                    break;
-                },
-                Err(err) => {
-                    // n.b. we do NOT call synchronize here! just log the error and move on
-                    let new_err = err.map(|e| ParseError::LexError(e));
-                    return Err(new_err)
-                }
-            };
-        };
+        // n.b. we do NOT call synchronize here! just report the error and let
+        // the caller decide.
+        self.current_token = self.lexer.next_token().map_err(|e| e.map(ParseError::LexError))?;
         Ok(prev)
     }
 
@@ -291,13 +274,13 @@ impl<'a> Parser<'a> {
         // this is separate from consume so we don't have to construct a dummy String to pass in
         let found = self.advance()?;
         match found.item {
-            Token::Identifier(_) => return Ok(found),
+            Token::Identifier(_) => Ok(found),
             _ => {
                 let err = found.map(|_| ParseError::ExpectedIdentifier);
                 self.errors.push(err.clone());
-                return Err(err);
+                Err(err)
             }
-        };
+        }
     }
  
     #[inline]

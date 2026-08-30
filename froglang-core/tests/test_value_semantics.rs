@@ -1,25 +1,31 @@
-//! Value semantics for `List<T>`, and `push` — MUTABILITY.md stage 6.
+//! Value semantics for `List<T>`, and `push` — MUTABILITY.md stages 6 and 7.
 //!
 //! Distinct from `test_gc_roots.rs`: that file guards against a *missing
 //! root* (a value the collector should have kept alive but didn't). This
-//! file guards against a *missing clone* — an alias becoming observable
-//! because two live bindings ended up sharing one heap object when value
-//! semantics say they must not. Both bug classes can be forced into the
-//! open by `FROG_GC_STRESS=1` (a wrongly-shared buffer that gets mutated
-//! and then collected/recycled corrupts a second binding's contents), so
-//! every behavioral test here runs through both `run` and `run_gc_stress`,
-//! same discipline as `test_gc_roots.rs`.
+//! file guards against an alias becoming observable — two live bindings
+//! sharing one heap object where value semantics say they must not. Both bug
+//! classes can be forced into the open by `FROG_GC_STRESS=1` (a wrongly
+//! shared buffer that gets mutated and then collected/recycled corrupts a
+//! second binding's contents), so every behavioral test here runs through
+//! both `run` and `run_gc_stress`, same discipline as `test_gc_roots.rs`.
 //!
-//! See codegen/mod.rs's `Ctx::liveness` and the `TypedExprKind::Var` arm of
-//! `compile_expr_multi` for the mechanism: a `Copy`-classified read of a
-//! GC-pointer-bearing binding is deep-cloned (`runtime::gc::GcHeap::clone_obj`
-//! / `ffi::frog_clone`) before use; a `Move`-classified read (this is the
-//! name's last use) is not. `push`'s own receiver is always `Move` by
+//! The mechanism is copy-on-write (Stage 7). A `Copy`-classified read of a
+//! `List` binding, and any read of one *out of a container*, marks the
+//! object `shared` (`codegen::mark_shared_if_aliased` /
+//! `mark_shared_extracted`); the two mutations that exist — `push` and index
+//! assignment — copy first if that bit is set (`codegen::emit_unshare`) and
+//! rebind their root to the copy. A `Move`-classified read is the name's
+//! last use, so it marks nothing; `push`'s own receiver is always `Move` by
 //! construction (`liveness.rs`'s `Call`/`mut_args` handling), which is the
 //! elision this whole design exists to deliver.
+//!
+//! Stage 6 deep-copied at the read instead. Stage 7's tests below carry
+//! `run_cow_verify` in addition, because moving the copy to the write
+//! introduces a failure mode the earlier scheme did not have: an aliasing
+//! site that forgets to mark.
 
 mod common;
-use common::{run, run_gc_stress};
+use common::{run, run_cow_verify, run_gc_stress};
 
 /// The canonical case: aliasing a `mut` list and mutating the alias must
 /// not be observable through the original binding. If `mut b = a`'s `Var`
@@ -178,4 +184,146 @@ fn push_with_the_same_root_as_both_arguments_is_rejected() {
         "mut xs = [1, 2, 3]\npush(mut xs, xs)\n1",
         "can't be passed 'mut'",
     );
+}
+
+// ── MUTABILITY.md Stage 7: copy-on-write ─────────────────────────────────────
+//
+// Stage 6 protected an alias by deep-copying it at the *read*. Stage 7 marks
+// it and copies at the *write* instead, which is what made the three
+// extraction cases below affordable to fix at all — under eager copying,
+// closing them meant a clone per element read.
+//
+// These run under `run_cow_verify` as well as `run`/`run_gc_stress`: the
+// failure mode copy-on-write has is a missed `shared` mark, and that check
+// catches it at the barrier rather than waiting for a wrong value to
+// surface. See `common::run_cow_verify`.
+
+/// Reading a list *out of a container* aliases it — the container keeps its
+/// own path to it — so pushing through the extracted binding must not be
+/// visible through the container. Before Stage 7 this printed
+/// `[[1, 2, 9], [3, 4]]`: extraction is not a `Var` read, so nothing cloned.
+#[test]
+fn pushing_through_a_list_extracted_from_a_list_does_not_affect_the_container() {
+    let src = r#"
+mut rows = [[1, 2], [3, 4]]
+mut inner = rows[0]
+push(mut inner, 9)
+print(rows)
+print(inner)
+"#;
+    assert_eq!(run(src), "[[1, 2], [3, 4]]\n[1, 2, 9]\n");
+    assert_eq!(run_gc_stress(src), "[[1, 2], [3, 4]]\n[1, 2, 9]\n");
+    assert_eq!(run_cow_verify(src), "[[1, 2], [3, 4]]\n[1, 2, 9]\n");
+}
+
+/// The same aliasing through a `for`-loop's element binding, which is the
+/// shape `benches/life.frog` is built out of. Before Stage 7 the pushes
+/// landed in the original rows: `[[1, 2, 7], [3, 4, 7]]`.
+#[test]
+fn pushing_through_a_for_loop_element_binding_does_not_affect_the_container() {
+    let src = r#"
+mut rows = [[1, 2], [3, 4]]
+for row in rows do {
+    mut r = row
+    push(mut r, 7)
+}
+print(rows)
+"#;
+    assert_eq!(run(src), "[[1, 2], [3, 4]]\n");
+    assert_eq!(run_gc_stress(src), "[[1, 2], [3, 4]]\n");
+    assert_eq!(run_cow_verify(src), "[[1, 2], [3, 4]]\n");
+}
+
+/// And through a struct field. Before Stage 7 both lines printed
+/// `[1, 2, 3]` — the struct's own field had been mutated.
+#[test]
+fn pushing_through_a_list_extracted_from_a_struct_field_does_not_affect_the_struct() {
+    let src = r#"
+data Box(items: List<Int>)
+let b = Box(items=[1, 2])
+mut got = b.items
+push(mut got, 3)
+print(b.items)
+print(got)
+"#;
+    assert_eq!(run(src), "[1, 2]\n[1, 2, 3]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2]\n[1, 2, 3]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2]\n[1, 2, 3]\n");
+}
+
+/// A list bound to an *immutable* name and then aliased into a `mut` one:
+/// the read of `a` is `Copy` (it is used again by `print`), so `a` is marked
+/// shared and `b`'s push copies. This is the case a "clone only when the
+/// source binding is `mut`" rule would get wrong.
+#[test]
+fn pushing_through_a_mut_alias_of_an_immutable_binding_does_not_affect_it() {
+    let src = r#"
+let a = [1, 2, 3]
+mut b = a
+push(mut b, 4)
+print(a)
+print(b)
+"#;
+    assert_eq!(run(src), "[1, 2, 3]\n[1, 2, 3, 4]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2, 3]\n[1, 2, 3, 4]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2, 3]\n[1, 2, 3, 4]\n");
+}
+
+/// A callee rebinding an immutable parameter to a `mut` local and pushing:
+/// the caller's list must be untouched. The protection is the caller-side
+/// mark (`f(a)` reads `a` as `Copy`, since `a` is read again afterwards),
+/// not anything the callee does.
+#[test]
+fn a_callee_rebinding_a_param_to_a_mut_local_does_not_affect_the_caller() {
+    let src = r#"
+func f(xs: List<Int>): Int = {
+    mut ys = xs
+    push(mut ys, 99)
+    ys.len()
+}
+mut a = [1, 2, 3]
+print(f(a))
+print(a)
+"#;
+    assert_eq!(run(src), "4\n[1, 2, 3]\n");
+    assert_eq!(run_gc_stress(src), "4\n[1, 2, 3]\n");
+    assert_eq!(run_cow_verify(src), "4\n[1, 2, 3]\n");
+}
+
+/// Index assignment is the other mutation the write barrier guards, and it
+/// needs the same treatment as `push` — including rebinding the root to the
+/// copy, without which the write would land on a list nobody reads.
+#[test]
+fn index_assignment_through_an_alias_does_not_affect_the_original() {
+    let src = r#"
+mut a = [1, 2, 3]
+mut b = a
+b[0] = 99
+print(a)
+print(b)
+"#;
+    assert_eq!(run(src), "[1, 2, 3]\n[99, 2, 3]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2, 3]\n[99, 2, 3]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2, 3]\n[99, 2, 3]\n");
+}
+
+/// The elision that makes this worth doing: a list only ever *read* — passed
+/// to a function many times, never mutated — is never copied. This is
+/// `benches/life.frog`'s shape reduced to a checkable size; under Stage 6 it
+/// deep-copied the whole grid on each of the nine calls per cell.
+#[test]
+fn passing_a_nested_list_to_a_function_repeatedly_does_not_copy_it() {
+    let src = r#"
+func at(rows: List<List<Int>>, y: Int, x: Int): Int = rows[y][x]
+let grid = [[1, 2], [3, 4]]
+mut total = 0
+for y in 0..2 do {
+    for x in 0..2 do { total = total + at(grid, y, x) }
+}
+print(total)
+print(grid)
+"#;
+    assert_eq!(run(src), "10\n[[1, 2], [3, 4]]\n");
+    assert_eq!(run_gc_stress(src), "10\n[[1, 2], [3, 4]]\n");
+    assert_eq!(run_cow_verify(src), "10\n[[1, 2], [3, 4]]\n");
 }

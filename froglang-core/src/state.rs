@@ -184,6 +184,12 @@ pub struct FrogState {
     pub entry_sources: Vec<EntrySource>,
 }
 
+impl Default for FrogState {
+    fn default() -> Self {
+        FrogState::builder().build().expect("FrogState::builder().build() with no host functions cannot fail")
+    }
+}
+
 impl FrogState {
     /// Look up which entry a `Codegen::source_map` `FnSourceInfo` came from
     /// — `plans/DATA.md` Stage 3. `None` only if `entry_id` is somehow out
@@ -193,11 +199,9 @@ impl FrogState {
     pub fn entry_source(&self, entry_id: usize) -> Option<&EntrySource> {
         self.entry_sources.get(entry_id)
     }
-}
 
-impl FrogState {
     pub fn new() -> Self {
-        FrogState::builder().build().expect("FrogState::builder().build() with no host functions cannot fail")
+        Self::default()
     }
 
     /// Start building a `FrogState` with host (Rust) functions registered —

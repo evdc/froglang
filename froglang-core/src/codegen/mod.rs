@@ -99,14 +99,20 @@ struct Ctx<'a> {
     mut_params:    Vec<(String, Type)>,
     /// This function/entry's move-vs-copy analysis (`liveness::analyze_body`/
     /// `analyze_entry`), consulted by `compile_expr_multi`'s `TypedExprKind::Var`
-    /// arm: a `Copy`-classified read of a GC-pointer-bearing binding is cloned
-    /// (`frog_clone`) before use, so no two live bindings can ever alias the
-    /// same `List`/union payload — see MUTABILITY.md stage 6 and RUNTIME.md.
-    /// `Move` means this is the name's last use, so the raw pointer is used
-    /// as-is, same as before this existed.
+    /// arm: a `Copy`-classified read of a `List` binding is marked shared
+    /// (`mark_shared_if_aliased`), so a later write through any path to it
+    /// copies first — see MUTABILITY.md Stage 7 and RUNTIME.md. `Move` means
+    /// this is the name's last use, so the value is being transferred rather
+    /// than duplicated and nothing needs marking.
     liveness:      liveness::Liveness,
     /// See `Codegen::host_fns`.
     host_fns:      &'a std::collections::HashSet<String>,
+    /// `FROG_COW_VERIFY` — emit a `frog_cow_verify` call on the write
+    /// barrier's unshared path, checking against the heap that nothing else
+    /// can actually reach the object. Read once per `Codegen`, so an
+    /// ordinary build emits no call at all rather than one that returns
+    /// early.
+    cow_verify:    bool,
 }
 
 /// True iff a slot of this type is a GC-scannable column — a word the
@@ -695,59 +701,65 @@ fn read_var_raw(name: &str, ty: &Type, bcx: &mut FunctionBuilder, vars: &HashMap
     }).collect()
 }
 
-/// MUTABILITY.md stage 6 / RUNTIME.md: clone `vals` (the just-compiled
-/// value of `expr`) if `expr` is itself a `Var` read of **exactly**
-/// `List` (`Type::is_list`) and `Ownership::Copy` (see `Ctx::liveness`) — otherwise
-/// return it unchanged. Called from the `Var` arm of `compile_expr_multi` —
-/// every *non*-transient consumer of a binding's value (a bind, a call
-/// argument, a return, a struct/list/variant literal's field or element, a
-/// `Widen`, a `Block`'s tail, a `Conditional` branch...) reaches it that way
-/// automatically, since they all read the binding through an ordinary
-/// `compile_expr`/`compile_expr_multi` call on a `Var` node.
+/// MUTABILITY.md Stage 7: mark `vals` (the just-compiled value of `expr`) as
+/// aliased if `expr` is a `Var` read of **exactly** `List` (`Type::is_list`)
+/// and `Ownership::Copy` (see `Ctx::liveness`). Called from the `Var` arm of
+/// `compile_expr_multi` — every *non*-transient consumer of a binding's value
+/// (a bind, a call argument, a return, a struct/list/variant literal's field
+/// or element, a `Widen`, a `Block`'s tail, a `Conditional` branch...)
+/// reaches it that way automatically, since they all read the binding through
+/// an ordinary `compile_expr`/`compile_expr_multi` call on a `Var` node.
 ///
-/// **Why exactly `List`, not "any GC-pointer-bearing type"**: cloning exists
-/// to protect against a mutation becoming visible through an alias, and
+/// **Why `Ownership::Copy` is exactly the right trigger.** `Copy` means the
+/// source name is still live after this read — which is precisely "a second
+/// path to this object now exists", the condition the `shared` flag records.
+/// `Move` means this read was the name's last, so the value is being
+/// transferred rather than duplicated and nothing needs marking; that is
+/// tier 2 of MUTABILITY.md §4, and it is what keeps `push` in a loop
+/// allocation-free (`liveness.rs`'s `Call` arm classifies a `mut` argument's
+/// root as `Move` unconditionally).
+///
+/// Stage 6 did a deep `frog_clone` here instead. That was correct but paid
+/// O(n) on every aliasing read whether or not anything ever wrote — 78% of
+/// `benches/life.frog`, which passes a `List<List<Int>>` to a function nine
+/// times per cell and never mutates it. The copy now happens at the write
+/// instead (`emit_unshare`), so an alias costs one byte store.
+///
+/// **Why exactly `List`, not "any GC-pointer-bearing type"**: this exists to
+/// protect against a mutation becoming visible through an alias, and
 /// `push`/index-assignment are the only mutations that exist — both require
 /// a *bare* `mut`-rooted `List` binding (`is_push`/`flatten_place`'s root
 /// check in typeck.rs), never a struct field or a union payload. A struct or
 /// union value can only ever be *rebound* (a new value replacing the whole
 /// thing), never mutated in place, so aliasing one is unobservable no matter
-/// how many bindings share it — cloning it would be a pure-waste `frog_clone`
-/// call. This was tried the broader way (`is_heap_ty` on every flattened
-/// leaf) and reverted: `Int | Bad`-style unions (a `Str`-bearing member)
-/// aren't mutable either, but the broad check cloned them on every `Copy`
-/// read anyway, nearly doubling `benches/pipeline.rs`'s `fallible` workload
-/// for a call that only ever hit `GcHeap::clone_obj`'s `Str` no-op branch.
+/// how many bindings share it.
 ///
 /// A non-`Var` expression (a literal, a call result, an `if`-merge, ...) is
 /// always freshly produced and never needs this — nothing else can alias a
 /// value that was just computed. Nor does a struct/union/`Str`-typed `Var`
 /// read, for the reason above.
 #[inline]
-fn clone_if_owned(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Vec<Value> {
+fn mark_shared_if_aliased(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Vec<Value> {
     let TypedExprKind::Var(_) = &expr.item.kind else { return vals };
     if !expr.item.ty.is_list() { return vals; }
     if ctx.liveness.ownership(expr.item.id) != liveness::Ownership::Copy { return vals; }
 
     debug_assert_eq!(vals.len(), 1, "a List value is always exactly one leaf");
-    let clone_id = ctx.func_ids["frog_clone"];
-    let callee = ctx.module.declare_func_in_func(clone_id, bcx.func);
-    let call   = bcx.ins().call(callee, &[vals[0]]);
-    let result = bcx.inst_results(call)[0];
-    declare_gc_ptr(bcx, result);
-    vec![result]
+    emit_mark_shared(bcx, vals[0]);
+    vals
 }
 
 /// Compile `expr` for a *transient* consumer: one that reads a pointer only
 /// to address through it (a list index, a struct/union field, a loop's
 /// `iterable`) and stores nothing new, so it must never trigger
-/// `clone_if_owned`'s cloning — that logic assumes the value is being
+/// `mark_shared_if_aliased` — that logic assumes the value is being
 /// duplicated into a new persistent home, which is false here by
-/// construction. Skipping this distinction and cloning at every `Var`
-/// occurrence unconditionally was tried and reverted: a scattered read
-/// inside a loop (`xs[j]` for many `j`) is `Copy`-classified on nearly every
-/// occurrence (the name is used again next iteration, by the next `j`), so
-/// it turned an O(n) read pass into an O(n^2) clone storm.
+/// construction, and marking it would make every later write to the list
+/// copy for nothing. Under Stage 6's eager cloning this distinction was
+/// load-bearing rather than merely tidy: a scattered read inside a loop
+/// (`xs[j]` for many `j`) is `Copy`-classified on nearly every occurrence
+/// (the name is used again next iteration, by the next `j`), so cloning at
+/// every `Var` occurrence turned an O(n) read pass into an O(n^2) storm.
 ///
 /// Bypasses cloning only when `expr` is directly a `Var` node — a
 /// `FieldAccess`/`Index` nested inside a transient target (which can't
@@ -805,6 +817,114 @@ fn list_stride(bcx: &mut FunctionBuilder, list: Value) -> Value {
     bcx.ins().select(is_zero, one, s)
 }
 
+/// Whether `FROG_COW_VERIFY` asked for the write barrier's unshared path to
+/// be checked against the heap — see `ffi::frog_cow_verify`. Read per
+/// `Codegen`, not per barrier.
+fn cow_verify_enabled() -> bool {
+    std::env::var_os("FROG_COW_VERIFY").is_some()
+}
+
+/// Byte offset of the copy-on-write `shared` flag within any GC object.
+/// Every one begins with a `GcHeader` at offset 0 (`#[repr(C)]`), so this is
+/// the same for `FrogList`, `FrogStr` and `FrogVariant`.
+fn shared_flag_offset() -> i32 {
+    (offset_of!(FrogList, header) + offset_of!(gc::GcHeader, shared)) as i32
+}
+
+/// Mark `val` as reachable by more than one live path, so a later write
+/// through any of them copies first — MUTABILITY.md Stage 7's aliasing half.
+/// One byte store, unconditionally: the flag is monotone, so re-marking an
+/// already-shared object is a no-op and testing first would only add a
+/// branch.
+///
+/// `val` must be a plain (untagged, non-null) heap pointer. Every caller
+/// holds a value of exactly `Type::List`, which is never tagged (only a
+/// union's word carries tag bits) and never null (`alloc_list` always
+/// returns an object, even for `[]`).
+fn emit_mark_shared(bcx: &mut FunctionBuilder, val: Value) {
+    let one = bcx.ins().iconst(types::I8, 1);
+    bcx.ins().store(heap_mem(), one, val, shared_flag_offset());
+}
+
+/// MUTABILITY.md Stage 7: mark every `List`-typed leaf of a value that was
+/// just read *out of a container* — a list element, a struct or variant
+/// field, a `for`-loop's element binding.
+///
+/// Unlike `mark_shared_if_aliased` there is no liveness test to make: the
+/// container keeps its own path to that list whatever happens to the name
+/// being bound, so the extracted value is aliased by construction.
+///
+/// This is what closes the gap Stage 6 recorded and deferred. Extraction is
+/// not a `Var` read, so it never cloned, and `mut inner = rows[0]` followed
+/// by `push(mut inner, ...)` mutated `rows` — a real value-semantics
+/// violation, along with the same shape through a `for`-loop binding and
+/// through a struct field. Closing it under eager cloning would have meant a
+/// deep copy per element read, which is exactly the O(n^2) storm
+/// `compile_expr_multi_transient` exists to avoid; under copy-on-write it is
+/// a byte store, which is the whole reason this is affordable now.
+fn mark_shared_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: &[Value], structs: &StructDefs) {
+    for (v, (_, lty)) in vals.iter().zip(struct_fields(ty, structs).iter()) {
+        if lty.is_list() {
+            emit_mark_shared(bcx, *v);
+        }
+    }
+}
+
+/// The write barrier: yield a pointer to a version of `val` that no other
+/// live path can observe, copying it first if it is shared. Returns the
+/// pointer the write must go through — which the caller **must** store back
+/// into the root's `Variable`, or the mutation lands on a copy nobody reads.
+///
+/// This is the whole cost of copy-on-write at a mutation site: a load, a
+/// test, and a well-predicted branch. It is also self-extinguishing —
+/// `frog_clone` produces a fresh, unshared object, so a loop that pushes
+/// repeatedly pays at most one copy on its first iteration.
+fn emit_unshare(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) -> Value {
+    let shared = bcx.ins().load(types::I8, heap_mem(), val, shared_flag_offset());
+
+    let copy_bb = bcx.create_block();
+    let keep_bb = bcx.create_block();
+    let done_bb = bcx.create_block();
+    bcx.append_block_param(done_bb, types::I64);
+    bcx.ins().brif(shared, copy_bb, &[], keep_bb, &[]);
+
+    // The unshared path: this write is about to land in place. Under
+    // `FROG_COW_VERIFY` that claim is checked against the heap first.
+    bcx.switch_to_block(keep_bb);
+    bcx.seal_block(keep_bb);
+    if ctx.cow_verify {
+        let verify_id = ctx.func_ids["frog_cow_verify"];
+        let callee = ctx.module.declare_func_in_func(verify_id, bcx.func);
+        bcx.ins().call(callee, &[val]);
+    }
+    bcx.ins().jump(done_bb, &[BlockArg::from(val)]);
+
+    bcx.switch_to_block(copy_bb);
+    bcx.seal_block(copy_bb);
+    let clone_id = ctx.func_ids["frog_clone"];
+    let callee = ctx.module.declare_func_in_func(clone_id, bcx.func);
+    let call = bcx.ins().call(callee, &[val]);
+    let cloned = bcx.inst_results(call)[0];
+    declare_gc_ptr(bcx, cloned);
+    bcx.ins().jump(done_bb, &[BlockArg::from(cloned)]);
+
+    bcx.switch_to_block(done_bb);
+    bcx.seal_block(done_bb);
+    let out = bcx.block_params(done_bb)[0];
+    declare_gc_ptr(bcx, out);
+    out
+}
+
+/// What a `for` loop does with each body value: discard it (a statement
+/// loop) or collect it into a fresh list (a comprehension). `Collect`
+/// carries the element layout the result list must be allocated with;
+/// `compile_for_loop` does that allocation itself, once it knows how long
+/// the iterable is.
+enum LoopOutput {
+    Discard,
+    Collect { stride: i64, ptr_mask: i64 },
+}
+
 /// Byte offset of payload slot `slot` within a `FrogVariant`.
 fn variant_slot_offset(slot: usize) -> i32 {
     (size_of::<FrogVariant>() + slot * 8) as i32
@@ -827,19 +947,36 @@ fn variant_slot_offset(slot: usize) -> i32 {
 fn push_element(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, vals: &[Value], leafs: &[(String, Type)]) {
     if leafs.is_empty() {
         let zero = bcx.ins().iconst(types::I64, 0);
-        emit_list_push(bcx, ctx, list, zero);
+        emit_list_push(bcx, ctx, list, &[zero]);
         return;
     }
-    for (v, (_, lty)) in vals.iter().zip(leafs.iter()) {
-        let wire = to_i64_repr(bcx, lty, *v);
-        emit_list_push(bcx, ctx, list, wire);
-    }
+    let wires: Vec<Value> = vals.iter().zip(leafs.iter())
+        .map(|(v, (_, lty))| to_i64_repr(bcx, lty, *v))
+        .collect();
+    emit_list_push(bcx, ctx, list, &wires);
 }
 
-fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, val: Value) {
+/// Append `vals` — one whole element's worth of slots — to `list`.
+///
+/// The capacity test, the `data` reload and the length store are done once
+/// for the element rather than once per slot: for a struct element every
+/// slot is contiguous and the whole group either fits or doesn't, so the
+/// per-slot versions were re-deriving the same address base and re-storing
+/// the same length `stride` times over. `benches/orders.frog` pushes a
+/// 4-leaf `Item`, so that was four bounds checks and four length stores per
+/// element where one of each will do.
+fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, vals: &[Value]) {
+    let n = vals.len() as i64;
     let len = bcx.ins().load(types::I32, heap_mem(), list, offset_of!(FrogList, len) as i32);
     let cap = bcx.ins().load(types::I32, heap_mem(), list, offset_of!(FrogList, cap) as i32);
-    let has_room = bcx.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+    // Widened to I64 before the arithmetic: `len + n` in I32 would wrap for
+    // a list near `u32::MAX` slots and wrongly report room. (`frog_list_push`
+    // aborts before a list can actually get there, so this is belt-and-braces
+    // — but the check is what that abort relies on being reachable.)
+    let len64 = bcx.ins().uextend(types::I64, len);
+    let cap64 = bcx.ins().uextend(types::I64, cap);
+    let need = bcx.ins().iadd_imm_s(len64, n);
+    let has_room = bcx.ins().icmp(IntCC::UnsignedLessThanOrEqual, need, cap64);
 
     let fast_bb = bcx.create_block();
     let slow_bb = bcx.create_block();
@@ -848,18 +985,24 @@ fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, val: Va
 
     bcx.switch_to_block(fast_bb);
     bcx.seal_block(fast_bb);
-    let len64 = bcx.ins().uextend(types::I64, len);
-    let addr = list_slot_addr(bcx, list, len64);
-    bcx.ins().store(heap_mem(), val, addr, 0);
-    let next_len = bcx.ins().iadd_imm_s(len, 1);
+    let base = list_slot_addr(bcx, list, len64);
+    for (k, v) in vals.iter().enumerate() {
+        bcx.ins().store(heap_mem(), *v, base, (k * 8) as i32);
+    }
+    let next_len = bcx.ins().ireduce(types::I32, need);
     bcx.ins().store(heap_mem(), next_len, list, offset_of!(FrogList, len) as i32);
     bcx.ins().jump(done_bb, &[]);
 
+    // Not enough room for the whole element. `frog_list_push` grows the
+    // buffer a slot at a time, so hand it every slot — the ones that did
+    // fit take its own fast path.
     bcx.switch_to_block(slow_bb);
     bcx.seal_block(slow_bb);
     let push_id = ctx.func_ids["frog_list_push"];
     let push_ref = ctx.module.declare_func_in_func(push_id, bcx.func);
-    bcx.ins().call(push_ref, &[list, val]);
+    for v in vals {
+        bcx.ins().call(push_ref, &[list, *v]);
+    }
     bcx.ins().jump(done_bb, &[]);
 
     bcx.switch_to_block(done_bb);
@@ -1112,20 +1255,71 @@ fn declare_rt(
 ///
 /// Emitting this leaves the builder positioned in a fresh "ok" block, so the
 /// caller's following `sdiv` lands after the guard.
+/// The constant `v` holds, if it is one — used to specialize guards on a
+/// literal operand. Reads the IR back rather than threading constant-ness
+/// down from the typed AST, so it sees every constant reaching this point
+/// however it got here.
+fn const_i64(bcx: &FunctionBuilder, v: Value) -> Option<i64> {
+    use cranelift_codegen::ir::{instructions::InstructionData, Opcode, ValueDef};
+    match bcx.func.dfg.value_def(v) {
+        ValueDef::Result(inst, _) => match bcx.func.dfg.insts[inst] {
+            InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => Some(imm.bits()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn emit_int_div_guard(bcx: &mut FunctionBuilder, ctx: &mut Ctx, lv: Value, rv: Value) {
+    // A literal divisor decides both fault conditions at compile time.
+    // `x / 100` is common in ordinary code (`benches/orders.frog`'s `apply`
+    // is a percentage calculation in the hot loop), and emitting five
+    // instructions, a branch and two blocks to re-establish that 100 is
+    // neither 0 nor -1 is pure overhead.
+    match const_i64(bcx, rv) {
+        // Divides by a constant that can never fault: no guard at all.
+        Some(c) if c != 0 && c != -1 => return,
+        // `x / -1` faults only for `Int::MIN`, so only that test is left.
+        Some(-1) => {
+            let is_min = bcx.ins().icmp_imm_s(IntCC::Equal, lv, i64::MIN);
+            emit_div_fault_branch(bcx, ctx, is_min, false);
+            return;
+        }
+        // `x / 0` always faults. Keep the call, drop the test around it.
+        Some(_) => {
+            let always = bcx.ins().iconst(types::I8, 1);
+            emit_div_fault_branch(bcx, ctx, always, true);
+            return;
+        }
+        None => {}
+    }
+
     let is_zero = bcx.ins().icmp_imm_s(IntCC::Equal, rv, 0);
     let is_neg1 = bcx.ins().icmp_imm_s(IntCC::Equal, rv, -1);
     let is_min  = bcx.ins().icmp_imm_s(IntCC::Equal, lv, i64::MIN);
     let is_ovf  = bcx.ins().band(is_neg1, is_min);
     let is_bad  = bcx.ins().bor(is_zero, is_ovf);
+    emit_div_fault_branch(bcx, ctx, is_bad, is_zero);
+}
 
+/// Branch to `frog_div_error` when `is_bad` holds, and carry on otherwise.
+/// `is_zero` is the flag that call takes: which of the two faults this is.
+fn emit_div_fault_branch(
+    bcx: &mut FunctionBuilder,
+    ctx: &mut Ctx,
+    is_bad: Value,
+    is_zero: impl Into<DivFaultKind>,
+) {
     let fault_bb = bcx.create_block();
     let ok_bb    = bcx.create_block();
     bcx.ins().brif(is_bad, fault_bb, &[], ok_bb, &[]);
 
     bcx.switch_to_block(fault_bb);
     bcx.seal_block(fault_bb);
-    let flag = bcx.ins().uextend(types::I64, is_zero);
+    let flag = match is_zero.into() {
+        DivFaultKind::Dynamic(v) => bcx.ins().uextend(types::I64, v),
+        DivFaultKind::Known(b) => bcx.ins().iconst(types::I64, b as i64),
+    };
     let id = ctx.func_ids["frog_div_error"];
     let callee = ctx.module.declare_func_in_func(id, bcx.func);
     bcx.ins().call(callee, &[flag]);
@@ -1137,6 +1331,12 @@ fn emit_int_div_guard(bcx: &mut FunctionBuilder, ctx: &mut Ctx, lv: Value, rv: V
     bcx.switch_to_block(ok_bb);
     bcx.seal_block(ok_bb);
 }
+
+/// Which integer-division fault a guard reports: computed at runtime, or
+/// already decided because the divisor was a literal.
+enum DivFaultKind { Dynamic(Value), Known(bool) }
+impl From<Value> for DivFaultKind { fn from(v: Value) -> Self { DivFaultKind::Dynamic(v) } }
+impl From<bool> for DivFaultKind { fn from(b: bool) -> Self { DivFaultKind::Known(b) } }
 
 /// Emit a non-GC string fragment used while formatting composite values.
 fn print_fragment(text: &str, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
@@ -1471,7 +1671,7 @@ fn emit_union_tag_test(
     } else {
         // Anonymous boxed unions only ever have `None` as an immediate
         // member — see `TypedExprKind::Widen`.
-        let any_immediate = members.iter().any(|m| *m == Type::None);
+        let any_immediate = members.contains(&Type::None);
         emit_tag_test(bcx, vals[0], *member_ty == Type::None, any_immediate, tag)
     }
 }
@@ -1820,6 +2020,12 @@ fn compile_place_assign(
             let list_ty = Type::list(elem_ty.clone());
             let list_var = get_or_declare_var(bcx, vars, &list_key, &list_ty);
             let list_val = bcx.use_var(list_var);
+            // Copy-on-write barrier (MUTABILITY.md Stage 7): this is one of
+            // the language's only two in-place mutations, and it is about to
+            // write through `root`. If anything else can still see this list,
+            // write to a private copy and rebind `root` to it.
+            let list_val = emit_unshare(bcx, ctx, list_val);
+            bcx.def_var(list_var, list_val);
             let idx_val = compile_expr(idx_expr, bcx, vars, ctx);
 
             let (base_offset, _) = if suffix.is_empty() {
@@ -1871,26 +2077,29 @@ fn compile_expr_multi(
             vec![result]
         },
 
-        // MUTABILITY.md stage 6 / RUNTIME.md: this is the shared funnel for
+        // MUTABILITY.md Stage 7 / RUNTIME.md: this is the shared funnel for
         // every read of a binding — a bind, a call argument, a return, a
         // struct/list-literal field, a `Widen`, a `Block`'s tail, a
         // `Conditional` branch flowing to its merge — any of which can
         // duplicate this binding's value into a new persistent home, so
-        // `clone_if_owned` (see its own doc comment) clones a
-        // `Copy`-classified GC-pointer leaf by default. The exceptions are
-        // the handful of *transient* consumers — `Index`/`Slice`/
-        // `FieldAccess`/`IsVariant`/`VariantField`'s target, a loop's
-        // `iterable` — which read a pointer only to address through it and
-        // store nothing; those call `compile_expr_transient`/
-        // `compile_expr_multi_transient` instead, which bypasses this arm's
-        // cloning via `read_var_raw` directly. Skipping that distinction
-        // was tried and reverted: a scattered read inside a loop (`xs[j]`
-        // for many `j`) is `Copy`-classified on nearly every occurrence
-        // (the name is used again next iteration), so cloning indiscriminately
-        // here turned an O(n) read pass into an O(n^2) clone storm.
+        // `mark_shared_if_aliased` (see its own doc comment) flags a
+        // `Copy`-classified `List` leaf as aliased, making a later write
+        // through any path to it copy first. The exceptions are the handful
+        // of *transient* consumers — `Index`/`Slice`/`FieldAccess`/
+        // `IsVariant`/`VariantField`'s target, a loop's `iterable` — which
+        // read a pointer only to address through it and store nothing;
+        // those call `compile_expr_transient`/`compile_expr_multi_transient`
+        // instead, which bypasses this arm via `read_var_raw` directly.
+        //
+        // That distinction mattered enormously when this arm cloned eagerly
+        // (a scattered `xs[j]` read is `Copy`-classified on nearly every
+        // occurrence, so cloning here turned an O(n) read pass into an
+        // O(n^2) clone storm) and is merely tidy now that it only sets a
+        // byte — but it stays, because marking a transiently-read list as
+        // shared would make every later write to it copy for no reason.
         TypedExprKind::Var(name) => {
             let raw = read_var_raw(name, &expr.item.ty, bcx, vars, ctx.structs);
-            clone_if_owned(expr, raw, bcx, ctx)
+            mark_shared_if_aliased(expr, raw, bcx, ctx)
         },
 
         TypedExprKind::Unary { op, expr: inner } => {
@@ -1939,6 +2148,7 @@ fn compile_expr_multi(
             // (`is_heap_ty`), so `root_flat_leaves` needs nothing else.
             let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
             declare_gc_leaves(bcx, &results, &leaf_tys);
+            mark_shared_extracted(bcx, &expr.item.ty, &results, ctx.structs);
             results
         },
 
@@ -2006,29 +2216,18 @@ fn compile_expr_multi(
         TypedExprKind::List(elems) => compile_list_lit(&expr.item.ty, elems, bcx, vars, ctx),
 
         TypedExprKind::ForLoop { var, iterable, cond, body } => {
-            compile_for_loop(var, iterable, cond, body, None, bcx, vars, ctx);
+            compile_for_loop(var, iterable, cond, body, LoopOutput::Discard, bcx, vars, ctx);
             vec![bcx.ins().iconst(types::I64, 0)]
         },
 
         TypedExprKind::Comprehension { var, iterable, cond, body } => {
             let leafs = struct_fields(&body.item.ty, ctx.structs);
-            let ptr_mask = gc_mask(leafs.iter().map(|(_, t)| t));
-            let stride = (leafs.len().max(1)) as i64;
-
-            let cap_val    = bcx.ins().iconst(types::I64, 1);
-            let stride_val = bcx.ins().iconst(types::I64, stride);
-            let mask_val   = bcx.ins().iconst(types::I64, ptr_mask);
-
-            let alloc_id = ctx.func_ids["frog_alloc_list"];
-            let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
-            let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, stride_val, mask_val]);
-            let result_list = bcx.inst_results(alloc_call)[0];
-            // Root the result list before the loop runs at all: it must
-            // already be reachable by the time the first pushed element
-            // (or the iterable itself) can trigger a collection.
-            declare_gc_ptr(bcx, result_list);
-
-            compile_for_loop(var, iterable, cond, body, Some(result_list), bcx, vars, ctx);
+            let collect = LoopOutput::Collect {
+                ptr_mask: gc_mask(leafs.iter().map(|(_, t)| t)),
+                stride: leafs.len().max(1) as i64,
+            };
+            let result_list = compile_for_loop(var, iterable, cond, body, collect, bcx, vars, ctx)
+                .expect("LoopOutput::Collect always yields a list");
             vec![result_list]
         },
 
@@ -2059,7 +2258,9 @@ fn compile_expr_multi(
                             // needs none.
                             let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
                             let leaves = unpack_union_member(&members, &members[0], &slots, bcx, ctx.structs);
-                            return leaves[offset..offset + leaf_types.len()].to_vec();
+                            let out = leaves[offset..offset + leaf_types.len()].to_vec();
+                            mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+                            return out;
                         }
                     }
                     // A common field of a boxed union, read out of heap
@@ -2068,12 +2269,16 @@ fn compile_expr_multi(
                     // heap-typed slot roots itself (see
                     // `for_each_heap_producer`'s matching arm).
                     let ptr = compile_expr_transient(target, bcx, vars, ctx);
-                    read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
+                    let out = read_variant_slots(ptr, offset, &leaf_types, bcx, ctx);
+                    mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+                    out
                 },
                 None => {
                     let target_vals = compile_expr_multi_transient(target, bcx, vars, ctx);
                     let (start, len) = field_slice_range(&target.item.ty, field, ctx.structs);
-                    target_vals[start..start + len].to_vec()
+                    let out = target_vals[start..start + len].to_vec();
+                    mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+                    out
                 },
             }
         },
@@ -2108,11 +2313,15 @@ fn compile_expr_multi(
                     let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
                     let member_ty = Type::strukt(format!("{}.{}", enum_name, variant));
                     let leaves = unpack_union_member(&members, &member_ty, &slots, bcx, ctx.structs);
-                    return leaves[offset..offset + leaf_types.len()].to_vec();
+                    let out = leaves[offset..offset + leaf_types.len()].to_vec();
+                    mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+                    return out;
                 }
             }
             let ptr = compile_expr_transient(target, bcx, vars, ctx);
-            read_variant_slots(ptr, offset, &leaf_types, bcx, ctx)
+            let out = read_variant_slots(ptr, offset, &leaf_types, bcx, ctx);
+            mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+            out
         },
 
         TypedExprKind::Return(value) => compile_return(value, bcx, vars, ctx),
@@ -2136,7 +2345,7 @@ fn compile_expr_multi(
             } else {
                 let val = compile_expr(target, bcx, vars, ctx);
                 let target_is_immediate = members.get(*tag as usize) == Some(&Type::None);
-                let any_immediate = members.iter().any(|m| *m == Type::None);
+                let any_immediate = members.contains(&Type::None);
                 vec![emit_tag_test(bcx, val, target_is_immediate, any_immediate, *tag)]
             }
         },
@@ -2598,14 +2807,26 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         let xs_arg = &args[0];
         let v_arg  = &args[1];
         let list_val = compile_expr(xs_arg, bcx, vars, ctx);
+        // Copy-on-write barrier (MUTABILITY.md Stage 7). `push` is one of
+        // the language's only two in-place mutations, and typeck's `is_push`
+        // guarantees the receiver is a bare `mut` binding — so the root's
+        // `Variable` is in scope here and can be rebound to a private copy
+        // when anything else can still observe the list.
+        //
+        // `frog_list_push`'s reallocation never moves the `FrogList` object
+        // itself, so this rebind — not that — is the only reason `xs`'s
+        // `Variable` needs writing back at all.
+        let list_val = emit_unshare(bcx, ctx, list_val);
+        let TypedExprKind::Var(root) = &xs_arg.item.kind else {
+            unreachable!("typeck's `is_push` only admits a bare mut binding as push's receiver")
+        };
+        let root_var = *vars.get(&var_key(root, ""))
+            .unwrap_or_else(|| panic!("push receiver '{}' is unbound in codegen", root));
+        bcx.def_var(root_var, list_val);
         let leafs = struct_fields(&v_arg.item.ty, ctx.structs);
         let vvals = compile_expr_multi(v_arg, bcx, vars, ctx);
         // See `compile_list_lit`'s identical push via `push_element`.
         push_element(bcx, ctx, list_val, &vvals, &leafs);
-        // No write-back into `xs`'s `Variable`: `emit_list_push`/
-        // `frog_list_push` may reallocate the `FrogList`'s internal `data`
-        // buffer, but never the `FrogList` object itself — the pointer
-        // `list_val` names stays valid and unchanged either way.
         return vec![bcx.ins().iconst(types::I64, 0)];
     }
 
@@ -3135,11 +3356,11 @@ fn compile_for_loop(
     iterable: &Spanned<TypedExpr>,
     cond: &Option<Box<Spanned<TypedExpr>>>,
     body: &Spanned<TypedExpr>,
-    result_list: Option<Value>,
+    output: LoopOutput,
     bcx: &mut FunctionBuilder,
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
-) {
+) -> Option<Value> {
     // Read-through, not a duplication: the loop walks this pointer directly
     // by index and never stores it into a new binding. See
     // `compile_expr_transient`.
@@ -3153,6 +3374,39 @@ fn compile_for_loop(
     let len_call = bcx.ins().call(len_callee, &[list_val]);
     let len_val = bcx.inst_results(len_call)[0];
     let stride_val = list_stride(bcx, list_val);
+
+    // A comprehension's result list is allocated here rather than at the
+    // `Comprehension` arm, so it can be sized from the iterable's length —
+    // which is only known once `frog_list_len` has run.
+    //
+    // The loop pushes at most one element per iteration, so `len_val` is an
+    // exact capacity when there is no filter and an upper bound when there
+    // is. Starting at 1 and doubling instead (which is what this did) meant
+    // a `realloc` plus a full `memmove` of the buffer at every power of two
+    // — `log2(n)` of them per comprehension, and that copying dominated
+    // `benches/orders.frog`, whose inner loop rebuilds a ~1300-element list
+    // 2000 times.
+    //
+    // Over-allocating on a selective filter is bounded by the iterable's
+    // own element count, so the transient waste is never worse than a
+    // second copy of a list the program already has materialized — a range
+    // iterable included, since `frog_range` builds a real list too.
+    let result_list = match output {
+        LoopOutput::Discard => None,
+        LoopOutput::Collect { stride, ptr_mask } => {
+            let stride_arg = bcx.ins().iconst(types::I64, stride);
+            let mask_arg   = bcx.ins().iconst(types::I64, ptr_mask);
+            let alloc_id = ctx.func_ids["frog_alloc_list"];
+            let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+            let alloc_call = bcx.ins().call(alloc_ref, &[len_val, stride_arg, mask_arg]);
+            let list = bcx.inst_results(alloc_call)[0];
+            // Root the result list before the loop runs at all: it must
+            // already be reachable by the time the first pushed element
+            // (or the iterable itself) can trigger a collection.
+            declare_gc_ptr(bcx, list);
+            Some(list)
+        }
+    };
 
     let header_bb = bcx.create_block();
     let body_bb   = bcx.create_block();
@@ -3182,12 +3436,18 @@ fn compile_for_loop(
     // through `frog_list_get` for negative-index and range handling — the
     // read needs no bounds check, just the slot arithmetic `frog_list_get`
     // would have done: `i * stride + leaf_idx`.
+    //
+    // One address computation for the whole element rather than one per
+    // leaf: an element's slots are contiguous, and nothing between these
+    // loads can reallocate the buffer (they all happen before the body
+    // runs), so `data` is loaded once and each leaf is a constant offset
+    // off it. `list_slot_addr` would reload `data` and redo the index
+    // arithmetic per leaf — four times over for a 4-leaf `Item`.
     let base_slot = bcx.ins().imul(i, stride_val);
+    let base_addr = list_slot_addr(bcx, list_val, base_slot);
     let mut elem_vals = Vec::with_capacity(elem_leafs.len());
     for (leaf_idx, (_, lty)) in elem_leafs.iter().enumerate() {
-        let slot = bcx.ins().iadd_imm_s(base_slot, leaf_idx as i64);
-        let addr = list_slot_addr(bcx, list_val, slot);
-        let raw = bcx.ins().load(types::I64, heap_mem(), addr, 0);
+        let raw = bcx.ins().load(types::I64, heap_mem(), base_addr, (leaf_idx * 8) as i32);
         elem_vals.push(from_i64_repr(bcx, lty, raw));
     }
     // Root every leaf before binding any of them: the loads above can't
@@ -3195,6 +3455,9 @@ fn compile_for_loop(
     // GC-scannable is a property of the column (`is_heap_ty`).
     let elem_leaf_tys: Vec<Type> = elem_leafs.iter().map(|(_, t)| t.clone()).collect();
     declare_gc_leaves(bcx, &elem_vals, &elem_leaf_tys);
+    // The list keeps its own path to every element, so a `List`-typed element
+    // is aliased the moment it is bound — see `mark_shared_extracted`.
+    mark_shared_extracted(bcx, &elem_ty, &elem_vals, ctx.structs);
     for ((leaf_path, lty), elem_val) in elem_leafs.iter().zip(elem_vals) {
         let key = var_key(var, leaf_path);
         let var_id = get_or_declare_var(bcx, vars, &key, lty);
@@ -3230,6 +3493,13 @@ fn compile_for_loop(
 
     bcx.switch_to_block(exit_bb);
     bcx.seal_block(exit_bb);
+    result_list
+}
+
+impl Default for Codegen {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Codegen {
@@ -3299,6 +3569,13 @@ impl Codegen {
     pub fn new_with_hosts(hosts: &[crate::host::HostFn]) -> Result<Self, String> {
         let mut flag_builder = settings::builder();
         flag_builder.set("is_pic", "false").expect("is_pic setting");
+        // `opt_level` is deliberately left at Cranelift's default of
+        // `none`. Measured at `speed` on 2026-08-29: orders 55.8 -> 56.1ms,
+        // fib(32) 22.7 -> 23.5ms, both regressions — the extra compile time
+        // (+1.3ms on orders) outweighs what GVN/LICM find, because froglang
+        // programs are small and JIT compilation is on the critical path of
+        // every run. Worth re-testing if whole-program compile time ever
+        // stops being a per-run cost.
         // The collector finds its roots by walking the native stack frame
         // by frame (`gc.rs`, "Precise roots"), which needs every JIT frame
         // to actually have a frame pointer. Without this, Cranelift is free
@@ -3343,6 +3620,7 @@ impl Codegen {
         builder.symbol("frog_variant_tag", ffi::frog_variant_tag as *const u8);
         builder.symbol("frog_variant_get", ffi::frog_variant_get as *const u8);
         builder.symbol("frog_variant_set", ffi::frog_variant_set as *const u8);
+        builder.symbol("frog_cow_verify", ffi::frog_cow_verify as *const u8);
         builder.symbol("frog_clone",       ffi::frog_clone       as *const u8);
         builder.symbol("frog_ctx_current", crate::runtime::host::frog_ctx_current as *const u8);
 
@@ -3410,6 +3688,7 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_variant_set", "frog_variant_set", &[I64, I64, I64], None);
         // Deep-clone-on-Copy for a GC-pointer-bearing `Var` read — see
         // `compile_expr_multi`'s `TypedExprKind::Var` arm and `Ctx::liveness`.
+        declare_rt(&mut module, &mut func_ids, "frog_cow_verify", "frog_cow_verify", &[I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_clone",      "frog_clone",      &[I64],           Some(I64));
         // Fetches the `FrogCtx*` a host call passes as its own argument 0
         // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,
@@ -3524,6 +3803,7 @@ impl Codegen {
             func_ids, module, string_arena, structs, unions,
             printing_unions: Vec::new(), comparing_unions: Vec::new(), mut_params, liveness: body_liveness,
             host_fns,
+            cow_verify: cow_verify_enabled(),
         };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
 
@@ -3654,6 +3934,7 @@ impl Codegen {
             func_ids, module, string_arena, structs, unions,
             printing_unions: Vec::new(), comparing_unions: Vec::new(), mut_params: Vec::new(), liveness: entry_liveness,
             host_fns,
+            cow_verify: cow_verify_enabled(),
         };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
@@ -3780,6 +4061,9 @@ impl Codegen {
         // but a function has no address until `finalize_definitions` below,
         // so they are held here and filed once at the end.
         let mut pending_maps: Vec<(FuncId, gc::JitFunctionMaps)> = Vec::new();
+        // Names for the same functions, kept only when `FROG_JIT_SYMBOLS`
+        // asks for a symbol dump — see `dump_jit_symbols`.
+        let mut pending_names: Vec<(FuncId, String)> = Vec::new();
 
         // ── Pass 2: Define all function bodies ───────────────────────────────
         let func_defs: Vec<(String, FuncId, Vec<(String, Type, bool)>, Type, Box<Spanned<TypedExpr>>)> =
@@ -3799,7 +4083,7 @@ impl Codegen {
             }).collect();
 
         for (dbgname, func_id, params, return_type, body) in &func_defs {
-            let sig = self.make_sig(params, &return_type, structs);
+            let sig = self.make_sig(params, return_type, structs);
             let mut ctx = self.module.make_context();
             ctx.func.signature = sig;
 
@@ -3826,6 +4110,7 @@ impl Codegen {
                 .define_function(*func_id, &mut ctx)
                 .unwrap_or_else(|e| panic!("define_function failed: {}", e));
             pending_maps.push((*func_id, take_stack_maps(&ctx)));
+            pending_names.push((*func_id, dbgname.clone()));
             self.module.clear_context(&mut ctx);
         }
 
@@ -3859,6 +4144,7 @@ impl Codegen {
             .define_function(main_id, &mut ctx)
             .unwrap_or_else(|e| panic!("define {} failed: {}", entry_name, e));
         pending_maps.push((main_id, take_stack_maps(&ctx)));
+        pending_names.push((main_id, entry_name.clone()));
         self.module.clear_context(&mut ctx);
 
         self.module.finalize_definitions().expect("finalize_definitions failed");
@@ -3870,8 +4156,37 @@ impl Codegen {
             let start = self.module.get_finalized_function(func_id) as usize;
             gc::JIT_CODE.with(|c| c.borrow_mut().register(gc::JitFunctionMaps { start, ..maps }));
         }
+        self.dump_jit_symbols(&pending_names);
 
         (main_id, bindings)
+    }
+}
+
+impl Codegen {
+    /// Append `start length name` for each just-finalized function to the
+    /// file named by `FROG_JIT_SYMBOLS`, and do nothing at all when that
+    /// variable is unset.
+    ///
+    /// A sampling profiler (macOS `sample`, `perf`) sees JIT-compiled code
+    /// as bare addresses in an anonymous mapping, so a profile of a
+    /// froglang program attributes essentially all of its time to `???`.
+    /// This is the missing half: `benches/symbolize.py` joins these ranges
+    /// against a profile's addresses to say which froglang function the
+    /// time was actually in.
+    fn dump_jit_symbols(&self, names: &[(FuncId, String)]) {
+        let Some(path) = std::env::var_os("FROG_JIT_SYMBOLS") else { return };
+        use std::io::Write;
+        let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+            eprintln!("frog: could not open FROG_JIT_SYMBOLS file {:?}", path);
+            return;
+        };
+        for (func_id, name) in names {
+            let start = self.module.get_finalized_function(*func_id) as usize;
+            // Cranelift does not hand back a finalized function's length, so
+            // the next function's start is used as this one's end by the
+            // symbolizer; a length of 0 here means "until the next symbol".
+            let _ = writeln!(f, "{:#x} 0 {}", start, name);
+        }
     }
 }
 

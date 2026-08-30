@@ -161,7 +161,7 @@ fn test_str_member_round_trips() {
          is Str(s) then -1\n\
          }\n\
          describe(\"hi\") * 1000 + describe(5)"
-    ), -1 * 1000 + 5);
+    ), -1000 + 5);
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn test_list_of_scalar_and_struct_union_round_trips() {
          let b = match xs[1] { is Int(n) then -1\nis Point(p) then p.x + p.y\n }\n\
          let c = match xs[2] { is Int(n) then n\nis Point(p) then -1\n }\n\
          a * 100 + b * 10 + c"
-    ), 1 * 100 + 7 * 10 + 5);
+    ), 100 + 7 * 10 + 5);
 }
 
 #[test]

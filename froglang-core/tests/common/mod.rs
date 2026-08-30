@@ -100,6 +100,34 @@ pub fn run_gc_stress(src: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Run `src` under `FROG_COW_VERIFY=1` and return its stdout, asserting it
+/// exited successfully — MUTABILITY.md Stage 7.
+///
+/// Complements `run_gc_stress`: that one forces a *missing GC root* into
+/// the open, this one forces a *missing `shared` mark* into the open. Every
+/// copy-on-write write barrier that decides an object is unshared
+/// recomputes the answer from the heap and aborts if anything else can
+/// actually reach it, so a program that mutates through an unmarked alias
+/// fails loudly here instead of silently producing the wrong value.
+///
+/// A subprocess for the same reason as `run_gc_stress`: codegen reads the
+/// variable once, when it builds its `Ctx`.
+pub fn run_cow_verify(src: &str) -> String {
+    let scratch = ScratchFile::new(src);
+    let output = Command::new(env!("CARGO_BIN_EXE_froglang-core"))
+        .args(["run", scratch.path.to_str().expect("scratch path is valid UTF-8")])
+        .env("FROG_COW_VERIFY", "1")
+        .output()
+        .expect("failed to run froglang-core binary");
+    assert!(
+        output.status.success(),
+        "program was expected to succeed but exited with {:?}\n--- stderr ---\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// Run `src` and return its stdout, asserting it exited successfully.
 pub fn run(src: &str) -> String {
     let out = run_raw(src);

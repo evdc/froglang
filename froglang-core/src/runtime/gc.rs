@@ -1,4 +1,4 @@
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::cell::{Cell, RefCell};
 
 /// Zero-cost GC tracing. Enable with `--features gc_trace`.
@@ -23,6 +23,19 @@ pub struct GcHeader {
     pub next:   *mut GcHeader,
     pub marked: bool,
     pub kind:   ObjKind,
+    /// Copy-on-write: set wherever a second live path to this object is
+    /// created, cleared only by producing a fresh object. A write through a
+    /// `mut` root must copy first when this is set — see MUTABILITY.md
+    /// Stage 7, and `codegen::emit_unshare` for the barrier.
+    ///
+    /// Lives in what was padding: the three fields before it are 8 + 1 + 1
+    /// bytes in a struct aligned to 8, so this costs nothing.
+    ///
+    /// Deliberately *not* touched by the collector. `sweep` clears `marked`
+    /// on every survivor; clearing `shared` there too would be a
+    /// use-after-alias, since surviving an unrelated collection says
+    /// nothing about how many paths reach an object.
+    pub shared: bool,
 }
 
 // ── FrogStr — immutable, inline bytes immediately after the struct ────────────
@@ -437,10 +450,10 @@ thread_local! {
     /// Every JIT-compiled function's stack maps — see `JitCode`. Populated
     /// by `Codegen` as it finalizes each function, read by the collector's
     /// native stack walk.
-    pub static JIT_CODE: RefCell<JitCode> = RefCell::new(JitCode::new());
+    pub static JIT_CODE: RefCell<JitCode> = const { RefCell::new(JitCode::new()) };
     /// Pointer to the GcHeap of the FrogState currently executing on this thread.
     /// Null when no froglang code is running (falls back to GC_HEAP).
-    pub static ACTIVE_HEAP: Cell<*mut GcHeap> = Cell::new(std::ptr::null_mut());
+    pub static ACTIVE_HEAP: Cell<*mut GcHeap> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Largest block size, in 8-byte words, that `GcHeap::free_bytes` keeps on
@@ -462,7 +475,13 @@ fn words_for(size: usize) -> usize {
     // not valid to pass to `alloc` in the first place. No caller currently
     // asks for zero bytes (every object has a header), so this is a floor,
     // not a case that fires.
-    ((size + 7) / 8).max(1)
+    size.div_ceil(8).max(1)
+}
+
+impl Default for GcHeap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GcHeap {
@@ -483,7 +502,12 @@ impl GcHeap {
             }
         }
         let layout = Layout::from_size_align(words * 8, 8).expect("gc block layout");
-        unsafe { alloc(layout) }
+        // `alloc` signals failure with a null pointer, which every caller
+        // here would otherwise write a header through. Route it to the
+        // standard OOM handler instead of producing a null object.
+        let p = unsafe { alloc(layout) };
+        if p.is_null() { handle_alloc_error(layout); }
+        p
     }
 
     /// Return `size` bytes at `ptr` (as passed to `alloc_bytes`) for reuse.
@@ -602,39 +626,56 @@ impl GcHeap {
         self.collect();
     }
 
-    fn collect(&mut self) {
-        gc_trace!("collect start — {} bytes allocated, threshold {}",
-            self.bytes_allocated, self.gc_threshold);
+    /// Call `f` with every root word that is a followable heap pointer,
+    /// from all three sources: the explicit roots the embedding API pushed,
+    /// the caller-owned buffers a running JIT call is filling
+    /// (`push_scanned_span`), and every GC-managed value live in a JIT frame
+    /// on the native stack.
+    ///
+    /// Factored out of `collect` so `count_refs` (the `FROG_COW_VERIFY`
+    /// check) traces reachability from *exactly* the same root set the
+    /// collector does — a verifier that disagreed with the collector about
+    /// what is live would be checking the wrong invariant.
+    fn for_each_root(&self, f: &mut impl FnMut(i64)) {
+        self.for_each_embedding_root(f);
+        self.for_each_jit_root(f);
+    }
 
-        // Mark phase — explicit roots pushed by the embedding API...
-        let roots = self.roots.clone();
-        gc_trace!("marking {} roots", roots.len());
-        for (value, is_ptr) in roots {
+    /// The roots that exist because the *embedding* is holding a value:
+    /// `push_root`, and the out-buffer a running entry is filling
+    /// (`push_scanned_span`).
+    ///
+    /// Split from `for_each_jit_root` because these are not independent
+    /// observers of the objects they name — see `count_refs`. A top-level
+    /// binding is rooted here (as `FrogState::eval`'s rebuilt `env` root, and
+    /// again as a slot in `call_jit`'s out-buffer) *and* held in a JIT frame,
+    /// three roots for one binding.
+    fn for_each_embedding_root(&self, f: &mut impl FnMut(i64)) {
+        for &(value, is_ptr) in &self.roots {
             if is_ptr && is_heap_ptr(value) {
-                unsafe { Self::mark_from(&mut self.mark_worklist, heap_ptr(value)); }
+                f(value);
             }
         }
 
-        // ...plus any caller-owned buffer the running JIT call is filling
-        // with GC pointers (`push_scanned_span`).
-        let spans = std::mem::take(&mut self.scanned_spans);
-        for (base, slots) in &spans {
+        for (base, slots) in &self.scanned_spans {
             for &i in slots {
                 let w = unsafe { *((*base as *const i64).add(i)) };
                 if is_heap_ptr(w) {
-                    unsafe { Self::mark_from(&mut self.mark_worklist, heap_ptr(w)) };
+                    f(w);
                 }
             }
         }
-        self.scanned_spans = spans;
+    }
 
-        // ...plus every GC-managed value live in a JIT frame on the native
-        // stack. `jit_frame` is the frame pointer of the runtime function
-        // the mutator called into, so the first iteration below already
-        // describes the innermost JIT frame: its return address is the
-        // safepoint we are stopped at, and its stack pointer is just above
-        // the two words that frame link occupies.
-        let mut _nframes = 0usize;
+    /// Every GC-managed value live in a JIT frame on the native stack —
+    /// one entry per live froglang value, which is what makes this the set
+    /// `count_refs` can actually count.
+    fn for_each_jit_root(&self, f: &mut impl FnMut(i64)) {
+        // `jit_frame` is the frame pointer of the runtime function the
+        // mutator called into, so the first iteration already describes the
+        // innermost JIT frame: its return address is the safepoint we are
+        // stopped at, and its stack pointer is just above the two words that
+        // frame link occupies.
         let mut fp = self.jit_frame;
         while fp != 0 {
             let (ret, caller_fp) = unsafe {
@@ -646,22 +687,150 @@ impl GcHeap {
                     for &off in offsets {
                         let w = unsafe { *((sp + off as usize) as *const i64) };
                         if is_heap_ptr(w) {
-                            unsafe { Self::mark_from(&mut self.mark_worklist, heap_ptr(w)) };
+                            f(w);
                         }
                     }
-                    _nframes += 1;
                 }
             });
-            // Stop at the first frame that is not above the current one:
-            // the chain runs from inner to outer, so a frame pointer that
-            // does not increase means we have walked off the end of it (or
-            // into a frame built without one) and must not keep following.
+            // Stop at the first frame that is not above the current one: the
+            // chain runs from inner to outer, so a frame pointer that does
+            // not increase means we have walked off the end of it (or into a
+            // frame built without one) and must not keep following.
             if caller_fp <= fp {
                 break;
             }
             fp = caller_fp;
         }
-        gc_trace!("marked {} JIT frame(s)", _nframes);
+    }
+
+    /// How many *independent observers* of `target` are live: one per JIT
+    /// stack-map slot naming it, plus one per scannable slot naming it in any
+    /// object reachable from a root. Stops counting at 2, since every caller
+    /// only wants to know "more than one".
+    ///
+    /// Reachability is traced from every root (`for_each_root`), so a
+    /// reference from a dead object never counts — but the *count* skips
+    /// `for_each_embedding_root`, because those are not independent
+    /// observers. One top-level binding is rooted up to three times over: as
+    /// a rebuilt `env` root, as a slot in `call_jit`'s conservatively scanned
+    /// out-buffer, and as the JIT value the entry is actually using. Counting
+    /// all three made every top-level `xs[i] = v` look aliased
+    /// (`tests/programs/mut_list_index_assign.frog` was the case that caught
+    /// this). The JIT stack map has exactly one entry per live froglang
+    /// value, which is the granularity this needs.
+    ///
+    /// Two honest limits follow from counting slots rather than bindings:
+    ///
+    /// - An alias held *only* by the embedding — a value in `env` the running
+    ///   entry never mentions — is invisible, since the count skips those
+    ///   roots.
+    /// - Two bindings holding the *identical* SSA value share one spill slot,
+    ///   so they count once. `mut got = b.items` is exactly that shape: the
+    ///   field read yields the same `Value` the struct's own leaf holds, and
+    ///   Cranelift records it once. Sabotaging `mark_shared_extracted` is
+    ///   caught for a list element and a `for`-loop binding but not for that
+    ///   struct field.
+    ///
+    /// So this is a strong check, not a complete one: it catches a missed
+    /// mark whenever the alias is a distinct value or lives in a heap slot,
+    /// which is most of them, and the behavioural assertions in
+    /// `tests/test_value_semantics.rs` remain the actual specification.
+    ///
+    /// This is the `FROG_COW_VERIFY` check (MUTABILITY.md Stage 7). The
+    /// failure mode copy-on-write actually has is a *missed* `shared` mark —
+    /// an aliasing site nobody thought of — which stays invisible until some
+    /// program observes a mutation through the stale alias. So at every
+    /// write barrier that decides an object is unshared, this recomputes the
+    /// answer from the heap and complains if it disagrees.
+    ///
+    /// Deliberately expensive: it marks the whole reachable graph, walks
+    /// every live object, and unmarks. Only ever run under the env var, in
+    /// the same spirit as `FROG_GC_STRESS` — and for the same reason, which
+    /// Stage 6's reverted GC-root sharing demonstrated: a stress sweep is
+    /// only as good as the shapes the test suite happens to contain, and an
+    /// invariant that can be checked directly should be.
+    pub fn count_refs(&mut self, target: *mut GcHeader) -> usize {
+        // Reachability first, so references from garbage don't count — an
+        // unswept dead object may still name `target` without anything
+        // being able to observe it.
+        let mut worklist = std::mem::take(&mut self.mark_worklist);
+        self.for_each_root(&mut |w| {
+            unsafe { Self::mark_from(&mut worklist, heap_ptr(w)) };
+        });
+        self.mark_worklist = worklist;
+
+        let mut count = 0usize;
+        self.for_each_jit_root(&mut |w| {
+            if heap_ptr(w) == target { count += 1; }
+        });
+
+        let mut obj = self.head;
+        while !obj.is_null() && count < 2 {
+            unsafe {
+                if (*obj).marked {
+                    Self::for_each_slot(obj, &mut |w| {
+                        if is_heap_ptr(w) && heap_ptr(w) == target { count += 1; }
+                    });
+                }
+                obj = (*obj).next;
+            }
+        }
+
+        // Leave the heap exactly as found: `marked` means "surviving this
+        // collection" to everyone else, and there is no collection here.
+        let mut obj = self.head;
+        while !obj.is_null() {
+            unsafe { (*obj).marked = false; obj = (*obj).next; }
+        }
+        count
+    }
+
+    /// Call `f` with every scannable word inside `obj` — the same slots
+    /// `mark_from` traces, factored out so `count_refs` cannot drift from
+    /// the collector's idea of what an object points at.
+    unsafe fn for_each_slot(obj: *mut GcHeader, f: &mut impl FnMut(i64)) {
+        match (*obj).kind {
+            ObjKind::Str => {}
+            ObjKind::List => {
+                let list = obj as *mut FrogList;
+                let mask = (*list).ptr_mask;
+                if mask == 0 { return; }
+                let stride = ((*list).stride as usize).max(1);
+                for i in 0..((*list).len as usize / stride) {
+                    for bit in 0..stride {
+                        if mask & (1u64 << bit) == 0 { continue; }
+                        f(*(*list).data.add(i * stride + bit));
+                    }
+                }
+            }
+            ObjKind::Variant => {
+                let variant = obj as *mut FrogVariant;
+                let mask = (*variant).ptr_mask;
+                if mask == 0 { return; }
+                let data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
+                for i in 0..((*variant).nslots as usize) {
+                    if mask & (1u64 << i) == 0 { continue; }
+                    f(*data.add(i));
+                }
+            }
+        }
+    }
+
+    fn collect(&mut self) {
+        gc_trace!("collect start — {} bytes allocated, threshold {}",
+            self.bytes_allocated, self.gc_threshold);
+
+        // The worklist is moved out of `self` for the whole mark phase, so
+        // the root sets below can be iterated in place rather than cloned or
+        // temporarily taken to satisfy the borrow checker.
+        let mut worklist = std::mem::take(&mut self.mark_worklist);
+
+        // Mark phase — every root, from all three sources.
+        gc_trace!("marking {} explicit roots", self.roots.len());
+        self.for_each_root(&mut |w| {
+            unsafe { Self::mark_from(&mut worklist, heap_ptr(w)) };
+        });
+        self.mark_worklist = worklist;
 
         // Sweep phase
         let before = self.bytes_allocated;
@@ -745,24 +914,35 @@ impl GcHeap {
         }
     }
 
+    /// Free every unmarked object and re-link the survivors, in their
+    /// original order, as the new object list.
+    ///
+    /// The survivor list is rebuilt from a local head/tail pair rather than
+    /// threading a `*mut *mut GcHeader` back through `self.head`: that
+    /// pointer would be derived from a `&mut self` borrow that `free_obj`
+    /// (which also takes `&mut self`) invalidates on every freed object.
     fn sweep(&mut self) {
-        let mut prev: *mut *mut GcHeader = &mut self.head;
         let mut current = self.head;
+        let mut live_head: *mut GcHeader = std::ptr::null_mut();
+        let mut live_tail: *mut GcHeader = std::ptr::null_mut();
 
         while !current.is_null() {
             let next = unsafe { (*current).next };
             if unsafe { !(*current).marked } {
-                // Unlink and free
-                unsafe { *prev = next; }
                 let freed = unsafe { self.free_obj(current) };
                 self.bytes_allocated -= freed;
             } else {
-                // Keep; clear mark bit; advance prev
-                unsafe { (*current).marked = false; }
-                prev = unsafe { &mut (*current).next };
+                // Keep; clear mark bit; append to the survivor list.
+                unsafe {
+                    (*current).marked = false;
+                    (*current).next = std::ptr::null_mut();
+                    if live_tail.is_null() { live_head = current; } else { (*live_tail).next = current; }
+                }
+                live_tail = current;
             }
             current = next;
         }
+        self.head = live_head;
     }
 
     /// Free a single GC object; returns the number of bytes freed. The
@@ -807,9 +987,15 @@ impl GcHeap {
 
     // ── Allocators ───────────────────────────────────────────────────────────
 
-    /// Allocate a GC-managed FrogStr and copy `len` bytes from `data` into it.
-    /// Appends a NUL terminator. `data` only needs to be valid for the duration of this call.
-    pub fn alloc_str(&mut self, data: *const u8, len: usize) -> *mut FrogStr {
+    /// Allocate a GC-managed `FrogStr` holding a copy of `data`, with a NUL
+    /// terminator appended.
+    ///
+    /// Takes a slice rather than the `(ptr, len)` pair the FFI boundary
+    /// deals in: every caller but `ffi::frog_alloc_str` already has one, and
+    /// keeping the raw-pointer reconstruction on that side puts the `unsafe`
+    /// where the unchecked assumption actually is.
+    pub fn alloc_str(&mut self, data: &[u8]) -> *mut FrogStr {
+        let len = data.len();
         let struct_size = std::mem::size_of::<FrogStr>();
         let total = words_for(struct_size + len + 1) * 8;
         let ptr = self.alloc_bytes(total) as *mut FrogStr;
@@ -818,12 +1004,11 @@ impl GcHeap {
                 next:   self.head,
                 marked: false,
                 kind:   ObjKind::Str,
+                shared: false,
             };
             (*ptr).len = len as u32;
             let dst = (ptr as *mut u8).add(struct_size);
-            if len > 0 {
-                std::ptr::copy_nonoverlapping(data, dst, len);
-            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, len);
             *dst.add(len) = 0;  // NUL terminator
         }
 
@@ -860,6 +1045,7 @@ impl GcHeap {
                 next:   self.head,
                 marked: false,
                 kind:   ObjKind::List,
+                shared: false,
             };
             (*ptr).len        = 0;
             (*ptr).cap        = slot_cap as u32;
@@ -890,6 +1076,7 @@ impl GcHeap {
                 next:   self.head,
                 marked: false,
                 kind:   ObjKind::Variant,
+                shared: false,
             };
             (*ptr).tag        = tag;
             (*ptr).nslots     = nslots as u32;
@@ -947,6 +1134,11 @@ impl GcHeap {
     /// shared-observer structures are explicitly out of scope for value
     /// semantics, and must be arena-plus-index instead). A future `Ref(T)` or
     /// handle type would need to revisit this.
+    ///
+    /// # Safety
+    ///
+    /// `obj` must be a live heap object of this heap, and must already be
+    /// rooted by the caller for the whole call (see below).
     ///
     /// **GC-safety**: every allocation this makes can itself trigger a
     /// collection. The object being cloned is assumed already rooted by the
@@ -1088,7 +1280,7 @@ pub fn push_root(value: i64, is_ptr: bool) {
 pub fn with_active_heap<R>(f: impl FnOnce(&mut GcHeap) -> R) -> R {
     let ptr = ACTIVE_HEAP.with(|h| h.get());
     if ptr.is_null() {
-        GC_HEAP.with(|h| f(&mut *h.borrow_mut()))
+        GC_HEAP.with(|h| f(&mut h.borrow_mut()))
     } else {
         unsafe { f(&mut *ptr) }
     }
@@ -1137,7 +1329,7 @@ mod tests {
         GC_HEAP.with(|h| {
             let mut h = h.borrow_mut();
             let s = b"hello";
-            let ptr = h.alloc_str(s.as_ptr(), s.len());
+            let ptr = h.alloc_str(s);
             unsafe {
                 assert_eq!((*ptr).len, 5);
                 let txt = frog_str_as_str(ptr as *const FrogStr);
@@ -1151,7 +1343,7 @@ mod tests {
         // Reset GC state for this test via a fresh GcHeap inline.
         let mut heap = GcHeap::new();
         let s = b"ephemeral";
-        heap.alloc_str(s.as_ptr(), s.len());
+        heap.alloc_str(s);
         let before = heap.bytes_allocated;
         assert!(before > 0);
         // No roots → everything swept
@@ -1164,12 +1356,24 @@ mod tests {
     fn test_gc_sweep_keeps_rooted() {
         let mut heap = GcHeap::new();
         let s = b"kept";
-        let ptr = heap.alloc_str(s.as_ptr(), s.len()) as i64;
+        let ptr = heap.alloc_str(s) as i64;
         heap.push_root(ptr, true);
         heap.collect();
         assert!(heap.bytes_allocated > 0, "rooted string should survive GC");
         heap.roots.clear();
         heap.collect();
         assert_eq!(heap.bytes_allocated, 0);
+    }
+}
+
+#[cfg(test)]
+mod header_layout {
+    use super::*;
+
+    /// `shared` must not have grown the header — it lives in padding the
+    /// three original fields already left behind (MUTABILITY.md Stage 7).
+    #[test]
+    fn shared_bit_is_free() {
+        assert_eq!(std::mem::size_of::<GcHeader>(), 16);
     }
 }

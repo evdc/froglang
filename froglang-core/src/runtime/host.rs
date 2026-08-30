@@ -24,7 +24,7 @@ thread_local! {
     /// mirrors `gc::ACTIVE_HEAP`, kept separate because it carries strictly
     /// more (and shorter-lived: valid only inside one `call_jit`, not for
     /// the `FrogState`'s whole lifetime) than a heap pointer.
-    static ACTIVE_CTX: Cell<*mut FrogCtx> = Cell::new(std::ptr::null_mut());
+    static ACTIVE_CTX: Cell<*mut FrogCtx> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Publish `ctx` as the active one for the duration of `f`. Used by
@@ -100,7 +100,7 @@ impl FrogCtx {
         let ptr = {
             let heap = self.heap();
             heap.maybe_collect();
-            heap.alloc_str(s.as_ptr(), s.len()) as i64
+            heap.alloc_str(s.as_bytes()) as i64
         };
         self.heap().push_root(ptr, true);
         ptr

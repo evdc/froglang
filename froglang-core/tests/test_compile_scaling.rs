@@ -125,7 +125,7 @@ fn fastest_check(label: &str, src: String) -> Duration {
 /// `1 <op> 1 <op> ... ` with `n` terms — a left-nested binary tree of depth
 /// `n`, the shape that makes re-inferring a subtree per level expensive.
 fn chain(op: &str, n: usize) -> String {
-    let terms: Vec<&str> = std::iter::repeat("1").take(n).collect();
+    let terms: Vec<&str> = std::iter::repeat_n("1", n).collect();
     format!("let x = {}\n", terms.join(&format!(" {} ", op)))
 }
 
@@ -146,7 +146,7 @@ fn arithmetic_chains_scale_the_same_for_every_operator() {
 fn long_string_concatenations_scale() {
     // The `+` arm's `Str` special case is the branch that used to double
     // the work; exercise it on strings too, not just the numeric fallthrough.
-    let terms: Vec<&str> = std::iter::repeat("\"a\"").take(40).collect();
+    let terms: Vec<&str> = std::iter::repeat_n("\"a\"", 40).collect();
     check_within_budget(
         "40-term string concatenation",
         format!("let s = {}\n", terms.join(" + ")),

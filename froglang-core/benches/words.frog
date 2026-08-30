@@ -1,0 +1,77 @@
+// Word-pipeline benchmark — exercises strings: construction, concatenation,
+// comparison, case folding, splitting and joining, plus `List<Str>`.
+//
+// The third shape in the suite, and the one that stresses the parts of the
+// runtime the other two don't touch at all. `orders.frog` allocates fixed-
+// width structs and variants; `life.frog` allocates nested lists of `Int`.
+// Neither ever allocates a `Str`, so neither exercises variable-size GC
+// objects, byte-wise comparison, or the `Str` stdlib (`split`/`join`/
+// `to_upper`/`contains`/`index_of` — all host functions reached through
+// UFCS, so this also covers the embedding boundary in a hot loop).
+//
+// Per round it builds a document out of a fixed vocabulary, splits it back
+// into words, and folds over them — so every round allocates several
+// thousand short-lived strings, which is the GC pressure this is really
+// about.
+//
+// The sibling words.{rs,go,py,lua} files implement exactly this, and
+// run_comparisons.sh reads the two bounds below out of *this* file and
+// passes them to the others, so all five stay in lockstep. All of them must
+// print the same checksum.
+//
+// Run: cargo run --release -- run benches/words.frog
+
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+
+// Same Knuth multiplicative hash as the other two benchmarks, so word
+// choice is deterministic and identical across implementations.
+func hash(i: Int): Int = modn(i * 2654435761 + 1013904223, 2147483647)
+
+let words_per_doc = 400
+let rounds = 800
+
+// A fixed vocabulary, deliberately containing both short and long words and
+// a repeated prefix ("frog"/"frogs") so `starts_with`/`index_of` do real
+// byte comparison rather than failing on the first character.
+let vocab = ["frog", "frogs", "toad", "newt", "salamander", "axolotl", "tadpole", "pond"]
+
+// One word, chosen by hash — `vocab` is 8 long, so this is hash mod 8.
+// `vocab` and `words_per_doc` are threaded through as parameters rather
+// than read from the top-level `let`s: a `func` body cannot currently
+// reference a top-level binding (codegen reports "unbound variable").
+func word_for(vocab: List<Str>, i: Int): Str = vocab[modn(hash(i), 8)]
+
+// Build the round's document as a list of words, then join it into one
+// string: the join is a single big allocation over many small ones, which
+// is the allocation shape a real templating/serialization path has.
+func build_doc(vocab: List<Str>, words_per_doc: Int, round: Int): Str = {
+    let base = round * words_per_doc
+    let ws = [for i in 0..words_per_doc do word_for(vocab, base + i)]
+    ws.join(" ")
+}
+
+// Score a word: longer words count more, and the two "frog"-prefixed ones
+// get a bonus — so the fold does a length check, a prefix comparison and an
+// equality comparison per word.
+func score(w: Str): Int = {
+    let base = w.len()
+    let bonus = if w.starts_with("frog") then 10 else 0
+    let exact = if w == "frog" then 5 else 0
+    base + bonus + exact
+}
+
+mut checksum = 0
+for round in 0..rounds do {
+    let doc = build_doc(vocab, words_per_doc, round)
+    let ws = doc.split(" ")
+    mut total = 0
+    for w in ws do { total = total + score(w) }
+    // Fold in something that depends on the whole joined string too, so the
+    // join can't be optimized away: its byte length, and whether the
+    // upper-cased form still contains the vocabulary's longest word.
+    let shouted = doc.to_upper()
+    let found = if shouted.contains("SALAMANDER") then 1 else 0
+    checksum = checksum + total + doc.len() + found
+}
+
+checksum

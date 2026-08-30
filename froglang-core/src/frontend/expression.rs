@@ -477,7 +477,7 @@ impl Expression {
     pub fn get_identifier(&self) -> Option<&str> {
         match self {
             Expression::Literal(lit) => match &lit.token {
-                Token::Identifier(name) => Some(&name),
+                Token::Identifier(name) => Some(name),
                 _ => None
             },
             _ => None

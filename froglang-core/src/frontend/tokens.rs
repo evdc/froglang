@@ -244,7 +244,7 @@ impl std::fmt::Display for Token {
             Token::Float(n) => write!(f, "{}", n),
             Token::String(s) => write!(f, "\"{}\"", s),
             Token::Identifier(i) => write!(f, "{}", i),
-            Token::Newline => write!(f, "\n"),
+            Token::Newline => writeln!(f),
             Token::EOF => write!(f, "<EOF>"),
             Token::Semicolon => write!(f, ";"),
             _ => self.display(f)

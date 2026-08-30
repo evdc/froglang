@@ -98,7 +98,7 @@ fn test_two_sequential_early_returns() {
             1\n\
         }\n\
         classify(-5) * 100 + classify(0) * 10 + classify(5)";
-    assert_eq!(compile_and_run(src), -1 * 100 + 0 * 10 + 1);
+    assert_eq!(compile_and_run(src), -100 + 1);
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn test_early_return_of_a_struct_value() {
         let p = pick(-5)\n\
         let q = pick(3)\n\
         p.x * 1000 + p.y * 100 + q.x * 10 + q.y";
-    assert_eq!(compile_and_run(src), 0 * 1000 + 0 * 100 + 3 * 10 + 6);
+    assert_eq!(compile_and_run(src), (3 * 10) + 6);
 }
 
 #[test]

@@ -1,0 +1,91 @@
+// Conway's Game of Life — exercises nested lists (`List<List<Int>>`),
+// element indexing, and nested comprehensions.
+//
+// Deliberately a different shape from `orders.frog`, which is all structs,
+// unions and flat lists of them: here the data is a list *of lists*, every
+// inner-loop read is a double index (`rows[y][x]`), and each generation
+// builds a whole new grid out of nested comprehensions rather than pushing
+// into one flat list. Between them the two benchmarks cover both list
+// layouts froglang has.
+//
+// The sibling life.{rs,go,py,lua} files implement exactly this, and
+// run_comparisons.sh reads the two bounds below out of *this* file and
+// passes them to the others, so all five stay in lockstep. All of them must
+// print the same checksum.
+//
+// Run: cargo run --release -- run benches/life.frog
+
+// Same spelled-out modulo as orders.frog — froglang has no `%` operator
+// yet, and every operand here is non-negative, so truncating and flooring
+// division agree with the other implementations' native `%`.
+func modn(x: Int, n: Int): Int = x - (x / n) * n
+
+// Knuth multiplicative hash, as in orders.frog: gives a fixed, unpatterned
+// starting grid that every implementation can reproduce exactly.
+func hash(i: Int): Int = modn(i * 2654435761 + 1013904223, 2147483647)
+
+let size = 48
+let generations = 40
+
+// Roughly a third of cells start alive — dense enough that the population
+// neither dies out nor saturates over the run.
+func seed_cell(size: Int, y: Int, x: Int): Int = if modn(hash(y * size + x), 3) == 0 then 1 else 0
+
+func seed(size: Int): List<List<Int>> = [for y in 0..size do [for x in 0..size do seed_cell(size, y, x)]]
+
+// Is (x, y) on the board and alive?  Out-of-range neighbours count as dead.
+// Written with an explicit bounds test rather than `rows.get(..) catch 0` so
+// the five implementations stay line-for-line comparable; the `catch`
+// spelling is exercised by tests/programs/life.frog instead.
+func cell_at(rows: List<List<Int>>, y: Int, x: Int): Int = {
+    let size = rows.len()
+    if y >= 0 and y < size and x >= 0 and x < size then rows[y][x] else 0
+}
+
+func neighbours(rows: List<List<Int>>, y: Int, x: Int): Int = {
+    mut n = 0
+    for dy in -1..2 do {
+        for dx in -1..2 do {
+            let skip = dx == 0 and dy == 0
+            n = n + (if skip then 0 else cell_at(rows, y + dy, x + dx))
+        }
+    }
+    n
+}
+
+func next_cell(rows: List<List<Int>>, y: Int, x: Int): Int = {
+    let alive = rows[y][x]
+    let n = neighbours(rows, y, x)
+    if alive == 1 then (if n == 2 or n == 3 then 1 else 0) else (if n == 3 then 1 else 0)
+}
+
+func step(rows: List<List<Int>>): List<List<Int>> = {
+    let size = rows.len()
+    [for y in 0..size do [for x in 0..size do next_cell(rows, y, x)]]
+}
+
+func population(rows: List<List<Int>>): Int = {
+    mut total = 0
+    for row in rows do {
+        for cell in row do { total = total + cell }
+    }
+    total
+}
+
+// Summing the population of every generation, rather than just the last
+// one, means no generation can be skipped and the whole history is checked.
+mut grid = seed(size)
+mut checksum = 0
+for g in 0..generations do {
+    checksum = checksum + population(grid)
+    grid = step(grid)
+}
+
+checksum
+
+// Note: this benchmark is what turned up MUTABILITY.md Stage 7. Before
+// copy-on-write, `cell_at(rows, ...)` and `neighbours(rows, ...)` deep-copied
+// the entire grid on every call — nine per cell — and 78% of the run was
+// inside `GcHeap::clone_obj`. Marking the alias and copying only at a write
+// took it from 2054ms to 27ms, and closed three value-semantics bugs that
+// eager copying could not afford to fix.

@@ -562,9 +562,10 @@ fn test_slice_non_int_bound_is_error() {
 #[test]
 fn test_range_type_inference() {
     let mut t = TypeChecker::new();
-    // 1..5 :: List<Int>
+    // 1..5 :: Range<Int> — a real, distinct nominal type, not List<Int>
+    // (see plans/RANGES.md).
     let r = spanned(Expression::range(int(1), int(5)));
-    assert_eq!(t.infer(&r).unwrap(), Type::list(Type::Int));
+    assert_eq!(t.infer(&r).unwrap(), Type::range(Type::Int));
 }
 
 #[test]

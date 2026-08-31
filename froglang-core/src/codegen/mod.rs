@@ -1455,6 +1455,18 @@ fn print_list(elem_ty: &Type, list_val: Value, bcx: &mut FunctionBuilder, ctx: &
 /// sequence of flattened leaf values, so this recursively consumes that
 /// sequence according to the declared field layout.
 fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    // `Range` gets its own round-trippable notation (`0..10`, matching
+    // source syntax) rather than falling into the generic struct printer
+    // below (which would otherwise print `Range(start=0, end=10)` — `Range`
+    // is structurally a 2-field struct to `as_struct_name`, so this has to
+    // be checked first).
+    if let Some(elem_ty) = ty.as_range_elem() {
+        let elem_ty = elem_ty.clone();
+        print_value(&elem_ty, values, cursor, bcx, ctx);
+        print_fragment("..", bcx, ctx);
+        print_value(&elem_ty, values, cursor, bcx, ctx);
+        return;
+    }
     if let Some(name) = ty.as_struct_name() {
         print_fragment(&format!("{}(", name), bcx, ctx);
         let fields = ctx.structs.get(ty).expect("known struct in codegen");
@@ -2372,16 +2384,17 @@ fn compile_expr_multi(
             vec![result]
         },
 
+        // A `Range` is two plain `i64` leaves (`start`, `end`) — the exact
+        // shape `struct_fields` already produces for `Range<Int>`'s
+        // registered 2-field layout (see `lower_range`/`RANGE_NAME`). No
+        // `declare_gc_ptr` here, deliberately: `is_heap_ty` already returns
+        // `false` for any `Named` type other than `Str`/`Union`/`List`, so
+        // neither leaf is ever a pointer needing a GC root — unlike the
+        // neighboring arms above, which do root their result.
         TypedExprKind::Range { start, end } => {
             let start_val = compile_expr(start, bcx, vars, ctx);
             let end_val   = compile_expr(end, bcx, vars, ctx);
-
-            let id     = ctx.func_ids["frog_range"];
-            let callee = ctx.module.declare_func_in_func(id, bcx.func);
-            let call   = bcx.ins().call(callee, &[start_val, end_val]);
-            let result = bcx.inst_results(call)[0];
-            declare_gc_ptr(bcx, result);
-            vec![result]
+            vec![start_val, end_val]
         },
 
         TypedExprKind::Assign { name, value } => {
@@ -2626,6 +2639,21 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
             },
             _ => unimplemented!("string binary op {:?}", op),
         }];
+    }
+
+    // ── Range membership (`x in a..b`) — O(1) bounds check ───────────
+    //
+    // Unlike List's `in`, this needs no scan at all: a `Range`'s two leaves
+    // (`start`, `end`) are already loaded as plain `i64`s by `compile_expr_multi`
+    // (no pointer, so `_transient` vs. non-`_transient` is moot — see the
+    // `TypedExprKind::Range` codegen arm), so membership is just two `icmp`s.
+    if *op == Token::In && right.item.ty.is_range() {
+        let lv = compile_expr(left, bcx, vars, ctx);
+        let range_vals = compile_expr_multi(right, bcx, vars, ctx);
+        let (start_val, end_val) = (range_vals[0], range_vals[1]);
+        let ge_start = bcx.ins().icmp(IntCC::SignedGreaterThanOrEqual, lv, start_val);
+        let lt_end   = bcx.ins().icmp(IntCC::SignedLessThan, lv, end_val);
+        return vec![bcx.ins().band(ge_start, lt_end)];
     }
 
     // ── List membership (`x in xs`) ──────────────────────────────────
@@ -3050,6 +3078,23 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
         let callee = ctx.module.declare_func_in_func(func_id, bcx.func);
         let call = bcx.ins().call(callee, &[arg_val]);
         return vec![bcx.inst_results(call)[0]];
+    }
+
+    // `to_list(range)` — the explicit `Range<T> -> List<T>` materialization
+    // (see typeck's `finish_to_list`). This is exactly what the old
+    // `TypedExprKind::Range` codegen arm used to do unconditionally for
+    // every range value — `frog_range` still exists as a runtime primitive,
+    // now reached only here, opt-in.
+    if func_name == "to_list" {
+        let arg = arg_exprs[0];
+        let range_vals = compile_expr_multi(arg, bcx, vars, ctx);
+        let (start_val, end_val) = (range_vals[0], range_vals[1]);
+        let id     = ctx.func_ids["frog_range"];
+        let callee = ctx.module.declare_func_in_func(id, bcx.func);
+        let call   = bcx.ins().call(callee, &[start_val, end_val]);
+        let result = bcx.inst_results(call)[0];
+        declare_gc_ptr(bcx, result);
+        return vec![result];
     }
 
     // A registered host function (`FrogStateBuilder::func`,
@@ -3589,6 +3634,16 @@ fn compile_for_loop(
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
 ) -> Option<Value> {
+    // A `Range` iterable needs none of this function's list machinery
+    // (`frog_list_len`, stride, slot addressing) — it's a plain counting
+    // loop over two already-loaded `i64`s. Dispatch to a dedicated sibling
+    // rather than threading a List/Range distinction through every step
+    // below, most of which (stride/slot arithmetic, GC rooting of the
+    // element) is genuinely List-specific and doesn't apply.
+    if iterable.item.ty.is_range() {
+        return compile_for_loop_range(var, iterable, cond, body, output, bcx, vars, ctx);
+    }
+
     // Read-through, not a duplication: the loop walks this pointer directly
     // by index and never stores it into a new binding. See
     // `compile_expr_transient`.
@@ -3717,6 +3772,105 @@ fn compile_for_loop(
 
     let i_next = bcx.ins().iadd_imm_s(i, 1);
     bcx.ins().jump(header_bb, &[BlockArg::from(i_next)]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(exit_bb);
+    bcx.seal_block(exit_bb);
+    result_list
+}
+
+/// `compile_for_loop`'s Range case — a plain counting loop over two
+/// already-loaded `i64`s (`start`, `end`), with none of the List version's
+/// stride/slot arithmetic, `frog_list_len` call, or per-element GC rooting
+/// (a range's element is always `Int`, never heap-scannable). The block
+/// param carries the *current element value* directly (not a separate
+/// `0..len` index), so advancing the loop and binding the loop variable are
+/// the same value — no offset/index indirection at all.
+#[allow(clippy::too_many_arguments)]
+fn compile_for_loop_range(
+    var: &str,
+    iterable: &Spanned<TypedExpr>,
+    cond: &Option<Box<Spanned<TypedExpr>>>,
+    body: &Spanned<TypedExpr>,
+    output: LoopOutput,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> Option<Value> {
+    let range_vals = compile_expr_multi(iterable, bcx, vars, ctx);
+    let (start_val, end_val) = (range_vals[0], range_vals[1]);
+    let elem_ty = iterable.item.ty.as_range_elem().cloned()
+        .unwrap_or_else(|| unreachable!("for-loop iterable must be a Range after type checking, got {}", iterable.item.ty));
+    let elem_leafs = struct_fields(&elem_ty, ctx.structs);
+
+    // A comprehension's result list needs a capacity — a range's length is
+    // a plain subtraction (clamped to 0, matching `frog_range`'s old
+    // "end <= start means empty" convention), no runtime call needed.
+    let zero64 = bcx.ins().iconst(types::I64, 0);
+    let diff   = bcx.ins().isub(end_val, start_val);
+    let is_neg = bcx.ins().icmp(IntCC::SignedLessThan, diff, zero64);
+    let len_val = bcx.ins().select(is_neg, zero64, diff);
+
+    let result_list = match output {
+        LoopOutput::Discard => None,
+        LoopOutput::Collect { stride, ptr_mask } => {
+            let stride_arg = bcx.ins().iconst(types::I64, stride);
+            let mask_arg   = bcx.ins().iconst(types::I64, ptr_mask);
+            let alloc_id = ctx.func_ids["frog_alloc_list"];
+            let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+            let alloc_call = bcx.ins().call(alloc_ref, &[len_val, stride_arg, mask_arg]);
+            let list = bcx.inst_results(alloc_call)[0];
+            declare_gc_ptr(bcx, list);
+            Some(list)
+        }
+    };
+
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    let exit_bb   = bcx.create_block();
+    bcx.append_block_param(header_bb, types::I64);
+
+    bcx.ins().jump(header_bb, &[BlockArg::from(start_val)]);
+
+    // Second predecessor is the back-edge below; sealed once that exists.
+    bcx.switch_to_block(header_bb);
+    let elem = bcx.block_params(header_bb)[0];
+    let in_range = bcx.ins().icmp(IntCC::SignedLessThan, elem, end_val);
+    bcx.ins().brif(in_range, body_bb, &[], exit_bb, &[]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+
+    for (leaf_path, lty) in elem_leafs.iter() {
+        let key = var_key(var, leaf_path);
+        let var_id = get_or_declare_var(bcx, vars, &key, lty);
+        bcx.def_var(var_id, elem);
+    }
+
+    // Optional `if` filter: skip straight to the increment when false.
+    if let Some(c) = cond {
+        let do_bb   = bcx.create_block();
+        let skip_bb = bcx.create_block();
+        let cond_val = compile_expr(c, bcx, vars, ctx);
+        bcx.ins().brif(cond_val, do_bb, &[], skip_bb, &[]);
+
+        bcx.switch_to_block(skip_bb);
+        bcx.seal_block(skip_bb);
+        let elem_next = bcx.ins().iadd_imm_s(elem, 1);
+        bcx.ins().jump(header_bb, &[BlockArg::from(elem_next)]);
+
+        bcx.switch_to_block(do_bb);
+        bcx.seal_block(do_bb);
+    }
+
+    let body_vals = compile_expr_multi(body, bcx, vars, ctx);
+    if let Some(list_ptr) = result_list {
+        let body_leafs = struct_fields(&body.item.ty, ctx.structs);
+        push_element(bcx, ctx, list_ptr, &body_vals, &body_leafs);
+    }
+
+    let elem_next = bcx.ins().iadd_imm_s(elem, 1);
+    bcx.ins().jump(header_bb, &[BlockArg::from(elem_next)]);
     bcx.seal_block(header_bb);
 
     bcx.switch_to_block(exit_bb);

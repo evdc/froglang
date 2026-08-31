@@ -56,11 +56,17 @@ pub enum Precedence {
     /// binds looser than `Range`/`Or`/`And`/etc. but tighter than `Assign`,
     /// so `let x = f() catch 0` parses `f() catch 0` as the let's value.
     Catch,
-    Range,
     Or,
     And,
     Equality,
     Comparison,
+    /// `..` — sits between `Comparison` and `Term` so `3 in 0..10` and
+    /// `x < 0..10` read the range as one operand without parens: a
+    /// comparison-precedence operator's right side is parsed one rung
+    /// tighter than itself (`Precedence::next`), which lands here.
+    /// Looser than `Term`/`Factor`/etc. so `0..n+1` still takes the whole
+    /// arithmetic expression as the range's end.
+    Range,
     Term,
     Factor,
     Unary,
@@ -74,12 +80,12 @@ impl Precedence {
             Precedence::None => Precedence::Assign,
             Precedence::Assign => Precedence::TypeAnnotation,
             Precedence::TypeAnnotation => Precedence::Catch,
-            Precedence::Catch => Precedence::Range,
-            Precedence::Range => Precedence::Or,
+            Precedence::Catch => Precedence::Or,
             Precedence::Or => Precedence::And,
             Precedence::And => Precedence::Equality,
             Precedence::Equality => Precedence::Comparison,
-            Precedence::Comparison => Precedence::Term,
+            Precedence::Comparison => Precedence::Range,
+            Precedence::Range => Precedence::Term,
             Precedence::Term => Precedence::Factor,
             Precedence::Factor => Precedence::Unary,
             Precedence::Unary => Precedence::Call,

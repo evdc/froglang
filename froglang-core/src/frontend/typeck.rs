@@ -268,11 +268,30 @@ impl PartialOrd for Type {
 /// The `List` type constructor's name, as it appears in `Type::Named`.
 pub const LIST_NAME: &str = "List";
 
+/// The `Range` type constructor's name, as it appears in `Type::Named`.
+///
+/// Unlike `List`, `Range` is a real generic struct (`struct_type_params`/
+/// `struct_templates` carry a genuine `[("start", T), ("end", T)]` field
+/// template for it — see `TypeChecker::initial_struct_type_params`/
+/// `initial_struct_templates`) rather than a hand-rolled special case:
+/// `Range<T>`'s runtime representation (two flat leaves) is exactly what the
+/// generic-struct "flattened leaf" machinery already produces for any
+/// 2-field struct, so it rides that machinery instead of duplicating it.
+/// `List` can't do the same because its GC-boxed representation has no
+/// field template at all — that asymmetry is deliberate, not an oversight.
+pub const RANGE_NAME: &str = "Range";
+
 impl Type {
     /// `Type::Named { name: LIST_NAME, args: vec![elem] }`. Prefer this
     /// over constructing `Type::Named` directly for a list.
     pub fn list(elem: Type) -> Type {
         Type::Named { name: LIST_NAME.to_string(), args: vec![elem] }
+    }
+
+    /// `Type::Named { name: RANGE_NAME, args: vec![elem] }`. Prefer this
+    /// over constructing `Type::Named` directly for a range.
+    pub fn range(elem: Type) -> Type {
+        Type::Named { name: RANGE_NAME.to_string(), args: vec![elem] }
     }
 
     /// `Type::Named { name, args: vec![] }` — a plain struct/nullary type.
@@ -285,6 +304,14 @@ impl Type {
     pub fn as_list_elem(&self) -> Option<&Type> {
         match self {
             Type::Named { name, args } if name == LIST_NAME => args.first(),
+            _ => None,
+        }
+    }
+
+    /// `Some(elem)` iff this is `Range<elem>`.
+    pub fn as_range_elem(&self) -> Option<&Type> {
+        match self {
+            Type::Named { name, args } if name == RANGE_NAME => args.first(),
             _ => None,
         }
     }
@@ -353,6 +380,10 @@ impl Type {
 
     pub fn is_list(&self) -> bool {
         matches!(self, Type::Named { name, .. } if name == LIST_NAME)
+    }
+
+    pub fn is_range(&self) -> bool {
+        matches!(self, Type::Named { name, .. } if name == RANGE_NAME)
     }
 
     pub fn is_struct(&self) -> bool {
@@ -1009,17 +1040,41 @@ impl Default for TypeChecker {
 }
 
 impl TypeChecker {
-    /// `struct_type_params`'s initial contents: just `List`, registered at
-    /// arity 1 so `resolve_type_expr`'s `TypeExpr::Apply` arm can arity-check
+    /// `struct_type_params`'s initial contents: `List`, registered at arity
+    /// 1 so `resolve_type_expr`'s `TypeExpr::Apply` arm can arity-check
     /// `List<...>` through the same lookup it uses for a user `data
     /// Name<A>` declaration (`TRAITS.md` Stage 3c), rather than a second
     /// hardcoded branch. The placeholder name is never substituted into
     /// anything — `List` has no field template (`struct_defs` has no entry
     /// for it, deliberately: it stays builtin-represented, not a struct) —
     /// it exists purely so `.len()` reads 1.
+    ///
+    /// `Range` is registered here too, at arity 1, but — unlike `List` — its
+    /// binder name (`"T@Range"`) *is* real: it's the exact key
+    /// `initial_struct_templates`'s two `TypeVar` fields use, so
+    /// `materialize_struct` actually substitutes a concrete element type
+    /// into them (see `RANGE_NAME`'s doc comment for why `Range` gets a real
+    /// template while `List` doesn't). The name is a fixed literal, not
+    /// minted via `fresh_var` — it never needs to be fresh, since it's the
+    /// same two occurrences being zipped against every time, not a
+    /// per-call-site instantiation — just distinct from `fresh_var`'s own
+    /// `"t{id}"` scheme so an unrelated inference variable can never
+    /// collide with it and get substituted in by accident.
     fn initial_struct_type_params() -> HashMap<String, Vec<String>> {
         let mut m = HashMap::new();
         m.insert(LIST_NAME.to_string(), vec!["T".to_string()]);
+        m.insert(RANGE_NAME.to_string(), vec!["T@Range".to_string()]);
+        m
+    }
+
+    /// `struct_templates`'s initial contents: just `Range`'s
+    /// `[("start", T@Range), ("end", T@Range)]` field template — see
+    /// `RANGE_NAME`'s doc comment. `List` is deliberately absent (no entry
+    /// at all, not even an empty one) since it has no field template.
+    fn initial_struct_templates() -> StructTemplates {
+        let mut m = HashMap::new();
+        let t = Type::TypeVar { name: "T@Range".to_string(), bounds: Vec::new() };
+        m.insert(RANGE_NAME.to_string(), vec![("start".to_string(), t.clone()), ("end".to_string(), t)]);
         m
     }
 
@@ -1067,11 +1122,11 @@ impl TypeChecker {
     }
 
     pub fn empty() -> Self {
-        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: HashMap::new(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
     }
 
     /// Check whether a concrete type implements the given trait. Only makes
@@ -3385,6 +3440,15 @@ impl TypeChecker {
                     }
                     return Ok(Type::Bool);
                 }
+                if let Some(elem) = resolved_right.as_range_elem().cloned() {
+                    if !self.unify(left_ty, &elem) {
+                        let resolved_left = self.lookup(left_ty);
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Operator 'in' got incompatible types: expected {}, got {}", elem, resolved_left)
+                        }, *left_span));
+                    }
+                    return Ok(Type::Bool);
+                }
                 if let Some(elem) = resolved_right.as_list_elem().cloned() {
                     if !self.unify(left_ty, &elem) {
                         let resolved_left = self.lookup(left_ty);
@@ -3395,7 +3459,7 @@ impl TypeChecker {
                     return Ok(Type::Bool);
                 }
                 Err(Spanned::from(TypeError {
-                    msg: format!("Operator 'in' requires Str or List on the right side, got {}", resolved_right)
+                    msg: format!("Operator 'in' requires Str, List, or Range on the right side, got {}", resolved_right)
                 }, *right_span))
             },
 
@@ -5602,6 +5666,18 @@ impl TypeChecker {
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "get"
         );
+        // `to_list` is the explicit, opt-in `Range<T> -> List<T>` conversion
+        // (RANGES.md Stage 1's "breaking-change handling") — since `Range`
+        // no longer secretly *is* a `List`, code that genuinely needs List
+        // semantics (indexing, push, slicing) on a range has to ask for the
+        // materialization explicitly rather than get it for free at every
+        // call boundary. Same "can't be a plain `default_context()` entry"
+        // reasoning as `len`/`push` (polymorphic over `T`, no generics
+        // system for a monomorphic binding to express that).
+        let is_to_list = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "to_list"
+        );
 
         let (kind, ty) = if let Some(name) = struct_name {
             // `TRAITS.md` Stage 3a: a generic struct's binders are
@@ -5696,6 +5772,14 @@ impl TypeChecker {
             let xs_arg = arg_iter.next().expect("arity checked just above");
             let i_arg  = arg_iter.next().expect("arity checked just above");
             return self.finish_get(xs_arg, i_arg, span);
+        } else if is_to_list {
+            if c.args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
+                }, callee_span));
+            }
+            let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
+            return self.finish_to_list(arg, callee_span, span);
         } else if matches!(&c.callable.item, Expression::FieldAccess(_)) {
             // `x.f(args)` where `f` isn't a struct/union field of
             // `typeof(x)` — resolved by `lower_ufcs_call` per
@@ -5807,6 +5891,31 @@ impl TypeChecker {
         Ok(Spanned::from(TypedExpr {
             id: 0,
             ty: Type::Int,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] },
+        }, span))
+    }
+
+    /// The tail of a `to_list` call once its argument is already lowered —
+    /// the explicit `Range<T> -> List<T>` conversion (see `is_to_list`'s
+    /// comment). Same "synthesize the callable directly" shape as
+    /// `finish_len`.
+    fn finish_to_list(&mut self, arg: Spanned<TypedExpr>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let arg_span = arg.span;
+        let arg_ty = self.lookup(&arg.item.ty);
+        let Some(elem) = arg_ty.as_range_elem().cloned() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("to_list's argument must be a Range, got {}", arg_ty)
+            }, arg_span));
+        };
+        let result_ty = Type::list(elem);
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![arg_ty.clone()], result: Box::new(result_ty.clone()) },
+            kind: TypedExprKind::Var("to_list".to_string()),
+        }, callee_span);
+        Ok(Spanned::from(TypedExpr {
+            id: 0,
+            ty: result_ty,
             kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] },
         }, span))
     }
@@ -6779,8 +6888,16 @@ impl TypeChecker {
                 msg: format!("Range end must be Int, got {}", self.lookup(&end.item.ty))
             }, end_span));
         }
+        let ty = Type::range(Type::Int);
+        // Eagerly register `Range<Int>`'s concrete layout so codegen's
+        // `struct_fields` never sees an unregistered instantiation (which
+        // would otherwise silently flatten to zero leaves via
+        // `unwrap_or_default` — a silent-corruption failure mode, not a
+        // panic). Mirrors how a real struct-construction call site always
+        // materializes its own layout before lowering can succeed.
+        self.materialize_struct(&ty);
         Ok(Spanned::from(TypedExpr { id: 0,
-            ty: Type::list(Type::Int),
+            ty,
             kind: TypedExprKind::Range { start: Box::new(start), end: Box::new(end) },
         }, span))
     }
@@ -6964,20 +7081,22 @@ impl TypeChecker {
         let iterable = self.check_and_lower(*fl.iterable)?;
         let iter_ty = iterable.item.ty.clone();
         let resolved_iter = self.lookup(&iter_ty);
-        let elem_ty = match resolved_iter.as_list_elem() {
-            Some(inner) => inner.clone(),
-            None if matches!(&resolved_iter, Type::TypeVar { .. }) => {
-                let elem = self.fresh_var();
-                if !self.unify(&iter_ty, &Type::list(elem.clone())) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("Can't iterate over {}", resolved_iter)
-                    }, iterable_span));
-                }
-                elem
-            },
-            _ => return Err(Spanned::from(TypeError {
-                msg: format!("Can't iterate over {}, expected a List", resolved_iter)
-            }, iterable_span)),
+        let elem_ty = if let Some(inner) = resolved_iter.as_list_elem() {
+            inner.clone()
+        } else if let Some(inner) = resolved_iter.as_range_elem() {
+            inner.clone()
+        } else if matches!(&resolved_iter, Type::TypeVar { .. }) {
+            let elem = self.fresh_var();
+            if !self.unify(&iter_ty, &Type::list(elem.clone())) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Can't iterate over {}", resolved_iter)
+                }, iterable_span));
+            }
+            elem
+        } else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Can't iterate over {}, expected a List or Range", resolved_iter)
+            }, iterable_span));
         };
 
         // The loop variable is bound for the guard and body only. The

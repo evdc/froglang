@@ -324,24 +324,36 @@ fn test_slice_chained_with_index() {
 
 #[test]
 fn test_range_materializes_list() {
-    let bits = compile_and_run("1..5");
+    // `1..5` no longer materializes a `List` on its own — `to_list` is the
+    // explicit opt-in conversion now (see the comment below).
+    let bits = compile_and_run("to_list(1..5)");
     assert_eq!(list_elems(bits), vec![1, 2, 3, 4]);
 }
 
+// `Range` is now a real, distinct nominal type (`Type::Named{"Range",[T]}`),
+// not a materializing `List<Int>` in disguise — see `plans/RANGES.md`.
+// `to_list(range)` is the explicit, opt-in conversion for tests (and
+// programs) that want `List` semantics.
+
 #[test]
 fn test_range_reversed_is_empty() {
-    let bits = compile_and_run("5..1");
+    let bits = compile_and_run("to_list(5..1)");
     assert_eq!(list_elems(bits), Vec::<i64>::new());
 }
 
 #[test]
-fn test_range_index() {
-    assert_eq!(compile_and_run("(1..10)[3]"), 4);
+fn test_range_index_is_a_type_error() {
+    let ast = froglang_core::frontend::parser::Parser::parse("(1..10)[3]").expect("parse error");
+    let mut tc = froglang_core::frontend::typeck::TypeChecker::new();
+    let err = tc.check_and_lower(ast).expect_err("indexing a Range should be a type error");
+    assert!(format!("{:?}", err).contains("Can't index into Range"), "unexpected error: {:?}", err);
 }
 
 #[test]
 fn test_range_in_let() {
-    let bits = compile_and_run("let r = 1..5\nr");
+    assert_eq!(compile_and_run("let r = 1..5\nr.start"), 1);
+    assert_eq!(compile_and_run("let r = 1..5\nr.end"), 5);
+    let bits = compile_and_run("let r = 1..5\nto_list(r)");
     assert_eq!(list_elems(bits), vec![1, 2, 3, 4]);
 }
 

@@ -216,19 +216,26 @@ impl<'a> Parser<'a> {
     }
 
     pub fn expression(&mut self, precedence: Precedence) -> ParseResult {
-        let mut token = self.advance()?;
+        let token = self.advance()?;
 
         let rule = Grammar::get_parse_rule(&token);
         let prefix = rule.prefix.unwrap_or(Grammar::prefix_error);
-        let mut left = prefix(self, token)?;
+        let left = prefix(self, token)?;
 
+        self.continue_expression(left, precedence)
+    }
+
+    /// The infix half of `expression`, resumable from an already-parsed
+    /// `left`. `Grammar::mut_prefix` uses it to pick up the `.field` /
+    /// `[index]` steps of a `mut` argument's place at `Precedence::Call`,
+    /// without swallowing the `,` or `)` that ends the argument.
+    pub fn continue_expression(&mut self, mut left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
         loop {
             let rule = Grammar::get_parse_rule(&self.current_token);
             if precedence > rule.precedence { break; }
-            token = self.advance()?;
+            let token = self.advance()?;
             left = (rule.infix)(self, token, left, rule.precedence)?;
         }
-
         Ok(left)
     }
 

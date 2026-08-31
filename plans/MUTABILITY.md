@@ -771,6 +771,69 @@ The three bugs above and the five table rows go into `tests/test_value_semantics
 
 Steps 1 and 2 are provably no-ops, which keeps the semantically risky commit small.
 
+#### Sharp corners found while auditing Stage 7
+
+**Non-aliasing readers must be transient, or ordinary loops go quadratic.** A read that stores
+nothing creates no alias, so marking it shared is pure loss — and worse than loss, because the
+*next* write then copies, re-marks and re-copies. Three were routed through `compile_expr` rather
+than `compile_expr_transient`, each turning an O(n) loop into an O(n²) one:
+
+```
+for i in 0..n { s = s + xs.len();  push(mut xs, i) }     147ms -> 11.8ms at n=40000
+for i in 0..n { print(xs);         push(mut xs, i) }
+for i in 0..n { if xs == small ..; push(mut xs, i) }      51ms -> 12.8ms at n=20000
+```
+
+All three fixed. The general rule, worth applying to any future builtin: **if it reads a list and
+stores nothing, it is transient.** `Index`, `Slice`, `FieldAccess` and a loop's `iterable` already
+were; `len`, `print` and structural `==` were not. This class of mistake is invisible to the test
+suite (it changes no output) and invisible to `FROG_COW_VERIFY` (over-marking is always sound), so
+it needs a benchmark or an audit to catch — `benches/pipeline.rs` is the right home for a
+regression workload.
+
+**The remaining cliff: passing a list to a non-`mut` parameter.** Still quadratic in a mutation
+loop, measured 51.6ms against an 11.5ms baseline at n=20000:
+
+```
+func peek(ys: List<Int>): Int = ys.len()
+for i in 0..n { s = s + peek(xs);  push(mut xs, i) }
+```
+
+Unlike the three above, this mark is *correct*: the callee's parameter is a second binding. Two
+things would be needed to elide it, and they only work together:
+
+1. Mark at `mut` binding sites, so a callee rebinding an immutable parameter into a `mut` local
+   (`mut ys = xs; push(mut ys, ..)`) marks rather than aliasing the caller's list. This is the
+   `Assign.mutable` plumbing the "rejected" section below turned down — but its cost/benefit is
+   different now that a mark is a byte store rather than a deep copy.
+2. A per-function *escape* summary: does any parameter's value reach a return position (directly,
+   or inside a returned container)? If not, the caller needn't mark. Whole-program compilation
+   through one `FrogState` makes this tractable, and it is the same shape of analysis the inliner
+   would want. Without it the elision is unsound — `func f(xs) = xs` hands the caller an alias the
+   call site cannot see.
+
+**Expressiveness gaps that are implementation limits, not semantic ones.** Every one of these is
+ordinary in Swift/Nim/V, and each was forbidden by where the mutation surface was drawn (a bare
+identifier root) rather than by mutable value semantics. **All three are fixed in Stage 8 below.**
+
+- `rows[y][x] = v` — rejected outright ("assignment through more than one list index isn't
+  supported yet"). This is the Game-of-Life shape; `benches/life.frog` rebuilds whole grids from
+  comprehensions partly because it cannot write one cell.
+- `push(mut b.items, v)` — rejected, **while `b.items[0] = v` works**. The place path already
+  supports a field prefix; `push` does not, so the two mutations disagree about what a root is.
+  Worth aligning: `is_push` should accept the same paths `flatten_place` does.
+- `push(mut rows[0], v)` — rejected for the same reason.
+
+Under copy-on-write these become tractable in a way they were not before: the write barrier needs
+the *root* to rebind, and for a path it would need to unshare each level along the way
+(`emit_unshare` per segment), which is O(depth) rather than O(size).
+
+**Unrelated bug found in passing.** `mut xs = []` followed by `print(xs)` prints `<?>` placeholders
+— the element type is still an unresolved type variable on that `Var` node when `print`'s
+type-directed codegen reads it. Annotating (`mut xs: List<Int> = []`) fixes it. Reproduces
+identically before Stage 7; it is a missing final resolution pass over the typed AST, not an
+aliasing issue.
+
 #### Rejected: static elision of the copy instead
 
 The alternative is to keep eager copying but skip it where the destination provably cannot be
@@ -788,6 +851,116 @@ place of one.
 Stages 1–4 are frontend work with no runtime component and can land before generics. Stage 6 is
 the one with a dependency in both directions: it needs the liveness analysis, and container
 mutation needs it.
+
+### Stage 8: paths as mutable places (implemented)
+
+Stage 7's audit left three expressiveness gaps, all with one cause: the two mutations disagreed
+about what a mutation target was. Assignment took a *place* — a root binding plus a `.field` /
+`[index]` path — while `push` took a bare identifier. So `b.items[0] = v` worked and
+`push(mut b.items, v)` did not, and neither `rows[y][x] = v` nor `push(mut rows[0], v)` worked at
+all. This is Hylo's *projection* idea in the narrow form the language can afford: not a general
+`subscript` that can `yield` access to a computed part, but the concrete "root plus static path"
+case, which is the shape the writable-keypath sketch in Racordon et al. §4 proposes for exactly the
+managed-runtime setting we are in.
+
+#### One representation for every mutation
+
+`typed_ast::Place { root, path }` is what a mutation names. In typeck, `lower_place` walks the path
+once — resolving each segment's type, checking the root is mutable — and every mutation calls it, so
+they cannot drift apart again.
+
+Three things carry a `Place`: `PlaceAssign { place, value }`, and — the part that makes this
+extensible — **a `mut` call argument**, via `Arg::Mut(Place)`:
+
+    pub enum Arg { Value(Spanned<TypedExpr>), Mut(Place) }
+
+    Call { callable: TypedExprRef, args: Vec<Arg> }      // `mut_args: Vec<bool>` is gone
+
+The first attempt gave `push` a `TypedExprKind` variant of its own so its receiver could be a path.
+That worked, but it was the wrong axis. A node costs a handler in **every** walker — 14 sites across
+typeck, liveness, linear and codegen — and that repeats for `pop`, `insert`, `remove` and every
+`Map` operation. Worse, it put the generality in the wrong place: the *builtin* could take a path
+while a user's own `func f(mut xs: List<Int>)` still could not, so `f(mut b.items)` was rejected.
+
+Carrying the place in the argument fixes both. A new mutating builtin needs one arm in
+`compile_call` and nothing else — the per-operation cost is codegen, which is inherent and cheap,
+not AST surgery. And `f(mut b.items)` / `f(mut rows[1])` now work, because a `mut` parameter is
+resolved, loaded and copied back out through the same `PlaceRef` as everything else. `push` went
+back to being a call dispatched on its callee name, exactly as `print` and `len` already are.
+
+Parsing changed too: `Grammar::mut_prefix` parses a full place at `Precedence::Call` (via a new
+`Parser::continue_expression`, the infix loop factored out of `Parser::expression`) instead of
+accepting only a bare identifier.
+
+**Still restricted:** a user-defined mutating *method*'s receiver (`b.bump()` where `bump` takes
+`mut self`) must be a bare binding — those two call paths build a `Place` with an empty path from
+the receiver's root name. `b.items.push(3)` works, since `push` resolves its receiver with
+`lower_place`, but the general case is unfinished. See roadmap.md.
+
+#### A liveness rule that changed with it
+
+A `mut` argument's root is **read-modify-write**: live going into the call, rebound by the copy-out.
+Anything that aliased it earlier must therefore see a `Copy` and mark.
+
+The old code did the opposite — it *removed* the root from `live_out` — and was still correct only
+because the argument was a `Var` node whose own transfer added it straight back; the removal existed
+solely to make that read a last use so it would not clone. Reading a place creates no `Var`
+occurrence at all, so translating the removal literally was a soundness bug:
+`let c = b; add(mut b.items)` made `let c = b` a last use, nothing marked the list, and the callee's
+push landed where `c` could see it. The clone-elision the removal used to buy is structural now —
+`emit_place_ref` reads the place directly and never marks — so the rule is simply
+`live_out ∪ {root}`, the same one `PlaceAssign` already used.
+
+#### Walking a path: unshare down, write back
+
+`codegen::emit_place_ref` walks a place, unsharing every list *above* its leaf, and returns where
+that leaf lives — flattened `Variable`s for a pure field path, or a slot in a list. `place_load` and
+`place_store` then read and write it, which is all a `mut` argument's copy-in/copy-out needs:
+
+    rows = unshare(rows)              // rebind the root's Variable
+    inner = list_get(rows, y)
+    inner = unshare(inner)            // may replace it with a private copy
+    list_set(rows, y, inner)          // ...so write the new pointer back
+    // ...repeat per level; the final write lands in `inner`
+
+Two things make this correct. **Every list on the path is unshared, not just the innermost**: writing
+into `rows[y]`'s buffer is observable through any other binding that can still reach `rows`. And
+**each unshared pointer is stored back into its parent slot** before the walk descends — that
+write-back is what keeps the chain connected without reference counts, since unsharing may replace a
+list with a copy.
+
+It stays O(depth), not O(size). `emit_unshare` copies only when the `shared` bit is set, and
+`GcHeap::clone_obj` is a *deep* clone, so once an outer list has been copied every list below it is
+already private and the remaining steps are pure tests.
+
+#### A soundness hole this exposed
+
+`mark_shared_if_aliased` marked a copied binding only when the binding's *own* type was `List`. So
+copying a struct that holds a list marked nothing, and
+
+    mut b = Box(items=[1, 2])
+    let c = b
+    b.items[0] = 99          // c.items now reads [99, 2]
+
+was wrong. This predates Stage 8 — `flatten_place` has always accepted a field prefix — and it
+survived the Stage 7 audit because that function's own doc comment asserted the opposite, that a
+mutation "requires a bare `mut`-rooted `List` binding ... never a struct field". The fix is to mark
+every `List` leaf of a copied value, which is what `mark_shared_extracted` already did for values
+read out of containers; the two now share it. No benchmark moved.
+
+Worth recording how it was *not* found: `FROG_COW_VERIFY` does not catch it. Two bindings holding
+the identical SSA value share one spill slot, so `count_refs` sees one reference — the limitation
+already documented under "How to know it's right". Deliberately disabling all marking still leaves
+this program silently wrong under the verifier, while the extraction shapes abort as they should.
+It took writing the test.
+
+#### The verifier learned about depth
+
+A nested write legitimately has *two* live references to the list it mutates in place: the JIT slot
+holding the pointer, and the parent list's own slot. Rather than relaxing the check to `> 2`
+everywhere, `frog_cow_verify` now takes how many references are expected at that position — 1 at a
+place rooted directly in a binding, 2 for a list reached through another list. The outer case stays
+as strict as it was, which is what a sabotage run confirms.
 
 ## Open questions
 

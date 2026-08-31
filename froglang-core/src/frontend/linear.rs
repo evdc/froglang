@@ -53,7 +53,7 @@ use std::collections::HashSet;
 
 use crate::frontend::liveness::{self, Liveness, NameSet, Ownership};
 use crate::frontend::tokens::{Span, Spanned};
-use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind};
+use crate::frontend::typed_ast::{Arg, PlaceSeg, TypedExpr, TypedExprKind};
 use crate::frontend::typeck::{TypeChecker, TypeError};
 
 /// Read-only state threaded through every `walk` call.
@@ -265,11 +265,12 @@ fn walk(
         }
         TypedExprKind::Function { .. } => Ok(HashSet::new()),
 
-        TypedExprKind::PlaceAssign { root, path, value } => {
-            let mut moved = walk(value, liveness, ctx, Some(root.as_str()))?;
-            for seg in path {
+        TypedExprKind::PlaceAssign { place, value } => {
+            let root = place.root.as_str();
+            let mut moved = walk(value, liveness, ctx, Some(root))?;
+            for seg in &place.path {
                 if let PlaceSeg::Index { index, .. } = seg {
-                    moved = union(moved, walk(index, liveness, ctx, Some(root.as_str()))?);
+                    moved = union(moved, walk(index, liveness, ctx, Some(root))?);
                 }
             }
             Ok(moved)
@@ -277,7 +278,17 @@ fn walk(
 
         // `callable` names a `func_ids` entry, not a binding — never
         // visited, matching `liveness::transfer`'s `Call` arm.
-        TypedExprKind::Call { args, .. } => fold(args, liveness, ctx, suppress),
+        // A `mut` argument is a place, not a value: its root is written
+        // back after the call rather than consumed, so only its `[index]`
+        // subexpressions participate here — the same treatment
+        // `PlaceAssign`'s own arm gives them.
+        TypedExprKind::Call { args, .. } => {
+            let mut moved = HashSet::new();
+            for a in args.iter().flat_map(Arg::subexprs) {
+                moved = union(moved, walk(a, liveness, ctx, suppress)?);
+            }
+            Ok(moved)
+        }
 
         TypedExprKind::Return(value) => match value {
             Some(v) => walk(v, liveness, ctx, suppress),

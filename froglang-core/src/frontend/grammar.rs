@@ -82,23 +82,32 @@ impl Grammar {
         Self::finish_declaration(parser, &token, name, Mutability::Immutable)
     }
 
-    /// `mut name = expr` (a declaration) or `mut name` (marks an existing
-    /// mutable binding as the target of a `mut` parameter at a call site,
-    /// `bump(mut a)`) — see `MUTABILITY.md`. Disambiguated by what follows
-    /// the identifier: `:` or `=` continues exactly like `let_binding`;
-    /// anything else (`,`, `)`, a statement separator) means this is the
-    /// call-argument form, which accepts nothing but a bare identifier —
-    /// `mut a.b` or `mut f()` have no meaning there, so the identifier
-    /// parsed above is already the whole of it.
+    /// `mut name = expr` (a declaration) or `mut place` (marks the target
+    /// of a `mut` parameter at a call site, `bump(mut a)` /
+    /// `push(mut b.items, v)`) — see `MUTABILITY.md`. Disambiguated by what
+    /// follows the identifier: `:` or `=` continues exactly like
+    /// `let_binding`; anything else (`,`, `)`, a statement separator) means
+    /// this is the call-argument form.
+    ///
+    /// That form takes a *place* — the same `.field` / `[index]` chain
+    /// rooted at an identifier that an assignment target may be
+    /// (`is_assignable_place`), parsed at `Precedence::Call` so the chain
+    /// is picked up but the `,` or `)` ending the argument is not.
+    /// Stage 8 widened this from a bare identifier; before it, the two
+    /// mutations disagreed about what a root was, so `b.items[0] = v` was
+    /// accepted while `push(mut b.items, v)` was a parse-level dead end.
     pub fn mut_prefix(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
         let name = parser.identifier()?;
         if parser.check(&Token::Colon) || parser.check(&Token::Assign) {
             return Self::finish_declaration(parser, &token, name, Mutability::Mutable);
         }
-        let name_span = name.span;
+        let target = parser.continue_expression(name.map(Expression::literal), Precedence::Call)?;
+        if !Self::is_assignable_place(&target.item) {
+            return Err(target.to(ParseError::InvalidAssignmentTarget));
+        }
         Ok(Spanned {
-            span: token.span.merge(name_span),
-            item: Expression::mut_arg(name.map(Expression::literal)),
+            span: token.span.merge(target.span),
+            item: Expression::mut_arg(target),
         })
     }
 

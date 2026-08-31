@@ -9,7 +9,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::liveness;
 use crate::frontend::tokens::{Span, Spanned, Token};
-use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
+use crate::frontend::typed_ast::{Arg, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
 use crate::runtime::{ffi, gc};
 use crate::runtime::gc::{FrogList, FrogVariant};
@@ -725,27 +725,31 @@ fn read_var_raw(name: &str, ty: &Type, bcx: &mut FunctionBuilder, vars: &HashMap
 /// times per cell and never mutates it. The copy now happens at the write
 /// instead (`emit_unshare`), so an alias costs one byte store.
 ///
-/// **Why exactly `List`, not "any GC-pointer-bearing type"**: this exists to
-/// protect against a mutation becoming visible through an alias, and
-/// `push`/index-assignment are the only mutations that exist — both require
-/// a *bare* `mut`-rooted `List` binding (`is_push`/`flatten_place`'s root
-/// check in typeck.rs), never a struct field or a union payload. A struct or
-/// union value can only ever be *rebound* (a new value replacing the whole
-/// thing), never mutated in place, so aliasing one is unobservable no matter
-/// how many bindings share it.
+/// **Why every `List` leaf, not just a `List`-typed value**: this exists to
+/// protect against a mutation becoming visible through an alias, and the
+/// mutable places a write can name (`typed_ast::Place`) reach *into*
+/// aggregates — `b.items[0] = v` and `push(mut b.items, v)` both mutate a
+/// list held in a struct field. So copying a struct aliases every list
+/// hanging off it, and each one has to be marked; only the non-`List`
+/// leaves are inert, since a struct or union value can itself only ever be
+/// *rebound*, never mutated in place.
+///
+/// Marking just the whole-value-is-a-`List` case was a soundness hole, not
+/// merely a missed one: `mut b = Box(items=[1, 2]); let c = b;
+/// b.items[0] = 99` left `c.items` reading `[99, 2]`. It predates Stage 8 —
+/// `flatten_place` has always accepted a field path — and survived the
+/// Stage 7 audit because this function's own doc comment asserted that a
+/// mutation could never name a struct field.
 ///
 /// A non-`Var` expression (a literal, a call result, an `if`-merge, ...) is
 /// always freshly produced and never needs this — nothing else can alias a
-/// value that was just computed. Nor does a struct/union/`Str`-typed `Var`
-/// read, for the reason above.
+/// value that was just computed.
 #[inline]
 fn mark_shared_if_aliased(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Vec<Value> {
     let TypedExprKind::Var(_) = &expr.item.kind else { return vals };
-    if !expr.item.ty.is_list() { return vals; }
     if ctx.liveness.ownership(expr.item.id) != liveness::Ownership::Copy { return vals; }
 
-    debug_assert_eq!(vals.len(), 1, "a List value is always exactly one leaf");
-    emit_mark_shared(bcx, vals[0]);
+    mark_shared_extracted(bcx, &expr.item.ty, &vals, ctx.structs);
     vals
 }
 
@@ -880,6 +884,13 @@ fn mark_shared_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: &[Value], s
 /// `frog_clone` produces a fresh, unshared object, so a loop that pushes
 /// repeatedly pays at most one copy on its first iteration.
 fn emit_unshare(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) -> Value {
+    emit_unshare_nested(bcx, ctx, val, 1)
+}
+
+/// `emit_unshare`, told how many live references legitimately reach `val`
+/// at this point — see `ffi::frog_cow_verify`. Only `FROG_COW_VERIFY` reads
+/// `allowed`; the emitted code is otherwise identical.
+fn emit_unshare_nested(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value, allowed: i64) -> Value {
     let shared = bcx.ins().load(types::I8, heap_mem(), val, shared_flag_offset());
 
     let copy_bb = bcx.create_block();
@@ -895,7 +906,8 @@ fn emit_unshare(bcx: &mut FunctionBuilder, ctx: &mut Ctx, val: Value) -> Value {
     if ctx.cow_verify {
         let verify_id = ctx.func_ids["frog_cow_verify"];
         let callee = ctx.module.declare_func_in_func(verify_id, bcx.func);
-        bcx.ins().call(callee, &[val]);
+        let allowed_val = bcx.ins().iconst(types::I64, allowed);
+        bcx.ins().call(callee, &[val, allowed_val]);
     }
     bcx.ins().jump(done_bb, &[BlockArg::from(val)]);
 
@@ -1957,94 +1969,223 @@ fn compile_expr(
 /// Cranelift (`declare_gc_value`/`declare_gc_var`) at or near the point it
 /// is produced, so it stays visible to a collection triggered anywhere it
 /// remains live — see `gc.rs`'s "Precise roots".
-/// Split a `PlaceAssign` path into the dotted field path before any
-/// `Index` step (`""` if the path starts with the index), the `Index`
-/// step's lowered expression and resolved element type if present
-/// (`TypeChecker::lower_place_assign` guarantees at most one), and the
-/// dotted field path after it (`""` if there is none, or no index at all).
-fn split_place_path(path: &[PlaceSeg]) -> (String, Option<(&TypedExprRef, &Type)>, String) {
-    let mut prefix = Vec::new();
-    let mut index = None;
-    let mut suffix = Vec::new();
-    for seg in path {
-        match seg {
-            PlaceSeg::Field(f) => {
-                if index.is_none() { prefix.push(f.as_str()); } else { suffix.push(f.as_str()); }
-            },
-            PlaceSeg::Index { index: idx, elem_ty } => { index = Some((idx, elem_ty)); },
-        }
-    }
-    (prefix.join("."), index, suffix.join("."))
+/// The dotted field path made of `segs`, which must all be
+/// `PlaceSeg::Field` — `""` for an empty run.
+fn dotted_fields(segs: &[PlaceSeg]) -> String {
+    segs.iter()
+        .map(|s| match s {
+            PlaceSeg::Field(f) => f.as_str(),
+            PlaceSeg::Index { .. } => unreachable!("caller slices on `Index` boundaries"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
-/// Codegen for `TypedExprKind::PlaceAssign` — see its doc comment for the
-/// two shapes this splits into.
+/// Where a place's leaf actually lives, once `emit_place_ref` has walked
+/// and unshared everything above it. Both of the language's mutations, and
+/// every `mut` argument, address storage through one of these two shapes.
+enum PlaceRef {
+    /// Flattened `Variable`s keyed `root[.field]*` — the leaf isn't on the
+    /// heap at all. A struct is a flat set of named bindings, so a pure
+    /// field path is a rebind, not a store.
+    Vars(String),
+    /// Slots `offset..` of element `index` of the heap-allocated `list`.
+    Slot { list: Value, index: Value, offset: usize },
+}
+
+/// Walk a place, unsharing every list *above* its leaf — `MUTABILITY.md`
+/// Stage 8 — and return where the leaf lives.
+///
+/// Every list on the path has to be unshared, not just the innermost one:
+/// writing into `rows[y]`'s buffer is observable through any other binding
+/// that can still reach `rows`. And because unsharing may *replace* a list
+/// with a private copy, each new pointer is stored back into the slot it
+/// came from before the walk descends — that write-back is what keeps the
+/// chain connected without reference counts.
+///
+/// The walk is O(depth), not O(size): `emit_unshare` copies only when the
+/// `shared` bit is actually set, and `GcHeap::clone_obj` is a *deep* clone,
+/// so once an outer list has been copied every list below it is private
+/// already and the remaining steps are pure tests.
+///
+/// The leaf itself is left alone. A caller that is about to mutate it in
+/// place unshares it too (`push` does); one that is handing it to a callee
+/// does not, because the callee's own barrier will, and copying here would
+/// defeat the point.
+fn emit_place_ref(
+    place: &Place,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> PlaceRef {
+    let root = place.root.as_str();
+    let path = &place.path;
+    let Some(last) = path.iter().rposition(|s| matches!(s, PlaceSeg::Index { .. })) else {
+        return PlaceRef::Vars(var_key(root, &dotted_fields(path)));
+    };
+    let PlaceSeg::Index { index, elem_ty } = &path[last] else {
+        unreachable!("`last` was found by matching `Index`")
+    };
+
+    let segs = &path[..last];
+    let first = segs.iter().position(|s| matches!(s, PlaceSeg::Index { .. }));
+
+    // Fields before the first `[index]` — the whole run, when there is no
+    // index — name one flattened leaf `Variable` holding the outermost
+    // list. It was declared when `root` was bound: a `List`-typed leaf
+    // never recurses further in `struct_fields`, so this names exactly one.
+    let list_key = var_key(root, &dotted_fields(&segs[..first.unwrap_or(segs.len())]));
+    let list_var = *vars.get(&list_key)
+        .unwrap_or_else(|| panic!("place root '{}' is unbound in codegen", list_key));
+    let mut cur = bcx.use_var(list_var);
+    cur = emit_unshare(bcx, ctx, cur);
+    bcx.def_var(list_var, cur);
+
+    // Every further `[index]` step reads a nested list out of its parent,
+    // unshares it, and writes it back. A field run after an index names a
+    // slot within that element's own flattened layout (`grid[y].cells[x]`),
+    // so it contributes an offset, exactly as the trailing run does below.
+    let mut rest = first.map_or(&[][..], |i| &segs[i..]);
+    while let Some((PlaceSeg::Index { index, elem_ty }, tail)) = rest.split_first() {
+        let next_index = tail.iter().position(|s| matches!(s, PlaceSeg::Index { .. })).unwrap_or(tail.len());
+        let offset = field_run_offset(elem_ty, &tail[..next_index], ctx);
+        let idx_val = compile_expr(index, bcx, vars, ctx);
+        let inner = emit_slot_load(bcx, ctx, cur, idx_val, offset);
+        let inner = emit_unshare_nested(bcx, ctx, inner, 2);
+        emit_slot_store(bcx, ctx, cur, idx_val, offset, inner);
+        cur = inner;
+        rest = &tail[next_index..];
+    }
+
+    let index = compile_expr(index, bcx, vars, ctx);
+    let offset = field_run_offset(elem_ty, &path[last + 1..], ctx);
+    PlaceRef::Slot { list: cur, index, offset }
+}
+
+/// The flattened-leaf offset a run of `.field` steps names within `ty`.
+fn field_run_offset(ty: &Type, segs: &[PlaceSeg], ctx: &Ctx) -> usize {
+    let fields = dotted_fields(segs);
+    if fields.is_empty() { 0 } else { dotted_leaf_range(ty, &fields, ctx.structs).0 }
+}
+
+fn emit_slot_load(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, index: Value, offset: usize) -> Value {
+    let off_val = bcx.ins().iconst(types::I64, offset as i64);
+    let get_id = ctx.func_ids["frog_list_get"];
+    let callee = ctx.module.declare_func_in_func(get_id, bcx.func);
+    let call = bcx.ins().call(callee, &[list, index, off_val]);
+    let raw = bcx.inst_results(call)[0];
+    declare_gc_ptr(bcx, raw);
+    raw
+}
+
+fn emit_slot_store(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, index: Value, offset: usize, val: Value) {
+    let off_val = bcx.ins().iconst(types::I64, offset as i64);
+    let set_id = ctx.func_ids["frog_list_set"];
+    let callee = ctx.module.declare_func_in_func(set_id, bcx.func);
+    bcx.ins().call(callee, &[list, index, off_val, val]);
+}
+
+/// Read a place's leaf, one value per flattened leaf of `ty`.
+fn place_load(
+    pref: &PlaceRef,
+    ty: &Type,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> Vec<Value> {
+    let leafs = struct_fields(ty, ctx.structs);
+    match pref {
+        PlaceRef::Vars(prefix) => leafs.iter()
+            .map(|(sub, lty)| {
+                let var = get_or_declare_var(bcx, vars, &var_key(prefix, sub), lty);
+                bcx.use_var(var)
+            })
+            .collect(),
+        PlaceRef::Slot { list, index, offset } => leafs.iter().enumerate()
+            .map(|(i, (_, lty))| {
+                let raw = emit_slot_load(bcx, ctx, *list, *index, offset + i);
+                from_i64_repr(bcx, lty, raw)
+            })
+            .collect(),
+    }
+}
+
+/// Write `vals` — one per flattened leaf of `ty` — into a place's leaf.
+fn place_store(
+    pref: &PlaceRef,
+    ty: &Type,
+    vals: &[Value],
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) {
+    let leafs = struct_fields(ty, ctx.structs);
+    match pref {
+        PlaceRef::Vars(prefix) => {
+            for (v, (sub, lty)) in vals.iter().zip(leafs.iter()) {
+                let var = get_or_declare_var(bcx, vars, &var_key(prefix, sub), lty);
+                bcx.def_var(var, *v);
+            }
+        },
+        PlaceRef::Slot { list, index, offset } => {
+            for (i, (v, (_, lty))) in vals.iter().zip(leafs.iter()).enumerate() {
+                let raw = to_i64_repr(bcx, lty, *v);
+                emit_slot_store(bcx, ctx, *list, *index, offset + i, raw);
+            }
+        },
+    }
+}
+
+/// Resolve a place to the `List` at its leaf, unshared and ready to be
+/// mutated in place — `push`'s receiver. The unshared pointer is written
+/// back to the place, so the mutation is reachable from the root.
+fn emit_mutable_list(
+    place: &Place,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> Value {
+    let pref = emit_place_ref(place, bcx, vars, ctx);
+    // How many live references legitimately reach this leaf, for
+    // `FROG_COW_VERIFY` (see `ffi::frog_cow_verify`). A leaf reached through
+    // a parent list has a second one — that parent's own slot.
+    //
+    // So does a `mut` *parameter*, and for a reason the callee cannot see:
+    // the caller may have passed a place that lives inside a container
+    // (`add(mut rows[1])`), which contributes a reference this function has
+    // no way to know about. That is exactly the limitation Racordon et al.
+    // (JOT 2022, §6) record for `inout` — "the callee has no way to
+    // determine whether that pointer refers to a value inside of a shared
+    // buffer". Their answer is a defensive copy by the caller; ours is to
+    // let the verifier expect the extra reference, since the mutation is
+    // sound either way: the caller unshared the whole chain down to that
+    // slot on the way in, and copies the result back out afterwards.
+    let from_mut_param = place.path.is_empty()
+        && ctx.mut_params.iter().any(|(n, _)| *n == place.root);
+    let allowed = match pref {
+        PlaceRef::Slot { .. } => 2,
+        PlaceRef::Vars(_) if from_mut_param => 2,
+        PlaceRef::Vars(_) => 1,
+    };
+    let list = place_load(&pref, &Type::list(Type::Int), bcx, vars, ctx)[0];
+    let list = emit_unshare_nested(bcx, ctx, list, allowed);
+    place_store(&pref, &Type::list(Type::Int), &[list], bcx, vars, ctx);
+    list
+}
+
+/// Codegen for `TypedExprKind::PlaceAssign` — resolve the place, store the
+/// value into it. The two shapes a place can resolve to (`PlaceRef`) are
+/// what used to be this function's two branches.
 fn compile_place_assign(
-    root: &str,
-    path: &[PlaceSeg],
+    place: &Place,
     value: &Spanned<TypedExpr>,
     bcx: &mut FunctionBuilder,
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
 ) {
-    let (prefix, index, suffix) = split_place_path(path);
-    match index {
-        // A pure field path — the struct "mutation" rebind sugar,
-        // generalized to any depth (`o.i.v = 5`): overwrite just the
-        // touched leaf `Variable`(s), leaving every other field of `root`
-        // untouched. Works precisely because a struct is a flat set of
-        // named bindings, not one aggregate value — no
-        // read-modify-reconstruct needed, unlike a boxed representation.
-        None => {
-            let vals = compile_expr_multi(value, bcx, vars, ctx);
-            let leafs = struct_fields(&value.item.ty, ctx.structs);
-            for (v, (sub_path, lty)) in vals.iter().zip(leafs.iter()) {
-                let full_path = if sub_path.is_empty() { prefix.clone() } else { format!("{}.{}", prefix, sub_path) };
-                let key = var_key(root, &full_path);
-                let var = get_or_declare_var(bcx, vars, &key, lty);
-                bcx.def_var(var, *v);
-            }
-        },
-        // A path with exactly one `[index]` step writes through a
-        // heap-allocated `FrogList` instead: the list pointer itself is a
-        // flattened `Variable` (a `List`-typed leaf never recurses
-        // further in `struct_fields`, so `prefix`, even empty, names
-        // exactly one leaf — already declared when `root` was bound, so
-        // the type passed to `get_or_declare_var` here is never actually
-        // observed). Each of `value`'s own leaves lands at its offset
-        // within the *indexed element*'s own flattened layout: the whole
-        // element's layout if `suffix` is empty (`xs[0] = v`), or the
-        // sub-range under `suffix` if not (`xs[0].f = v`).
-        Some((idx_expr, elem_ty)) => {
-            let list_key = var_key(root, &prefix);
-            let list_ty = Type::list(elem_ty.clone());
-            let list_var = get_or_declare_var(bcx, vars, &list_key, &list_ty);
-            let list_val = bcx.use_var(list_var);
-            // Copy-on-write barrier (MUTABILITY.md Stage 7): this is one of
-            // the language's only two in-place mutations, and it is about to
-            // write through `root`. If anything else can still see this list,
-            // write to a private copy and rebind `root` to it.
-            let list_val = emit_unshare(bcx, ctx, list_val);
-            bcx.def_var(list_var, list_val);
-            let idx_val = compile_expr(idx_expr, bcx, vars, ctx);
-
-            let (base_offset, _) = if suffix.is_empty() {
-                (0, struct_fields(elem_ty, ctx.structs).len())
-            } else {
-                dotted_leaf_range(elem_ty, &suffix, ctx.structs)
-            };
-
-            let vals = compile_expr_multi(value, bcx, vars, ctx);
-            let value_leafs = struct_fields(&value.item.ty, ctx.structs);
-            let set_id = ctx.func_ids["frog_list_set"];
-            for (i, (v, (_, lty))) in vals.iter().zip(value_leafs.iter()).enumerate() {
-                let raw = to_i64_repr(bcx, lty, *v);
-                let callee = ctx.module.declare_func_in_func(set_id, bcx.func);
-                let off_val = bcx.ins().iconst(types::I64, (base_offset + i) as i64);
-                bcx.ins().call(callee, &[list_val, idx_val, off_val, raw]);
-            }
-        },
-    }
+    let pref = emit_place_ref(place, bcx, vars, ctx);
+    let vals = compile_expr_multi(value, bcx, vars, ctx);
+    place_store(&pref, &value.item.ty, &vals, bcx, vars, ctx);
 }
 
 fn compile_expr_multi(
@@ -2126,7 +2267,7 @@ fn compile_expr_multi(
         TypedExprKind::Conditional { cond, true_branch, false_branch } =>
             compile_conditional(expr, cond, true_branch, false_branch, bcx, vars, ctx),
 
-        TypedExprKind::Call { callable, args, mut_args } => compile_call(callable, args, mut_args, bcx, vars, ctx),
+        TypedExprKind::Call { callable, args } => compile_call(callable, args, bcx, vars, ctx),
 
         TypedExprKind::Index { target, index } => {
             let list_val = compile_expr_transient(target, bcx, vars, ctx);
@@ -2283,8 +2424,8 @@ fn compile_expr_multi(
             }
         },
 
-        TypedExprKind::PlaceAssign { root, path, value } => {
-            compile_place_assign(root, path, value, bcx, vars, ctx);
+        TypedExprKind::PlaceAssign { place, value } => {
+            compile_place_assign(place, value, bcx, vars, ctx);
             vec![bcx.ins().iconst(types::I64, 0)]
         },
 
@@ -2430,8 +2571,13 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
     // nodes `build_struct_eq` synthesizes with the field's own type.
     if left.item.ty.is_list() && matches!(op, Token::EqEq | Token::NotEq) {
         let elem = left.item.ty.as_list_elem().expect("is_list implies an element type").clone();
-        let lv = compile_expr(left,  bcx, vars, ctx);
-        let rv = compile_expr(right, bcx, vars, ctx);
+        // Transient on both sides: a structural comparison reads the two
+        // lists and stores nothing, so neither operand is aliased by it.
+        // Marking them made `if xs == ys` inside a loop that also pushes
+        // quadratic — worse than `len`'s version of the same mistake, since
+        // it marked two lists per comparison.
+        let lv = compile_expr_transient(left,  bcx, vars, ctx);
+        let rv = compile_expr_transient(right, bcx, vars, ctx);
         let eq = eq_list(&elem, lv, rv, bcx, ctx);
         return vec![negate_if_ne(op, eq, bcx)];
     }
@@ -2711,17 +2857,39 @@ fn compile_conditional(
     }
 }
 
-fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_args: &[bool], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     let func_name = match &callable.item.kind {
         TypedExprKind::Var(name) => name.clone(),
         _ => panic!("only named function calls supported in codegen"),
     };
 
+    // `push(mut place, v)` — a mutating builtin. It needs no node of its
+    // own: its receiver is an ordinary `Arg::Mut`, so all that is special
+    // here is what to *do* with the resolved list. The next mutating
+    // builtin (`pop`, `insert`, a `Map` operation) is another arm here and
+    // nothing else. See `typed_ast::Arg`.
+    if func_name == "push" {
+        let (Arg::Mut(place), Some(v_arg)) = (&args[0], args[1].value()) else {
+            unreachable!("typeck's `finish_push` builds push's receiver as `Arg::Mut`")
+        };
+        let list_val = emit_mutable_list(place, bcx, vars, ctx);
+        let leafs = struct_fields(&v_arg.item.ty, ctx.structs);
+        let vvals = compile_expr_multi(v_arg, bcx, vars, ctx);
+        // See `compile_list_lit`'s identical push via `push_element`.
+        push_element(bcx, ctx, list_val, &vvals, &leafs);
+        return vec![bcx.ins().iconst(types::I64, 0)];
+    }
+
+    // Everything below reads arguments as values. `print` and the host/user
+    // call paths that follow take no `mut` place except through the
+    // copy-out at the very end, which resolves them itself.
+    let arg_exprs: Vec<&Spanned<TypedExpr>> = args.iter().filter_map(Arg::value).collect();
+
     // `print` accepts values of any type.  Its runtime entry
     // point is selected here, after type checking has established the
     // concrete argument type, so no invalid Str coercion is emitted.
     if func_name == "print" {
-        let arg = &args[0];
+        let arg = arg_exprs[0];
         if arg.item.ty == Type::Never {
             // `print`'s builtin signature has no declared param
             // type, so typeck doesn't reject a `Never` argument
@@ -2741,7 +2909,10 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         // `print(none)` work instead of falling into the scalar match's
         // panic below.
         if arg.item.ty.is_struct() || matches!(arg.item.ty, Type::Union(_) | Type::None) {
-            let values = compile_expr_multi(arg, bcx, vars, ctx);
+            // Transient: printing walks the value and stores nothing, so no
+            // alias survives this — see the `List` case just below for what
+            // marking it here would cost.
+            let values = compile_expr_multi_transient(arg, bcx, vars, ctx);
             let mut cursor = 0;
             print_value(&arg.item.ty, &values, &mut cursor, bcx, ctx);
             print_fragment("\n", bcx, ctx);
@@ -2751,7 +2922,12 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
             // Same type-directed walk the struct case above uses: the
             // element loop is emitted here, not delegated to a runtime
             // function that has lost `inner` (plans/DATA.md stage 0).
-            let list_val = compile_expr(arg, bcx, vars, ctx);
+            // Transient, and this is the case where it matters:
+            // `print(xs)` creates no alias, so marking `xs` shared here
+            // would make the *next* `push(mut xs, ..)` copy the whole list
+            // — and re-mark, and re-copy, turning an O(n) loop that prints
+            // as it goes into an O(n^2) one. Same reasoning as `Index`'s.
+            let list_val = compile_expr_transient(arg, bcx, vars, ctx);
             print_list(&inner, list_val, bcx, ctx);
             print_fragment("\n", bcx, ctx);
             return vec![bcx.ins().iconst(types::I64, 0)];
@@ -2777,8 +2953,12 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
     // which already exist as internal runtime primitives for indexing and
     // iteration (`compile_index`, comprehension lowering).
     if func_name == "len" {
-        let arg = &args[0];
-        let arg_val = compile_expr(arg, bcx, vars, ctx);
+        let arg = arg_exprs[0];
+        // Transient: `len` reads the header and discards the pointer, so it
+        // creates no alias. Marking here made `for i in .. { xs.len(); push(mut xs, i) }`
+        // — an entirely ordinary loop — quadratic, since every iteration
+        // re-shared the list and the following push copied it.
+        let arg_val = compile_expr_transient(arg, bcx, vars, ctx);
         let rt_name = if arg.item.ty.is_list() {
             "frog_list_len"
         } else {
@@ -2793,50 +2973,13 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         return vec![bcx.inst_results(call)[0]];
     }
 
-    // `push(mut xs, v)` — MUTABILITY.md stage 6's unlock. No `func_ids`
-    // entry backs "push" (see typeck's `is_push`), so this must be handled
-    // before the generic lookup below. `xs`'s own value is read through the
-    // ordinary `Var` funnel (`compile_expr`), so it *is* subject to the
-    // clone-on-`Copy` rule — but `liveness.rs`'s `Call`/`mut_args` handling
-    // unconditionally treats a `mut` argument's root as dead going into the
-    // call, so this occurrence is always `Move` and never clones; see
-    // `Ctx::liveness`'s doc comment. `v`'s leaves funnel the same way, so a
-    // `Copy`-classified pushed value is cloned before insertion with no
-    // `push`-specific logic needed here either.
-    if func_name == "push" {
-        let xs_arg = &args[0];
-        let v_arg  = &args[1];
-        let list_val = compile_expr(xs_arg, bcx, vars, ctx);
-        // Copy-on-write barrier (MUTABILITY.md Stage 7). `push` is one of
-        // the language's only two in-place mutations, and typeck's `is_push`
-        // guarantees the receiver is a bare `mut` binding — so the root's
-        // `Variable` is in scope here and can be rebound to a private copy
-        // when anything else can still observe the list.
-        //
-        // `frog_list_push`'s reallocation never moves the `FrogList` object
-        // itself, so this rebind — not that — is the only reason `xs`'s
-        // `Variable` needs writing back at all.
-        let list_val = emit_unshare(bcx, ctx, list_val);
-        let TypedExprKind::Var(root) = &xs_arg.item.kind else {
-            unreachable!("typeck's `is_push` only admits a bare mut binding as push's receiver")
-        };
-        let root_var = *vars.get(&var_key(root, ""))
-            .unwrap_or_else(|| panic!("push receiver '{}' is unbound in codegen", root));
-        bcx.def_var(root_var, list_val);
-        let leafs = struct_fields(&v_arg.item.ty, ctx.structs);
-        let vvals = compile_expr_multi(v_arg, bcx, vars, ctx);
-        // See `compile_list_lit`'s identical push via `push_element`.
-        push_element(bcx, ctx, list_val, &vvals, &leafs);
-        return vec![bcx.ins().iconst(types::I64, 0)];
-    }
-
     // A registered host function (`FrogStateBuilder::func`,
     // `plans/EMBEDDING.md`) — every one shares the uniform
     // `extern "C" fn(ctx, args, out)` shim signature regardless of its frog
     // type, so it's called through a stack-slot arg/out buffer instead of a
     // native Cranelift call. See "The uniform shim ABI" in the design doc.
     if ctx.host_fns.contains(&func_name) {
-        return compile_host_call(&func_name, callable, args, bcx, vars, ctx);
+        return compile_host_call(&func_name, callable, &arg_exprs, bcx, vars, ctx);
     }
 
     let func_id = ctx.func_ids[&func_name];
@@ -2851,8 +2994,21 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         _ => Type::Int,
     };
 
+    // A `mut` argument is passed by loading its place; the copy-out below
+    // writes the callee's final value back into that same place.
+    let mut arg_places: Vec<(PlaceRef, Type)> = Vec::new();
     let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
-    for (i, a) in args.iter().enumerate() {
+    for (i, arg) in args.iter().enumerate() {
+        let a = match arg {
+            Arg::Value(e) => e,
+            Arg::Mut(place) => {
+                let param_ty = param_types.get(i).cloned().unwrap_or(Type::Int);
+                let pref = emit_place_ref(place, bcx, vars, ctx);
+                arg_vals.extend(place_load(&pref, &param_ty, bcx, vars, ctx));
+                arg_places.push((pref, param_ty));
+                continue;
+            },
+        };
         if is_multi_leaf_type(&a.item.ty, ctx.structs) {
             // Struct args are never widened (nominal/exact match),
             // and an inline-union arg is already the exact target
@@ -2924,26 +3080,19 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
         vec![result]
     };
 
-    // Copy-out: root each `mut` argument's returned leaves exactly like
-    // the primary return above, then rebind them into the argument's own
-    // `Variable`(s) — `lower_call` only ever allows a bare identifier as
-    // a `mut` argument, so `var_key` needs nothing more than its name.
-    for (arg, is_mut) in args.iter().zip(mut_args.iter()) {
-        if !*is_mut { continue; }
-        let name = match &arg.item.kind {
-            TypedExprKind::Var(n) => n.clone(),
-            _ => unreachable!("TypeChecker::lower_call only allows a bare Var as a 'mut' argument"),
-        };
-        let leafs = struct_fields(&arg.item.ty, ctx.structs);
+    // Copy-out: root each `mut` argument's returned leaves exactly like the
+    // primary return above, then store them back into the place the
+    // argument named. `emit_place_ref` already walked and unshared that
+    // path on the way in, so the parent chain is private and this store is
+    // reachable from the root — which is what lets a `mut` argument be
+    // `f(mut b.items)` and not just `f(mut xs)`.
+    for (pref, ty) in &arg_places {
+        let leafs = struct_fields(ty, ctx.structs);
         let (this_arg, rest) = copyout_raw.split_at(leafs.len());
         copyout_raw = rest;
         let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
         declare_gc_leaves(bcx, this_arg, &leaf_tys);
-        for (v, (path, lty)) in this_arg.iter().zip(leafs.iter()) {
-            let key = var_key(&name, path);
-            let var = get_or_declare_var(bcx, vars, &key, lty);
-            bcx.def_var(var, *v);
-        }
+        place_store(pref, ty, this_arg, bcx, vars, ctx);
     }
 
     primary_results
@@ -2964,7 +3113,7 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], mut_
 /// own stack map — a raw stack slot isn't a `Value` — which is exactly why
 /// the shim on the other side must `RuntimeRoots::hold` every argument
 /// slot itself (`plans/EMBEDDING.md`, "GC safety").
-fn compile_host_call(func_name: &str, callable: &Spanned<TypedExpr>, args: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+fn compile_host_call(func_name: &str, callable: &Spanned<TypedExpr>, args: &[&Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     let return_ty: Type = match &callable.item.ty {
         Type::Function { result, .. } => *result.clone(),
         _ => Type::Int,
@@ -3688,7 +3837,7 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_variant_set", "frog_variant_set", &[I64, I64, I64], None);
         // Deep-clone-on-Copy for a GC-pointer-bearing `Var` read — see
         // `compile_expr_multi`'s `TypedExprKind::Var` arm and `Ctx::liveness`.
-        declare_rt(&mut module, &mut func_ids, "frog_cow_verify", "frog_cow_verify", &[I64], None);
+        declare_rt(&mut module, &mut func_ids, "frog_cow_verify", "frog_cow_verify", &[I64, I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_clone",      "frog_clone",      &[I64],           Some(I64));
         // Fetches the `FrogCtx*` a host call passes as its own argument 0
         // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,

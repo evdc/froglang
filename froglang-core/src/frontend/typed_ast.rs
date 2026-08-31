@@ -53,6 +53,86 @@ pub enum PlaceSeg {
     },
 }
 
+/// A *mutable place*: a root binding plus a root-to-leaf path naming one
+/// part of it (`MUTABILITY.md` Stage 8). `root` is always a mutable
+/// binding — every constructor checks that before building one — and
+/// `path` may be empty, which names the root itself.
+///
+/// Both of the language's in-place mutations address their target this
+/// way: `PlaceAssign` writes a value *into* a place, and `Push` appends to
+/// a place that is itself a `List`. Sharing one representation is what
+/// lets them accept the same paths; they disagreed before Stage 8, so
+/// `b.items[0] = v` was accepted while `push(mut b.items, v)` was not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Place {
+    pub root: String,
+    pub path: Vec<PlaceSeg>,
+}
+
+impl Place {
+    /// The subexpressions a place evaluates, in evaluation order: its
+    /// `[index]` steps. `root` is a binding name, not an expression, and a
+    /// `.field` step is a static offset — so these are the only ones.
+    pub fn index_exprs(&self) -> impl Iterator<Item = &Spanned<TypedExpr>> {
+        self.path.iter().filter_map(|s| match s {
+            PlaceSeg::Index { index, .. } => Some(&**index),
+            PlaceSeg::Field(_) => None,
+        })
+    }
+
+    pub fn index_exprs_mut(&mut self) -> impl Iterator<Item = &mut Spanned<TypedExpr>> {
+        self.path.iter_mut().filter_map(|s| match s {
+            PlaceSeg::Index { index, .. } => Some(&mut **index),
+            PlaceSeg::Field(_) => None,
+        })
+    }
+}
+
+/// One argument at a call site.
+///
+/// A `mut` argument is a **place**, not a value: it names storage the callee
+/// may write through, so it is resolved by `codegen::emit_place_ref` and
+/// written back after the call, never evaluated as an ordinary expression.
+/// Everything else is a value.
+///
+/// This is what makes mutating operations extensible (`MUTABILITY.md`
+/// Stage 8). `push` briefly had a `TypedExprKind` variant of its own so that
+/// its receiver could be a path — but a node per mutating operation costs a
+/// handler in every walker in typeck, liveness, linear and codegen, and
+/// would repeat for `pop`, `insert`, `remove` and every `Map` operation.
+/// Carrying the place in the *argument* instead means a new mutating builtin
+/// needs only its own codegen arm, and — the half the node could never give
+/// — a user's own `func f(mut xs: List<Int>)` accepts `f(mut b.items)` too.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Arg {
+    Value(Spanned<TypedExpr>),
+    Mut(Place),
+}
+
+impl Arg {
+    /// The argument's value expression, or `None` for a `mut` place.
+    pub fn value(&self) -> Option<&Spanned<TypedExpr>> {
+        match self { Arg::Value(e) => Some(e), Arg::Mut(_) => None }
+    }
+
+    pub fn is_mut(&self) -> bool { matches!(self, Arg::Mut(_)) }
+
+    /// Every subexpression this argument evaluates, in evaluation order.
+    pub fn subexprs(&self) -> Box<dyn Iterator<Item = &Spanned<TypedExpr>> + '_> {
+        match self {
+            Arg::Value(e) => Box::new(std::iter::once(e)),
+            Arg::Mut(p) => Box::new(p.index_exprs()),
+        }
+    }
+
+    pub fn subexprs_mut(&mut self) -> Box<dyn Iterator<Item = &mut Spanned<TypedExpr>> + '_> {
+        match self {
+            Arg::Value(e) => Box::new(std::iter::once(e)),
+            Arg::Mut(p) => Box::new(p.index_exprs_mut()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprKind {
     IntLit(i64),
@@ -109,7 +189,7 @@ pub enum TypedExprKind {
     /// final value for that parameter is one of its *extra* return values
     /// (see `Function`'s doc comment), to be copied back into `args[i]`'s
     /// own (already-validated-mutable) binding.
-    Call { callable: TypedExprRef, args: Vec<Spanned<TypedExpr>>, mut_args: Vec<bool> },
+    Call { callable: TypedExprRef, args: Vec<Arg> },
 
     /// `target[index]` — list element access.
     Index { target: TypedExprRef, index: TypedExprRef },
@@ -173,14 +253,12 @@ pub enum TypedExprKind {
     /// A path with no `Index` segment is the struct "mutation" rebind
     /// sugar generalized to any depth (`o.i.v = 5`): codegen rebinds the
     /// touched leaf `Variable`(s) directly, since a struct is a flat set
-    /// of named bindings. A path with exactly one `Index` segment writes
-    /// through a heap-allocated `FrogList` instead (`frog_list_set`).
-    /// `TypeChecker::lower_assign` rejects a path with more than one
-    /// `Index` — writing through nested list indices (`xs[i][j] = v`) —
-    /// as a v1 restriction, not a fundamental one.
+    /// of named bindings. A path containing an `Index` writes through a
+    /// heap-allocated `FrogList` instead — see `codegen`'s
+    /// `emit_place_ref`, which walks any number of them
+    /// (`rows[y][x] = v`, `grid[y].cells[x] = v`).
     PlaceAssign {
-        root:  String,
-        path:  Vec<PlaceSeg>,
+        place: Place,
         value: TypedExprRef,
     },
 

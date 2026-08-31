@@ -10,6 +10,42 @@
   bugs eager copying could not afford to fix — a list extracted from a list, from a `for`-loop
   binding, or from a struct field was aliased, not copied, so pushing to it mutated the container.
   `FROG_COW_VERIFY=1` re-derives the sharing answer from the heap at every write barrier.
+- Perf: **elide the mark when passing a list to a non-`mut` parameter.** The last quadratic cliff
+  in MVS: `for i in .. { s = s + peek(xs); push(mut xs, i) }` is 51.6ms against an 11.5ms baseline
+  at n=20000, because the call marks `xs` shared and the push then copies. Needs two things
+  together — marking at `mut` binding sites (`Assign.mutable`), and a per-function "does a
+  parameter reach a return position" escape summary. See MUTABILITY.md Stage 7, "Sharp corners".
+- **Done (MUTABILITY.md Stage 8): paths as mutable places.** Assignment, `push`, and every `mut` call
+  argument now take the same `typed_ast::Place` (root plus a `.field`/`[index]` path), resolved by
+  one shared `lower_place`. So `push(mut b.items, v)`, `rows[y][x] = v`, `push(mut rows[0], v)`,
+  mixed paths like `g.cells[1][1] = v`, **and `f(mut b.items)` for a user-defined `func`** all work.
+  `codegen::emit_place_ref` walks a path unsharing every list on the way down and writing each
+  private copy back into its parent slot — O(depth), not O(size).
+  A `mut` argument is `Arg::Mut(Place)`, so `Call` shed its `mut_args: Vec<bool>` and a new mutating
+  builtin (`pop`, `insert`, a `Map` operation) costs one arm in `compile_call` and no AST changes.
+  Fixed a pre-existing soundness hole on the way: copying a struct did not mark its list fields
+  shared, so `let c = b; b.items[0] = 99` was visible through `c`.
+- Language: a user-defined mutating **method**'s receiver must still be a bare binding —
+  `b.items.bump()` where `bump` takes `mut self` is rejected, though `b.items.push(3)` works.
+  `lower_bound_member_call` and `lower_ufcs_call` build the receiver's `Place` from its root name
+  because the raw receiver expression is consumed before they know the member is mutating; threading
+  it through (as the `push` branch already does) would close this.
+- Perf: `benches/life.frog` predates Stage 8 and still rebuilds whole grids from comprehensions
+  because it could not write one cell. Rewriting it around `rows[y][x] = v` would make it a
+  materially different (and more representative) benchmark against the Go/Rust/Lua/Python siblings.
+- Perf, **measured and rejected**: eliding redundant copy-on-write barriers. Swiftlet's own
+  postmortem (Racordon et al., JOT 2022 §7.5) blames most of its gap to Swift on unnecessary
+  uniqueness checks, but that finding does not transfer: Swiftlet checks a *reference count*, so it
+  also pays increments on every copy and decrements in every destructor, whereas our barrier is one
+  load of a monotone byte off a cache line the mutation is about to touch anyway. Deleting the
+  barrier outright — unsound, so an upper bound on any elision — is worth 0% on orders/life/words,
+  ~1% on a pure `push` loop and ~10% on a pure index-assign loop (40M writes each). Removing the
+  division in `frog_list_get`/`frog_list_set` recovers ~4% of that index-assign case and nothing
+  elsewhere. Don't build the analysis; the headroom isn't there. If the indexed-write path is ever
+  worth attention it's the per-leaf FFI call itself, not the barrier or the arithmetic inside it.
+- Bug: `mut xs = []` then `print(xs)` prints `<?>` placeholders — the element type is still an
+  unresolved type variable on that `Var` node when print's type-directed codegen reads it.
+  Annotating works around it. Needs a final resolution pass over the typed AST.
 - Perf: **inlining.** With calls out of line, `benches/orders.frog` spends ~30% in one-line functions (`modn` 20%, `checked_gross` 8%) that Rust/Go erase. Hand-inlining two call sites takes orders from 54.8ms to 45.1ms, so a small-leaf-function inliner is worth roughly 20% there.
 - Perf: functions can't reference top-level `let` bindings — typeck accepts it, codegen panics with `unbound variable in codegen: <name>`. Both `life.frog` and `words.frog` had to thread constants through as parameters to work around it. Either implement the capture or reject it in typeck with a real error.
 - Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value. Secondary: the `#[frog_fn]` boundary converts every `Str` argument into an owned Rust `String` (`__frog_shim_starts_with` is 14% of `benches/words.frog`) — taking `&str` would remove a copy per call.

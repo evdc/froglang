@@ -16,7 +16,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::frontend::tokens::Spanned;
-use crate::frontend::typed_ast::{NodeId, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
+use crate::frontend::typed_ast::{Arg, NodeId, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 
 /// Stamp every node reachable from `expr` (including nested `Function`
 /// bodies — unlike `codegen::for_each_heap_producer`, which skips them
@@ -70,7 +70,7 @@ fn number_kind(kind: &mut TypedExprKind, next: &mut NodeId) {
         TypedExprKind::Function { body, .. } => number(body, next),
         TypedExprKind::Call { callable, args, .. } => {
             number(callable, next);
-            for a in args { number(a, next); }
+            for a in args.iter_mut().flat_map(Arg::subexprs_mut) { number(a, next); }
         }
         TypedExprKind::Index { target, index } => {
             number(target, next);
@@ -101,8 +101,8 @@ fn number_kind(kind: &mut TypedExprKind, next: &mut NodeId) {
             for (_, v) in fields { number(v, next); }
         }
         TypedExprKind::FieldAccess { target, .. } => number(target, next),
-        TypedExprKind::PlaceAssign { path, value, .. } => {
-            for seg in path {
+        TypedExprKind::PlaceAssign { place, value } => {
+            for seg in place.path.iter_mut() {
                 if let PlaceSeg::Index { index, .. } = seg {
                     number(index, next);
                 }
@@ -301,7 +301,7 @@ fn dump_walk_kind(kind: &TypedExprKind, liveness: &Liveness) {
             if !matches!(value.item.kind, TypedExprKind::Function { .. }) { dump_walk(value, liveness); }
         }
         TypedExprKind::Function { .. } => {}
-        TypedExprKind::Call { args, .. } => { for a in args { dump_walk(a, liveness); } }
+        TypedExprKind::Call { args, .. } => { for a in args.iter().flat_map(Arg::subexprs) { dump_walk(a, liveness); } }
         TypedExprKind::Index { target, index } => { dump_walk(target, liveness); dump_walk(index, liveness); }
         TypedExprKind::Slice { target, start, end } => {
             dump_walk(target, liveness); dump_walk_opt(start, liveness); dump_walk_opt(end, liveness);
@@ -315,8 +315,8 @@ fn dump_walk_kind(kind: &TypedExprKind, liveness: &Liveness) {
         }
         TypedExprKind::StructInit { fields, .. } => for (_, v) in fields { dump_walk(v, liveness); },
         TypedExprKind::FieldAccess { target, .. } => dump_walk(target, liveness),
-        TypedExprKind::PlaceAssign { path, value, .. } => {
-            for seg in path {
+        TypedExprKind::PlaceAssign { place, value } => {
+            for seg in &place.path {
                 if let PlaceSeg::Index { index, .. } = seg { dump_walk(index, liveness); }
             }
             dump_walk(value, liveness);
@@ -495,11 +495,14 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
         // (`codegen/mod.rs:1379` then `:1387` — the index is needed to
         // compute the write address first), so backward, `value` is
         // processed before the path's index expressions.
-        TypedExprKind::PlaceAssign { root, path, value } => {
+        // `Push` is the same shape: a read-modify-write of `place`'s root
+        // (`MUTABILITY.md` Stage 8), with its own value evaluated after the
+        // path's index expressions.
+        TypedExprKind::PlaceAssign { place, value } => {
             let mut lo = live_out.clone();
-            lo.insert(root.clone());
+            lo.insert(place.root.clone());
             lo = transfer(value, &lo, ctx, out);
-            for seg in path.iter().rev() {
+            for seg in place.path.iter().rev() {
                 if let PlaceSeg::Index { index, .. } = seg {
                     lo = transfer(index, &lo, ctx, out);
                 }
@@ -557,17 +560,28 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
         // ordinary `Var` child would be treated would wrongly add the
         // function's name to this analysis's binding namespace, so it's
         // deliberately never visited.
-        TypedExprKind::Call { args, mut_args, .. } => {
+        TypedExprKind::Call { args, .. } => {
             let mut lo = live_out.clone();
-            for (arg, is_mut) in args.iter().zip(mut_args.iter()) {
-                if *is_mut {
-                    if let TypedExprKind::Var(name) = &arg.item.kind {
-                        lo.remove(name);
-                    }
-                }
+            // A `mut` argument's root is read-modify-write, exactly like a
+            // `PlaceAssign`'s: the call reads the place's current value and
+            // the copy-out writes a new one back, so the root is live going
+            // in. Anything that aliased it earlier must therefore see a
+            // `Copy` and mark — `mut b = a; f(mut a)` where the callee
+            // pushes must not be visible through `b`.
+            //
+            // Before places, this arm *removed* the root instead, and was
+            // still correct only because the argument was a `Var` node whose
+            // own transfer added it straight back; the removal existed to
+            // make that read a last use, so it would not clone. Reading a
+            // place creates no `Var` occurrence at all, so there is nothing
+            // left to classify — the elision is structural now
+            // (`codegen::emit_place_ref` never marks), and this is a plain
+            // read-modify-write.
+            for arg in args.iter() {
+                if let Arg::Mut(place) = arg { lo.insert(place.root.clone()); }
             }
-            for arg in args.iter().rev() {
-                lo = transfer(arg, &lo, ctx, out);
+            for a in args.iter().rev().flat_map(Arg::subexprs) {
+                lo = transfer(a, &lo, ctx, out);
             }
             lo
         }
@@ -689,7 +703,7 @@ mod tests {
             TypedExprKind::Function { body, .. } => collect_ids(body, out),
             TypedExprKind::Call { callable, args, .. } => {
                 collect_ids(callable, out);
-                for a in args { collect_ids(a, out); }
+                for a in args.iter().flat_map(Arg::subexprs) { collect_ids(a, out); }
             }
             TypedExprKind::Index { target, index } => { collect_ids(target, out); collect_ids(index, out); }
             TypedExprKind::Slice { target, start, end } => {
@@ -704,8 +718,8 @@ mod tests {
             }
             TypedExprKind::StructInit { fields, .. } => for (_, v) in fields { collect_ids(v, out); },
             TypedExprKind::FieldAccess { target, .. } => collect_ids(target, out),
-            TypedExprKind::PlaceAssign { path, value, .. } => {
-                for seg in path {
+            TypedExprKind::PlaceAssign { place, value } => {
+                for seg in &place.path {
                     if let PlaceSeg::Index { index, .. } = seg { collect_ids(index, out); }
                 }
                 collect_ids(value, out);
@@ -829,7 +843,7 @@ mod tests {
             TypedExprKind::Function { body, .. } => collect_var_ids(body, name, out),
             TypedExprKind::Call { callable, args, .. } => {
                 collect_var_ids(callable, name, out);
-                for a in args { collect_var_ids(a, name, out); }
+                for a in args.iter().flat_map(Arg::subexprs) { collect_var_ids(a, name, out); }
             }
             TypedExprKind::Index { target, index } => { collect_var_ids(target, name, out); collect_var_ids(index, name, out); }
             TypedExprKind::Slice { target, start, end } => {
@@ -844,8 +858,8 @@ mod tests {
             }
             TypedExprKind::StructInit { fields, .. } => for (_, v) in fields { collect_var_ids(v, name, out); },
             TypedExprKind::FieldAccess { target, .. } => collect_var_ids(target, name, out),
-            TypedExprKind::PlaceAssign { path, value, .. } => {
-                for seg in path {
+            TypedExprKind::PlaceAssign { place, value } => {
+                for seg in &place.path {
                     if let PlaceSeg::Index { index, .. } = seg { collect_var_ids(index, name, out); }
                 }
                 collect_var_ids(value, name, out);
@@ -932,11 +946,21 @@ mod tests {
     }
 
     /// Corner case 5/6: a `mut` call argument is both a use (of the old
-    /// value) and a def (of the copy-out) — the `Var` occurrence at the
-    /// call site must be a last use, since nothing after the call can see
-    /// the pre-call value under that name.
+    /// value) and a def (of the copy-out).
+    ///
+    /// Since `MUTABILITY.md` Stage 8 it is a `Place`, not an expression, so
+    /// it produces **no `Var` occurrence at all** — there is nothing left to
+    /// classify, and the clone-elision this used to encode (marking the
+    /// argument a last use so it would not clone) is structural now:
+    /// `codegen::emit_place_ref` reads the place directly and never marks.
+    ///
+    /// What still has to hold is that the root is *live into* the call, so
+    /// an earlier alias of it is a `Copy` and marks. Getting this wrong is
+    /// a soundness bug, not a missed optimization: with the root removed
+    /// from `live_out`, `mut b = a` below reads as a last use, nothing marks
+    /// the list, and a callee that pushes mutates it where `b` can see.
     #[test]
-    fn mut_argument_is_a_last_use_of_the_old_value() {
+    fn mut_argument_keeps_its_root_live_into_the_call() {
         // The body ends with an explicit `none` literal rather than the
         // bare assignment `p = p + 1`: assignment expressions type to the
         // *assigned value's* type, not `Type::None` (a pre-existing
@@ -944,18 +968,17 @@ mod tests {
         // `MUTABILITY.md` stage-4 implementation notes), so a body whose
         // tail is a bare reassignment fails to type-check against a
         // declared `: None` return.
-        let src = "func bump(mut p: Int): None = {\np = p + 1\nnone\n}\nmut a = 1\nbump(mut a)\na";
+        let src = "func bump(mut p: Int): None = {\np = p + 1\nnone\n}\nmut a = 1\nmut b = a\nbump(mut a)\na";
         let typed = lower_numbered(src);
         let mut ids = Vec::new();
         collect_var_ids(&typed, "a", &mut ids);
-        // Two occurrences: the call-site argument itself (`bump(mut a)`),
-        // and the trailing `a` — an ordinary `Var("a")` node reading
-        // whatever `bump`'s copy-out just rebound the name to.
+        // Two occurrences, and neither is the argument: the read in
+        // `mut b = a`, and the trailing `a` reading whatever `bump`'s
+        // copy-out rebound the name to. `bump(mut a)` contributes none.
         assert_eq!(ids.len(), 2, "expected 2 occurrences of `a`, found {}", ids.len());
         let liveness = analyze_entry(&entry_stmts(typed), &NameSet::new());
-        assert_eq!(liveness.ownership(ids[0]), Ownership::Move,
-            "bump(mut a) consumes the caller's old `a` and hands back a fresh one \
-             (from the same-named binding), so the argument occurrence has no more use");
+        assert_eq!(liveness.ownership(ids[0]), Ownership::Copy,
+            "`a` is read again by `bump(mut a)` below, so aliasing it here is not a last use");
         assert_eq!(liveness.ownership(ids[1]), Ownership::Move,
             "the trailing `a` has nothing live after it in this entry");
     }

@@ -488,22 +488,32 @@ pub extern "C" fn frog_variant_set(variant: i64, slot: i64, val: i64) {
 
 /// `FROG_COW_VERIFY`'s check: called from the write barrier's *unshared*
 /// path (`codegen::emit_unshare`), only in a build whose codegen saw the env
-/// var set. Aborts if `w` turns out to be reachable by more than one live
-/// reference despite not being marked shared — i.e. an aliasing site failed
+/// var set. Aborts if `w` turns out to be reachable by more live references
+/// than this position in a place walk permits — i.e. an aliasing site failed
 /// to mark, which is the one failure mode copy-on-write actually has.
 ///
+/// `allowed` is how many references reaching `w` are legitimate here. It is
+/// 1 for a place rooted directly in a binding: the JIT slot holding the
+/// pointer about to be written through. It is 2 for a list reached *through*
+/// another list (`rows[y][x] = v`, `push(mut rows[0], v)`), where the parent
+/// list's own slot is a second, expected reference — and mutating through it
+/// is exactly what the walk is entitled to do, because `emit_place_ref`
+/// unshared that parent immediately beforehand. Passing the depth in rather
+/// than relaxing the check to `> 2` everywhere keeps the outer case strict.
+///
 /// See `GcHeap::count_refs` for why this is worth the cost, and
-/// MUTABILITY.md Stage 7.
+/// MUTABILITY.md Stages 7 and 8.
 #[no_mangle]
-pub extern "C" fn frog_cow_verify(w: i64) {
+pub extern "C" fn frog_cow_verify(w: i64, allowed: i64) {
     let _jit_frame = crate::jit_frame_guard!();
     if !super::gc::is_heap_ptr(w) { return; }
     let refs = with_heap(|heap| heap.count_refs(super::gc::heap_ptr(w)));
-    if refs > 1 {
+    if refs as i64 > allowed {
         frog_abort(format_args!(
             "FROG_COW_VERIFY: about to mutate {:#x} in place, but {} live references reach it \
-             — an aliasing site failed to set the shared bit (MUTABILITY.md Stage 7)",
-            w, refs,
+             ({} expected here) — an aliasing site failed to set the shared bit \
+             (MUTABILITY.md Stage 7)",
+            w, refs, allowed,
         ));
     }
 }

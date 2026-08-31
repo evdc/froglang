@@ -327,3 +327,258 @@ print(grid)
     assert_eq!(run_gc_stress(src), "10\n[[1, 2], [3, 4]]\n");
     assert_eq!(run_cow_verify(src), "10\n[[1, 2], [3, 4]]\n");
 }
+
+/// Reading a list for its length creates no alias, so it must not mark the
+/// list shared — otherwise the next `push` copies it, and a loop that
+/// queries `len` as it builds is quadratic.
+///
+/// This is a behavioural test of an elision, so it asserts the *output*
+/// (which never depended on the bug) and relies on the size to make a
+/// regression obvious: at 20000 elements the marked version copied the whole
+/// list on every iteration and took ~4x as long. `benches/pipeline.rs` is
+/// where the timing lives; this is here to pin the semantics that make the
+/// elision legal.
+#[test]
+fn reading_len_in_a_push_loop_does_not_share_the_list() {
+    let src = r#"
+mut xs = []
+mut seen = 0
+for i in 0..2000 do {
+    seen = seen + xs.len()
+    push(mut xs, i)
+}
+print(xs.len())
+print(seen)
+"#;
+    // seen is 0+1+...+1999 = 1999000 only if every `len` observed the list
+    // the pushes are actually growing — i.e. no copy diverted them.
+    assert_eq!(run(src), "2000\n1999000\n");
+    assert_eq!(run_cow_verify(src), "2000\n1999000\n");
+}
+
+/// The same for `print`, which walks a list and stores nothing.
+///
+/// Annotated rather than inferred from `[]` only to dodge an unrelated,
+/// pre-existing bug: an unannotated `mut xs = []` leaves the element type an
+/// unresolved type variable on the `Var` node inside the loop, and `print`'s
+/// type-directed codegen emits `<?>` placeholders for it. Nothing to do with
+/// aliasing — it reproduces identically before Stage 7.
+#[test]
+fn printing_a_list_in_a_push_loop_does_not_share_it() {
+    let src = r#"
+mut xs: List<Int> = []
+for i in 0..3 do {
+    print(xs)
+    push(mut xs, i)
+}
+print(xs)
+"#;
+    assert_eq!(run(src), "[]\n[0]\n[0, 1]\n[0, 1, 2]\n");
+    assert_eq!(run_cow_verify(src), "[]\n[0]\n[0, 1]\n[0, 1, 2]\n");
+}
+
+// ── Stage 8: mutable places ─────────────────────────────────────────────────
+//
+// Before Stage 8 a mutation's target had to be a bare `mut` binding for
+// `push` but could be a whole field/index path for assignment, so
+// `b.items[0] = v` was accepted while `push(mut b.items, v)` was not, and
+// `rows[y][x] = v` was rejected outright. Both now take the same `Place`,
+// and `codegen::emit_place_container` walks it, unsharing every list on the
+// way down and writing each private copy back into its parent slot.
+
+/// The inconsistency Stage 8 closed: pushing through a struct field.
+#[test]
+fn pushing_through_a_struct_field_works() {
+    let src = r#"
+data Box(items: List<Int>)
+mut b = Box(items=[1, 2])
+push(mut b.items, 3)
+print(b.items)
+"#;
+    assert_eq!(run(src), "[1, 2, 3]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2, 3]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2, 3]\n");
+}
+
+/// Copying a struct aliases the lists hanging off it, so mutating one
+/// through the original must not be visible through the copy.
+///
+/// This was a real soundness hole, and it predates Stage 8 — the
+/// index-assign half of it (`b.items[0] = 99`) has always been legal.
+/// `mark_shared_if_aliased` only marked a value whose *own* type was
+/// `List`, so copying the enclosing struct marked nothing; see its doc
+/// comment.
+#[test]
+fn copying_a_struct_does_not_share_its_list_field() {
+    let src = r#"
+data Box(items: List<Int>)
+mut b = Box(items=[1, 2])
+let c = b
+b.items[0] = 99
+push(mut b.items, 3)
+print(c.items)
+print(b.items)
+"#;
+    assert_eq!(run(src), "[1, 2]\n[99, 2, 3]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2]\n[99, 2, 3]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2]\n[99, 2, 3]\n");
+}
+
+/// Assignment through nested list indices — the Game-of-Life shape, and the
+/// one `lower_place_assign` used to reject with "assignment through more
+/// than one list index isn't supported yet".
+#[test]
+fn assigning_through_nested_indices_works() {
+    let src = r#"
+mut rows = [[1, 2], [3, 4]]
+rows[1][0] = 99
+print(rows)
+"#;
+    assert_eq!(run(src), "[[1, 2], [99, 4]]\n");
+    assert_eq!(run_gc_stress(src), "[[1, 2], [99, 4]]\n");
+    assert_eq!(run_cow_verify(src), "[[1, 2], [99, 4]]\n");
+}
+
+/// ...and pushing to an inner list reached by index.
+#[test]
+fn pushing_through_a_list_index_works() {
+    let src = r#"
+mut rows = [[1, 2], [3, 4]]
+push(mut rows[0], 7)
+print(rows)
+"#;
+    assert_eq!(run(src), "[[1, 2, 7], [3, 4]]\n");
+    assert_eq!(run_gc_stress(src), "[[1, 2, 7], [3, 4]]\n");
+    assert_eq!(run_cow_verify(src), "[[1, 2, 7], [3, 4]]\n");
+}
+
+/// A path that alternates field and index steps, so the walk has to add a
+/// within-element field offset between two `[index]` steps rather than
+/// descending straight down.
+#[test]
+fn a_mixed_field_and_index_path_works() {
+    let src = r#"
+data Grid(cells: List<List<Int>>)
+mut g = Grid(cells=[[1, 2], [3, 4]])
+g.cells[1][1] = 42
+push(mut g.cells[0], 9)
+print(g.cells)
+"#;
+    assert_eq!(run(src), "[[1, 2, 9], [3, 42]]\n");
+    assert_eq!(run_gc_stress(src), "[[1, 2, 9], [3, 42]]\n");
+    assert_eq!(run_cow_verify(src), "[[1, 2, 9], [3, 42]]\n");
+}
+
+/// Value semantics through a nested write: an alias of the *outer* list must
+/// not observe a mutation of an inner one. This is what forces
+/// `emit_place_container` to unshare every list on the path, not just the
+/// innermost — writing into `rows[0]`'s buffer would otherwise be visible
+/// through `copy`, which reaches the same inner list.
+#[test]
+fn a_nested_write_does_not_leak_through_an_outer_alias() {
+    let src = r#"
+mut rows = [[1, 2], [3, 4]]
+let copy = rows
+rows[0][0] = 99
+push(mut rows[1], 7)
+print(copy)
+print(rows)
+"#;
+    assert_eq!(run(src), "[[1, 2], [3, 4]]\n[[99, 2], [3, 4, 7]]\n");
+    assert_eq!(run_gc_stress(src), "[[1, 2], [3, 4]]\n[[99, 2], [3, 4, 7]]\n");
+    assert_eq!(run_cow_verify(src), "[[1, 2], [3, 4]]\n[[99, 2], [3, 4, 7]]\n");
+}
+
+/// The other direction: a binding extracted *out* of the outer list must not
+/// see a later nested write, and must not have its own pushes leak back in.
+#[test]
+fn an_extracted_inner_list_is_independent_of_a_nested_write() {
+    let src = r#"
+mut rows = [[1, 2], [3, 4]]
+mut inner = rows[0]
+rows[0][0] = 99
+push(mut inner, 7)
+print(inner)
+print(rows)
+"#;
+    assert_eq!(run(src), "[1, 2, 7]\n[[99, 2], [3, 4]]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2, 7]\n[[99, 2], [3, 4]]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2, 7]\n[[99, 2], [3, 4]]\n");
+}
+
+/// One list stored twice in an outer list is still one object, so pushing
+/// through one slot must not be visible through the other, nor through the
+/// binding it came from.
+#[test]
+fn pushing_through_one_slot_does_not_affect_a_twin_slot() {
+    let src = r#"
+mut xs = [1, 2]
+mut rows = [xs, xs]
+push(mut rows[0], 99)
+print(xs)
+print(rows)
+"#;
+    assert_eq!(run(src), "[1, 2]\n[[1, 2, 99], [1, 2]]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2]\n[[1, 2, 99], [1, 2]]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2]\n[[1, 2, 99], [1, 2]]\n");
+}
+
+/// A `mut` argument still has to be a place, not an arbitrary expression.
+/// `Grammar::mut_prefix` now parses a whole `.field`/`[index]` path instead
+/// of a bare identifier, so this is caught in the parser (where an
+/// assignment target with a non-identifier root is caught) rather than in
+/// typeck.
+#[test]
+fn push_into_a_non_place_is_rejected() {
+    let err = froglang_core::frontend::parser::Parser::parse("mut rows = [[1, 2]]\npush(mut rows.len(), 4)\n1")
+        .expect_err("expected a parse error");
+    assert!(
+        format!("{:?}", err).contains("InvalidAssignmentTarget"),
+        "unexpected error: {:?}", err
+    );
+}
+
+/// The half a dedicated `push` node could never deliver: a *user* function's
+/// `mut` parameter accepts a place too, because a `mut` argument is a
+/// `typed_ast::Arg::Mut` carrying a `Place` rather than a bare identifier.
+#[test]
+fn a_user_functions_mut_param_accepts_a_place() {
+    let src = r#"
+data Box(items: List<Int>)
+func add(mut xs: List<Int>): None = { push(mut xs, 9) }
+mut b = Box(items=[1, 2])
+add(mut b.items)
+mut rows = [[1], [2]]
+add(mut rows[1])
+print(b.items)
+print(rows)
+"#;
+    assert_eq!(run(src), "[1, 2, 9]\n[[1], [2, 9]]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2, 9]\n[[1], [2, 9]]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2, 9]\n[[1], [2, 9]]\n");
+}
+
+/// ...and it stays value-semantic: an alias taken before the call must not
+/// observe what the callee writes.
+///
+/// This is the shape that caught a real bug in the `Arg::Mut` refactor. The
+/// old code removed a `mut` argument's root from `live_out`, which was only
+/// correct because the argument was a `Var` node whose own transfer added it
+/// straight back. A place has no such read, so the removal made `let c = b`
+/// a last use, nothing marked the list, and the callee's push landed where
+/// `c` could see it. `liveness.rs` now treats the root as read-modify-write.
+#[test]
+fn a_place_mut_argument_does_not_leak_through_an_earlier_alias() {
+    let src = r#"
+data Box(items: List<Int>)
+func add(mut xs: List<Int>): None = { push(mut xs, 9) }
+mut b = Box(items=[1, 2])
+let c = b
+add(mut b.items)
+print(c.items)
+print(b.items)
+"#;
+    assert_eq!(run(src), "[1, 2]\n[1, 2, 9]\n");
+    assert_eq!(run_gc_stress(src), "[1, 2]\n[1, 2, 9]\n");
+    assert_eq!(run_cow_verify(src), "[1, 2]\n[1, 2, 9]\n");
+}

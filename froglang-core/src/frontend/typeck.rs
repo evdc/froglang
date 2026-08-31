@@ -10,7 +10,7 @@ use crate::frontend::{
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::type_expr::TypeExpr;
-use crate::frontend::typed_ast::{PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
+use crate::frontend::typed_ast::{Arg, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 
 /// Reserved name for the builtin `panic` alias that `!` desugars to.
 /// Contains `!`, which the lexer never produces inside an identifier, so
@@ -3775,14 +3775,14 @@ impl TypeChecker {
                 if !matches!(callable.item.kind, TypedExprKind::Var(_)) {
                     self.validate_codegen_constraints(callable)?;
                 }
-                for a in args { self.validate_codegen_constraints(a)?; }
+                for a in args.iter().flat_map(Arg::subexprs) { self.validate_codegen_constraints(a)?; }
                 // `print`'s argument is dispatched at runtime by
                 // `codegen::print_union`, which recurses through struct
                 // fields and nested unions to render whichever member
                 // actually matched — reject anything that would recurse
                 // into itself before codegen has to discover that the hard
                 // way (see `print_union`'s own guard, which this mirrors).
-                if let (TypedExprKind::Var(name), [arg, ..]) = (&callable.item.kind, args.as_slice()) {
+                if let (TypedExprKind::Var(name), Some(Some(arg))) = (&callable.item.kind, args.first().map(Arg::value)) {
                     if name == "print" {
                         self.check_printable(&arg.item.ty, arg.span)?;
                     }
@@ -3835,8 +3835,8 @@ impl TypeChecker {
             },
 
             TypedExprKind::FieldAccess { target, .. } => self.validate_codegen_constraints(target),
-            TypedExprKind::PlaceAssign { path, value, .. } => {
-                for seg in path {
+            TypedExprKind::PlaceAssign { place, value } => {
+                for seg in &place.path {
                     if let PlaceSeg::Index { index, .. } = seg {
                         self.validate_codegen_constraints(index)?;
                     }
@@ -4122,7 +4122,7 @@ impl TypeChecker {
 
             TypedExprKind::Call { callable, args, .. } => {
                 self.collect_generic_var_types(callable, seen);
-                for a in args { self.collect_generic_var_types(a, seen); }
+                for a in args.iter().flat_map(Arg::subexprs) { self.collect_generic_var_types(a, seen); }
             },
 
             TypedExprKind::Index { target, index } => {
@@ -4166,8 +4166,8 @@ impl TypeChecker {
             },
 
             TypedExprKind::FieldAccess { target, .. } => self.collect_generic_var_types(target, seen),
-            TypedExprKind::PlaceAssign { path, value, .. } => {
-                for seg in path {
+            TypedExprKind::PlaceAssign { place, value } => {
+                for seg in &place.path {
                     if let PlaceSeg::Index { index, .. } = seg {
                         self.collect_generic_var_types(index, seen);
                     }
@@ -4266,7 +4266,7 @@ impl TypeChecker {
 
             TypedExprKind::Call { callable, args, .. } => {
                 Self::walk_vars_mut(callable, f);
-                for a in args.iter_mut() { Self::walk_vars_mut(a, f); }
+                for a in args.iter_mut().flat_map(Arg::subexprs_mut) { Self::walk_vars_mut(a, f); }
             },
 
             TypedExprKind::Index { target, index } => {
@@ -4310,8 +4310,8 @@ impl TypeChecker {
             },
 
             TypedExprKind::FieldAccess { target, .. } => Self::walk_vars_mut(target, f),
-            TypedExprKind::PlaceAssign { path, value, .. } => {
-                for seg in path.iter_mut() {
+            TypedExprKind::PlaceAssign { place, value } => {
+                for seg in place.path.iter_mut() {
                     if let PlaceSeg::Index { index, .. } = seg {
                         Self::walk_vars_mut(index, f);
                     }
@@ -4487,7 +4487,7 @@ impl TypeChecker {
 
             TypedExprKind::Call { callable, args, .. } => {
                 self.substitute_types_deep(callable, mapping);
-                for a in args.iter_mut() { self.substitute_types_deep(a, mapping); }
+                for a in args.iter_mut().flat_map(Arg::subexprs_mut) { self.substitute_types_deep(a, mapping); }
             },
 
             TypedExprKind::Index { target, index } => {
@@ -4532,8 +4532,8 @@ impl TypeChecker {
 
             TypedExprKind::FieldAccess { target, .. } => self.substitute_types_deep(target, mapping),
 
-            TypedExprKind::PlaceAssign { path, value, .. } => {
-                for seg in path.iter_mut() {
+            TypedExprKind::PlaceAssign { place, value } => {
+                for seg in place.path.iter_mut() {
                     if let PlaceSeg::Index { index, elem_ty } = seg {
                         self.substitute_types_deep(index, mapping);
                         *elem_ty = self.lookup(elem_ty).substitute(mapping);
@@ -4924,7 +4924,11 @@ impl TypeChecker {
     /// the untyped-`Expression` counterpart of `typed_ast::PlaceSeg`.
     /// `flatten_place` walks a target expression into a root name plus a
     /// list of these, root-to-leaf.
-    fn flatten_place(target: Spanned<Expression>) -> (String, Vec<RawPlaceSeg>) {
+    /// `None` when the path bottoms out in something that isn't a bare
+    /// identifier — impossible for an assignment target (`Grammar::assign`
+    /// guarantees it) but reachable through UFCS, where the receiver of
+    /// `xs.push(v)` is an arbitrary expression.
+    fn flatten_place(target: Spanned<Expression>) -> Option<(String, Vec<RawPlaceSeg>)> {
         let mut segs = Vec::new();
         let mut cur = target;
         loop {
@@ -4938,30 +4942,35 @@ impl TypeChecker {
                     cur = *idx.target;
                 },
                 other => {
-                    let name = other.get_identifier()
-                        .expect("Grammar::assign guarantees an identifier root")
-                        .to_string();
+                    let name = other.get_identifier()?.to_string();
                     segs.reverse();
-                    return (name, segs);
+                    return Some((name, segs));
                 },
             }
         }
     }
 
-    /// `root(.field | [index])* = value` — see `TypedExprKind::PlaceAssign`.
-    /// `target` is a `FieldAccess` or `Index` (checked by the caller);
-    /// `flatten_place` reduces it to `root` plus a root-to-leaf path,
-    /// which this walks segment by segment, tracking the current type
-    /// exactly as `lower_field_access`/`lower_index` do for a *read* of
-    /// the same path, and enforcing that `root` is mutable before
-    /// touching anything.
-    fn lower_place_assign(
+    /// Resolve an assignment/`push` target into a `Place` plus the type of
+    /// the part it names. `target` is a `FieldAccess`, an `Index`, or a
+    /// bare identifier; `flatten_place` reduces it to `root` plus a
+    /// root-to-leaf path, which this walks segment by segment, tracking
+    /// the current type exactly as `lower_field_access`/`lower_index` do
+    /// for a *read* of the same path, and enforcing that `root` is mutable
+    /// before touching anything.
+    ///
+    /// Shared by `lower_place_assign` and `finish_push` — the two in-place
+    /// mutations — so they accept exactly the same paths. See
+    /// `typed_ast::Place`.
+    fn lower_place(
         &mut self,
         target: Spanned<Expression>,
-        value: Spanned<Expression>,
         span: Span,
-    ) -> Result<(TypedExprKind, Type), Spanned<TypeError>> {
-        let (root, raw_path) = Self::flatten_place(target);
+    ) -> Result<(Place, Type), Spanned<TypeError>> {
+        let Some((root, raw_path)) = Self::flatten_place(target) else {
+            return Err(Spanned::from(TypeError {
+                msg: "a mutation target must be a mutable binding or a path into one, not an expression".to_string()
+            }, span));
+        };
         match self.ctx.is_mutable(&root) {
             None => return Err(Spanned::from(TypeError {
                 msg: format!("'{}' is not declared", root)
@@ -4973,12 +4982,6 @@ impl TypeChecker {
         }
         let mut cur_ty = self.ctx.get(&root).expect("checked mutable above").clone();
         let mut path = Vec::with_capacity(raw_path.len());
-        // At most one `[index]` step — writing through a *second* one
-        // (`xs[i][j] = v`, a list of lists) would need a heap store
-        // nested inside another heap store, which codegen doesn't
-        // implement yet. A v1 restriction, not a fundamental one — see
-        // `TypedExprKind::PlaceAssign`'s doc comment.
-        let mut seen_index = false;
         for seg in raw_path {
             match seg {
                 RawPlaceSeg::Field(fname) => {
@@ -4998,12 +5001,6 @@ impl TypeChecker {
                     cur_ty = field_ty;
                 },
                 RawPlaceSeg::Index(idx_expr) => {
-                    if seen_index {
-                        return Err(Spanned::from(TypeError {
-                            msg: "assignment through more than one list index isn't supported yet".to_string()
-                        }, span));
-                    }
-                    seen_index = true;
                     let resolved = self.lookup(&cur_ty);
                     let elem_ty = match resolved.as_list_elem() {
                         Some(inner) => inner.clone(),
@@ -5023,7 +5020,17 @@ impl TypeChecker {
                 },
             }
         }
-        let leaf_ty = self.lookup(&cur_ty);
+        Ok((Place { root, path }, self.lookup(&cur_ty)))
+    }
+
+    /// `root(.field | [index])* = value` — see `TypedExprKind::PlaceAssign`.
+    fn lower_place_assign(
+        &mut self,
+        target: Spanned<Expression>,
+        value: Spanned<Expression>,
+        span: Span,
+    ) -> Result<(TypedExprKind, Type), Spanned<TypeError>> {
+        let (place, leaf_ty) = self.lower_place(target, span)?;
         // The assigned leaf is exactly as much a union-typed slot as a
         // `StructInit` argument is, so it needs the same check-and-widen
         // — without it, `c.v = 9` would overwrite a boxed `Int | Bool`
@@ -5032,10 +5039,10 @@ impl TypeChecker {
         let value = self.lower_expected(value, &leaf_ty)?;
         // A place assignment is a statement: codegen rebinds the touched
         // leaf `Variable`(s) (a pure field path) or writes through the
-        // indexed list (a path with one `Index`), and yields one dummy
-        // value — `None` is both the documented result type and the only
-        // single-slot type that can't disagree with that.
-        Ok((TypedExprKind::PlaceAssign { root, path, value: Box::new(value) }, Type::None))
+        // indexed list, and yields one dummy value — `None` is both the
+        // documented result type and the only single-slot type that can't
+        // disagree with that.
+        Ok((TypedExprKind::PlaceAssign { place, value: Box::new(value) }, Type::None))
     }
 
     fn lower_assign(&mut self, a: AssignExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -5615,7 +5622,7 @@ impl TypeChecker {
             // (join with other branches, dead-code trapping, etc.)
             // instead of falsely claiming `None`.
             let ty = if arg.item.ty == Type::Never { Type::Never } else { Type::None };
-            (TypedExprKind::Call { callable: Box::new(callable), args: vec![arg], mut_args: vec![false] }, ty)
+            (TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] }, ty)
         } else if is_push {
             if c.args.len() != 2 {
                 return Err(Spanned::from(TypeError {
@@ -5633,24 +5640,12 @@ impl TypeChecker {
                     msg: "push's first argument must be marked 'mut'".to_string()
                 }, xs_span)),
             };
-            // Same check the generic `mut`-argument path applies
-            // (`self.ctx.is_mutable`) — `push`'s receiver is exactly a
-            // `mut` argument, just to a builtin rather than a user `func`.
-            let root = xs_inner.item.get_identifier().map(|s| s.to_string()).ok_or_else(|| Spanned::from(TypeError {
-                msg: "'mut' argument must be a plain mutable binding, not an expression".to_string()
-            }, xs_span))?;
-            match self.ctx.is_mutable(&root) {
-                None => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not declared", root)
-                }, xs_span)),
-                Some(false) => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to pass it as a 'mut' argument", root, root)
-                }, xs_span)),
-                Some(true) => {},
-            }
-
-            let xs_lowered = self.check_and_lower(xs_inner)?;
-            return self.finish_push(xs_lowered, xs_span, root, v_arg, callee_span, span);
+            // `push`'s receiver is a *place*, not just a binding
+            // (`MUTABILITY.md` Stage 8) — `lower_place` resolves the same
+            // paths `lower_place_assign` accepts and applies the same
+            // mutability check to the root.
+            let (place, leaf_ty) = self.lower_place(xs_inner, xs_span)?;
+            return self.finish_push(place, leaf_ty, xs_span, v_arg, span);
         } else if is_len {
             if c.args.len() != 1 {
                 return Err(Spanned::from(TypeError {
@@ -5705,8 +5700,9 @@ impl TypeChecker {
     /// `root` comes from an explicit `mut` marker) and `lower_ufcs_call`
     /// (where `xs.push(v)`'s receiver is exempt from that marker, per
     /// `TRAITS.md` Part 2, but `root` still names the same binding).
-    fn finish_push(&mut self, xs_lowered: Spanned<TypedExpr>, xs_span: Span, root: String, v_arg: Spanned<Expression>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
-        let xs_ty = self.lookup(&xs_lowered.item.ty);
+    fn finish_push(&mut self, place: Place, leaf_ty: Type, xs_span: Span, v_arg: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let root = place.root.clone();
+        let xs_ty = self.lookup(&leaf_ty);
         let Some(elem_ty) = xs_ty.as_list_elem() else {
             return Err(Spanned::from(TypeError {
                 msg: format!("push's first argument must be a List, got {:?}", xs_ty)
@@ -5736,24 +5732,24 @@ impl TypeChecker {
         }
         let v_widened = self.lower_widen(v_lowered, elem_ty)?;
 
-        // No `default_context()` entry backs "push" (see `is_push`'s own
-        // comment), so the callable's `TypedExpr` is synthesized here
-        // rather than resolved by `check_and_lower` — it's never
-        // consulted for anything except `compile_call`'s dispatch on
-        // the literal name `"push"`.
+        // `push` has no `default_context()` entry to resolve (see `is_push`),
+        // so its callable is synthesized here and consulted for nothing but
+        // `compile_call`'s dispatch on the literal name — exactly as `print`
+        // is dispatched. Its receiver rides in `Arg::Mut`, so nothing about
+        // this shape is special to `push`: the next mutating builtin needs
+        // only its own arm in `compile_call`.
         let callable = Spanned::from(TypedExpr {
             id: 0,
             ty: Type::Function { params: vec![xs_ty.clone(), (*elem_ty).clone()], result: Box::new(Type::None) },
             kind: TypedExprKind::Var("push".to_string()),
-        }, callee_span);
+        }, xs_span);
 
         Ok(Spanned::from(TypedExpr {
             id: 0,
             ty: Type::None,
             kind: TypedExprKind::Call {
                 callable: Box::new(callable),
-                args: vec![xs_lowered, v_widened],
-                mut_args: vec![true, false],
+                args: vec![Arg::Mut(place), Arg::Value(v_widened)],
             },
         }, span))
     }
@@ -5779,7 +5775,7 @@ impl TypeChecker {
         Ok(Spanned::from(TypedExpr {
             id: 0,
             ty: Type::Int,
-            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![arg], mut_args: vec![false] },
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] },
         }, span))
     }
 
@@ -5957,7 +5953,7 @@ impl TypeChecker {
         }
         self.check_mut_exclusivity(&mut_args, &all_roots)?;
         let ty = self.lookup(&result);
-        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Call { callable: Box::new(callable), args, mut_args } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Call { callable: Box::new(callable), args } }, span))
     }
 
     /// One argument of a call: unwraps a `mut` marker, validates it
@@ -5966,27 +5962,13 @@ impl TypeChecker {
     /// unifies/widens the argument's type against `param`. Shared by
     /// `finish_call` (every argument) and `lower_ufcs_call` (every
     /// argument after the exempt receiver).
-    fn lower_call_arg(&mut self, i: usize, arg: Spanned<Expression>, param: &Type, declared: Option<bool>) -> Result<(Spanned<TypedExpr>, bool, Option<(String, Span)>), Spanned<TypeError>> {
+    fn lower_call_arg(&mut self, i: usize, arg: Spanned<Expression>, param: &Type, declared: Option<bool>) -> Result<(Arg, bool, Option<(String, Span)>), Spanned<TypeError>> {
         let arg_span = arg.span;
         let (is_mut, inner) = match arg.item {
             Expression::MutArg(inner) => (true, *inner),
             other => (false, Spanned::from(other, arg_span)),
         };
         let root = inner.item.get_identifier().map(|r| (r.to_string(), arg_span));
-        if is_mut {
-            let name = root.as_ref().map(|(n, _)| n.clone()).ok_or_else(|| Spanned::from(TypeError {
-                msg: "'mut' argument must be a plain mutable binding, not an expression".to_string()
-            }, arg_span))?;
-            match self.ctx.is_mutable(&name) {
-                None => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not declared", name)
-                }, arg_span)),
-                Some(false) => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to pass it as a 'mut' argument", name, name)
-                }, arg_span)),
-                Some(true) => {},
-            }
-        }
         // `.get(i)`, not `d[i]`: `func_mut_params` is keyed by bare
         // name with no scoping, so a local binding that shadows a
         // `func` of the same name can produce a shorter list than
@@ -6005,6 +5987,23 @@ impl TypeChecker {
             }, arg_span)),
             _ => {},
         }
+        // A `mut` argument names storage, not a value: resolve it as a
+        // place (which checks the root is mutable) and type-check its leaf
+        // against the parameter. No widening — a `mut` parameter is copied
+        // back out into the very same storage afterwards, so its type has
+        // to match exactly in both directions.
+        if is_mut {
+            let (place, leaf_ty) = self.lower_place(inner, arg_span)?;
+            let resolved_argt  = self.lookup(&leaf_ty);
+            let resolved_param = self.lookup(param);
+            if !self.unify(&leaf_ty, param) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Can't unify {} and {}", resolved_argt, resolved_param)
+                }, arg_span));
+            }
+            let root = Some((place.root.clone(), arg_span));
+            return Ok((Arg::Mut(place), true, root));
+        }
         let lowered = self.check_and_lower(inner)?;
         let resolved_argt  = self.lookup(&lowered.item.ty);
         let resolved_param = self.lookup(param);
@@ -6017,7 +6016,7 @@ impl TypeChecker {
             }, arg_span));
         }
         let widened = self.lower_widen(lowered, param)?;
-        Ok((widened, is_mut, root))
+        Ok((Arg::Value(widened), is_mut, root))
     }
 
     /// A `mut`-marked argument's root may not also be any other
@@ -6307,11 +6306,21 @@ impl TypeChecker {
             kind: TypedExprKind::Var(Self::pending_member_symbol(trait_name, member)),
         }, callee_span);
 
-        let mut args = Vec::with_capacity(params.len());
+        let mut args: Vec<Arg> = Vec::with_capacity(params.len());
         let mut mut_args = Vec::with_capacity(params.len());
         let mut all_roots: Vec<Option<(String, Span)>> = Vec::with_capacity(params.len());
-        all_roots.push(root_name.map(|n| (n, target_span)));
-        args.push(self.lower_widen(target, &params[0].1)?);
+        all_roots.push(root_name.clone().map(|n| (n, target_span)));
+        // The receiver of a mutating method takes no `mut` marker (`TRAITS.md`
+        // Part 2), but it is still a `mut` argument, so it rides in `Arg::Mut`
+        // like any other. `check_mut_receiver` above has already established
+        // that it is a bare mutable binding, hence the empty path — unlike
+        // `push(mut b.items, v)`, a user-defined mutating *method* still
+        // can't be called on a path receiver. See roadmap.md.
+        args.push(if mut_first {
+            Arg::Mut(Place { root: root_name.expect("check_mut_receiver requires a root"), path: Vec::new() })
+        } else {
+            Arg::Value(self.lower_widen(target, &params[0].1)?)
+        });
         mut_args.push(mut_first);
         for (i, (arg, (_, param, declared))) in rest_args.into_iter().zip(params[1..].iter()).enumerate() {
             let (lowered, is_mut, root) = self.lower_call_arg(i + 1, arg, param, Some(*declared))?;
@@ -6324,7 +6333,7 @@ impl TypeChecker {
         let ty = self.lookup(&result);
         Ok(Spanned::from(TypedExpr {
             id: 0, ty,
-            kind: TypedExprKind::Call { callable: Box::new(callable), args, mut_args },
+            kind: TypedExprKind::Call { callable: Box::new(callable), args },
         }, span))
     }
 
@@ -6334,6 +6343,10 @@ impl TypeChecker {
         // can be the root of a `mut` receiver, same restriction ordinary
         // `mut` arguments have (`lower_call_arg`).
         let root_name = fa.target.item.get_identifier().map(|s| s.to_string());
+        // `push` needs the *untyped* receiver to resolve it as a place
+        // (`lower_place`), and which builtin this is isn't known until
+        // after the target is lowered — so keep a copy.
+        let raw_target = (*fa.target).clone();
         let target = self.check_and_lower(*fa.target)?;
         let resolved = self.lookup(&target.item.ty);
 
@@ -6461,20 +6474,9 @@ impl TypeChecker {
                     msg: format!("Wrong number of arguments, expected 1, got {}", rest_args.len())
                 }, callee_span));
             }
-            let root = root_name.ok_or_else(|| Spanned::from(TypeError {
-                msg: "the receiver of a mutating method must be a plain mutable binding, not an expression".to_string()
-            }, target_span))?;
-            match self.ctx.is_mutable(&root) {
-                None => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not declared", root)
-                }, target_span)),
-                Some(false) => return Err(Spanned::from(TypeError {
-                    msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to call a mutating method on it", root, root)
-                }, target_span)),
-                Some(true) => {},
-            }
+            let (place, leaf_ty) = self.lower_place(raw_target, target_span)?;
             let v_arg = rest_args.into_iter().next().expect("arity checked just above");
-            return self.finish_push(target, target_span, root, v_arg, callee_span, span);
+            return self.finish_push(place, leaf_ty, target_span, v_arg, span);
         }
 
         // `get` has no `ctx` entry either, same reasoning as `len`/`push`
@@ -6542,12 +6544,22 @@ impl TypeChecker {
         let callee_sym = self.ctx.symbol(&callee).map(str::to_string).unwrap_or_else(|| callee.clone());
         let callable = Spanned::from(TypedExpr { id: 0, ty: func_ty, kind: TypedExprKind::Var(callee_sym) }, callee_span);
 
-        let mut args = Vec::with_capacity(rest_args.len() + 1);
+        let mut args: Vec<Arg> = Vec::with_capacity(rest_args.len() + 1);
         let mut mut_args = Vec::with_capacity(rest_args.len() + 1);
         let mut all_roots: Vec<Option<(String, Span)>> = Vec::with_capacity(rest_args.len() + 1);
 
-        all_roots.push(root_name.map(|n| (n, target_span)));
-        args.push(self.lower_widen(target, &params[0])?);
+        all_roots.push(root_name.clone().map(|n| (n, target_span)));
+        // The receiver of a mutating method takes no `mut` marker (`TRAITS.md`
+        // Part 2), but it is still a `mut` argument, so it rides in `Arg::Mut`
+        // like any other. `check_mut_receiver` above has already established
+        // that it is a bare mutable binding, hence the empty path — unlike
+        // `push(mut b.items, v)`, a user-defined mutating *method* still
+        // can't be called on a path receiver. See roadmap.md.
+        args.push(if mut_first {
+            Arg::Mut(Place { root: root_name.expect("check_mut_receiver requires a root"), path: Vec::new() })
+        } else {
+            Arg::Value(self.lower_widen(target, &params[0])?)
+        });
         mut_args.push(mut_first);
 
         for (i, (arg, param)) in rest_args.into_iter().zip(params[1..].iter()).enumerate() {
@@ -6561,7 +6573,7 @@ impl TypeChecker {
         self.check_mut_exclusivity(&mut_args, &all_roots)?;
 
         let ty = self.lookup(&result);
-        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Call { callable: Box::new(callable), args, mut_args } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Call { callable: Box::new(callable), args } }, span))
     }
 
     fn lower_tuple(&mut self, elems: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {

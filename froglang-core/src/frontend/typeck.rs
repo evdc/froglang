@@ -3367,6 +3367,38 @@ impl TypeChecker {
                 Ok(Type::Bool)
             },
 
+            "in" => {
+                // `x in y` — `y` decides the shape: `Str` requires `x: Str`
+                // (substring search), `List<T>` requires `x: T` (element
+                // membership). Asymmetric like `+`'s Str case above, so it
+                // gets its own arm rather than going through
+                // `join_operand_types`.
+                let (left_ty, left_span) = &args[0];
+                let (right_ty, right_span) = &args[1];
+                let resolved_right = self.lookup(right_ty);
+                if resolved_right == Type::Str {
+                    let resolved_left = self.lookup(left_ty);
+                    if resolved_left != Type::Str {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Operator 'in' on Str requires Str on the left side, got {}", resolved_left)
+                        }, *left_span));
+                    }
+                    return Ok(Type::Bool);
+                }
+                if let Some(elem) = resolved_right.as_list_elem().cloned() {
+                    if !self.unify(left_ty, &elem) {
+                        let resolved_left = self.lookup(left_ty);
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Operator 'in' got incompatible types: expected {}, got {}", elem, resolved_left)
+                        }, *left_span));
+                    }
+                    return Ok(Type::Bool);
+                }
+                Err(Spanned::from(TypeError {
+                    msg: format!("Operator 'in' requires Str or List on the right side, got {}", resolved_right)
+                }, *right_span))
+            },
+
             _ => Err(Spanned::from(TypeError {
                 msg: format!("Unknown operator: {}", op)
             }, span)),

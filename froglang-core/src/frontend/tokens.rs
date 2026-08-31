@@ -55,6 +55,7 @@ pub enum Token {
     Minus,
 
     #[prefix(Grammar::unary)]
+    #[infix(Grammar::not_in, Precedence::Comparison)]
     #[lex("not")]
     Not,
 
@@ -137,6 +138,7 @@ pub enum Token {
     #[prefix(Grammar::for_expr)]
     #[lex("for")]
     For,
+    #[infix(Grammar::binary, Precedence::Comparison)]
     #[lex("in")]
     In,
     #[lex("do")]

@@ -201,3 +201,11 @@ a fully consistent, unambiguous syntax would be like
 ... but I don't exactly like `Person{name="Alice", age=42}` for some reason (Python familiarity, perhaps)
 
 ---
+
+rethinking concurrency
+
+what if a Task is basically the same thing as a Scope
+such that: you need a Task handle to spawn new sub-Tasks, so all Tasks naturally have a parent
+there is a "main task", which is implicitly always available / can be explicitly swapped out
+
+something like Zig's explicit IO design except the 

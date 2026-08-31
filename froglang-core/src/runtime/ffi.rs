@@ -100,6 +100,30 @@ pub extern "C" fn frog_str_cmp(a: i64, b: i64) -> i64 {
     }
 }
 
+/// `needle in haystack` for strings — substring search. `1` if `haystack`
+/// contains `needle` as a contiguous byte run (the empty string is always
+/// contained, matching Python's `"" in s`), else `0`.
+#[no_mangle]
+pub extern "C" fn frog_str_contains(needle: i64, haystack: i64) -> i64 {
+    let needle_ptr = needle as *const FrogStr;
+    let haystack_ptr = haystack as *const FrogStr;
+    let struct_size = std::mem::size_of::<FrogStr>();
+    unsafe {
+        let needle_len = (*needle_ptr).len as usize;
+        let haystack_len = (*haystack_ptr).len as usize;
+        if needle_len > haystack_len { return 0; }
+        let needle_data = (needle_ptr as *const u8).add(struct_size);
+        let haystack_data = (haystack_ptr as *const u8).add(struct_size);
+        let needle_bytes = std::slice::from_raw_parts(needle_data, needle_len);
+        let haystack_bytes = std::slice::from_raw_parts(haystack_data, haystack_len);
+        if haystack_bytes.windows(needle_len.max(1)).any(|w| w == needle_bytes) || needle_len == 0 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn frog_str_print(s: i64) {
     let ptr = s as *const FrogStr;

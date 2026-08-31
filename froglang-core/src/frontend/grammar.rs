@@ -48,7 +48,25 @@ impl Grammar {
             item: Expression::binary(token.item, left, right)
         })
     }
-    
+
+    /// `x not in y` — the mirror of `x in y` (see `Token::In`'s infix
+    /// rule), parsed by `Token::Not` seeing a trailing `in` in infix
+    /// position. Desugars to `not (x in y)` rather than inventing a
+    /// `NotIn` AST/token, so typeck and codegen need no changes beyond
+    /// what `in` and `not` already handle individually.
+    pub fn not_in(parser: &mut Parser, token: Spanned<Token>, left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
+        parser.consume(Token::In)?;
+        let right = parser.expression(precedence.next())?;
+        let in_expr = Spanned {
+            span: left.span.merge(right.span),
+            item: Expression::binary(Token::In, left, right)
+        };
+        Ok(Spanned {
+            span: token.span.merge(in_expr.span),
+            item: Expression::unary(Token::Not, in_expr)
+        })
+    }
+
     /// `let name = expr` / `mut name = expr` — a fresh declaration. Which
     /// keyword introduced this call decides the binding's `Mutability`
     /// (`token.item` is `Token::Let` or `Token::Mut`; see `MUTABILITY.md`).

@@ -1771,6 +1771,63 @@ fn eq_list(elem_ty: &Type, lv: Value, rv: Value, bcx: &mut FunctionBuilder, ctx:
     bcx.block_params(merge_bb)[0]
 }
 
+/// `x in xs` — scans `haystack` (a `List<elem_ty>`) for an element equal to
+/// `needle` (`needle`'s already-flattened leaves), short-circuiting on the
+/// first match. Mirrors `eq_list`'s loop skeleton, but compares one fixed
+/// value against each element in turn instead of two lists pairwise.
+/// Returns an `I8` boolean.
+fn list_contains(elem_ty: &Type, needle: &[Value], haystack: Value, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
+    let elem_leafs = struct_fields(elem_ty, ctx.structs);
+    let len_id = ctx.func_ids["frog_list_len"];
+    let len_callee = ctx.module.declare_func_in_func(len_id, bcx.func);
+    let len_call = bcx.ins().call(len_callee, &[haystack]);
+    let len = bcx.inst_results(len_call)[0];
+
+    let merge_bb = bcx.create_block();
+    bcx.append_block_param(merge_bb, types::I8);
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    bcx.append_block_param(header_bb, types::I64);
+
+    let stride = list_stride(bcx, haystack);
+    let zero = bcx.ins().iconst(types::I64, 0);
+    bcx.ins().jump(header_bb, &[BlockArg::from(zero)]);
+
+    // Sealed only after the back edge below exists, as in `eq_list`.
+    bcx.switch_to_block(header_bb);
+    let i = bcx.block_params(header_bb)[0];
+    let in_range = bcx.ins().icmp(IntCC::SignedLessThan, i, len);
+    // Ran off the end without a match: not found.
+    let no = bcx.ins().iconst(types::I8, 0);
+    bcx.ins().brif(in_range, body_bb, &[], merge_bb, &[BlockArg::from(no)]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+    let base = bcx.ins().imul(i, stride);
+    let mut vals = Vec::with_capacity(elem_leafs.len());
+    for (leaf_idx, (_, lty)) in elem_leafs.iter().enumerate() {
+        let slot = bcx.ins().iadd_imm_s(base, leaf_idx as i64);
+        let addr = list_slot_addr(bcx, haystack, slot);
+        let raw = bcx.ins().load(types::I64, heap_mem(), addr, 0);
+        vals.push(from_i64_repr(bcx, lty, raw));
+    }
+    let elem_leaf_tys: Vec<Type> = elem_leafs.iter().map(|(_, t)| t.clone()).collect();
+    declare_gc_leaves(bcx, &vals, &elem_leaf_tys);
+    let mut cursor = 0;
+    let eq = eq_value(elem_ty, needle, &vals, &mut cursor, bcx, ctx);
+
+    // `eq_value` may have emitted its own blocks; jump from wherever it
+    // left the builder.
+    let i_next = bcx.ins().iadd_imm_s(i, 1);
+    let yes = bcx.ins().iconst(types::I8, 1);
+    bcx.ins().brif(eq, merge_bb, &[BlockArg::from(yes)], header_bb, &[BlockArg::from(i_next)]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(merge_bb);
+    bcx.seal_block(merge_bb);
+    bcx.block_params(merge_bb)[0]
+}
+
 /// Structural `==` for two values of the same union type — the equality
 /// counterpart of `print_union`, and the reason a `data` union compares by
 /// contents rather than by box address.
@@ -2560,8 +2617,30 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
                 };
                 bcx.ins().icmp(cc, cmp, zero)
             },
+            Token::In => {
+                let id     = ctx.func_ids["frog_str_contains"];
+                let callee = ctx.module.declare_func_in_func(id, bcx.func);
+                let call   = bcx.ins().call(callee, &[lv, rv]);
+                let result = bcx.inst_results(call)[0];
+                bcx.ins().ireduce(types::I8, result)
+            },
             _ => unimplemented!("string binary op {:?}", op),
         }];
+    }
+
+    // ── List membership (`x in xs`) ──────────────────────────────────
+    //
+    // Unlike `==`, the two operands have different types (an element and a
+    // list), so this can't share `eq_list`'s "both operands are This List"
+    // framing — it scans `right` comparing each element to `left` via
+    // `eq_value` (`list_contains`), short-circuiting on the first hit.
+    if *op == Token::In && right.item.ty.is_list() {
+        let elem = right.item.ty.as_list_elem().expect("is_list implies an element type").clone();
+        let lv = compile_expr_multi(left, bcx, vars, ctx);
+        let elem_leaf_tys: Vec<Type> = struct_fields(&elem, ctx.structs).into_iter().map(|(_, t)| t).collect();
+        declare_gc_leaves(bcx, &lv, &elem_leaf_tys);
+        let rv = compile_expr_transient(right, bcx, vars, ctx);
+        return vec![list_contains(&elem, &lv, rv, bcx, ctx)];
     }
 
     // ── List equality (structural — see `eq_list`) ──────────────────
@@ -3745,6 +3824,7 @@ impl Codegen {
         builder.symbol("frog_str_concat",  ffi::frog_str_concat  as *const u8);
         builder.symbol("frog_str_eq",      ffi::frog_str_eq      as *const u8);
         builder.symbol("frog_str_cmp",     ffi::frog_str_cmp     as *const u8);
+        builder.symbol("frog_str_contains", ffi::frog_str_contains as *const u8);
         builder.symbol("frog_str_print",   ffi::frog_str_print   as *const u8);
         builder.symbol("frog_str_repr_print", ffi::frog_str_repr_print as *const u8);
         builder.symbol("frog_bytes_print", ffi::frog_bytes_print as *const u8);
@@ -3796,6 +3876,7 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_str_concat", "frog_str_concat", &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_str_eq",     "frog_str_eq",     &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_str_cmp",    "frog_str_cmp",    &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_str_contains", "frog_str_contains", &[I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_str_print",  "frog_str_print",  &[I64],           None);
         declare_rt(&mut module, &mut func_ids, "frog_str_repr_print", "frog_str_repr_print", &[I64], None);
         declare_rt(&mut module, &mut func_ids, "frog_bytes_print", "frog_bytes_print", &[I64, I64], None);

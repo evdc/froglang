@@ -9,7 +9,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use crate::frontend::liveness;
 use crate::frontend::tokens::{Span, Spanned, Token};
-use crate::frontend::typed_ast::{Arg, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
+use crate::frontend::typed_ast::{Arg, IterVia, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
 use crate::runtime::{ffi, gc};
 use crate::runtime::gc::{FrogList, FrogVariant};
@@ -2426,18 +2426,18 @@ fn compile_expr_multi(
 
         TypedExprKind::List(elems) => compile_list_lit(&expr.item.ty, elems, bcx, vars, ctx),
 
-        TypedExprKind::ForLoop { var, iterable, cond, body } => {
-            compile_for_loop(var, iterable, cond, body, LoopOutput::Discard, bcx, vars, ctx);
+        TypedExprKind::ForLoop { var, iterable, cond, body, iter_via } => {
+            compile_for_loop(var, iterable, iter_via, cond, body, LoopOutput::Discard, bcx, vars, ctx);
             vec![bcx.ins().iconst(types::I64, 0)]
         },
 
-        TypedExprKind::Comprehension { var, iterable, cond, body } => {
+        TypedExprKind::Comprehension { var, iterable, cond, body, iter_via } => {
             let leafs = struct_fields(&body.item.ty, ctx.structs);
             let collect = LoopOutput::Collect {
                 ptr_mask: gc_mask(leafs.iter().map(|(_, t)| t)),
                 stride: leafs.len().max(1) as i64,
             };
-            let result_list = compile_for_loop(var, iterable, cond, body, collect, bcx, vars, ctx)
+            let result_list = compile_for_loop(var, iterable, iter_via, cond, body, collect, bcx, vars, ctx)
                 .expect("LoopOutput::Collect always yields a list");
             vec![result_list]
         },
@@ -3363,6 +3363,14 @@ fn compile_variant_init(
             let member_ty = Type::strukt(format!("{}.{}", enum_name, variant));
             return pack_union_member(members, &member_ty, member_tag(idx), &flat_vals, bcx, ctx.structs);
         }
+    } else {
+        // `union_ty` isn't a union at all: the checked expected type at
+        // this construction site was the variant's own qualified struct
+        // type directly (`let c: Shape.Circle = Circle(r=3)`), not
+        // `Shape` — see `TypeChecker::lower_expected`'s `exact_variant`
+        // case. No tag, no box: an ordinary flattened struct value, same
+        // representation `StructInit` produces for any other `data` type.
+        return flat_vals;
     }
 
     // A boxed union's variant with no fields at all — neither its own nor
@@ -3627,6 +3635,7 @@ fn dotted_leaf_range(ty: &Type, dotted: &str, structs: &StructDefs) -> (usize, u
 fn compile_for_loop(
     var: &str,
     iterable: &Spanned<TypedExpr>,
+    iter_via: &Option<IterVia>,
     cond: &Option<Box<Spanned<TypedExpr>>>,
     body: &Spanned<TypedExpr>,
     output: LoopOutput,
@@ -3634,6 +3643,13 @@ fn compile_for_loop(
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
 ) -> Option<Value> {
+    // The `Iterable<Item>` trait-dispatch fallback (`RANGES.md` Stage 2) —
+    // `iterable`'s type is neither List- nor Range-shaped, so none of this
+    // function's index/stride machinery applies at all; hand off entirely.
+    if let Some(via) = iter_via {
+        return compile_iterable_for_loop(var, iterable, via, cond, body, output, bcx, vars, ctx);
+    }
+
     // A `Range` iterable needs none of this function's list machinery
     // (`frog_list_len`, stride, slot addressing) — it's a plain counting
     // loop over two already-loaded `i64`s. Dispatch to a dedicated sibling
@@ -3871,6 +3887,151 @@ fn compile_for_loop_range(
 
     let elem_next = bcx.ins().iadd_imm_s(elem, 1);
     bcx.ins().jump(header_bb, &[BlockArg::from(elem_next)]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(exit_bb);
+    bcx.seal_block(exit_bb);
+    result_list
+}
+
+/// `compile_for_loop`'s `Iterable<Item>` trait-dispatch fallback
+/// (`RANGES.md` Stage 2, `IterVia`'s own doc comment). Unlike the List/
+/// Range cases, there is no index to bound the loop by — each iteration
+/// calls `via.next_call` afresh and tag-tests its `Item?` result, exiting
+/// on `None`. Every piece of that (the call itself, the tag test, the
+/// unwrap) reuses existing codegen machinery directly — a `mut`-argument
+/// call's ordinary copy-in/copy-out convention, and the same
+/// `union_is_inline`/`emit_tag_test`/`compile_narrow` helpers
+/// `TypedExprKind::TypeTag`/`Narrow` themselves call — so this function's
+/// own job is only the loop's block wiring.
+#[allow(clippy::too_many_arguments)]
+fn compile_iterable_for_loop(
+    var: &str,
+    iterable: &Spanned<TypedExpr>,
+    via: &IterVia,
+    cond: &Option<Box<Spanned<TypedExpr>>>,
+    body: &Spanned<TypedExpr>,
+    output: LoopOutput,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> Option<Value> {
+    // Bind `iterable`'s value into the internal `mut` place `next_call`'s
+    // `Arg::Mut` receiver names — exactly like an ordinary `Assign`, once,
+    // before the loop starts.
+    let init_vals = compile_expr_multi(iterable, bcx, vars, ctx);
+    let iter_leafs = struct_fields(&iterable.item.ty, ctx.structs);
+    let iter_leaf_tys: Vec<Type> = iter_leafs.iter().map(|(_, t)| t.clone()).collect();
+    declare_gc_leaves(bcx, &init_vals, &iter_leaf_tys);
+    for ((path, lty), v) in iter_leafs.iter().zip(init_vals.iter()) {
+        let key = var_key(&via.iter_var, path);
+        let var_id = get_or_declare_var(bcx, vars, &key, lty);
+        bcx.def_var(var_id, *v);
+    }
+
+    // `Item?`'s member list — needed for the tag positions `Widen`/
+    // `Narrow`/`TypeTag` already number every union by (`Type::normalize`'s
+    // canonical order): `None`'s to test for loop exit, the other's (
+    // `Item`'s) to unwrap.
+    let opt_ty = via.next_call.item.ty.clone();
+    let Type::Union(members) = &opt_ty else {
+        unreachable!("Iterable::next always returns Item | None, got {}", opt_ty)
+    };
+    let none_tag = members.iter().position(|m| *m == Type::None)
+        .expect("Item? always includes None") as u32;
+    let item_ty = members.iter().find(|m| **m != Type::None).cloned()
+        .expect("Item? always includes a non-None Item member");
+    let opt_var = format!("{}$opt", via.iter_var);
+    let opt_leafs = struct_fields(&opt_ty, ctx.structs);
+    let opt_leaf_tys: Vec<Type> = opt_leafs.iter().map(|(_, t)| t.clone()).collect();
+    // A dummy span: this node exists only inside codegen, compiled once
+    // and never diagnosed against — no codegen path reads `.span`.
+    let dummy_span = Span::new((0, 0), (0, 0));
+    let opt_var_node = Spanned::from(
+        TypedExpr { id: 0, ty: opt_ty.clone(), kind: TypedExprKind::Var(opt_var.clone()) },
+        dummy_span,
+    );
+
+    // Comprehension output has no length to preallocate from ahead of
+    // time, unlike List/Range — start small and let `push_element`'s
+    // existing growth handle the rest, same as any other unsized producer.
+    let result_list = match output {
+        LoopOutput::Discard => None,
+        LoopOutput::Collect { stride, ptr_mask } => {
+            let cap_arg    = bcx.ins().iconst(types::I64, 1);
+            let stride_arg = bcx.ins().iconst(types::I64, stride);
+            let mask_arg   = bcx.ins().iconst(types::I64, ptr_mask);
+            let alloc_id = ctx.func_ids["frog_alloc_list"];
+            let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+            let alloc_call = bcx.ins().call(alloc_ref, &[cap_arg, stride_arg, mask_arg]);
+            let list = bcx.inst_results(alloc_call)[0];
+            declare_gc_ptr(bcx, list);
+            Some(list)
+        }
+    };
+
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    let exit_bb   = bcx.create_block();
+    bcx.ins().jump(header_bb, &[]);
+
+    // Two predecessors (this jump, and the back edge below) — sealed only
+    // once the back edge exists, same discipline every other loop header
+    // in this file follows.
+    bcx.switch_to_block(header_bb);
+    let opt_vals = compile_expr_multi(&via.next_call, bcx, vars, ctx);
+    declare_gc_leaves(bcx, &opt_vals, &opt_leaf_tys);
+    for ((path, lty), v) in opt_leafs.iter().zip(opt_vals.iter()) {
+        let key = var_key(&opt_var, path);
+        let var_id = get_or_declare_var(bcx, vars, &key, lty);
+        bcx.def_var(var_id, *v);
+    }
+    // Mirrors `TypedExprKind::TypeTag`'s own codegen arm exactly (see
+    // codegen/mod.rs's `compile_expr_multi` match) — reading `opt_var_node`
+    // twice (here and in the `Narrow` call below) is fine and re-executes
+    // no side effect, since a plain `Var` read is pure.
+    let is_none_val = if union_is_inline(members, ctx.structs) {
+        let slots = compile_expr_multi(&opt_var_node, bcx, vars, ctx);
+        emit_inline_tag_test(bcx, &slots, none_tag as usize)
+    } else {
+        let val = compile_expr(&opt_var_node, bcx, vars, ctx);
+        emit_tag_test(bcx, val, true, true, none_tag)
+    };
+    bcx.ins().brif(is_none_val, exit_bb, &[], body_bb, &[]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+    let item_vals = compile_narrow(&item_ty, &opt_var_node, bcx, vars, ctx);
+    let elem_leafs = struct_fields(&item_ty, ctx.structs);
+    for ((leaf_path, lty), elem_val) in elem_leafs.iter().zip(item_vals) {
+        let key = var_key(var, leaf_path);
+        let var_id = get_or_declare_var(bcx, vars, &key, lty);
+        bcx.def_var(var_id, elem_val);
+    }
+
+    // Optional `if` filter: skip straight to the next `next()` call when
+    // false — same shape as the List/Range loops' own filter.
+    if let Some(c) = cond {
+        let do_bb   = bcx.create_block();
+        let skip_bb = bcx.create_block();
+        let cond_val = compile_expr(c, bcx, vars, ctx);
+        bcx.ins().brif(cond_val, do_bb, &[], skip_bb, &[]);
+
+        bcx.switch_to_block(skip_bb);
+        bcx.seal_block(skip_bb);
+        bcx.ins().jump(header_bb, &[]);
+
+        bcx.switch_to_block(do_bb);
+        bcx.seal_block(do_bb);
+    }
+
+    let body_vals = compile_expr_multi(body, bcx, vars, ctx);
+    if let Some(list_ptr) = result_list {
+        let body_leafs = struct_fields(&body.item.ty, ctx.structs);
+        push_element(bcx, ctx, list_ptr, &body_vals, &body_leafs);
+    }
+
+    bcx.ins().jump(header_bb, &[]);
     bcx.seal_block(header_bb);
 
     bcx.switch_to_block(exit_bb);

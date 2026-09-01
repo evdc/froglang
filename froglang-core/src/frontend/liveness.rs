@@ -586,8 +586,8 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
             lo
         }
 
-        TypedExprKind::ForLoop { var, iterable, cond, body }
-        | TypedExprKind::Comprehension { var, iterable, cond, body } =>
+        TypedExprKind::ForLoop { var, iterable, cond, body, .. }
+        | TypedExprKind::Comprehension { var, iterable, cond, body, .. } =>
             transfer_loop(var, iterable, cond, body, live_out, ctx, out),
     }
 }

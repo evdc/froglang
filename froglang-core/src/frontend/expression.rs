@@ -217,9 +217,18 @@ pub struct TraitMemberDecl {
 /// `trait Name { ... }` — `TRAITS.md` Stage 5. A trait with no members is a
 /// marker (the shape `Error` and `Linear` have), and both `trait Marker` and
 /// `trait Marker { }` spell it.
+///
+/// `trait Iterable<Item> { ... }` — `RANGES.md` Stage 2: a trait-level type
+/// parameter, distinct from a member's own implicit `Self`. Parsed the same
+/// way `DataDeclExpr::type_params` is (`Grammar::type_param_list`), and
+/// scoped once for the whole trait during registration — a member signature
+/// like `func next(mut self): Item?` references `Item` as an already-bound
+/// name, the same way an `impl`'s body references its own type without
+/// re-declaring it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitDeclExpr {
     pub name:    String,
+    pub type_params: Vec<TypeParam>,
     pub members: Vec<TraitMemberDecl>,
 }
 

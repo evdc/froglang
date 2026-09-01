@@ -35,6 +35,30 @@ impl PartialEq for TypedExpr {
     }
 }
 
+/// The trait-dispatch fallback for `for var in iterable do ...` — carried
+/// on `TypedExprKind::ForLoop`/`Comprehension` when `iterable`'s type
+/// provides `Iterable<Item>` rather than being List/Range-shaped
+/// (`RANGES.md` Stage 2).
+///
+/// `iterable`'s value is bound once, before the loop, into a fresh internal
+/// `mut` place named `iter_var` — the receiver `next_call`'s `Arg::Mut`
+/// argument repeatedly mutates via the ordinary `mut`-parameter copy-in/
+/// copy-out convention every other call already uses, so no new codegen is
+/// needed for the *call* itself, only for the loop that re-runs it.
+/// `next_call` is `<iter_var>.next()`, fully typed (`Item?`, i.e. `Item |
+/// None`) — `codegen::compile_iterable_for_loop` recompiles it once per
+/// iteration (the same node, into the same Cranelift loop-body block,
+/// which runs repeatedly via a back edge — nothing here is re-lowered or
+/// re-typechecked per iteration), tag-tests its result for the `None`
+/// member to decide whether to exit, and narrows it to `Item` (via the
+/// same union-unpacking codegen `TypedExprKind::Narrow` itself uses) to
+/// bind the loop variable otherwise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IterVia {
+    pub iter_var:  String,
+    pub next_call: TypedExprRef,
+}
+
 /// One step of a `PlaceAssign` path — see its doc comment.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaceSeg {
@@ -213,6 +237,14 @@ pub enum TypedExprKind {
         iterable: TypedExprRef,
         cond:     Option<TypedExprRef>,
         body:     TypedExprRef,
+        /// `Some` iff `iterable`'s type is neither List- nor Range-shaped
+        /// but provides `Iterable<Item>` — the trait-dispatch fallback
+        /// (`RANGES.md` Stage 2). Carries what `codegen::compile_iterable_for_loop`
+        /// needs to run the loop by repeatedly calling the resolved `next`
+        /// member rather than indexing: see `IterVia`'s own doc comment.
+        /// `None` for every List/Range iterable — the ordinary, unchanged
+        /// fast path — so this is never even inspected for those.
+        iter_via: Option<IterVia>,
     },
 
     /// `[for var in iterable (if cond)? body]` — same shape as `ForLoop`,
@@ -223,6 +255,7 @@ pub enum TypedExprKind {
         iterable: TypedExprRef,
         cond:     Option<TypedExprRef>,
         body:     TypedExprRef,
+        iter_via: Option<IterVia>,
     },
 
     /// `Name(field=value, ...)` struct construction, already reordered into

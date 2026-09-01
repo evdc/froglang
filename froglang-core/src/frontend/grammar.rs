@@ -328,6 +328,19 @@ impl Grammar {
         };
         let mut end = name_tok.span;
 
+        // `trait Iterable<Item> { ... }` — a trait-level binder, parsed the
+        // same way `data Name<A, B>`'s is (`RANGES.md` Stage 2). Distinct
+        // from a member's own per-member binder list, which `func_signature`
+        // rejects below — `Item` here is scoped once for the whole trait,
+        // referenced by members as an already-bound name.
+        let type_params = if parser.check(&Token::Lt) {
+            let (params, closing) = Self::type_param_list(parser)?;
+            end = closing;
+            params
+        } else {
+            Vec::new()
+        };
+
         let mut members = Vec::new();
         if parser.check(&Token::LeftBrace) {
             parser.advance()?;
@@ -360,7 +373,7 @@ impl Grammar {
 
         Ok(Spanned {
             span: token.span.merge(end),
-            item: Expression::TraitDecl(TraitDeclExpr { name, members }),
+            item: Expression::TraitDecl(TraitDeclExpr { name, type_params, members }),
         })
     }
 

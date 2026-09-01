@@ -202,10 +202,20 @@ a fully consistent, unambiguous syntax would be like
 
 ---
 
-rethinking concurrency
-
-what if a Task is basically the same thing as a Scope
-such that: you need a Task handle to spawn new sub-Tasks, so all Tasks naturally have a parent
-there is a "main task", which is implicitly always available / can be explicitly swapped out
-
-something like Zig's explicit IO design except the 
+Improvements to Ranges
+- Range as a builtin type (Std prelude)
+  - `data Range<T>(T, T)`
+  - member functions for contains, iter, ...
+  - `x .. y` syntax simply desugars to `Range(x, y)` (instead of materializing a List)
+- That implies user-definable traits for 
+  - Iterable (provides `next()`)
+  - Container (provides `has()`, `len()`)
+  - Builtin `for ... in` syntax uses Iterable, `x in y` operator uses Container
+  - We still want the common case to be as performant as possible
+- Range types (limited: only ints)
+  - `let x: 0..256` for example
+  - Subtyping: R <: S iff R.start >= S.start and R.end <= S.end
+  - Probably don't attempt to widen via arithmetic, e.g. `func f(a: 0..3, b: 0..4) = a * b`, the return type isn't inferred `0..12`
+    - Just widens to Int?
+    - What languages do feature this, and what does e.g. Ada (one that I remember has range types) do?
+  - Do not attempt to add generalized refinement types as a first step

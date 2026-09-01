@@ -5,12 +5,12 @@ use crate::frontend::{
         AnnotatedExpr, AssignExpr, BinaryExpr, CallExpr, ConditionalExpr, Expression,
         FieldAccessExpr, ForLoopExpr, FunctionExpr, IndexExpr, IsPatternExpr,
         LiteralExpr, MatchArm, Mutability, Parameter, Pattern, RangeExpr, SliceExpr,
-        TraitMemberDecl, UnaryExpr,
+        TraitMemberDecl, TypeParam, UnaryExpr,
     },
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::type_expr::TypeExpr;
-use crate::frontend::typed_ast::{Arg, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
+use crate::frontend::typed_ast::{Arg, IterVia, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 
 /// Reserved name for the builtin `panic` alias that `!` desugars to.
 /// Contains `!`, which the lexer never produces inside an identifier, so
@@ -137,6 +137,18 @@ pub struct TraitDef {
     /// intrinsic, not a member; see `TRAITS.md` Part 5's note that operator
     /// desugaring is a separate stage).
     pub members: Vec<TraitMemberSig>,
+    /// `trait Iterable<Item> { ... }`'s `<Item>` binder list — `RANGES.md`
+    /// Stage 2. Empty for every built-in and every ordinary user trait.
+    /// Each name here has a matching `Type::TypeVar { name:
+    /// "{trait}::{param}", .. }` placeholder baked into every `members`
+    /// signature by `hoist_trait_members` — `register_impl` mints one fresh
+    /// unification variable per name here for each impl it registers, so
+    /// the concrete type is *inferred* from that impl's own member
+    /// annotations rather than written at the `provides` site (there is no
+    /// `provides Iterable<Int>` syntax — just `provides Iterable { func
+    /// next(mut s: Self): Int? = ... }`, and `Int` is where `Item` comes
+    /// from).
+    pub type_params: Vec<TypeParam>,
 }
 
 /// One trait member's resolved signature.
@@ -1095,7 +1107,7 @@ impl TypeChecker {
         let mut m = HashMap::new();
         for t in [Trait::Num, Trait::Eq, Trait::Ord, Trait::Error, Trait::Linear] {
             let name = t.to_string();
-            m.insert(name.clone(), TraitDef { name, builtin: Some(t), members: Vec::new() });
+            m.insert(name.clone(), TraitDef { name, builtin: Some(t), members: Vec::new(), type_params: Vec::new() });
         }
         m
     }
@@ -1122,11 +1134,64 @@ impl TypeChecker {
     }
 
     pub fn empty() -> Self {
-        TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        let mut tc = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() };
+        tc.seed_iterable_container_traits();
+        tc
     }
 
     pub fn new() -> Self {
-        TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() }
+        let mut tc = TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() };
+        tc.seed_iterable_container_traits();
+        tc
+    }
+
+    /// `Iterable<Item>`/`Container<Item>` (`RANGES.md` Stage 2) — seeded by
+    /// parsing and hoisting a fixed source string rather than hand-building
+    /// `TraitDef`s, so their member signatures go through exactly the
+    /// parse-and-hoist path a user's own `trait` declaration would (no risk
+    /// of a hand-built `Type`/`TypeExpr` tree silently drifting from what
+    /// the parser actually produces). `for x in y`/`x in y` fall back to
+    /// these — via an ordinary `member_index` lookup, same as any other
+    /// trait — when `y`'s type is neither List/Range/Str-shaped; see
+    /// `lower_for_loop`/`lower_in`.
+    ///
+    /// The parse-and-hoist itself runs once per process (`cached_...`,
+    /// below), not once per `TypeChecker`: `new()`/`empty()` run once per
+    /// compile (`benches/pipeline.rs`'s `compile/*` group measures exactly
+    /// that), so re-parsing this fixed string on every construction was a
+    /// flat tax on every compile, whether or not the program ever mentions
+    /// `Iterable`/`Container` — cloning the two already-hoisted `TraitDef`s
+    /// is the same result for a fraction of the cost.
+    fn seed_iterable_container_traits(&mut self) {
+        let (iterable, container) = Self::cached_iterable_container_traits();
+        self.traits.insert("Iterable".to_string(), iterable.clone());
+        self.traits.insert("Container".to_string(), container.clone());
+    }
+
+    /// The `Iterable`/`Container` `TraitDef`s, parsed and hoisted exactly
+    /// once per process and cached for every `TypeChecker` built after the
+    /// first. Built against a bare bootstrap checker (not `Self::empty()`,
+    /// which would recurse back into `seed_iterable_container_traits`) —
+    /// only `traits`/`struct_templates`/`union_defs` matter to hoisting, so
+    /// the rest of its fields are never touched.
+    fn cached_iterable_container_traits() -> &'static (TraitDef, TraitDef) {
+        static CACHE: std::sync::OnceLock<(TraitDef, TraitDef)> = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| {
+            let src = "trait Iterable<Item> { func next(mut s: Self): Item? }\n\
+                        trait Container<Item> { func has(s: Self, x: Item): Bool\nfunc len(s: Self): Int }\n";
+            let ast = crate::frontend::parser::Parser::parse(src)
+                .expect("builtin Iterable/Container trait source must parse");
+            let stmts = match ast.item {
+                Expression::Block(stmts) => stmts,
+                other => vec![Spanned::from(other, ast.span)],
+            };
+            let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() };
+            boot.hoist_trait_names(&stmts).expect("builtin Iterable/Container trait names must hoist");
+            boot.hoist_trait_members(&stmts).expect("builtin Iterable/Container trait members must hoist");
+            let iterable = boot.traits.remove("Iterable").expect("hoisted above");
+            let container = boot.traits.remove("Container").expect("hoisted above");
+            (iterable, container)
+        })
     }
 
     /// Check whether a concrete type implements the given trait. Only makes
@@ -1746,13 +1811,27 @@ impl TypeChecker {
             ));
         }
         let Type::Union(members) = &target else { return Ok(lowered) };
-        let Some(tag) = members.iter().position(|m| *m == from) else { return Ok(lowered) };
         let span = lowered.span;
+        // `target`'s own members are always flat (`Type::normalize` never
+        // leaves a union nested inside another), so `from` being a
+        // `Type::Union` itself can never equal one of them — the `position`
+        // lookup below would always miss and silently fall through to
+        // `Ok(lowered)` unchanged, leaving a value in its *narrower* union's
+        // own representation (a different member count and tag numbering)
+        // embedded somewhere that expects `target`'s wider one. That used
+        // to be a silent miscompile (a two-member `ParseError`'s tag word
+        // misread as an index into a three-member `Int | ParseError`, e.g.
+        // a `BadChar` reading UnexpectedEof's payload) rather than a
+        // rejection, since nothing upstream re-checks that a widened node's
+        // representation actually matches its claimed type. Reject it
+        // explicitly instead — this whole-union-to-union widening just
+        // isn't implemented yet (unlike widening a single member in).
         if matches!(from, Type::Union(_)) {
             return Err(Spanned::from(TypeError {
                 msg: format!("widening a union-typed value ({}) into a different union ({}) is not yet supported", from, target)
             }, span));
         }
+        let Some(tag) = members.iter().position(|m| *m == from) else { return Ok(lowered) };
         Ok(Spanned::from(
             TypedExpr { id: 0, ty: target.clone(), kind: TypedExprKind::Widen { value: Box::new(lowered), tag: tag as u32 } },
             span,
@@ -1850,7 +1929,36 @@ impl TypeChecker {
                 ))
             },
             (other, _) => {
+                // A variant constructor call (`ParseError.UnexpectedEof(pos=3)`)
+                // is retyped down to that exact variant's own qualified
+                // struct type before the subtype check below, rather than
+                // left at `lower_call`'s `VariantInit` default (the whole
+                // *union*'s type — so an unannotated `let` still gets the
+                // familiar `Shape.Circle | Shape.Rectangle`, not a silently
+                // narrower type dependent on which arm happened to run).
+                // Left at that default, the check below would be backwards
+                // whenever `expected` names the one variant just
+                // constructed, or an anonymous union containing it: the
+                // union is not a subtype of one of its own members, even
+                // though the value being checked plainly *is* exactly that
+                // member already — this is `T ≤ (T|U)`'s narrowing
+                // counterpart (README, "Union types"), applied at the one
+                // site the value's exact shape is knowable before it's even
+                // lowered. Ordinary subtyping/widening below then handles
+                // every shape `expected` can take from here: the bare
+                // qualified type itself, an anonymous union member, or
+                // (through `is_subtype`) the variant's own declaring union.
+                let exact_variant_ty = if let Expression::Call(c) = &other {
+                    self.resolve_variant_callee(&c.callable.item).ok().flatten()
+                        .map(|(enum_name, variant)| Type::strukt(format!("{}.{}", enum_name, variant)))
+                } else {
+                    None
+                };
                 let lowered = self.check_and_lower(Spanned::from(other, span))?;
+                let lowered = match exact_variant_ty {
+                    Some(ty) => Spanned::from(TypedExpr { id: lowered.item.id, ty, kind: lowered.item.kind }, lowered.span),
+                    None => lowered,
+                };
                 let resolved = self.lookup(&lowered.item.ty);
                 let accepted = self.is_subtype(&resolved, &expected)
                     || widens_to(&resolved, &expected)
@@ -2141,6 +2249,16 @@ impl TypeChecker {
         Type::TypeVar { name: SELF_BINDER.to_string(), bounds: vec![Trait::User(trait_name.to_string())] }
     }
 
+    /// The stable placeholder name a type-parameterized trait's own binder
+    /// (e.g. `Iterable`'s `Item`) is stored under in every member signature
+    /// — scoped by trait name so two traits' same-named binder (`Item`)
+    /// never collide in `Type::substitute`'s flat `HashMap<String, Type>`.
+    /// Parallel to `SELF_BINDER`, except per-trait rather than global,
+    /// since (unlike `Self`) more than one such name can exist at once.
+    fn trait_type_param_binder(trait_name: &str, param_name: &str) -> String {
+        format!("{}::{}", trait_name, param_name)
+    }
+
     /// First of the two trait-hoisting passes: register every `trait Name`
     /// in this statement list under its name, with no members yet.
     ///
@@ -2174,6 +2292,7 @@ impl TypeChecker {
                 }
                 self.traits.insert(t.name.clone(), TraitDef {
                     name: t.name.clone(), builtin: None, members: Vec::new(),
+                    type_params: t.type_params.clone(),
                 });
             }
         }
@@ -2205,7 +2324,37 @@ impl TypeChecker {
                         msg: format!("Member '{}' is declared twice in trait {}", m.name, t.name)
                     }, s.span));
                 }
-                self.type_param_scope = HashMap::from([(SELF_BINDER.to_string(), self_ty.clone())]);
+                // A type-parameterized trait's default body would need
+                // `register_impl` to fill in `Item` (etc.) via
+                // `substitute_self_expr`-style *source-text* substitution,
+                // which only handles `Self` (a single spellable name) — a
+                // fresh unification variable, which is how `Item` is
+                // resolved (see `TraitDef::type_params`'s doc comment), has
+                // no source spelling to substitute in. Not attempted; every
+                // member of a type-parameterized trait must be supplied.
+                if !t.type_params.is_empty() && m.default.is_some() {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!(
+                            "trait member '{}.{}' can't have a default body — '{}' is type-parameterized, and a default's type-parameter-mentioning positions can't be filled in automatically",
+                            t.name, m.name, t.name
+                        )
+                    }, s.span));
+                }
+                let mut scope: HashMap<String, Type> = HashMap::with_capacity(t.type_params.len());
+                for tp in &t.type_params {
+                    // Same discipline as a generic `data` decl's binders
+                    // (`hoist_data_decls`): the written bounds ride on the
+                    // placeholder `TypeVar` itself, since `unify` and
+                    // `type_implements` only ever consult a `TypeVar`'s own
+                    // `bounds` field.
+                    let bounds = match self.resolve_bounds(&tp.bounds, s.span) {
+                        Ok(b) => b,
+                        Err(e) => { self.type_param_scope = outer.clone(); return Err(e); }
+                    };
+                    scope.insert(tp.name.clone(), Type::TypeVar { name: Self::trait_type_param_binder(&t.name, &tp.name), bounds });
+                }
+                scope.insert(SELF_BINDER.to_string(), self_ty.clone());
+                self.type_param_scope = scope;
                 let mut params = Vec::with_capacity(m.params.len());
                 let mut resolve_err = None;
                 for p in &m.params {
@@ -2505,6 +2654,25 @@ impl TypeChecker {
 
         let mut out = Vec::new();
         for def in &defs {
+            // One fresh unification variable per binder of a
+            // type-parameterized trait (empty for the overwhelming
+            // majority, which have none) — `check_impl_member` binds each
+            // from this impl's own explicit member annotations rather than
+            // from anything written at the `provides` site. See
+            // `TraitDef::type_params`'s doc comment.
+            //
+            // Bounded, not bare: `def.type_params[i].bounds` is the
+            // binder's own declared bound list (`trait Boxy<Item: Num>`),
+            // and this fresh var is what `check_impl_member`'s
+            // `declared.substitute(&subst)` replaces the binder with — so a
+            // bare `fresh_var` here would silently drop the bound before
+            // `bind_item_template`/`unify` ever get a chance to check it.
+            let mut item_subst: HashMap<String, Type> = HashMap::with_capacity(def.type_params.len());
+            for tp in &def.type_params {
+                let bounds = self.resolve_bounds(&tp.bounds, span)?;
+                let var = self.fresh_bounded_var(bounds);
+                item_subst.insert(Self::trait_type_param_binder(&def.name, &tp.name), var);
+            }
             let mut symbols: HashMap<String, String> = HashMap::new();
             for m in &def.members {
                 // One symbol per member, named for the declared type even
@@ -2513,7 +2681,7 @@ impl TypeChecker {
                 let symbol = Self::member_symbol(&type_key, &m.name);
                 match supplied.remove(&m.name) {
                     Some(decl) => {
-                        let renamed = self.check_impl_member(decl, m, self_ty, &type_key, &symbol)?;
+                        let renamed = self.check_impl_member(decl, m, self_ty, &type_key, &symbol, &item_subst)?;
                         out.push(renamed);
                     }
                     None if m.has_default() => {
@@ -2631,6 +2799,7 @@ impl TypeChecker {
         self_ty: &Type,
         type_key: &str,
         symbol: &str,
+        item_subst: &HashMap<String, Type>,
     ) -> Result<Spanned<Expression>, Spanned<TypeError>> {
         let span = decl.span;
         let err = |msg: String| Spanned::from(TypeError { msg }, span);
@@ -2644,7 +2813,8 @@ impl TypeChecker {
             )));
         }
 
-        let subst = HashMap::from([(SELF_BINDER.to_string(), self_ty.clone())]);
+        let mut subst = item_subst.clone();
+        subst.insert(SELF_BINDER.to_string(), self_ty.clone());
         for (i, p) in f.params.iter_mut().enumerate() {
             let (_, declared, declared_mut) = &sig.params[i];
             let expected = declared.substitute(&subst);
@@ -2653,15 +2823,35 @@ impl TypeChecker {
                     let mut ann = p.ty.clone().expect("just matched Some");
                     Self::substitute_self_expr(&mut ann, type_key);
                     let got = self.resolve_type_expr(&ann)?;
-                    if got != expected {
+                    // `unify`, not `==`: `expected` may still carry an
+                    // unbound fresh variable for one of the trait's own
+                    // type parameters (`item_subst`) — this is the site
+                    // that *infers* it, from this member's own explicit
+                    // annotation. For every ordinary (non-parameterized)
+                    // trait `expected` is already fully concrete, so
+                    // `unify` behaves exactly like `==` did (its first
+                    // check is a plain equality short-circuit).
+                    if !self.bind_item_template(&expected, &got) {
                         return Err(err(format!(
                             "parameter '{}' of member '{}' is declared {}, but the trait says {}",
-                            p.name, sig.name, got, expected
+                            p.name, sig.name, got, self.lookup(&expected)
                         )));
                     }
                     p.ty = Some(ann);
                 }
                 None => {
+                    // A position that mentions one of the trait's own type
+                    // parameters has nothing to fill in *from* — its
+                    // concrete type is exactly what's being inferred here,
+                    // there is no source spelling for it to copy the way
+                    // `Self` (a single spellable name) can be. Only `Self`
+                    // itself may still be omitted and auto-filled.
+                    if item_subst.keys().any(|k| Self::mentions_typevar_named(declared, k)) {
+                        return Err(err(format!(
+                            "parameter '{}' of member '{}' needs a type annotation — its type isn't just Self, so nothing can infer it",
+                            p.name, sig.name
+                        )));
+                    }
                     // Fill it in from the trait's own annotation, specialized
                     // to this impl — exact, and it keeps the lowering path
                     // that follows entirely ordinary.
@@ -2690,14 +2880,20 @@ impl TypeChecker {
                 let mut ann = f.return_type.clone().expect("just matched Some");
                 Self::substitute_self_expr(&mut ann, type_key);
                 let got = self.resolve_type_expr(&ann)?;
-                if got != expected_ret {
+                if !self.bind_item_template(&expected_ret, &got) {
                     return Err(err(format!(
-                        "member '{}' returns {}, but the trait says {}", sig.name, got, expected_ret
+                        "member '{}' returns {}, but the trait says {}", sig.name, got, self.lookup(&expected_ret)
                     )));
                 }
                 f.return_type = Some(ann);
             }
             None => {
+                if item_subst.keys().any(|k| Self::mentions_typevar_named(&sig.return_type, k)) {
+                    return Err(err(format!(
+                        "member '{}' needs a return type annotation — its type isn't just Self, so nothing can infer it",
+                        sig.name
+                    )));
+                }
                 if let Some(mut ann) = sig.decl.return_type.clone() {
                     Self::substitute_self_expr(&mut ann, type_key);
                     f.return_type = Some(ann);
@@ -2734,6 +2930,76 @@ impl TypeChecker {
             Type::Union(members) => members.iter().any(Self::mentions_self),
             Type::Function { params, result } =>
                 params.iter().any(Self::mentions_self) || Self::mentions_self(result),
+            _ => false,
+        }
+    }
+
+    /// Bind a type-parameterized trait member's declared type (`template`,
+    /// already `Self`-substituted but still possibly mentioning one of the
+    /// trait's own type-parameter placeholders as a free `TypeVar`) against
+    /// an impl's concrete, fully-resolved annotation (`concrete`) —
+    /// `check_impl_member`'s comparison step for a member that mentions
+    /// `Item` (or another trait-level binder).
+    ///
+    /// Not plain `unify`: `unify`'s `Union` handling is built for "does a
+    /// bare member widen into a union", not "match two structurally
+    /// parallel unions member-for-member" — and the two sides genuinely can
+    /// have different member *orders*, since `Type::normalize`'s sort key
+    /// ranks an unbound placeholder `TypeVar` differently than whatever
+    /// concrete type it ends up bound to (`Item | None` and `Int | None`
+    /// are both canonical, but not the same list order). So a `Union` match
+    /// here pairs each side's *fully concrete* members up by equality
+    /// first (`None` with `None`), and only pairs the — necessarily
+    /// placeholder-mentioning — leftovers positionally, which for every
+    /// shape this trait system's members actually produce (an optional
+    /// return, `T | None`) is exactly the one leftover pair that resolves
+    /// the placeholder. Every other `Type` shape just recurses structurally
+    /// down to a bare `TypeVar` (bound via ordinary `unify`, the standard
+    /// "bind a free variable to a concrete type" case) or a scalar
+    /// (compared by equality).
+    fn bind_item_template(&mut self, template: &Type, concrete: &Type) -> bool {
+        match template {
+            Type::TypeVar { name, bounds } => self.unify(&Type::TypeVar { name: name.clone(), bounds: bounds.clone() }, concrete),
+            Type::Named { name: n1, args: a1 } => match concrete {
+                Type::Named { name: n2, args: a2 } if n1 == n2 && a1.len() == a2.len() =>
+                    a1.iter().zip(a2.iter()).all(|(x, y)| self.bind_item_template(x, y)),
+                _ => false,
+            },
+            Type::Function { params: p1, result: r1 } => match concrete {
+                Type::Function { params: p2, result: r2 } if p1.len() == p2.len() =>
+                    p1.iter().zip(p2.iter()).all(|(x, y)| self.bind_item_template(x, y))
+                        && self.bind_item_template(r1, r2),
+                _ => false,
+            },
+            Type::Union(tmembers) => {
+                let Type::Union(cmembers) = concrete else { return false };
+                if tmembers.len() != cmembers.len() { return false; }
+                let mut cleft: Vec<Type> = cmembers.clone();
+                let mut pending: Vec<&Type> = Vec::new();
+                for tm in tmembers {
+                    if let Some(pos) = cleft.iter().position(|c| c == tm) {
+                        cleft.remove(pos);
+                    } else {
+                        pending.push(tm);
+                    }
+                }
+                if pending.len() != cleft.len() { return false; }
+                pending.iter().zip(cleft.iter()).all(|(t, c)| self.bind_item_template(t, c))
+            },
+            _ => template == concrete,
+        }
+    }
+
+    /// `mentions_self`, generalized to any named placeholder — used for a
+    /// type-parameterized trait's own binders (`RANGES.md` Stage 2), which
+    /// unlike `Self` are not one fixed global name.
+    fn mentions_typevar_named(ty: &Type, name: &str) -> bool {
+        match ty {
+            Type::TypeVar { name: n, .. } => n == name,
+            Type::Named { args, .. } => args.iter().any(|a| Self::mentions_typevar_named(a, name)),
+            Type::Union(members) => members.iter().any(|m| Self::mentions_typevar_named(m, name)),
+            Type::Function { params, result } =>
+                params.iter().any(|p| Self::mentions_typevar_named(p, name)) || Self::mentions_typevar_named(result, name),
             _ => false,
         }
     }
@@ -3222,11 +3488,6 @@ impl TypeChecker {
     /// consistently by `Widen`/`Narrow`/`TypeTag` for the same union) and
     /// its resolved `Type`.
     fn check_type_pattern(&self, pattern: &Pattern, members: &[Type], span: Span) -> Result<(usize, Type), Spanned<TypeError>> {
-        if pattern.path.is_some() {
-            return Err(Spanned::from(TypeError {
-                msg: "a qualifier ('X.Y') only applies to a nominal union's variant name".to_string()
-            }, span));
-        }
         // A pattern the compiler synthesized itself (`union_entries`'s
         // anonymous-union branch) already knows its member's index — use it
         // directly rather than re-deriving it from `variant`, which for a
@@ -3239,8 +3500,20 @@ impl TypeChecker {
             }, span))?;
             (idx, member_ty)
         } else {
-            let member_ty = self.resolve_type_name(&pattern.variant).ok_or_else(|| Spanned::from(TypeError {
-                msg: format!("Unknown type '{}'", pattern.variant)
+            // A qualified pattern (`is ParseError.UnexpectedEof(...)`) names
+            // one *flat* member of this anonymous union directly — `data X
+            // is A | B`'s desugaring registers `X.A`/`X.B` as their own
+            // struct types, and normalizing a union that contains the
+            // nominal alias `X` flattens it to those same qualified member
+            // types (`Type::normalize`), so there is no separate nested tag
+            // to unbox here: `"path.variant"` is simply this member's own
+            // registered name, resolved exactly like a bare one.
+            let lookup_name = match &pattern.path {
+                Some(path) => format!("{}.{}", path, pattern.variant),
+                None => pattern.variant.clone(),
+            };
+            let member_ty = self.resolve_type_name(&lookup_name).ok_or_else(|| Spanned::from(TypeError {
+                msg: format!("Unknown type '{}'", lookup_name)
             }, span))?;
             let idx = members.iter().position(|m| *m == member_ty).ok_or_else(|| Spanned::from(TypeError {
                 msg: format!("{} is not a member of {}", member_ty, Type::Union(members.to_vec()))
@@ -3422,47 +3695,9 @@ impl TypeChecker {
                 Ok(Type::Bool)
             },
 
-            "in" => {
-                // `x in y` — `y` decides the shape: `Str` requires `x: Str`
-                // (substring search), `List<T>` requires `x: T` (element
-                // membership). Asymmetric like `+`'s Str case above, so it
-                // gets its own arm rather than going through
-                // `join_operand_types`.
-                let (left_ty, left_span) = &args[0];
-                let (right_ty, right_span) = &args[1];
-                let resolved_right = self.lookup(right_ty);
-                if resolved_right == Type::Str {
-                    let resolved_left = self.lookup(left_ty);
-                    if resolved_left != Type::Str {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("Operator 'in' on Str requires Str on the left side, got {}", resolved_left)
-                        }, *left_span));
-                    }
-                    return Ok(Type::Bool);
-                }
-                if let Some(elem) = resolved_right.as_range_elem().cloned() {
-                    if !self.unify(left_ty, &elem) {
-                        let resolved_left = self.lookup(left_ty);
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("Operator 'in' got incompatible types: expected {}, got {}", elem, resolved_left)
-                        }, *left_span));
-                    }
-                    return Ok(Type::Bool);
-                }
-                if let Some(elem) = resolved_right.as_list_elem().cloned() {
-                    if !self.unify(left_ty, &elem) {
-                        let resolved_left = self.lookup(left_ty);
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("Operator 'in' got incompatible types: expected {}, got {}", elem, resolved_left)
-                        }, *left_span));
-                    }
-                    return Ok(Type::Bool);
-                }
-                Err(Spanned::from(TypeError {
-                    msg: format!("Operator 'in' requires Str, List, or Range on the right side, got {}", resolved_right)
-                }, *right_span))
-            },
-
+            // `in` is handled entirely by `lower_in`, called directly from
+            // `lower_binary` before this generic dispatch is ever reached
+            // — see its own doc comment for why.
             _ => Err(Spanned::from(TypeError {
                 msg: format!("Unknown operator: {}", op)
             }, span)),
@@ -4907,6 +5142,14 @@ impl TypeChecker {
     fn lower_binary(&mut self, b: BinaryExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let left  = self.check_and_lower(*b.left)?;
         let right = self.check_and_lower(*b.right)?;
+        // Pulled out of the generic `builtin_op_type` dispatch below:
+        // unlike every other operator, `in`'s trait-dispatch fallback
+        // (`Container<Item>`, `RANGES.md` Stage 2) needs to change the
+        // node's whole *shape* (a `Call` to `y.has(x)`, not a `Binary`),
+        // not just its type — see `lower_in`.
+        if b.op == Token::In {
+            return self.lower_in(left, right, span);
+        }
         let op = format!("{}", b.op);
         let ty = self.builtin_op_type(
             &op,
@@ -4948,6 +5191,112 @@ impl TypeChecker {
             TypedExprKind::Binary { op: b.op, left: Box::new(left), right: Box::new(right) }
         };
         Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
+    }
+
+    /// `x in y` — `y` decides the shape: `Str` requires `x: Str` (substring
+    /// search), `List<T>`/`Range<T>` require `x: T` (element membership,
+    /// O(1) for `Range` — see `codegen`'s `Token::In` handling), and —
+    /// the trait-dispatch fallback (`RANGES.md` Stage 2) — any type
+    /// providing `Container<Item>` desugars entirely into `y.has(x)`, an
+    /// ordinary `Call` to the resolved symbol (`lower_container_has`).
+    /// Pulled out of `builtin_op_type`'s generic dispatch (unlike every
+    /// other operator) because that last case changes the node's shape,
+    /// not just its type.
+    fn lower_in(&mut self, left: Spanned<TypedExpr>, right: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let left_span = left.span;
+        let right_span = right.span;
+        let resolved_right = self.lookup(&right.item.ty);
+        let bool_binary = |left: Spanned<TypedExpr>, right: Spanned<TypedExpr>| Spanned::from(
+            TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Binary { op: Token::In, left: Box::new(left), right: Box::new(right) } },
+            span,
+        );
+        if resolved_right == Type::Str {
+            let resolved_left = self.lookup(&left.item.ty);
+            if resolved_left != Type::Str {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Operator 'in' on Str requires Str on the left side, got {}", resolved_left)
+                }, left_span));
+            }
+            return Ok(bool_binary(left, right));
+        }
+        if let Some(elem) = resolved_right.as_range_elem().cloned() {
+            if !self.unify(&left.item.ty, &elem) {
+                let resolved_left = self.lookup(&left.item.ty);
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Operator 'in' got incompatible types: expected {}, got {}", elem, resolved_left)
+                }, left_span));
+            }
+            return Ok(bool_binary(left, right));
+        }
+        if let Some(elem) = resolved_right.as_list_elem().cloned() {
+            if !self.unify(&left.item.ty, &elem) {
+                let resolved_left = self.lookup(&left.item.ty);
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Operator 'in' got incompatible types: expected {}, got {}", elem, resolved_left)
+                }, left_span));
+            }
+            return Ok(bool_binary(left, right));
+        }
+        if let Some(call) = self.lower_container_has(&resolved_right, left, right, span)? {
+            return Ok(call);
+        }
+        Err(Spanned::from(TypeError {
+            msg: format!("Operator 'in' requires Str, List, Range, or a type providing Container on the right side, got {}", resolved_right)
+        }, right_span))
+    }
+
+    /// `x in y` when `y`'s type provides `Container<Item>` — desugars to
+    /// `y.has(x)`, the same way `IterVia`'s `next_call` desugars `for`.
+    /// `Ok(None)` iff `y`'s type has no `Container` impl at all; the caller
+    /// (`lower_in`) reports "operator 'in' requires..." itself.
+    fn lower_container_has(&mut self, resolved_right: &Type, left: Spanned<TypedExpr>, right: Spanned<TypedExpr>, span: Span) -> Result<Option<Spanned<TypedExpr>>, Spanned<TypeError>> {
+        let Some(type_key) = Self::grant_key(resolved_right) else { return Ok(None) };
+        let Some((trait_name, symbol)) = self.member_index.get(&(type_key, "has".to_string())).cloned() else {
+            return Ok(None);
+        };
+        if trait_name != "Container" {
+            // Some other trait happens to declare a `has` member — not
+            // this one's business.
+            return Ok(None);
+        }
+        // See the identical situation in `lower_iter_via`: `member_index`
+        // already knows about this impl, but its member's type isn't in
+        // `ctx` until the (position-preserving) renamed declaration itself
+        // gets lowered, which hasn't happened yet for a forward reference.
+        let Some(has_ty) = self.ctx.get(&symbol).cloned() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!(
+                    "'{}' provides 'Container', but that impl is declared later in the program — move it before this use",
+                    resolved_right
+                )
+            }, span));
+        };
+        let Type::Function { params, result } = has_ty else {
+            unreachable!("a trait member's resolved type is always Function")
+        };
+        // `has(s: Self, x: Item)` — `params[1]` is `Item`, already resolved
+        // to a concrete type at registration (`check_impl_member`); `left`
+        // (`x`) is unified against it exactly like any ordinary call's
+        // argument would be.
+        let item_ty = params.get(1).cloned().unwrap_or(Type::Never);
+        let left_span = left.span;
+        if !self.unify(&left.item.ty, &item_ty) {
+            let resolved_left = self.lookup(&left.item.ty);
+            return Err(Spanned::from(TypeError {
+                msg: format!("Operator 'in' got incompatible types: expected {}, got {}", item_ty, resolved_left)
+            }, left_span));
+        }
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: params.clone(), result: result.clone() },
+            kind: TypedExprKind::Var(symbol),
+        }, span);
+        let call = TypedExpr {
+            id: 0,
+            ty: *result,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(right), Arg::Value(left)] },
+        };
+        Ok(Some(Spanned::from(call, span)))
     }
 
     fn lower_conditional(&mut self, c: ConditionalExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -6903,11 +7252,11 @@ impl TypeChecker {
     }
 
     fn lower_for_loop_expr(&mut self, fl: ForLoopExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
-        let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
+        let (var, iterable, cond, body, iter_via) = self.lower_for_loop(fl)?;
         // Each iteration discards the body's value exactly like a
         // non-tail Block statement does — same must-handle rule.
         self.check_must_handle(&body)?;
-        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::ForLoop { var, iterable, cond, body } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::ForLoop { var, iterable, cond, body, iter_via } }, span))
     }
 
     fn lower_comprehension(&mut self, inner: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -6918,9 +7267,9 @@ impl TypeChecker {
         // A comprehension collects the body's value into the
         // result list rather than discarding it, so must-handle
         // does not apply here — unlike a plain ForLoop.
-        let (var, iterable, cond, body) = self.lower_for_loop(fl)?;
+        let (var, iterable, cond, body, iter_via) = self.lower_for_loop(fl)?;
         let ty = Type::list(self.lookup(&body.item.ty));
-        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Comprehension { var, iterable, cond, body } }, span))
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Comprehension { var, iterable, cond, body, iter_via } }, span))
     }
 
     fn lower_field_access(&mut self, fa: FieldAccessExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -7074,17 +7423,17 @@ impl TypeChecker {
     /// against `List(elem)` if its type is still open), and the optional
     /// guard is a condition.
     fn lower_for_loop(&mut self, fl: ForLoopExpr) -> Result<
-        (String, Box<Spanned<TypedExpr>>, Option<Box<Spanned<TypedExpr>>>, Box<Spanned<TypedExpr>>),
+        (String, Box<Spanned<TypedExpr>>, Option<Box<Spanned<TypedExpr>>>, Box<Spanned<TypedExpr>>, Option<IterVia>),
         Spanned<TypeError>
     > {
         let iterable_span = fl.iterable.span;
         let iterable = self.check_and_lower(*fl.iterable)?;
         let iter_ty = iterable.item.ty.clone();
         let resolved_iter = self.lookup(&iter_ty);
-        let elem_ty = if let Some(inner) = resolved_iter.as_list_elem() {
-            inner.clone()
+        let (elem_ty, iter_via) = if let Some(inner) = resolved_iter.as_list_elem() {
+            (inner.clone(), None)
         } else if let Some(inner) = resolved_iter.as_range_elem() {
-            inner.clone()
+            (inner.clone(), None)
         } else if matches!(&resolved_iter, Type::TypeVar { .. }) {
             let elem = self.fresh_var();
             if !self.unify(&iter_ty, &Type::list(elem.clone())) {
@@ -7092,10 +7441,15 @@ impl TypeChecker {
                     msg: format!("Can't iterate over {}", resolved_iter)
                 }, iterable_span));
             }
-            elem
+            (elem, None)
+        } else if let Some(via) = self.lower_iter_via(&resolved_iter, iterable_span)? {
+            let elem = via.next_call.item.ty.clone();
+            let elem = Self::optional_item_ty(&elem)
+                .unwrap_or_else(|| unreachable!("lower_iter_via's next_call always returns Item?"));
+            (elem, Some(via))
         } else {
             return Err(Spanned::from(TypeError {
-                msg: format!("Can't iterate over {}, expected a List or Range", resolved_iter)
+                msg: format!("Can't iterate over {}, expected a List, Range, or a type providing Iterable", resolved_iter)
             }, iterable_span));
         };
 
@@ -7118,7 +7472,78 @@ impl TypeChecker {
                 Ok((cond, body))
             },
         )?;
-        Ok((fl.var, Box::new(iterable), cond, Box::new(body)))
+        Ok((fl.var, Box::new(iterable), cond, Box::new(body), iter_via))
+    }
+
+    /// The `Item` half of an `Item?` (`Type::Union([Item, None])`) result —
+    /// the shape `Iterable::next`'s declared return type is always checked
+    /// against at registration (`check_impl_member`), so this is a pure
+    /// destructure, not a fallible narrowing.
+    fn optional_item_ty(opt_ty: &Type) -> Option<Type> {
+        match opt_ty {
+            Type::Union(members) if members.len() == 2 => {
+                members.iter().find(|m| **m != Type::None).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// The `Iterable<Item>` trait-dispatch fallback for `for x in y do` —
+    /// `Some(IterVia)` iff `resolved_iter` has a registered `Iterable`
+    /// impl providing `next`, `None` if it has no impl at all (the ordinary
+    /// "not iterable" case, left for the caller to report). Builds a fresh
+    /// internal `mut` binding for the iterable's value and a fully-typed
+    /// `<binding>.next()` call to its resolved symbol — see `IterVia`'s own
+    /// doc comment for why this needs no further codegen support beyond an
+    /// ordinary function call.
+    fn lower_iter_via(&mut self, resolved_iter: &Type, span: Span) -> Result<Option<IterVia>, Spanned<TypeError>> {
+        let Some(type_key) = Self::grant_key(resolved_iter) else { return Ok(None) };
+        let Some((trait_name, symbol)) = self.member_index.get(&(type_key, "next".to_string())).cloned() else {
+            return Ok(None);
+        };
+        if trait_name != "Iterable" {
+            // Some other trait happens to declare a `next` member — not
+            // this one's business; report "not iterable" like any type
+            // with no `Iterable` impl at all.
+            return Ok(None);
+        }
+        // `member_index` is populated for the whole program by
+        // `expand_impls` before any statement is lowered, but a member's
+        // type only lands in `ctx` once its (position-preserving) renamed
+        // declaration is itself lowered — so a `for` that textually
+        // precedes its iterable's `provides Iterable` sees the symbol here
+        // but not yet in `ctx`. Report it like any other forward reference
+        // rather than tripping the invariant `register_impl` relies on for
+        // every *already-lowered* impl.
+        let Some(next_ty) = self.ctx.get(&symbol).cloned() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!(
+                    "'{}' provides 'Iterable', but that impl is declared later in the program — move it before this use",
+                    resolved_iter
+                )
+            }, span));
+        };
+        let Type::Function { params, result } = next_ty else {
+            unreachable!("a trait member's resolved type is always Function")
+        };
+
+        let iter_var = format!("#iter{}", self.next_id);
+        self.next_id += 1;
+
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: params.clone(), result: result.clone() },
+            kind: TypedExprKind::Var(symbol),
+        }, span);
+        let next_call = Spanned::from(TypedExpr {
+            id: 0,
+            ty: *result,
+            kind: TypedExprKind::Call {
+                callable: Box::new(callable),
+                args: vec![Arg::Mut(Place { root: iter_var.clone(), path: Vec::new() })],
+            },
+        }, span);
+        Ok(Some(IterVia { iter_var, next_call: Box::new(next_call) }))
     }
 
     /// Lower `match subject { arms... (else default)? }` — and, via
@@ -7335,21 +7760,49 @@ impl TypeChecker {
         // prelude, then re-tests the guard, only falling through to `tail`
         // (cloned — it's the else of both the tag test and, on guard
         // failure, the inner check too) if that also fails.
-        let true_inner = match guard {
-            None => body,
-            Some(g) => self.joined_conditional(g, body, tail.clone(), span)?,
+        // The condition gating whether this arm's *body* runs: the tag
+        // test alone for an unguarded arm, or the tag test *and* the guard
+        // for a guarded one — the guard re-runs the (side-effect-free,
+        // pattern-extraction-only) `prelude` in its own scoped block so it
+        // can see the bound names, short-circuiting under `base_cond` via
+        // `joined_conditional` so a false tag test never evaluates it.
+        //
+        // Folding the guard into `cond` this way, rather than nesting a
+        // second `Conditional` inside the tag test's true branch, means
+        // `tail` is embedded exactly once below — not once as the tag
+        // test's own false branch *and* once more as the guard's. That
+        // doubling used to compound arm over arm (each arm's `tail` is the
+        // one built by every arm to its right), giving O(2^n) tree size —
+        // and O(2^n) compiled code, since codegen has no way to know two
+        // syntactically distinct subtrees are the same code — for n
+        // consecutive guarded arms. `prelude` is duplicated instead (once
+        // here, once in `true_branch` below), which costs nothing per arm
+        // rather than everything to the arm's right.
+        let cond = match guard {
+            None => base_cond,
+            Some(g) => {
+                let guard_check = if prelude.is_empty() {
+                    g
+                } else {
+                    let mut stmts = prelude.clone();
+                    stmts.push(g);
+                    Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Block(stmts) }, span)
+                };
+                let false_lit = Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::BoolLit(false) }, span);
+                self.joined_conditional(base_cond, guard_check, Some(false_lit), span)?
+            }
         };
 
         let true_branch = if prelude.is_empty() {
-            true_inner
+            body
         } else {
-            let inner_ty = true_inner.item.ty.clone();
+            let inner_ty = body.item.ty.clone();
             let mut stmts = prelude;
-            stmts.push(true_inner);
+            stmts.push(body);
             Spanned::from(TypedExpr { id: 0, ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
         };
 
-        self.joined_conditional(base_cond, true_branch, tail, span)
+        self.joined_conditional(cond, true_branch, tail, span)
     }
 
     /// A `Conditional` typed as the join of its two branches, with each

@@ -168,12 +168,10 @@ Scope was deliberately cut down from the original design's "full type surface in
 and unions" to what's implemented today (scalars, `Str`, `List<T>`), because the marshalling
 complexity for the rest turned out to be real, not incidental:
 
-- **`Result<T, E>` ↔ `T | E`.** Packing a Rust `Result` into an inline union's tagged-pointer
-  columns (`UnionLayout`, `codegen/mod.rs`) needs the *frog* union type's member ordering and tag
-  assignment, which depends on `T`/`E`'s normalized position relative to each other — not
-  knowable from `T`/`E`'s Rust types alone without also threading `FrogCtx::unions()` through
-  `ToFrog::to_frog`, and reasoning correctly about `union_is_inline` vs. the boxed fallback. The
-  ABI already supports it (a union return is just N `out` slots); only the trait impl is missing.
+- ~~**`Result<T, E>` ↔ `T | E`.**~~ **Done** (updated 2026-09-01) — `impl<T: ToFrog, E: ToFrog>
+  ToFrog for Result<T, E>` exists in `host.rs`, with documented constraints (`T::SLOTS ==
+  E::SLOTS == 1`, `T`'s type ≠ `E`'s type, no `()` payload). The stdlib's whole `ErrMsg` story
+  (every fallible file/string host function) already depends on it.
 - **Struct/union marshalling in general**, i.e. `#[derive(FrogData)]`/`#[derive(FrogUnion)]`
   mapping a Rust struct/enum onto a registered frog `data` type by field order. The raw ABI
   handles any type uniformly today (`struct_fields` already flattens both); what's missing is

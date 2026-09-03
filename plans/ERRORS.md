@@ -1,8 +1,15 @@
 # Errors, Sum Types, Option
 
-Status: **design**. Nothing here is implemented. Syntax is a sketch and should be expected to
-change; the *decisions* in "Foundational choices" are the part meant to be stable, since they
-are the ones that are expensive to revisit later.
+Status (updated 2026-09-01): **mostly shipped**. `data X is A | B(...)` sugar, `match`/`is`/
+destructuring, `error X(...)`, `provides Error`, `?` propagation, `catch` (value and handler
+form), `!`, the tagged-pointer union representation, the `Truthy` trait, and flow narrowing after
+a bindless `is`/`match` arm are all implemented and tested — see `README.md`'s "Union types" and
+"Error handling" sections, and `test_truthy_and_narrowing.rs`/`test_unions.rs`/`test_result_marshalling.rs`.
+Still open: error return traces. (The `Truthy`-on-union crash formerly noted here is fixed —
+`coerce_truthy` now desugars a union condition into a per-member tag dispatch, see `roadmap.md`.)
+This file's syntax sketches below are otherwise a reasonably accurate description of what
+shipped, not a stale proposal — treat divergences from current README syntax as the doc being
+behind, not the code.
 
 This supersedes the "Error handling, Pattern Matching" section of `DESIGN.md`, and revises the
 enum parts of "Data Structures" — the two turned out to be one design.

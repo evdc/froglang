@@ -1368,7 +1368,64 @@ impl TypeChecker {
     /// doesn't reject anything.
     fn coerce_truthy(&mut self, e: Spanned<TypedExpr>, span: Span) -> Spanned<TypedExpr> {
         if e.item.ty == Type::Bool { return e; }
+        // A union satisfies `Trait::Truthy` iff every member does
+        // (`type_implements_rec`'s union rule) — `check_condition` already
+        // proved that, but `codegen::compile_truthy` only knows how to read
+        // a bare scalar/`List`/`None`'s own bits, not dispatch on a runtime
+        // tag first. Desugar into the dispatch here instead of teaching
+        // codegen a new node, the same way `?`/`!`/`catch` desugar into an
+        // ordinary `match`: tag-test each member (right-to-left, so the
+        // last one needs no test — the tags are exhaustive by
+        // construction), narrow to it, and recurse `coerce_truthy` on the
+        // narrowed value to get *that* member's own Truthy rule.
+        if let Type::Union(members) = self.lookup(&e.item.ty) {
+            return self.coerce_truthy_union(e, members, span);
+        }
         Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Truthy(Box::new(e)) }, span)
+    }
+
+    /// `coerce_truthy`'s union case, split out: bind `e` to a temporary
+    /// (its members are each read at least once below, and `e` may be
+    /// side-effecting) then fold a right-to-left `TypeTag`/`Narrow`
+    /// dispatch, exactly like `fold_match_arm`'s tag chain but with no
+    /// pattern binds and a boolean result instead of an arm body.
+    fn coerce_truthy_union(&mut self, e: Spanned<TypedExpr>, members: Vec<Type>, span: Span) -> Spanned<TypedExpr> {
+        let subject_ty = Type::Union(members.clone());
+        let subject_name = format!("__truthy_subject_{}", self.next_id); self.next_id += 1;
+        let subject_assign = Spanned::from(
+            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(e) } },
+            span,
+        );
+
+        let mut chain: Option<Spanned<TypedExpr>> = None;
+        for (i, member_ty) in members.iter().enumerate().rev() {
+            let subject_var = Spanned::from(
+                TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Var(subject_name.clone()) },
+                span,
+            );
+            let narrowed = Spanned::from(
+                TypedExpr { id: 0, ty: member_ty.clone(), kind: TypedExprKind::Narrow { value: Box::new(subject_var.clone()), tag: i as u32 } },
+                span,
+            );
+            let member_truthy = self.coerce_truthy(narrowed, span);
+            chain = Some(match chain {
+                None => member_truthy,
+                Some(rest) => {
+                    let tag_test = Spanned::from(
+                        TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::TypeTag { target: Box::new(subject_var), tag: i as u32 } },
+                        span,
+                    );
+                    Spanned::from(
+                        TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Conditional {
+                            cond: Box::new(tag_test), true_branch: Box::new(member_truthy), false_branch: Some(Box::new(rest)),
+                        } },
+                        span,
+                    )
+                }
+            });
+        }
+        let chain = chain.expect("a union type always has at least one member");
+        Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::Block(vec![subject_assign, chain]) }, span)
     }
 
     /// A statement-position value may not silently discard a possible

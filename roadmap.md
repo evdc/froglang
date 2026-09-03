@@ -1,70 +1,140 @@
-- Modules
-- Better error messages / pretty-printing rustc-style using span info
-- Enums / variants, common fields, matching expressions (e.g. via `if x is Circle(r) then ...`) — done: `data X is A | B(...)`, `match`, `is`, boxed+tagged GC representation, exhaustiveness checking
-  - follow-ups: structural `==` on enums, named/nested pattern binds, multi-line leading-`|` variant lists
-  - done: payload-less variants are unboxed to an immediate tag (`(tag << 1) | 1`, low bit distinguishes them from 8-aligned pointers — see gc.rs "Immediate (unboxed) values")
-- Perf: copy-on-write for lists — **done**, MUTABILITY.md Stage 7. A `List` binding is marked
-  `shared` where a second live path to it is created and copied only at a write, instead of being
-  deep-copied at every aliasing read. `benches/life.frog` 2054ms -> 27ms; `benches/words.frog`
-  108ms -> 97ms; `orders` unchanged (it never paid the cost). It also closed three value-semantics
-  bugs eager copying could not afford to fix — a list extracted from a list, from a `for`-loop
-  binding, or from a struct field was aliased, not copied, so pushing to it mutated the container.
-  `FROG_COW_VERIFY=1` re-derives the sharing answer from the heap at every write barrier.
-- Perf: **elide the mark when passing a list to a non-`mut` parameter.** The last quadratic cliff
-  in MVS: `for i in .. { s = s + peek(xs); push(mut xs, i) }` is 51.6ms against an 11.5ms baseline
-  at n=20000, because the call marks `xs` shared and the push then copies. Needs two things
-  together — marking at `mut` binding sites (`Assign.mutable`), and a per-function "does a
-  parameter reach a return position" escape summary. See MUTABILITY.md Stage 7, "Sharp corners".
-- **Done (MUTABILITY.md Stage 8): paths as mutable places.** Assignment, `push`, and every `mut` call
-  argument now take the same `typed_ast::Place` (root plus a `.field`/`[index]` path), resolved by
-  one shared `lower_place`. So `push(mut b.items, v)`, `rows[y][x] = v`, `push(mut rows[0], v)`,
-  mixed paths like `g.cells[1][1] = v`, **and `f(mut b.items)` for a user-defined `func`** all work.
-  `codegen::emit_place_ref` walks a path unsharing every list on the way down and writing each
-  private copy back into its parent slot — O(depth), not O(size).
-  A `mut` argument is `Arg::Mut(Place)`, so `Call` shed its `mut_args: Vec<bool>` and a new mutating
-  builtin (`pop`, `insert`, a `Map` operation) costs one arm in `compile_call` and no AST changes.
-  Fixed a pre-existing soundness hole on the way: copying a struct did not mark its list fields
-  shared, so `let c = b; b.items[0] = 99` was visible through `c`.
-- Language: a user-defined mutating **method**'s receiver must still be a bare binding —
-  `b.items.bump()` where `bump` takes `mut self` is rejected, though `b.items.push(3)` works.
-  `lower_bound_member_call` and `lower_ufcs_call` build the receiver's `Place` from its root name
-  because the raw receiver expression is consumed before they know the member is mutating; threading
-  it through (as the `push` branch already does) would close this.
-- Perf: `benches/life.frog` predates Stage 8 and still rebuilds whole grids from comprehensions
-  because it could not write one cell. Rewriting it around `rows[y][x] = v` would make it a
-  materially different (and more representative) benchmark against the Go/Rust/Lua/Python siblings.
-- Perf, **measured and rejected**: eliding redundant copy-on-write barriers. Swiftlet's own
-  postmortem (Racordon et al., JOT 2022 §7.5) blames most of its gap to Swift on unnecessary
-  uniqueness checks, but that finding does not transfer: Swiftlet checks a *reference count*, so it
-  also pays increments on every copy and decrements in every destructor, whereas our barrier is one
-  load of a monotone byte off a cache line the mutation is about to touch anyway. Deleting the
-  barrier outright — unsound, so an upper bound on any elision — is worth 0% on orders/life/words,
-  ~1% on a pure `push` loop and ~10% on a pure index-assign loop (40M writes each). Removing the
-  division in `frog_list_get`/`frog_list_set` recovers ~4% of that index-assign case and nothing
-  elsewhere. Don't build the analysis; the headroom isn't there. If the indexed-write path is ever
-  worth attention it's the per-leaf FFI call itself, not the barrier or the arithmetic inside it.
-- Bug: `mut xs = []` then `print(xs)` prints `<?>` placeholders — the element type is still an
-  unresolved type variable on that `Var` node when print's type-directed codegen reads it.
-  Annotating works around it. Needs a final resolution pass over the typed AST.
-- Perf: **inlining.** With calls out of line, `benches/orders.frog` spends ~30% in one-line functions (`modn` 20%, `checked_gross` 8%) that Rust/Go erase. Hand-inlining two call sites takes orders from 54.8ms to 45.1ms, so a small-leaf-function inliner is worth roughly 20% there.
-- Perf: functions can't reference top-level `let` bindings — typeck accepts it, codegen panics with `unbound variable in codegen: <name>`. Both `life.frog` and `words.frog` had to thread constants through as parameters to work around it. Either implement the capture or reject it in typeck with a real error.
-- Perf: unbox variants *with* payloads — flatten them into tag-plus-fields slots the way structs already are, boxing only self-referential enums (`Tree`). `benches/orders.frog` allocates one `FrogVariant` per enum value. Secondary: the `#[frog_fn]` boundary converts every `Str` argument into an owned Rust `String` (`__frog_shim_starts_with` is 14% of `benches/words.frog`) — taking `&str` would remove a copy per call.
-- Error handling, errors as values + early-return sugar, etc — builds on enums (Result/Option as compiler-known enums)
-- Traits/interfaces, generics, and methods — designed in `plans/TRAITS.md`; **Stages 0-3 and 5 shipped**
-    - The `provides`/impl duality is resolved: one `provides` keyword, inline on `data` or standalone (`provides T for Int { ... }`), with a body
-    - Members live in the impl's namespace, not the global one — so there is no function overloading anywhere
-    - `x.f(y)` resolves field → member → free function; all three steps work, each a hash lookup
-    - Bounded generics call trait members (`func f<T: Shape>(x: T) = x.area()`), resolved per instantiation during monomorphization — so a generic stdlib written against traits is now unblocked
-    - Still missing: operators desugaring to member calls (so no user `provides Num`), structural `Show`/`Error.message`, and impls for generic types
-- Annotations, and auto-deriving trait implementations (macros/comptime?)
-- Structured concurrency
+Consolidated 2026-09-01 from a full audit of `plans/*.md`, README's "Up Next", and this file's
+own prior contents against the actual code/tests. Several previously-listed "not started" items
+turned out to be shipped and undocumented; a few "done" claims turned out stale; one previously
+unknown crash-on-valid-code bug was found in the process. Superseded entries below have been
+removed rather than struck through — check `plans/*.md` git history if you want the trail.
 
-What it takes to get from here to self-hosting compiler
-- User-definable generics (List(T) is a builtin hack)
-- a Dict/Map type (which could be stdlib but I would give it blessed `{key=val}` syntax as it's ubiquitous)
-- ~~Traits/interfaces generalized beyond Error, user definable~~ — done (`plans/TRAITS.md` Stage 5)
-- stdlib with file IO, string functions, etc.
-- an AOT compile path, swapping Cranelift JIT for cranelift-object, linking against the runtime etc.
+### Newly found, fixed 2026-09-02
+
+- ~~**Bug (crash): `Truthy` coercion panics on a real union type.**~~ **Fixed.** `if find() then
+  ...` / `find() or 0` where `find(): Int | None` used to hit `unreachable!("Truthy on non-Truthy
+  type {}", other)` in `codegen::compile_truthy` (`codegen/mod.rs:3522`) — the type checker
+  correctly accepted the union (`type_implements_rec`'s "every member" rule), but codegen only
+  ever learned to read a bare scalar/`List`/`None`'s own bits, never how to dispatch on a union's
+  runtime tag first. Fixed by desugaring in `coerce_truthy` instead of teaching codegen a new
+  node — the same pattern `?`/`!`/`catch` already use: tag-test each member right-to-left,
+  narrow, and recurse `coerce_truthy` on the narrowed value to reuse its own (already-working)
+  scalar rule. No codegen changes needed. `test_truthy_and_narrowing.rs` and the full suite still
+  pass; spot-checked 2- and 3-member unions (`Int | Str | None`) by hand across `if`/`or`.
+
+### Corrections to formerly-stale docs (fixed 2026-09-01)
+
+- **README "Up Next"**: "Flow narrowing and `Truthy`" was listed as ERRORS.md phases 6-7, "not
+  started" — actually shipped (`test_truthy_and_narrowing.rs`, 12 passing tests: Truthy in
+  `if`/`for`/`match` guards, short-circuit coercion, nominal/anonymous-union flow narrowing,
+  `Error`-trait arm exhaustiveness). The `Truthy`-on-union crash above is the one real gap left in
+  that area. The exponential match-guard bug and the qualified-variant-in-type-position gap it also
+  listed are both fixed this session (see commit history).
+- **ERRORS.md**: header said "Status: design. Nothing here is implemented" — badly stale. Verified
+  live: `data X is A | B` sugar, `match`/`is`/destructuring, `error X(...)`, `provides`, `?`
+  propagation, `catch`, `!`, the tagged-pointer union representation. `Type::Enum` is gone, folded
+  into `Type::Union` exactly as the doc's "what this deletes" section wanted.
+- **EMBEDDING.md**: listed `Result<T, E>` ↔ `T | E` marshalling as deferred ("ABI supports it, only
+  the trait impl is missing") — actually implemented (`ToFrog for Result<T, E>`, `host.rs`), and
+  the stdlib already depends on it for every fallible file/string function.
+- **Modules**: this file used to list "Modules" as a bare, unannotated open item — actually fully
+  implemented (imports, qualified/named, cycles, diamonds, cross-module structs/traits/shadowing;
+  see `froglang-core/tests/programs/modules/`).
+- **User-definable generics**: also previously listed here as blocking self-hosting — done, both
+  generic functions and generic structs, with real monomorphization (`plans/TRAITS.md` Stage 3,
+  `test_generics_stage2.rs`/`test_generics_stage3.rs`). This *unblocks* `Dict`/`Map` below as a
+  pure stdlib task.
+- **`mut xs = []; print(xs)` printing `<?>` placeholders**: no longer reproducible (tried the
+  original repro plus two variants) — fixed silently at some point, undocumented.
+
+### Near-term (usability + gaps most likely to bite real code)
+
+- **Better error messages** — span-aware, rustc-style rendered errors (`miette` or `ariadne`).
+  Errors still print as raw `Debug` output. Still the single highest-leverage usability item.
+- **Cheaper primitive-member union matches** — `?`/`catch`/`is`/`match` on a union whose
+  non-error member is `Int`/`Float`/`Bool` still goes through the same boxed-union machinery as
+  the `Str`/struct/list case (the `orders` benchmark regression this caused is documented in
+  `README.md`'s Benchmarks section).
+- **Operators desugaring to member calls** — `data Vec2(...) provides Num` still can't give you
+  `+`; `join_operand_types`/`compile_binary` are hardcoded to the built-in numeric types.
+- **Structural `Show` and `Error.message`** — `provides Show for X` errors "Unknown trait 'Show'".
+- **Impls for generic types** — `data Box<A> provides Shape` errors "Unknown type 'A'" when the
+  `provides` clause references the type parameter.
+- **`Dict`/`Map`** — no type exists yet (`{"a": 1}` doesn't parse); purely a stdlib task now that
+  generics are done, though the map-literal syntax itself is still an open bikeshed (see "Other
+  Ideas" below).
+
+### Path to a self-hosting compiler — updated gap list
+
+- ~~User-definable generics~~ — **done**.
+- ~~Modules~~ — **done**.
+- `Dict`/`Map` — still missing, no longer generics-blocked (see above).
+- An AOT compile path — swap the Cranelift JIT for `cranelift-object`, link against the runtime.
+  Nothing built; `host.rs` has one doc-comment line describing the idea, no dependency, no `build`
+  CLI subcommand (only `run`/`check`).
+- Struct/union marshalling, `mut` parameters, and generic host functions in the embedding API —
+  all still open (`plans/EMBEDDING.md`'s own deferred list, still accurate).
+
+### Perf backlog (deduplicated from this file + `RUNTIME.md`)
+
+- Unbox variants *with* payloads — flatten into tag-plus-fields slots like structs already are,
+  boxing only self-referential enums (`Tree`). `orders.frog` still allocates one `FrogVariant` per
+  enum value.
+- Elide the COW mark when passing a list to a non-`mut` parameter — the last quadratic cliff in
+  MVS (`MUTABILITY.md` Stage 7, "Sharp corners").
+- Small-leaf-function inlining — ~20% on `orders.frog` from hand-inlining two call sites.
+- Top-level `let` bindings aren't capturable from functions — typeck accepts the reference,
+  codegen panics with "unbound variable". `life.frog`/`words.frog` both had to work around it by
+  threading constants through as parameters. Needs either real capture or a clean typeck rejection
+  — the codegen panic is the actual bug, not the missing feature.
+- `#[frog_fn]`'s `Str` argument marshalling copies into an owned `String` per call
+  (`__frog_shim_starts_with` is 14% of `benches/words.frog`); a `&str`-based ABI would remove it.
+- `RUNTIME.md`'s open item: list-stride overhead is 7.5ns/elem vs. Rust's 2.6ns, unexplained —
+  nobody has profiled why since the doc was written.
+- **Rejected, keep rejected** (already measured, `RUNTIME.md`): eliding copy-on-write barriers
+  entirely. Worth 0% on orders/life/words, ~1-10% on synthetic push/index-assign loops — not
+  enough headroom to justify the analysis. Don't revisit without new measurements.
+
+### `plans/TRAITS.md` — Stage 6/7 + Deferred (still accurate, doc self-audits well)
+
+- Stage 6 (partial): operators-as-member-calls and structural `Show`/`Error.message` — see
+  "Near-term" above.
+- Stage 7 (untouched): capabilities (`provides`/`can`/`without` as implicit instances) — merges
+  with `plans/CONCURRENCY.md` Stage 7.
+- Deferred (by design, not urgency): associated types, blanket impls, higher-kinded parameters,
+  `any Trait` boxed existentials, opt-out from structural traits, annotation-driven derives,
+  trait members in `data` fields + variance, general trait inheritance (`trait A: B`).
+
+### `plans/CONCURRENCY.md` — fully unimplemented, single largest remaining design surface
+
+539 lines of staged design, zero corresponding code (verified: no `spawn`/`Scope`/fiber-switch/
+`defer` anywhere in `froglang-core/src`). Staged plan, in order: **Unwinding** (JIT frame unwind,
+`defer`/`with`, panic-as-unwind) → **Fibers** (stack-switch trampoline, pooled stacks, per-task
+shadow-stack registry) → **Scheduler and I/O** (run queue, timers, kqueue, swappable `Io` value,
+deterministic test `Io`) → **Scopes** (`spawn`/`scope`, lexical-nesting-only) → **Supervisors**
+(`Scope` library type, `all`/`collect`/`race`/`n_of`, `Deadline`/`Shield`/`Limit`) → **Regions**
+(region-bound types, contagion, whole-program retention checking) → **Capabilities** (shared with
+`TRAITS.md` Stage 7). Cross-doc TODO neither doc has closed: whether `Scope`/`Task(T)` need
+`Linear` (`plans/TRAITS.md` Part 7 flags it, `CONCURRENCY.md` hasn't picked it up).
+
+### `plans/DATA.md` — data notation/serialization, stages 0/2/3 done, 1 half-done, 4-8 open
+
+Stage 4 (`Sink`/`StrBuf`) is unblocked now — `Trait::Linear` (its prerequisite) already exists —
+but still unstarted. Stages 5-8 (repr/read round-trip, field annotations, host exposure, JSON) are
+fully open, design-only. Open question worth resolving before more code depends on it: whether
+closing `project_list_aliasing_gap` (see `~/.claude` memory, or just: does a `List<T>` still alias
+through a `mut` binding once index-assign exists) is a hard prerequisite for the repr/read
+round-trip law, since `MUTABILITY.md` Stage 7/8 (COW, paths-as-places) may have already narrowed
+or closed it without DATA.md's design being updated to reflect that.
+
+### Open design questions worth resolving before more code depends on them
+
+- **`plans/TRAITS.md`**: does `[Int]` survive as sugar for `List<Int>`? How much bound inference
+  before requiring the bound be written? Do prelude operator traits admit user impls on user types
+  (`data Vec2(...) provides Num`)? A display form for bounds on function types (`[~t2:Num] ->
+  ~t2:Num` prints today, unreadable). "Instantiated from here" error chains for per-instantiation
+  trait failures.
+- **`plans/MUTABILITY.md`**: call-site marker spelling for a `mut` argument, `List` covariance,
+  the large-struct flattening threshold, `mut` + UFCS composition, REPL `let`/`mut` persistence
+  across entries.
+- **`plans/DATA.md`**: which JSON stack is canonical for a value crossing the embedding boundary;
+  default union tagging (external vs. internal); is `StrBuf` the same object as `Sink`, or does
+  `Sink` come later as an abstraction over it.
 
 ---
 

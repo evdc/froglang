@@ -461,18 +461,26 @@ Roughly in priority order:
 - **Cheaper primitive-member union matches** — see the `orders` benchmark regression above;
   `?`/`catch`/`is`/`match` on a union whose non-error member is `Int`/`Float`/`Bool` still
   goes through the same boxed-union machinery as the `Str`/struct/list case.
-- **Flow narrowing and `Truthy`** — ERRORS.md phases 6-7: narrowing a union after an `is`
-  check without a full `match`, the `Truthy` trait for condition-position coercion, and
-  error return traces. `lower_match`'s guard-clause cloning also has a known exponential-size
-  bug to fix alongside phase 6.
+- ~~**Flow narrowing and `Truthy`**~~ — **done**: narrowing a union after a bindless `is` arm,
+  the `Truthy` trait for condition-position coercion (`if`/`for`/`match` guards, `and`/`or`/`not`
+  short-circuit, including on a union whose members are all `Truthy` — desugared to a per-member
+  tag dispatch in `coerce_truthy`), and `Error`-trait match arms with exhaustiveness all ship and
+  are tested (`test_truthy_and_narrowing.rs`). Error return traces are still unbuilt.
+  `lower_match`'s guard-clause cloning, previously flagged here as exponential, is fixed.
 - ~~**User-defined traits and impls**~~ — **done, see "Traits" above** (`plans/TRAITS.md`
   Stage 5), including calling a member through a bound (`func f<T: Shape>(x: T) = x.area()`).
   Still missing from the trait system: operators desugaring to member calls (so
   `data Vec2 provides Num` can't give you `+`), structural `Show` and therefore
   `Error.message`, and impls for generic types (`data Box<A> provides Shape`).
-- **Qualified variant names in type position** — `ParseError.UnexpectedEof` isn't yet
-  spellable in a `TypeExpr` annotation, nor resolvable as an `is`/`match` pattern nested
-  inside a further anonymous union.
+- ~~**Qualified variant names in type position**~~ — **done**: `ParseError.UnexpectedEof` is
+  spellable in a `TypeExpr` annotation and resolvable as an `is`/`match` pattern nested inside a
+  further anonymous union.
+- ~~**Modules**~~ — **done, undocumented above**: `import "./path.frog" { name }` (named) and
+  `import "./path.frog" as alias` (qualified) both work, including import cycles, diamond
+  imports, and cross-module structs/traits — see `froglang-core/tests/programs/modules/`.
+- ~~**User-definable generics**~~ — **done**: both generic functions and generic structs
+  (`data Pair<A, B>(...)`) work with real monomorphization (`plans/TRAITS.md` Stage 3). This was
+  previously the top blocker for `Dict`/`Map` and for self-hosting; see "Embedding" below.
 
 ### Embedding
 
@@ -484,6 +492,6 @@ Roughly in priority order:
 - ~~Minimal stdlib~~ — **done for strings/file IO, see "Standard library" above**:
   `FrogState::with_stdlib()`, `Result<T, E>` ↔ `T | E` marshalling (`ToFrog for Result<T, E>`
   in `froglang_core::host`), and the shared `ErrMsg` error type. Still needed for a real
-  self-hosting compiler: `Dict`/`Map` and generic `map`/`filter`/`fold` (both blocked on
-  user-definable generics), and nominal struct/union marshalling beyond `ErrMsg`'s one fixed
-  shape (`plans/EMBEDDING.md`'s follow-ups).
+  self-hosting compiler: `Dict`/`Map` and generic `map`/`filter`/`fold` — no longer blocked on
+  generics (user-definable generics are done), just unbuilt — and nominal struct/union
+  marshalling beyond `ErrMsg`'s one fixed shape (`plans/EMBEDDING.md`'s follow-ups).

@@ -50,6 +50,16 @@ pub enum Trait {
     Num,   // Int, Float — arithmetic operators
     Eq,    // Int, Float, Bool, Str — == and !=
     Ord,   // Int, Float, Str — <, >, <=, >=
+    /// Structural, derived alongside `Eq` with the same recursion rule
+    /// (`plans/DATA.md` stage 1/5: "`Show`/`Eq` must be derived together
+    /// with the same recursion rule" — a type printable but not comparable
+    /// has an untestable round-trip law). Every primitive, `List<T>` (iff
+    /// `T` is), and every struct (iff every field is, recursively) is
+    /// `Show`; a `Type::Function` is not, matching `validate_codegen_
+    /// constraints`'s existing rejection of function values reaching
+    /// codegen at all. Consumed by `repr`'s `check_reprable`, the way
+    /// `print` is predicted by `check_printable` without a trait.
+    Show,
     /// Marker trait for fallible-function error types (`ERRORS.md`). Unlike
     /// the other three traits, no type implements this structurally — it's
     /// granted per-struct-name by a `provides Error` clause on a `data`
@@ -100,6 +110,7 @@ impl Display for Trait {
             Trait::Num    => write!(f, "Num"),
             Trait::Eq     => write!(f, "Eq"),
             Trait::Ord    => write!(f, "Ord"),
+            Trait::Show   => write!(f, "Show"),
             Trait::Error  => write!(f, "Error"),
             Trait::Truthy => write!(f, "Truthy"),
             Trait::Linear => write!(f, "Linear"),
@@ -1105,7 +1116,7 @@ impl TypeChecker {
     /// letting it fall through to a bare "unknown trait".
     fn initial_traits() -> HashMap<String, TraitDef> {
         let mut m = HashMap::new();
-        for t in [Trait::Num, Trait::Eq, Trait::Ord, Trait::Error, Trait::Linear] {
+        for t in [Trait::Num, Trait::Eq, Trait::Ord, Trait::Show, Trait::Error, Trait::Linear] {
             let name = t.to_string();
             m.insert(name.clone(), TraitDef { name, builtin: Some(t), members: Vec::new(), type_params: Vec::new() });
         }
@@ -1136,13 +1147,45 @@ impl TypeChecker {
     pub fn empty() -> Self {
         let mut tc = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() };
         tc.seed_iterable_container_traits();
+        tc.seed_base_prelude();
         tc
     }
 
     pub fn new() -> Self {
         let mut tc = TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() };
         tc.seed_iterable_container_traits();
+        tc.seed_base_prelude();
         tc
+    }
+
+    /// `ReadError` (`plans/DATA.md` stage 5: `read`'s error type) — seeded
+    /// directly rather than parsed from a prelude source string the way
+    /// `stdlib::install`'s `ErrMsg`/`IndexError` are (`stdlib/mod.rs`'s
+    /// `.prelude(...)` calls, which run through `FrogState::eval` and so
+    /// only exist for `with_stdlib()`). Two reasons this one is different:
+    ///
+    /// - `read` is a core builtin like `print`, not a `stdlib`-gated one,
+    ///   so its error type has to be unconditionally present in every
+    ///   `TypeChecker`, `FrogState::new()` included.
+    /// - Running it through `FrogState::eval` would consume an
+    ///   `entry_id`/`entry_sources` slot ahead of the embedder's own first
+    ///   entry — `test_source_map.rs` pins the first *user* eval at entry
+    ///   0, and `codegen::compile_and_run` has no prelude mechanism to
+    ///   begin with.
+    ///
+    /// So it is written out by hand, the way `Range`'s template is
+    /// (`initial_struct_templates`) rather than hoisted from source the way
+    /// `Iterable`/`Container` are (`seed_iterable_container_traits`) —
+    /// `ReadError` has no generics and no trait members, so there is
+    /// nothing a parse-and-hoist would buy over stating the two fields
+    /// directly, and `hoist_data_decls`' full two-pass machinery (binder
+    /// scoping, variant handling, cycle checks) is aimed at exactly the
+    /// generality this type doesn't need.
+    fn seed_base_prelude(&mut self) {
+        let fields = vec![("msg".to_string(), Type::Str), ("offset".to_string(), Type::Int)];
+        self.struct_templates.insert("ReadError".to_string(), fields.clone());
+        self.struct_defs.insert(Type::strukt("ReadError"), fields);
+        self.provides.insert("ReadError".to_string(), vec![Trait::Error]);
     }
 
     /// `Iterable<Item>`/`Container<Item>` (`RANGES.md` Stage 2) — seeded by
@@ -1250,7 +1293,7 @@ impl TypeChecker {
             // struct's is (the length is a runtime value), so codegen emits
             // the element loop instead: `eq_list`. `seen` guards the same
             // cycle a struct field can form (`data W(xs: List<W>)`).
-            Type::Named { name, args } if name == LIST_NAME && *tr == Trait::Eq => {
+            Type::Named { name, args } if name == LIST_NAME && matches!(tr, Trait::Eq | Trait::Show) => {
                 if seen.contains(ty) { return true; }
                 seen.push(ty.clone());
                 // An element type still a variable is undetermined, not
@@ -1269,7 +1312,7 @@ impl TypeChecker {
             // for a non-generic struct's empty `args`). The `args` check is
             // not redundant with the field check: a binder that appears in
             // no field still has to be `Eq` for the instantiation to be.
-            Type::Named { name, args } if name != LIST_NAME && *tr == Trait::Eq => {
+            Type::Named { name, args } if name != LIST_NAME && matches!(tr, Trait::Eq | Trait::Show) => {
                 if seen.contains(ty) { return true; }
                 if !args.iter().all(|a| self.type_implements_rec(a, tr, seen)) { return false; }
                 seen.push(ty.clone());
@@ -1288,6 +1331,7 @@ impl TypeChecker {
                 // `none == none` is true by construction — the type has
                 // exactly one value.
                 Trait::Eq     => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None),
+                Trait::Show   => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None),
                 Trait::Ord    => matches!(ty, Type::Int | Type::Float | Type::Str),
                 Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None) || ty.is_list(),
                 // Handled by the granted arm above, before any of this.
@@ -1974,6 +2018,9 @@ impl TypeChecker {
                 let lowered = self.lower_zero_self_call(c, &want_trait, &member, &expected, span)?;
                 self.lower_widen(lowered, &expected)
             },
+            // `read(s)` — `zero_self_target`'s sibling: the expected type
+            // is what says what to read, not a value at the call site.
+            (Expression::Call(c), _) if Self::is_read_call(&c) => self.lower_read(c, &expected, span),
             (Expression::Tuple(elems), _) if expected.as_list_elem().is_some() => {
                 let elem_ty = expected.as_list_elem().expect("checked above").clone();
                 let mut items = Vec::with_capacity(elems.len());
@@ -2061,6 +2108,125 @@ impl TypeChecker {
             }
             _ => None,
         }
+    }
+
+    /// `read(s)` — a bare call to the reserved name, exactly the shape
+    /// `is_repr`'s own `matches!` checks (`lower_call`), pulled out to a
+    /// named predicate since `lower_expected`'s dispatch arm needs it too.
+    fn is_read_call(c: &CallExpr) -> bool {
+        matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "read"
+        )
+    }
+
+    /// `read(s): T | ReadError` — return-type directed, `zero_self_target`'s
+    /// sibling arm in `lower_expected`. `expected` must already be
+    /// `self.lookup`-resolved (`lower_expected`'s own contract).
+    fn lower_read(&mut self, c: CallExpr, expected: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        if c.args.len() != 1 {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
+            }, span));
+        }
+        let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
+        let arg_span = arg.span;
+        let arg_ty = self.lookup(&arg.item.ty);
+        if arg_ty != Type::Str {
+            return Err(Spanned::from(TypeError {
+                msg: format!("read's argument must be Str, got {}", arg_ty)
+            }, arg_span));
+        }
+
+        let read_error_ty = Type::strukt("ReadError");
+        let members = match expected {
+            Type::Union(ms) if ms.contains(&read_error_ty) => ms.clone(),
+            _ => return Err(Spanned::from(TypeError {
+                msg: "read returns 'T | ReadError'; annotate e.g. 'let x: Person | ReadError = read(s)'".to_string()
+            }, span)),
+        };
+        let t_members: Vec<Type> = members.into_iter().filter(|m| *m != read_error_ty).collect();
+        if t_members.is_empty() {
+            return Err(Spanned::from(TypeError {
+                msg: "read needs a type to read besides ReadError itself".to_string()
+            }, span));
+        }
+
+        let node_name = format!("__read_root{}", self.next_id); self.next_id += 1;
+        let result_name = format!("__read_result{}", self.next_id); self.next_id += 1;
+
+        let open_call = Self::read_leaf_call("frog_read_open", Type::Str, Type::Int, arg, span);
+        let open_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(open_call) } }, span);
+
+        // `t_members.len() == 1` — an ordinary single-type `read`
+        // (`Int | ReadError`, `Person | ReadError`, ...): build against
+        // that one type and widen the single member into `expected`,
+        // which `lower_widen` supports directly.
+        //
+        // `t_members.len() > 1` — `T` is *itself* a union (`Shape |
+        // ReadError`, where `Shape` is `Circle | Rect`): build directly
+        // against `expected` instead, via `build_read_union_as` — see its
+        // own doc comment for why `lower_widen` can't take the widening
+        // step from here (union-into-union widening isn't supported, and
+        // building against the wider type from the start sidesteps rather
+        // than needs that support).
+        let happy_widened = if t_members.len() == 1 {
+            let t = t_members.into_iter().next().expect("len checked above");
+            self.check_readable(&t, span)?;
+            let happy = self.build_read(&t, Self::node_var(&node_name, span), span)?;
+            self.lower_widen(happy, expected)?
+        } else {
+            let t = Type::Union(t_members.clone()).normalize();
+            self.check_readable(&t, span)?;
+            let Type::Union(normalized_members) = t else { unreachable!("normalize of >1 members is always a Union") };
+            self.build_read_union_as(&normalized_members, Self::node_var(&node_name, span), expected, span)?
+        };
+
+        let msg_call = Self::read_call0("frog_read_msg", Type::Str, span);
+        let offset_call = Self::read_call0("frog_read_offset", Type::Int, span);
+        let error_value = Spanned::from(TypedExpr {
+            id: 0, ty: read_error_ty.clone(),
+            kind: TypedExprKind::StructInit { name: "ReadError".to_string(), fields: vec![
+                ("msg".to_string(), Box::new(msg_call)), ("offset".to_string(), Box::new(offset_call)),
+            ] },
+        }, span);
+        let error_widened = self.lower_widen(error_value, expected)?;
+
+        // `happy_widened` must run — and so discover any sticky failure —
+        // *before* `frog_read_failed()` is checked, or the check always
+        // sees "not failed yet" (nothing has read anything). Binding it to
+        // a temporary first, unconditionally, is what makes the check
+        // downstream of the read it's supposed to be checking, rather
+        // than racing ahead of it.
+        let happy_name = format!("__read_happy{}", self.next_id); self.next_id += 1;
+        let happy_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: happy_name.clone(), value: Box::new(happy_widened) } }, span);
+        let happy_var = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Var(happy_name) }, span);
+
+        let failed_test = Self::read_call0("frog_read_failed", Type::Bool, span);
+        let dispatch = Spanned::from(TypedExpr {
+            id: 0, ty: expected.clone(),
+            kind: TypedExprKind::Conditional { cond: Box::new(failed_test), true_branch: Box::new(error_widened), false_branch: Some(Box::new(happy_var)) },
+        }, span);
+        let result_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: result_name.clone(), value: Box::new(dispatch) } }, span);
+        let close_call = Self::read_call0("frog_read_close", Type::None, span);
+        let result_var = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Var(result_name) }, span);
+
+        Ok(Spanned::from(TypedExpr {
+            id: 0, ty: expected.clone(),
+            kind: TypedExprKind::Block(vec![open_assign, happy_assign, result_assign, close_call, result_var]),
+        }, span))
+    }
+
+    fn read_call0(rt_name: &str, ret: Type, span: Span) -> Spanned<TypedExpr> {
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![], result: Box::new(ret.clone()) },
+            kind: TypedExprKind::Var(rt_name.to_string()),
+        }, span);
+        Spanned::from(TypedExpr {
+            id: 0, ty: ret,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![] },
+        }, span)
     }
 
     /// Does `trait_name` declare `member` with no `Self` in its first
@@ -6021,6 +6187,17 @@ impl TypeChecker {
             }, span));
         }
 
+        // `read(s)` reached here (rather than through `lower_expected`'s
+        // own arm, below) means there was no expected type to read *into*
+        // — the whole reason it's return-type directed at all (`plans/
+        // DATA.md` stage 5, mirroring `zero_self_target`'s `zero(): Self`
+        // just above).
+        if Self::is_read_call(&c) {
+            return Err(Spanned::from(TypeError {
+                msg: "cannot infer what to read; annotate the expected type, e.g. 'let x: T | ReadError = read(s)'".to_string()
+            }, span));
+        }
+
         // Struct construction: `Person(name="Alice", age=42)` looks
         // like an ordinary call syntactically (there's no dedicated
         // construction grammar — see `Grammar::data_decl`'s doc
@@ -6040,6 +6217,20 @@ impl TypeChecker {
         let is_print = matches!(
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "print"
+        );
+        // `repr` (`plans/DATA.md` stage 5) is `print`'s canonical twin: a
+        // builtin conversion, not a `default_context()` entry, since it
+        // too needs to accept any `Show` type rather than one monomorphic
+        // signature. Unlike `print` it is not total — its argument must
+        // implement `Show` — so that check happens right here rather than
+        // being deferred to `validate_codegen_constraints` the way
+        // `print`'s recursion guard is: there is no codegen arm for `repr`
+        // to protect (`desugar_notation` expands it away before codegen
+        // ever runs), so the check has nothing to predict *for*, only a
+        // typed AST to build correctly.
+        let is_repr = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "repr"
         );
         // `push` is a builtin mutating operation on `List<T>`, polymorphic
         // over `T` — like `print`, it can't be a monomorphic
@@ -6137,6 +6328,49 @@ impl TypeChecker {
             // instead of falsely claiming `None`.
             let ty = if arg.item.ty == Type::Never { Type::Never } else { Type::None };
             (TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] }, ty)
+        } else if is_repr {
+            if c.args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
+                }, callee_span));
+            }
+            let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
+            let arg_ty = self.lookup(&arg.item.ty);
+            // A bare (still-generic) `TypeVar` defers both checks to
+            // `desugar_notation` time, once monomorphization has produced
+            // a concretely-typed clone of this call site to check instead
+            // — the same "don't reject at the unresolved binder, check
+            // each instantiation" rule `join_operand_types` already
+            // applies to every binary operator's own trait bound
+            // (`Trait::Num`/`Trait::Eq`/`Trait::Ord`). Without this,
+            // `func show<T>(x: T): Str = repr(x)` could never type-check
+            // for *any* concrete `T`, since `Show` isn't yet inferable as
+            // a bound the way `<T: Num>`/`<T: Eq>` are.
+            if !matches!(arg_ty, Type::TypeVar { .. }) {
+                if !self.type_implements(&arg_ty, &Trait::Show) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("{} has no notation — 'repr' needs Show", arg_ty)
+                    }, arg.span));
+                }
+                // Same prediction `check_printable` makes for `print`, at
+                // the same span — see `is_repr`'s own comment on why this
+                // happens here rather than in `validate_codegen_constraints`.
+                self.check_no_recursive_union(&arg_ty, arg.span, "repr", "formats it field-by-field")?;
+            }
+            // A placeholder, not the finished node: `desugar_notation`
+            // (run from `FrogState::eval_with_base`/`codegen::compile_and_run`,
+            // after monomorphization) replaces every one of these with the
+            // actual per-type expansion, once every type in the tree is
+            // fully substituted — see its own doc comment for why that
+            // ordering matters. `callable`'s `Function` type carries no
+            // `func_ids` entry (nothing ever looks "repr" up there): the
+            // node never reaches codegen under this name.
+            let callable = Spanned::from(TypedExpr {
+                id: 0,
+                ty: Type::Function { params: vec![arg_ty.clone()], result: Box::new(Type::Str) },
+                kind: TypedExprKind::Var("repr".to_string()),
+            }, callee_span);
+            (TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] }, Type::Str)
         } else if is_push {
             if c.args.len() != 2 {
                 return Err(Spanned::from(TypeError {
@@ -8104,6 +8338,835 @@ impl TypeChecker {
         chain.unwrap_or_else(|| Spanned::from(TypedExpr { id: 0, ty: Type::Bool, kind: TypedExprKind::BoolLit(true) }, span))
     }
 
+    // ── `repr` (`plans/DATA.md` stage 5) ───────────────────────────────────
+    //
+    // `repr(x)` lowers (`is_repr` above) to a placeholder `Call{callable:
+    // Var("repr"), args:[x]}` node with `ty: Str` — nothing about `x`'s type
+    // is expanded yet. `desugar_notation` is a whole-tree post-pass, run
+    // once per entry after `monomorphize_generics` (`state.rs`'s
+    // `eval_with_base`, `codegen::compile_and_run`) and before
+    // `liveness::number_nodes`, that finds every one of those placeholders
+    // and replaces it with `build_repr`'s per-type expansion. It has to run
+    // after monomorphization, not during `lower_call`, for two reasons
+    // (both concrete failures, not just tidiness):
+    //
+    //  - A struct/union field's `Type` is only guaranteed fully substituted
+    //    (no leftover generic binder `TypeVar`s) once monomorphization has
+    //    cloned and specialized every instantiation — `desugar_struct_eq`
+    //    gets away with running during ordinary lowering because `==`'s
+    //    operand types are already concrete at that point in a way a
+    //    generic function *body*'s `repr(x)` is not.
+    //  - `self.lookup(&arg.item.ty)` at placeholder-build time would return
+    //    an unresolved `TypeVar` for something like `mut xs = []` — whose
+    //    binding gets a concrete `List<Int>` type only after the rest of
+    //    the entry has been checked. Emitting `"[]"` for that at lowering
+    //    time would be a *lie* about a possibly non-empty list; running
+    //    after the whole entry is checked and substituted is what makes
+    //    `self.lookup` here trustworthy (this is also what fixes
+    //    `MUTABILITY.md`'s `mut xs = []; print(xs)` → `<?>` bug for `repr`,
+    //    for free — that bug is a stale node `.ty`, not a genuinely
+    //    unresolved type).
+    //
+    /// Walk every node reachable from `expr` (mirroring
+    /// `liveness::number_nodes`'s exhaustive structural recursion — nested
+    /// `Function` bodies included, since a lambda can call `repr` too),
+    /// replacing each `repr(...)` placeholder found along the way with
+    /// `build_repr`'s expansion. Runs before `number_nodes`, so every
+    /// synthesized node's `id: 0` is fine — the next pass assigns real ones.
+    pub fn desugar_notation(&mut self, expr: &mut Spanned<TypedExpr>) -> Result<(), Spanned<TypeError>> {
+        self.desugar_notation_children(&mut expr.item.kind)?;
+        let is_repr_call = matches!(
+            &expr.item.kind,
+            TypedExprKind::Call { callable, .. } if matches!(&callable.item.kind, TypedExprKind::Var(name) if name == "repr")
+        );
+        if !is_repr_call { return Ok(()); }
+        let TypedExprKind::Call { args, .. } = &expr.item.kind else { unreachable!("just matched above") };
+        let arg = args[0].value().expect("repr's placeholder always has exactly one Arg::Value").clone();
+        let span = expr.span;
+        let ty = self.lookup(&arg.item.ty);
+        // `is_repr`'s own checks defer here, unrun, when the argument's
+        // type was still a bare generic `TypeVar` at that point (a call
+        // inside a generic function body) — this is where each concrete
+        // monomorphized instantiation finally gets checked, exactly once,
+        // against its own resolved type.
+        if !self.type_implements(&ty, &Trait::Show) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("{} has no notation — 'repr' needs Show", ty)
+            }, arg.span));
+        }
+        self.check_no_recursive_union(&ty, arg.span, "repr", "formats it field-by-field")?;
+        let temp_name = format!("__repr_v{}", self.next_id); self.next_id += 1;
+        let temp_assign = Spanned::from(
+            TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Assign { name: temp_name.clone(), value: Box::new(arg) } },
+            span,
+        );
+        let temp_var = Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Var(temp_name) }, span);
+        let body = self.build_repr(&ty, temp_var, span)?;
+        *expr = Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![temp_assign, body]) }, span);
+        Ok(())
+    }
+
+    fn desugar_notation_opt(&mut self, expr: &mut Option<Box<Spanned<TypedExpr>>>) -> Result<(), Spanned<TypeError>> {
+        match expr {
+            Some(e) => self.desugar_notation(e),
+            None => Ok(()),
+        }
+    }
+
+    /// `desugar_notation`'s exhaustive per-kind recursion — every arm below
+    /// mirrors `liveness::number_kind`'s traversal shape exactly (that pass
+    /// visits the same nodes for the same reason: nothing may be skipped),
+    /// with `number`/`number_opt` calls replaced by `self.desugar_notation`/
+    /// `self.desugar_notation_opt`, which can fail (an ill-typed `repr`
+    /// argument) where numbering never could.
+    fn desugar_notation_children(&mut self, kind: &mut TypedExprKind) -> Result<(), Spanned<TypeError>> {
+        match kind {
+            TypedExprKind::IntLit(_)
+            | TypedExprKind::FloatLit(_)
+            | TypedExprKind::BoolLit(_)
+            | TypedExprKind::StrLit(_)
+            | TypedExprKind::NoneLit
+            | TypedExprKind::Var(_) => {}
+
+            TypedExprKind::Unary { expr, .. } => self.desugar_notation(expr)?,
+            TypedExprKind::Binary { left, right, .. } => {
+                self.desugar_notation(left)?;
+                self.desugar_notation(right)?;
+            }
+            TypedExprKind::Conditional { cond, true_branch, false_branch } => {
+                self.desugar_notation(cond)?;
+                self.desugar_notation(true_branch)?;
+                self.desugar_notation_opt(false_branch)?;
+            }
+            TypedExprKind::Assign { value, .. } => self.desugar_notation(value)?,
+            TypedExprKind::Function { body, .. } => self.desugar_notation(body)?,
+            TypedExprKind::Call { callable, args, .. } => {
+                self.desugar_notation(callable)?;
+                for a in args.iter_mut().flat_map(Arg::subexprs_mut) { self.desugar_notation(a)?; }
+            }
+            TypedExprKind::Index { target, index } => {
+                self.desugar_notation(target)?;
+                self.desugar_notation(index)?;
+            }
+            TypedExprKind::Slice { target, start, end } => {
+                self.desugar_notation(target)?;
+                self.desugar_notation_opt(start)?;
+                self.desugar_notation_opt(end)?;
+            }
+            TypedExprKind::Range { start, end } => {
+                self.desugar_notation(start)?;
+                self.desugar_notation(end)?;
+            }
+            TypedExprKind::List(elems) => {
+                for e in elems { self.desugar_notation(e)?; }
+            }
+            TypedExprKind::Block(stmts) => {
+                for s in stmts { self.desugar_notation(s)?; }
+            }
+            TypedExprKind::ForLoop { iterable, cond, body, .. }
+            | TypedExprKind::Comprehension { iterable, cond, body, .. } => {
+                self.desugar_notation(iterable)?;
+                self.desugar_notation_opt(cond)?;
+                self.desugar_notation(body)?;
+            }
+            TypedExprKind::StructInit { fields, .. } => {
+                for (_, v) in fields { self.desugar_notation(v)?; }
+            }
+            TypedExprKind::FieldAccess { target, .. } => self.desugar_notation(target)?,
+            TypedExprKind::PlaceAssign { place, value } => {
+                for seg in place.path.iter_mut() {
+                    if let PlaceSeg::Index { index, .. } = seg {
+                        self.desugar_notation(index)?;
+                    }
+                }
+                self.desugar_notation(value)?;
+            }
+            TypedExprKind::VariantInit { fields, .. } => {
+                for (_, v) in fields { self.desugar_notation(v)?; }
+            }
+            TypedExprKind::IsVariant { target, .. } => self.desugar_notation(target)?,
+            TypedExprKind::VariantField { target, .. } => self.desugar_notation(target)?,
+            TypedExprKind::Return(value) => self.desugar_notation_opt(value)?,
+            TypedExprKind::Widen { value, .. } => self.desugar_notation(value)?,
+            TypedExprKind::Narrow { value, .. } => self.desugar_notation(value)?,
+            TypedExprKind::TypeTag { target, .. } => self.desugar_notation(target)?,
+            TypedExprKind::Truthy(value) => self.desugar_notation(value)?,
+            TypedExprKind::Coerce(value) => self.desugar_notation(value)?,
+        }
+        Ok(())
+    }
+
+    fn str_lit(s: impl Into<String>, span: Span) -> Spanned<TypedExpr> {
+        Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::StrLit(s.into()) }, span)
+    }
+
+    /// Left-fold `parts` (every one `Str`-typed) into a `Str + Str + ...`
+    /// chain, merging adjacent `StrLit`s at build time first instead of
+    /// emitting a `Binary` node for them — halves the fragment/allocation
+    /// count for a struct's field-name/punctuation literals at zero
+    /// runtime cost (`plans/DATA.md` stage 5's known O(n^2)-in-fragment-
+    /// count risk; this doesn't fix the underlying shape, `Sink`/`StrBuf`
+    /// does, but it's a free partial mitigation). `parts` must be non-empty.
+    fn str_cat(parts: Vec<Spanned<TypedExpr>>, span: Span) -> Spanned<TypedExpr> {
+        let mut folded: Vec<Spanned<TypedExpr>> = Vec::with_capacity(parts.len());
+        for p in parts {
+            let mut merged = false;
+            if let TypedExprKind::StrLit(s) = &p.item.kind {
+                if let Some(last) = folded.last_mut() {
+                    if let TypedExprKind::StrLit(prev) = &mut last.item.kind {
+                        prev.push_str(s);
+                        merged = true;
+                    }
+                }
+            }
+            if !merged { folded.push(p); }
+        }
+        let mut iter = folded.into_iter();
+        let first = iter.next().expect("str_cat: parts must be non-empty");
+        iter.fold(first, |acc, p| {
+            Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Binary { op: Token::Plus, left: Box::new(acc), right: Box::new(p) } }, span)
+        })
+    }
+
+    /// `Call{Var(rt_name), [v]}` — one of the allocating scalar `repr`
+    /// leaves (`runtime/ffi.rs`'s `frog_{int,float,bool,str}_repr`,
+    /// registered under these exact `func_ids` keys in `codegen/mod.rs`).
+    fn repr_leaf_call(rt_name: &str, param_ty: Type, v: Spanned<TypedExpr>, span: Span) -> Spanned<TypedExpr> {
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![param_ty], result: Box::new(Type::Str) },
+            kind: TypedExprKind::Var(rt_name.to_string()),
+        }, span);
+        Spanned::from(TypedExpr {
+            id: 0, ty: Type::Str,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(v)] },
+        }, span)
+    }
+
+    /// `Call{Var("__str_join"), [list, sep]}` — `List<T>`'s `repr` arm
+    /// reduces its per-element fragments this way instead of an O(depth)
+    /// `+` chain (`runtime/ffi.rs::frog_str_join`).
+    fn build_str_join(list: Spanned<TypedExpr>, sep: Spanned<TypedExpr>, span: Span) -> Spanned<TypedExpr> {
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![Type::list(Type::Str), Type::Str], result: Box::new(Type::Str) },
+            kind: TypedExprKind::Var("__str_join".to_string()),
+        }, span);
+        Spanned::from(TypedExpr {
+            id: 0, ty: Type::Str,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(list), Arg::Value(sep)] },
+        }, span)
+    }
+
+    /// `repr`'s per-type dispatch. `ty` must already be `self.lookup`-
+    /// resolved (every caller either resolves it just before calling, or
+    /// receives it already resolved from a caller that did) — this never
+    /// re-resolves `v`'s own stored `.ty`, so a caller that skips that step
+    /// gets whatever `TypeVar` was in `ty` back out, unhelpfully.
+    fn build_repr(&mut self, ty: &Type, v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // `Range` first: it is structurally a 2-field struct to
+        // `as_struct_name` below, exactly the ordering `print_value`
+        // itself needs and explains (`codegen/mod.rs`).
+        if let Some(elem_ty) = ty.as_range_elem().cloned() {
+            // Registers `Range<elem>`'s flattened layout in `struct_defs`
+            // (if this is the first time this instantiation is seen) —
+            // needed for codegen to resolve the `FieldAccess` nodes below,
+            // the same reason `build_struct_eq` calls it for a struct.
+            self.materialize_struct(ty);
+            let start = Spanned::from(TypedExpr { id: 0, ty: elem_ty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(v.clone()), field: "start".to_string(), enum_name: None } }, span);
+            let end   = Spanned::from(TypedExpr { id: 0, ty: elem_ty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(v),         field: "end".to_string(),   enum_name: None } }, span);
+            let start_repr = self.build_repr(&elem_ty, start, span)?;
+            let end_repr   = self.build_repr(&elem_ty, end, span)?;
+            return Ok(Self::str_cat(vec![start_repr, Self::str_lit("..", span), end_repr], span));
+        }
+        if let Some(name) = ty.as_struct_name().map(str::to_string) {
+            return self.build_repr_struct(&name, ty, v, span);
+        }
+        if let Some(elem_ty) = ty.as_list_elem().cloned() {
+            return self.build_repr_list(&elem_ty, v, span);
+        }
+        match ty {
+            Type::Union(members) => {
+                let members = members.clone();
+                self.build_repr_union(&members, v, span)
+            }
+            Type::Str   => Ok(Self::repr_leaf_call("__repr_str", Type::Str, v, span)),
+            Type::None  => Ok(Self::str_lit("none", span)),
+            Type::Int   => Ok(Self::repr_leaf_call("__repr_int", Type::Int, v, span)),
+            Type::Float => Ok(Self::repr_leaf_call("__repr_float", Type::Float, v, span)),
+            Type::Bool  => Ok(Self::repr_leaf_call("__repr_bool", Type::Bool, v, span)),
+            // Only reachable for a bare (non-list-element) argument whose
+            // type inference never pinned down — which, for a `Show`-
+            // checked argument, means it was never actually observed at a
+            // concrete type anywhere in the program. `List<T>`'s own arm
+            // (`build_repr_list`) handles the one case that legitimately
+            // happens in working programs (an empty list literal) before
+            // ever calling back in here with a bare `TypeVar`.
+            Type::TypeVar { .. } => Err(Spanned::from(TypeError {
+                msg: "cannot infer the type of repr's argument; annotate the expected type".to_string()
+            }, span)),
+            other => Err(Spanned::from(TypeError { msg: format!("{} has no notation", other) }, span)),
+        }
+    }
+
+    /// `Name(f=repr(v.f), ...)` / `Name(repr(v.0), ...)` — struct notation,
+    /// matching `print_value`'s exact struct arm (`codegen/mod.rs`):
+    /// positional fields (`is_positional_fields`) print bare, named fields
+    /// print `f=`-prefixed.
+    fn build_repr_struct(&mut self, name: &str, ty: &Type, v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let fields = self.materialize_struct(ty);
+        let positional = is_positional_fields(&fields);
+        let mut parts = vec![Self::str_lit(format!("{}(", name), span)];
+        for (i, (fname, fty)) in fields.iter().enumerate() {
+            if i != 0 { parts.push(Self::str_lit(", ", span)); }
+            if !positional { parts.push(Self::str_lit(format!("{}=", fname), span)); }
+            let fv = Spanned::from(TypedExpr {
+                id: 0, ty: fty.clone(),
+                kind: TypedExprKind::FieldAccess { target: Box::new(v.clone()), field: fname.clone(), enum_name: None },
+            }, span);
+            parts.push(self.build_repr(fty, fv, span)?);
+        }
+        parts.push(Self::str_lit(")", span));
+        Ok(Self::str_cat(parts, span))
+    }
+
+    /// `[repr(e0), repr(e1), ...]` — `List<T>` notation. Binds `v` to a
+    /// temporary first (`__repr_l{n}`), since the loop reads it as an
+    /// iterable and it may otherwise be an arbitrary (possibly
+    /// side-effecting) expression; the per-element loop body reads a
+    /// second temporary (`__repr_e{n}`), the `Comprehension`'s own bound
+    /// variable. The iterable read is an ordinary `for`-loop-shaped one
+    /// (`Var` fed straight into `Comprehension::iterable`), so it is
+    /// transient under the existing liveness analysis exactly like any
+    /// user-written `[for x in xs do ...]` — no `repr`-specific plumbing
+    /// needed there (`MUTABILITY.md`'s O(n^2) trap this avoids).
+    fn build_repr_list(&mut self, elem_ty: &Type, v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // An element type inference never fixed — only possible for a
+        // provably empty list (`repr([])`), since any element would have
+        // fixed the variable. The comprehension body below would be dead
+        // code, so skip it and emit the same `[]` a literal empty list
+        // reprs as, rather than building a loop over a type that doesn't
+        // exist yet — mirrors `print_value`'s `TypeVar` arm's reasoning.
+        if matches!(elem_ty, Type::TypeVar { .. }) {
+            return Ok(Self::str_lit("[]", span));
+        }
+        let list_name = format!("__repr_l{}", self.next_id); self.next_id += 1;
+        let elem_name = format!("__repr_e{}", self.next_id); self.next_id += 1;
+        let list_ty = Type::list(elem_ty.clone());
+
+        let list_assign = Spanned::from(TypedExpr { id: 0, ty: list_ty.clone(), kind: TypedExprKind::Assign { name: list_name.clone(), value: Box::new(v) } }, span);
+        let list_var = Spanned::from(TypedExpr { id: 0, ty: list_ty, kind: TypedExprKind::Var(list_name) }, span);
+        let elem_var = Spanned::from(TypedExpr { id: 0, ty: elem_ty.clone(), kind: TypedExprKind::Var(elem_name.clone()) }, span);
+        let elem_repr = self.build_repr(elem_ty, elem_var, span)?;
+
+        let comprehension = Spanned::from(TypedExpr {
+            id: 0, ty: Type::list(Type::Str),
+            kind: TypedExprKind::Comprehension { var: elem_name, iterable: Box::new(list_var), cond: None, body: Box::new(elem_repr), iter_via: None },
+        }, span);
+        let joined = Self::build_str_join(comprehension, Self::str_lit(", ", span), span);
+        let cat = Self::str_cat(vec![Self::str_lit("[", span), joined, Self::str_lit("]", span)], span);
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![list_assign, cat]) }, span))
+    }
+
+    /// Union notation, nominal or anonymous. Binds `v` to a temporary
+    /// first (`__repr_u{n}`) — every member arm below reads the subject at
+    /// least once, some (a nominal variant's own fields) more than once,
+    /// so it must be cheap to duplicate — then dispatches on whether the
+    /// (already-normalized) member list resolves to a declared `data ...
+    /// is ...` union.
+    fn build_repr_union(&mut self, members: &[Type], v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let union_ty = Type::Union(members.to_vec());
+        let subj_name = format!("__repr_u{}", self.next_id); self.next_id += 1;
+        let subj_assign = Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Assign { name: subj_name.clone(), value: Box::new(v) } }, span);
+
+        let resolved = self.resolve_union(&union_ty).map(|(n, d)| (n.to_string(), d.clone()));
+        let body = match resolved {
+            Some((enum_name, def)) => self.build_repr_nominal_union(&enum_name, &def, &subj_name, &union_ty, span)?,
+            None => self.build_repr_anon_union(members, &subj_name, &union_ty, span)?,
+        };
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![subj_assign, body]) }, span))
+    }
+
+    /// `Enum.Variant(f=repr(v.f), ...)`, folded right-to-left into a nested
+    /// `Conditional` over `IsVariant` — exactly `fold_match_arm`'s "the
+    /// rightmost arm needs no tag test" shape (`lower_match_lowered`) and
+    /// `print_union_body`'s declared-order dispatch (`codegen/mod.rs`),
+    /// since every branch here already agrees on its result type (`Str`)
+    /// there is no need for `fold_match_arm`'s own `joined_conditional`
+    /// widening machinery — a plain `Conditional` node suffices.
+    fn build_repr_nominal_union(&mut self, enum_name: &str, def: &UnionDef, subj_name: &str, subj_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let common = def.common.clone();
+        let variants = def.variants.clone();
+        let mut tail: Option<Spanned<TypedExpr>> = None;
+        for (idx, (vname, vfields)) in variants.iter().enumerate().rev() {
+            let subject_var = Spanned::from(TypedExpr { id: 0, ty: subj_ty.clone(), kind: TypedExprKind::Var(subj_name.to_string()) }, span);
+
+            let flat: Vec<(String, Type)> = common.iter().chain(vfields.iter()).cloned().collect();
+            let positional = is_positional_fields(&flat);
+            let mut parts = vec![Self::str_lit(format!("{}.{}(", enum_name, vname), span)];
+            for (i, (fname, fty)) in flat.iter().enumerate() {
+                if i != 0 { parts.push(Self::str_lit(", ", span)); }
+                if !positional { parts.push(Self::str_lit(format!("{}=", fname), span)); }
+                let fv = if i < common.len() {
+                    Spanned::from(TypedExpr {
+                        id: 0, ty: fty.clone(),
+                        kind: TypedExprKind::FieldAccess { target: Box::new(subject_var.clone()), field: fname.clone(), enum_name: Some(enum_name.to_string()) },
+                    }, span)
+                } else {
+                    Spanned::from(TypedExpr {
+                        id: 0, ty: fty.clone(),
+                        kind: TypedExprKind::VariantField { target: Box::new(subject_var.clone()), enum_name: enum_name.to_string(), variant: vname.clone(), field: fname.clone() },
+                    }, span)
+                };
+                parts.push(self.build_repr(fty, fv, span)?);
+            }
+            parts.push(Self::str_lit(")", span));
+            let body = Self::str_cat(parts, span);
+
+            if tail.is_none() {
+                tail = Some(body);
+                continue;
+            }
+            let cond = Spanned::from(TypedExpr {
+                id: 0, ty: Type::Bool,
+                kind: TypedExprKind::IsVariant { target: Box::new(subject_var), enum_name: enum_name.to_string(), variant: vname.clone(), tag: idx as u32 },
+            }, span);
+            tail = Some(Spanned::from(TypedExpr {
+                id: 0, ty: Type::Str,
+                kind: TypedExprKind::Conditional { cond: Box::new(cond), true_branch: Box::new(body), false_branch: tail.map(Box::new) },
+            }, span));
+        }
+        Ok(tail.expect("a nominal union always declares at least one variant"))
+    }
+
+    /// Anonymous union notation — `TypeTag`/`Narrow` in place of
+    /// `IsVariant`/`VariantField`, same right-to-left fold as the nominal
+    /// case above. A `None` member needs no `Narrow`: there is no payload
+    /// to unbox, and its own tag test already proved which member it is.
+    fn build_repr_anon_union(&mut self, members: &[Type], subj_name: &str, subj_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let mut tail: Option<Spanned<TypedExpr>> = None;
+        for (idx, member_ty) in members.iter().enumerate().rev() {
+            let subject_var = Spanned::from(TypedExpr { id: 0, ty: subj_ty.clone(), kind: TypedExprKind::Var(subj_name.to_string()) }, span);
+            let narrowed = if *member_ty == Type::None {
+                Self::str_lit("none", span)
+            } else {
+                let narrow_val = Spanned::from(TypedExpr {
+                    id: 0, ty: member_ty.clone(),
+                    kind: TypedExprKind::Narrow { value: Box::new(subject_var.clone()), tag: idx as u32 },
+                }, span);
+                self.build_repr(member_ty, narrow_val, span)?
+            };
+
+            if tail.is_none() {
+                tail = Some(narrowed);
+                continue;
+            }
+            let cond = Spanned::from(TypedExpr {
+                id: 0, ty: Type::Bool,
+                kind: TypedExprKind::TypeTag { target: Box::new(subject_var), tag: idx as u32 },
+            }, span);
+            tail = Some(Spanned::from(TypedExpr {
+                id: 0, ty: Type::Str,
+                kind: TypedExprKind::Conditional { cond: Box::new(cond), true_branch: Box::new(narrowed), false_branch: tail.map(Box::new) },
+            }, span));
+        }
+        Ok(tail.expect("an anonymous union always has at least two members"))
+    }
+
+    // ── `read` (`plans/DATA.md` stage 5) ────────────────────────────────────
+    //
+    // `read`'s inverse relationship to `repr` is exact at the desugar layer
+    // too: `build_read(ty, node, span)` has the same per-type dispatch shape
+    // as `build_repr(ty, v, span)`, with the direction of data flow
+    // reversed — instead of consuming a real froglang *value* and producing
+    // `Str` fragments, it consumes a *node handle* (always `Type::Int` at
+    // the froglang level — an opaque pointer into `runtime::read`'s parsed
+    // `Expression` tree, `runtime/read.rs`'s own doc comment) and produces
+    // a real froglang value. Every `frog_read_*` accessor is
+    // sticky-error-tolerant (records the *first* mismatch, keeps going with
+    // some always-valid placeholder — `runtime/read.rs` again), which is
+    // what lets this build one unconditional "happy path" expression per
+    // type with no early-exit control flow of its own: the caller
+    // (`lower_read`, below) checks `frog_read_failed()` exactly once, after
+    // the whole tree has been built, and discards the result in favor of a
+    // `ReadError` if it has.
+    //
+    // Unlike `build_repr`, a union's dispatch here cannot skip a test for
+    // the "last" alternative: `repr`'s own output is exhaustive by
+    // construction (whichever member `desugar_notation` started from), but
+    // `read`'s input is an arbitrary string that might name none of a
+    // union's members at all, so every alternative is tested and a real
+    // "nothing matched" fallback marks failure (`frog_read_expect`) before
+    // falling through to a placeholder construction — see
+    // `build_read_nominal_union`/`build_read_anon_union`.
+
+    fn read_leaf_call(rt_name: &str, param: Type, ret: Type, node: Spanned<TypedExpr>, span: Span) -> Spanned<TypedExpr> {
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![param], result: Box::new(ret.clone()) },
+            kind: TypedExprKind::Var(rt_name.to_string()),
+        }, span);
+        Spanned::from(TypedExpr {
+            id: 0, ty: ret,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(node)] },
+        }, span)
+    }
+
+    fn read_call2(rt_name: &str, p0: Type, p1: Type, ret: Type, a: Spanned<TypedExpr>, b: Spanned<TypedExpr>, span: Span) -> Spanned<TypedExpr> {
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![p0, p1], result: Box::new(ret.clone()) },
+            kind: TypedExprKind::Var(rt_name.to_string()),
+        }, span);
+        Spanned::from(TypedExpr {
+            id: 0, ty: ret,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(a), Arg::Value(b)] },
+        }, span)
+    }
+
+    fn int_lit(v: i64, span: Span) -> Spanned<TypedExpr> {
+        Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::IntLit(v) }, span)
+    }
+
+    fn node_var(name: &str, span: Span) -> Spanned<TypedExpr> {
+        Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Var(name.to_string()) }, span)
+    }
+
+    /// `read`'s per-type dispatch, `build_repr`'s inverse. `ty` must
+    /// already be `self.lookup`-resolved (same contract as `build_repr`).
+    fn build_read(&mut self, ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        if let Some(elem_ty) = ty.as_range_elem().cloned() {
+            self.materialize_struct(ty);
+            let lo_node = Self::read_leaf_call("frog_read_range_lo", Type::Int, Type::Int, node.clone(), span);
+            let hi_node = Self::read_leaf_call("frog_read_range_hi", Type::Int, Type::Int, node, span);
+            let lo = self.build_read(&elem_ty, lo_node, span)?;
+            let hi = self.build_read(&elem_ty, hi_node, span)?;
+            let name = ty.as_struct_name().expect("Range is a struct name").to_string();
+            return Ok(Spanned::from(TypedExpr {
+                id: 0, ty: ty.clone(),
+                kind: TypedExprKind::StructInit { name, fields: vec![("start".to_string(), Box::new(lo)), ("end".to_string(), Box::new(hi))] },
+            }, span));
+        }
+        if let Some(name) = ty.as_struct_name().map(str::to_string) {
+            return self.build_read_struct(&name, ty, node, span);
+        }
+        if let Some(elem_ty) = ty.as_list_elem().cloned() {
+            return self.build_read_list(&elem_ty, node, span);
+        }
+        match ty {
+            Type::Union(members) => {
+                let members = members.clone();
+                self.build_read_union(&members, node, span)
+            }
+            Type::Str   => Ok(Self::read_leaf_call("frog_read_str", Type::Int, Type::Str, node, span)),
+            Type::None  => Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, span)),
+            Type::Int   => Ok(Self::read_leaf_call("frog_read_int", Type::Int, Type::Int, node, span)),
+            Type::Float => Ok(Self::read_leaf_call("frog_read_float", Type::Int, Type::Float, node, span)),
+            Type::Bool  => Ok(Self::read_leaf_call("frog_read_bool", Type::Int, Type::Bool, node, span)),
+            other => Err(Spanned::from(TypeError { msg: format!("{} has no notation to read", other) }, span)),
+        }
+    }
+
+    /// `Name(f=read(field), ...)` / `Name(read(arg), ...)` — struct
+    /// notation's inverse, `build_repr_struct`'s mirror. Does not verify
+    /// the call's own callee name against `name`: `read`'s error surface
+    /// is field-by-field (a missing/mistyped field fails there), which is
+    /// enough to make the law hold — verifying the outer shape too is a
+    /// real but secondary quality gap on malformed/adversarial input, not
+    /// on `repr`'s own output.
+    fn build_read_struct(&mut self, name: &str, ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let fields = self.materialize_struct(ty);
+        let positional = is_positional_fields(&fields);
+        let mut out = Vec::with_capacity(fields.len());
+        for (i, (fname, fty)) in fields.iter().enumerate() {
+            let fnode = if positional {
+                Self::read_call2("frog_read_arg", Type::Int, Type::Int, Type::Int, node.clone(), Self::int_lit(i as i64, span), span)
+            } else {
+                Self::read_call2("frog_read_field", Type::Int, Type::Str, Type::Int, node.clone(), Self::str_lit(fname.clone(), span), span)
+            };
+            let fval = self.build_read(fty, fnode, span)?;
+            out.push((fname.clone(), Box::new(fval)));
+        }
+        Ok(Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::StructInit { name: name.to_string(), fields: out } }, span))
+    }
+
+    /// `[for i in 0..len(node) do read(list_at(node, i))]` — `List<T>`
+    /// notation's inverse. `node` is bound to a temporary first, matching
+    /// `build_repr_list`'s reasoning (the loop reads it more than once).
+    fn build_read_list(&mut self, elem_ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let node_name = format!("__read_n{}", self.next_id); self.next_id += 1;
+        let idx_name = format!("__read_i{}", self.next_id); self.next_id += 1;
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+
+        let len_call = Self::read_leaf_call("frog_read_list_len", Type::Int, Type::Int, Self::node_var(&node_name, span), span);
+        // `Type::range(Int)`, not `Type::list(Int)`: `TypedExprKind::Range`'s
+        // own doc comment ("eagerly materialized as List<Int>") is stale —
+        // `lower_range` types a bare `a..b` as `Range<Int>` (RANGES.md's
+        // "Range as a real builtin type"), and codegen's `Range` arm
+        // compiles it as the flat `(start, end)` pair that type's unboxed
+        // representation is, not an allocated list. `Comprehension`
+        // already iterates a `Range<Int>` iterable directly (the same
+        // shape any `[for i in 0..n do ...]` produces), so this just needs
+        // the matching type.
+        let range = Spanned::from(TypedExpr {
+            id: 0, ty: Type::range(Type::Int),
+            kind: TypedExprKind::Range { start: Box::new(Self::int_lit(0, span)), end: Box::new(len_call) },
+        }, span);
+        let elem_node = Self::read_call2("frog_read_list_at", Type::Int, Type::Int, Type::Int, Self::node_var(&node_name, span), Self::node_var(&idx_name, span), span);
+        let elem_val = self.build_read(elem_ty, elem_node, span)?;
+
+        let comprehension = Spanned::from(TypedExpr {
+            id: 0, ty: Type::list(elem_ty.clone()),
+            kind: TypedExprKind::Comprehension { var: idx_name, iterable: Box::new(range), cond: None, body: Box::new(elem_val), iter_via: None },
+        }, span);
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::list(elem_ty.clone()), kind: TypedExprKind::Block(vec![node_assign, comprehension]) }, span))
+    }
+
+    /// Union notation's inverse. `node` is bound to a temporary first
+    /// (every dispatch arm reads it, most more than once).
+    fn build_read_union(&mut self, members: &[Type], node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let union_ty = Type::Union(members.to_vec());
+        self.build_read_union_as(members, node, &union_ty, span)
+    }
+
+    /// `build_read_union`, but every constructed node is stamped
+    /// `target_ty` rather than `Type::Union(members)` — `lower_read`'s own
+    /// escape hatch for `read(s): T | ReadError` where `T` is *itself*
+    /// already a union (`Shape | ReadError`, not just `Int | ReadError`).
+    ///
+    /// `lower_widen` can't take an already-union-typed value (`Shape`, from
+    /// an ordinary `build_read_union` call) and widen it into a *wider*
+    /// union (`Shape | ReadError`) after the fact — it explicitly rejects
+    /// union-into-union widening, since the two have different tag
+    /// numbering and (once member count crosses `MAX_INLINE_UNION_MEMBERS`)
+    /// potentially different representations entirely (inline columns vs.
+    /// boxed). But the *construction* nodes don't need the narrower type —
+    /// `Widen`'s own `tag` is defined as "position in *this* node's target
+    /// union" in both layouts — so building directly against `expected`
+    /// from the start, instead of building against the narrower `T` and
+    /// widening afterward, sidesteps the limitation rather than needing to
+    /// lift it.
+    ///
+    /// The one node that is *not* target-type-agnostic is `VariantInit`:
+    /// its tag is a nominal union's declaration index, which only the
+    /// inline layout reconciles with an anonymous union's normalized
+    /// member positions. `build_read_nominal_union` handles that — see its
+    /// `nominal_target` split — rather than stamping a wider union onto a
+    /// `VariantInit`.
+    fn build_read_union_as(&mut self, members: &[Type], node: Spanned<TypedExpr>, target_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let union_ty = Type::Union(members.to_vec());
+        let node_name = format!("__read_u{}", self.next_id); self.next_id += 1;
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+
+        let resolved = self.resolve_union(&union_ty).map(|(n, d)| (n.to_string(), d.clone()));
+        let body = match resolved {
+            Some((enum_name, def)) => self.build_read_nominal_union(&enum_name, &def, &node_name, target_ty, span)?,
+            None => self.build_read_anon_union(members, &node_name, target_ty, span)?,
+        };
+        Ok(Spanned::from(TypedExpr { id: 0, ty: target_ty.clone(), kind: TypedExprKind::Block(vec![node_assign, body]) }, span))
+    }
+
+    /// Every variant is tested — unlike `build_repr_nominal_union`, the
+    /// last one gets no "it must be this one" exemption, since the input
+    /// might match none of them. The final fallback marks failure
+    /// (`frog_read_expect`) and reconstructs the last variant anyway, off
+    /// the same (mismatched) node — a type-correct placeholder, discarded
+    /// by `lower_read` once it sees `frog_read_failed()`.
+    fn build_read_nominal_union(&mut self, enum_name: &str, def: &UnionDef, node_name: &str, union_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let common = def.common.clone();
+        let variants = def.variants.clone();
+
+        // Is `union_ty` the enum's *own* union type, or a wider anonymous
+        // one (`build_read_union_as`'s escape hatch — `lower_read` reading
+        // a nominal `T` straight into `T | ReadError`)? The two need
+        // different construction nodes, because a boxed union's tag means
+        // different things in each: `VariantInit` boxes the *declaration*
+        // index, which is what `IsVariant`/`emit_is_variant` compares
+        // against, while an anonymous union discriminates by normalized
+        // member position (`TypeTag`/`emit_tag_test`). Only the inline
+        // layout reconciles them (`compile_variant_init` converts through
+        // `nominal_member_index` there), so a `VariantInit` stamped with
+        // the wider union is correct only while that union stays inline —
+        // past `MAX_INLINE_UNION_MEMBERS` it boxes a declaration index
+        // into a value everything downstream reads as a member position,
+        // and the mismatch is a wrong-member read, not a clean failure.
+        //
+        // So for a wider target, build the variant at its own exact
+        // qualified type (`Enum.Variant` — `compile_variant_init`'s
+        // no-tag, no-box "the expected type *was* the variant" case) and
+        // `Widen` that into the target, exactly as `build_read_anon_union`
+        // does for its own members. `Widen`'s tag is defined as normalized
+        // member position in both layouts, so this needs no special case
+        // for either.
+        let nominal_target = self.resolve_union(union_ty).map(|(n, _)| n) == Some(enum_name);
+        let Type::Union(target_members) = union_ty else {
+            unreachable!("build_read_nominal_union's union_ty is always a Type::Union")
+        };
+        let target_members = target_members.clone();
+
+        let mut constructions: Vec<Spanned<TypedExpr>> = Vec::with_capacity(variants.len());
+        for (idx, (vname, vfields)) in variants.iter().enumerate() {
+            // Field order and naming mirror `build_repr_nominal_union`'s
+            // exactly — common fields first, then the variant's own, and
+            // positional ("tuple struct") fields read back bare by
+            // position (`frog_read_arg`) since that is how `repr` wrote
+            // them. Same split `build_read_struct` makes.
+            let flat: Vec<(String, Type)> = common.iter().chain(vfields.iter()).cloned().collect();
+            let positional = is_positional_fields(&flat);
+            let mut fields_out = Vec::new();
+            for (i, (fname, fty)) in flat.iter().enumerate() {
+                let fnode = if positional {
+                    Self::read_call2("frog_read_arg", Type::Int, Type::Int, Type::Int, Self::node_var(node_name, span), Self::int_lit(i as i64, span), span)
+                } else {
+                    Self::read_call2("frog_read_field", Type::Int, Type::Str, Type::Int, Self::node_var(node_name, span), Self::str_lit(fname.clone(), span), span)
+                };
+                let fval = self.build_read(fty, fnode, span)?;
+                fields_out.push((fname.clone(), Box::new(fval)));
+            }
+            let variant_ty = Type::strukt(format!("{}.{}", enum_name, vname));
+            let init = Spanned::from(TypedExpr {
+                id: 0, ty: if nominal_target { union_ty.clone() } else { variant_ty.clone() },
+                kind: TypedExprKind::VariantInit { enum_name: enum_name.to_string(), variant: vname.clone(), tag: idx as u32, fields: fields_out },
+            }, span);
+            constructions.push(if nominal_target { init } else {
+                let tag = target_members.iter().position(|m| *m == variant_ty)
+                    .expect("every variant of the union being read is a member of the target union") as u32;
+                Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Widen { value: Box::new(init), tag } }, span)
+            });
+        }
+
+        let last = constructions.len() - 1;
+        let fail = Self::read_call2("frog_read_expect", Type::Int, Type::Str, Type::Int, Self::node_var(node_name, span), Self::str_lit(format!("expected a variant of {}", enum_name), span), span);
+        let mut tail = Spanned::from(TypedExpr {
+            id: 0, ty: union_ty.clone(), kind: TypedExprKind::Block(vec![fail, constructions[last].clone()]),
+        }, span);
+        for idx in (0..variants.len()).rev() {
+            let vname = &variants[idx].0;
+            let test = Self::read_call2("frog_read_is_call", Type::Int, Type::Str, Type::Bool, Self::node_var(node_name, span), Self::str_lit(vname.clone(), span), span);
+            tail = Spanned::from(TypedExpr {
+                id: 0, ty: union_ty.clone(),
+                kind: TypedExprKind::Conditional { cond: Box::new(test), true_branch: Box::new(constructions[idx].clone()), false_branch: Some(Box::new(tail)) },
+            }, span);
+        }
+        Ok(tail)
+    }
+
+    /// Anonymous union notation's inverse — one `frog_read_is_*` kind
+    /// predicate tested per member (a union with more than one
+    /// struct-shaped member, the one case a syntactic kind test can't
+    /// disambiguate, is rejected below by `check_union_readable`), same
+    /// "every alternative tested, real fallback" shape as the nominal case
+    /// above.
+    fn build_read_anon_union(&mut self, members: &[Type], node_name: &str, union_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // `Widen`'s own `tag` is "position in *this node's* target union"
+        // (`TypedExprKind::Widen`'s doc comment) — `union_ty`'s member
+        // list, which is `members` for an ordinary (recursive-field) call
+        // but a *wider* list for `build_read_union_as`'s escape hatch
+        // (`lower_read` widening `T` directly into `T | ReadError`), so the
+        // tag has to come from there, not from `members`' own position.
+        let Type::Union(target_members) = union_ty else {
+            unreachable!("build_read_anon_union's union_ty is always a Type::Union")
+        };
+        let target_members = target_members.clone();
+
+        // The kind tests below can't tell two struct-shaped members apart
+        // — `lower_read` runs this on the type it was annotated with, but
+        // a union reached recursively (a struct field, a list element)
+        // arrives here without ever having passed through that check.
+        // `members`, not `union_ty`: the dispatch set is what has to be
+        // unambiguous, and for `lower_read`'s `T | ReadError` hatch the
+        // target additionally carries `ReadError`, which is never
+        // dispatched on.
+        self.check_union_readable(&Type::Union(members.to_vec()), span)?;
+
+        let mut constructions: Vec<Spanned<TypedExpr>> = Vec::with_capacity(members.len());
+        for member_ty in members {
+            let value = if *member_ty == Type::None {
+                Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, span)
+            } else {
+                self.build_read(member_ty, Self::node_var(node_name, span), span)?
+            };
+            constructions.push(value);
+        }
+        let widened: Vec<Spanned<TypedExpr>> = constructions.into_iter().zip(members.iter())
+            .map(|(v, mty)| {
+                let tag = target_members.iter().position(|m| m == mty)
+                    .expect("every dispatch member is present in its own target union") as u32;
+                Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Widen { value: Box::new(v), tag } }, span)
+            })
+            .collect();
+
+        let last = widened.len() - 1;
+        let fail = Self::read_call2("frog_read_expect", Type::Int, Type::Str, Type::Int, Self::node_var(node_name, span), Self::str_lit(format!("expected {}", union_ty), span), span);
+        let mut tail = Spanned::from(TypedExpr {
+            id: 0, ty: union_ty.clone(), kind: TypedExprKind::Block(vec![fail, widened[last].clone()]),
+        }, span);
+        for idx in (0..members.len()).rev() {
+            let predicate = match &members[idx] {
+                Type::Int   => "frog_read_is_int",
+                Type::Float => "frog_read_is_float",
+                Type::Bool  => "frog_read_is_bool",
+                Type::Str   => "frog_read_is_str",
+                Type::None  => "frog_read_is_none",
+                t if t.as_list_elem().is_some()  => "frog_read_is_list",
+                t if t.as_range_elem().is_some() => "frog_read_is_range",
+                _ => "frog_read_is_struct",
+            };
+            let test = Self::read_leaf_call(predicate, Type::Int, Type::Bool, Self::node_var(node_name, span), span);
+            tail = Spanned::from(TypedExpr {
+                id: 0, ty: union_ty.clone(),
+                kind: TypedExprKind::Conditional { cond: Box::new(test), true_branch: Box::new(widened[idx].clone()), false_branch: Some(Box::new(tail)) },
+            }, span);
+        }
+        Ok(tail)
+    }
+
+    /// `read`'s counterpart to `check_reprable`: the same recursive-union
+    /// prediction (`build_read` can't emit unbounded branch trees any more
+    /// than `build_repr` can), plus a check `repr` doesn't need — an
+    /// anonymous union with more than one struct-shaped member has no
+    /// syntactic feature `frog_read_is_struct` can use to tell them apart
+    /// (both `repr` to a bare `Name(...)` call), so `read` at that type
+    /// would silently and unpredictably pick one. Named per DATA.md
+    /// Stage 8's identical ruling for JSON (`Int | Float` there; the struct
+    /// case here), stated once so both can point at it.
+    fn check_readable(&self, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        self.check_no_recursive_union(ty, span, "read", "constructs it field-by-field")?;
+        self.check_union_readable(ty, span)
+    }
+
+    /// The struct-shaped-members half of `check_readable`, on its own so
+    /// it can also run at every union `build_read` *descends into* — a
+    /// union reached through a struct field or a list element is dispatched
+    /// by exactly the same `frog_read_is_*` kind tests as a top-level one,
+    /// so it is ambiguous for exactly the same reason. Checked at the point
+    /// of descent (`build_read_anon_union`) rather than by walking `ty`
+    /// up front, so the diagnostic can't disagree with what actually gets
+    /// built: the recursion that reaches a nested union and the recursion
+    /// that would validate it are then the same recursion.
+    ///
+    /// Nominal unions are exempt (`resolve_union`): their variants `repr`
+    /// with a `Enum.Variant(...)` head, which `frog_read_is_call` tells
+    /// apart by name.
+    fn check_union_readable(&self, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        if let Type::Union(members) = ty {
+            if self.resolve_union(ty).is_none() {
+                let struct_members = members.iter().filter(|m| {
+                    m.as_struct_name().is_some() && m.as_range_elem().is_none() && m.as_list_elem().is_none()
+                }).count();
+                if struct_members > 1 {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!(
+                            "read can't tell apart the struct-shaped members of {} — wrap them in a 'data ... is ...' union instead",
+                            ty
+                        )
+                    }, span));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a parsed type annotation (`crate::frontend::type_expr`) into a
     /// `Type`. Total over the type grammar — every `TypeExpr` variant is
     /// handled here, so an unresolvable annotation is a *name* problem, never
@@ -8606,6 +9669,24 @@ mod helper_tests {
         assert_eq!(s.get("print"), Some(&Type::Int));
         s.close(mark);
         assert_eq!(s.get("print"), Some(&Type::Str));
+    }
+
+    // ── Trait::Show ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn show_is_structural_over_lists_and_struct_fields_like_eq() {
+        let mut tc = TypeChecker::empty();
+        tc.struct_templates.insert("W".to_string(), vec![("xs".to_string(), Type::list(Type::Int))]);
+        assert!(tc.type_implements(&Type::strukt("W"), &Trait::Show));
+        assert!(tc.type_implements(&Type::list(Type::Str), &Trait::Show));
+    }
+
+    #[test]
+    fn a_function_typed_field_is_not_show() {
+        let mut tc = TypeChecker::empty();
+        let f = Type::Function { params: vec![Type::Int], result: Box::new(Type::Int) };
+        tc.struct_templates.insert("F".to_string(), vec![("f".to_string(), f)]);
+        assert!(!tc.type_implements(&Type::strukt("F"), &Trait::Show));
     }
 
     // ── join_types ───────────────────────────────────────────────────────────

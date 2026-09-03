@@ -310,12 +310,22 @@ impl FrogState {
             self.tc.restore(cp);
             return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
         }
+        // `plans/DATA.md` stage 5: expand every `repr(...)` placeholder
+        // left by `TypeChecker::lower_call`'s `is_repr` arm into its
+        // per-type notation. Must run after monomorphization (every type
+        // in the tree is fully substituted only now — see
+        // `TypeChecker::desugar_notation`'s own doc comment) and before
+        // `number_nodes` (so the nodes it synthesizes get numbered too).
+        if let Err(e) = self.tc.desugar_notation(&mut typed) {
+            self.tc.restore(cp);
+            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
+        }
         // Stamp every node with a fresh id — including whatever
-        // `monomorphize_generics` just cloned in, which starts out
-        // unnumbered (`NodeId`'s doc comment) — before codegen's
-        // liveness-dependent passes touch the tree. Must run after
-        // monomorphization, not before, so newly-inserted instantiation
-        // bodies get real ids too.
+        // `monomorphize_generics`/`desugar_notation` just cloned or
+        // synthesized in, which starts out unnumbered (`NodeId`'s doc
+        // comment) — before codegen's liveness-dependent passes touch the
+        // tree. Must run after both, not before, so newly-inserted bodies
+        // get real ids too.
         crate::frontend::liveness::number_nodes(&mut typed);
 
         // `TRAITS.md` Part 7: `Linear` violations are type errors, and must
@@ -457,7 +467,7 @@ impl FrogState {
 /// of these would silently never be called, since the special case wins
 /// before the generic `func_ids` lookup ever runs. Rejected at `build()`
 /// with a clear error instead.
-const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "panic", "panic!builtin", "gc_dump"];
+const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "panic", "panic!builtin", "gc_dump", "repr", "read"];
 
 /// Builds a `FrogState` with host (Rust) functions registered before the
 /// JIT module exists — required because `JITBuilder::symbol` only accepts
@@ -523,6 +533,13 @@ impl FrogStateBuilder {
         };
 
         // Host `data` types, if any, before anything references them.
+        // `ReadError` is already present — `TypeChecker::new()` seeds it
+        // directly, the way `Range`/`Iterable`/`Container` are seeded,
+        // rather than being evaluated here: evaluating it would consume an
+        // `entry_id`/`entry_sources` slot ahead of the embedder's own first
+        // entry (`test_source_map.rs` pins the first *user* eval at entry
+        // 0), and `read` needs to be unconditionally available the way
+        // `print` is, not gated behind a builder call.
         for src in &self.prelude {
             state.eval(src)?;
         }

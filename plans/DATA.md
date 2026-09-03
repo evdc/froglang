@@ -138,11 +138,11 @@ tier and the interop tier; the syntax changes are deliberately last.
 | # | Stage | Unblocks | Depends on |
 |---|---|---|---|
 | 0 | **done** — List printing into the codegen walk | everything | — |
-| 1 | **`print` half done** — `print` / `repr` split; `Show`+`Eq` totality | the law | 0 |
+| 1 | **done** — `print` / `repr` split; `Show`+`Eq` totality | the law | 0 |
 | 2 | **done** — float and string notation fixes | the law | — |
 | 3 | **done** — Source map: fn-ptr → span, rustc-style error rendering | diagnostics (function printing still blocked on function values existing) | — |
 | 4 | `Sink` (implemented by `StrBuf`) — **`Linear`'s enforcement now exists** (`TRAITS.md` Part 7), `Sink` itself doesn't | every serializer | — |
-| 5 | `repr` / `read` at the typed-AST layer; the property test | Tier 1 | 1, 2, 4 |
+| 5 | **done** — `repr` / `read` at the typed-AST layer; the property test | Tier 1 | 1, 2, 4 |
 | 6 | Annotations: syntax, typed declarations, validation | Tier 2, host-side libs | — |
 | 7 | Host exposure of the declaration table | ORM/DB use case | 6 |
 | 8 | JSON interop tier | Tier 2 | 5, 6 |
@@ -238,16 +238,19 @@ Done, all of it on the `print` side:
   The error now names the struct. A type that reaches itself (a nominal union's variant
   carrying that union) terminates via a `seen` list and is treated as satisfied.
 
-Not done, deliberately:
+Since done, on the `repr` side (Stage 5 landed this):
 
-- **`Show` as a `Trait` variant.** Its only consumer is `repr`, which is Stage 5 by this
-  document's own layer table, and `print` is total and requires no trait. The recursion
-  in `type_implements_rec` is trait-generic, so adding the variant is the whole change
-  when Stage 5 arrives.
+- **`Trait::Show` exists** (`typeck.rs`), exactly the trait-generic extension of
+  `type_implements_rec` this section predicted — structural like `Eq`, with the same
+  recursion, a `Type::Function` member excluded. `check_reprable`/`is_repr` consult it.
+- **`print(x) == repr(x)` drift test**: `tests/test_repr.rs::repr_and_print_agree_on_every_form`,
+  a fixed table across every `print_value` arm.
+
+Still not done, deliberately:
+
 - **`<func ... @ span>`.** Function values can't be used as values at all yet ("'g' is a
   function — it can be called, or given another name with 'let', but not used as a
   value"), so there is nothing to print. Stage 3's source map and this land together.
-- **`print(x) == repr(x)` drift test.** Needs `repr`.
 
 ### Why two layers is correct here, not an accident
 
@@ -479,17 +482,104 @@ Part 7); the operator, if wanted, is a one-line sugar afterward, not a design of
 
 ---
 
-## Stage 5 — `repr` / `read`, and the law under test
+## Stage 5 — `repr` / `read`, and the law under test — **done**
 
-`repr` as a typed-AST desugar over the `Sink`, sharing the walk's shape with `print`. `read(s): T`
-return-type directed, per TRAITS.md's `zero(): Self` mechanism.
+`repr(x): Str` and `read(s): T | ReadError` both ship, the law is property-tested, and
+`FrogState::new()` (not just `with_stdlib()`) has both — `read`/`repr` are core builtins
+like `print`, not stdlib-gated.
 
-Then the property test, which is the actual deliverable of this stage.
+**Known dependency, resolved before this stage started**: qualified variant names
+(`Shape.Circle(r=1)`) were already spellable and resolvable — `grammar.rs` keeps a dotted
+callee as one `FieldAccess` node, and `resolve_variant_callee` already handled it. The
+README's "Up Next" entry recording this as outstanding was stale; Tier 1 needed nothing
+here.
 
-**Known dependency**: qualified variant names. `Circle(r=1)` printed from an anonymous union is
-ambiguous if two `data ... is` declarations both have a `Circle`, so the notation wants
-`Shape.Circle(r=1)`. README's "Up Next" records that qualified variant names are not yet
-spellable in a `TypeExpr` nor resolvable as a pattern. Same fix, and Tier 1 needs it.
+**Built without Stage 4 (`Sink`), contrary to this doc's own dependency listed above.**
+`repr` concatenates via ordinary `Str + Str` (`Binary{Plus}` → `frog_str_concat`) and a
+new internal `__str_join` builtin for `List<T>`'s per-element fragments, exactly the way
+the "central decision" table always allowed (Tier 1 is canonical notation, not
+performance-optimal notation) — `Sink`/`StrBuf` would cut the allocation count for a wide
+struct, not enable the law. Recorded as a real, accepted cost, not a gap: see Stage 4's
+own "Risks" note below for the O(n²)-in-fragment-count mitigation taken instead
+(adjacent-`StrLit` folding at build time).
+
+### Architecture
+
+Two layers, each doing what it's already good at — not the codegen-emitter design this
+section originally sketched:
+
+- **`repr` is a typed-AST desugar** (`TypeChecker::desugar_notation`, beside
+  `desugar_struct_eq`), run once per entry **after** `monomorphize_generics` and before
+  `liveness::number_nodes` (both in `state.rs`'s `eval_with_base` and
+  `codegen::compile_and_run`). Post-monomorphization placement is load-bearing, not
+  cosmetic: a value's type is only guaranteed fully substituted at that point, and
+  `self.lookup` on an unresolved binder earlier would risk emitting `"[]"` for a
+  possibly-non-empty list. `build_repr`/`build_repr_struct`/`build_repr_list`/
+  `build_repr_union` mirror `print_value`'s exact arm order and output format
+  byte-for-byte (asserted by `test_repr.rs`'s drift test), synthesizing ordinary
+  `FieldAccess`/`VariantField`/`IsVariant`/`Narrow`/`Comprehension` nodes — the same
+  vocabulary `desugar_struct_eq`/`lower_match` already use, not a new mechanism.
+- **`read` is a runtime parser plus a typed-AST desugar over it, not a codegen walk.**
+  `repr`'s output is frog source by definition, so `runtime::read`'s authority on reading
+  it back is `frontend::parser::Parser` itself — the same "round-trips through the lexer"
+  discipline `notation.rs` already established, extended one level. `frog_read_open`
+  parses once into an ordinary `Expression` tree; every other `frog_read_*` accessor is
+  **sticky-error-and-continue** (records the first mismatch, returns an always-valid
+  placeholder, keeps going) — which is what lets `build_read` synthesize one
+  unconditional "happy path" expression per type, checked against `frog_read_failed()`
+  exactly once at the end, with no early-exit control flow of its own. `read`'s dispatch
+  hangs off `lower_expected` exactly like `zero(): Self` (TRAITS.md) does — return-type
+  directed, no new mechanism there either.
+
+Both `Show` (structural, mirrors `Eq`'s recursion) and the property test's law were built
+as this section originally specified.
+
+### What it took beyond the sketch
+
+- **Return-type-directed dispatch already existed** (`zero_self_target`/
+  `lower_zero_self_call`, TRAITS.md's `zero(): Self`) — `read` is one more arm in
+  `lower_expected`, not new machinery.
+- **`is_repr`'s `Show`/recursive-union checks had to defer past a bare generic
+  `TypeVar`**, mirroring `join_operand_types`'s existing defer for `Num`/`Eq`/`Ord`
+  bounds — otherwise `func show<T>(x: T): Str = repr(x)` could never type-check for any
+  concrete `T`, since `Show` has no bound-inference story of its own yet. Re-checked in
+  `desugar_notation` once monomorphization gives each call site a concrete type.
+- **Union-into-union widening doesn't exist** (`lower_widen` rejects it explicitly —
+  different tag numbering/representation). `read(s): Shape | ReadError`, where `Shape`
+  is itself `Circle | Rect`, needs it: the narrow `Shape`-typed happy-path value can't be
+  widened into the wider `Shape | ReadError` afterward. Fixed by building
+  `VariantInit`/`Widen` nodes stamped with the **wide** target type from the start
+  (`build_read_union_as`) rather than building narrow and widening after —
+  `compile_variant_init` already recomputes a variant's tag/column layout from whatever
+  type is stamped on the node, so this sidesteps the limitation instead of needing to
+  lift it. `catch`'s own handler-widening hits the identical wall independently (a
+  pre-existing gap, not something this stage introduced or fixed).
+- **`TypedExprKind::Range`'s own doc comment is stale.** It says "eagerly materialized as
+  `List<Int>`"; `lower_range` actually types a bare `a..b` as `Range<Int>` (RANGES.md),
+  and codegen compiles it as the flat `(start, end)` pair that type's unboxed
+  representation is — never allocating a list. `build_read_list`'s synthesized `0..len`
+  iterable had to be typed `Range<Int>`, not `List<Int>`.
+- **A real GC bug, exactly the kind this doc's own risk section anticipated**:
+  `frog_read_str` was missing `jit_frame_guard!()` before its allocating call. Silent
+  without `FROG_GC_STRESS=1`; under it, a `List<Str>` built via `read` silently aliased
+  element N with element N+1, then a `bytes_allocated` underflow panic in `gc::sweep` on
+  a later collection. Caught immediately because every new construct was tested under
+  `FROG_GC_STRESS=1` from the start, not at the end — the mitigation this doc's own
+  "Risks" section prescribes.
+- **The property test found two pre-existing bugs unrelated to this stage**, both in
+  `!`/`==`/`catch` machinery that existed before `repr`/`read` did and reproduce with
+  plain hand-written source: (1) `==` is wrong for a union whose only members are `None`
+  plus a struct/error type (tag narrowing is fine; only `==` is wrong); (2) `!` + `==`
+  crashes the Cranelift verifier for an anonymous union mixing a `Bool`/`Float` member
+  with another scalar, joined with an `Error`-providing type. Both reported; the
+  generator and one hand-written test were adjusted to route around them rather than
+  fixing them here.
+
+### Verification
+
+`tests/test_repr.rs` (20), `tests/test_read.rs` (21), `tests/test_notation_law.rs` (40
+generated seeds) — all green, including under `FROG_GC_STRESS=1`. Full crate suite (44
+binaries) unaffected.
 
 ---
 
@@ -749,8 +839,14 @@ TRAITS.md stages 2–3 land. Runtime reflection declined.**
 - **Default union tagging** — external or internal.
 - **Is `StrBuf` the same object as a `Sink` trait**, or does `Sink` come later as an abstraction
   over it? Deciding at design time is cheaper than retrofitting.
-- **Does closing `project_list_aliasing_gap` become a prerequisite** for asserting the law, or
-  can `repr` ship with a depth limit as a stopgap? Prefer the former.
+- ~~**Does closing `project_list_aliasing_gap` become a prerequisite** for asserting the law?~~
+  *Settled, stage 5*: not a prerequisite — the gap can't build a cycle. `finish_push` (and the
+  general `check_mut_exclusivity`) rejects `push(mut xs, xs)` by name against the place's own
+  root; a self-referential *type* is rejected earlier still (`check_no_recursive_union`, which
+  `check_reprable`/`check_readable` both call); and even a nominal self-reference can't alias at
+  runtime because copy-on-write's write barrier deep-clones the shared root before the store
+  lands (MUTABILITY.md Stage 7). The law is asserted with no seen-set and no depth limit
+  (`tests/test_notation_law.rs`).
 - ~~**`Sink`'s exemption from value semantics**~~ *Settled*: `Sink` implementers require
   `provides Linear` (`TRAITS.md` Part 7) — a checked marker trait, not a special-cased rule, and
   it generalizes to any future host-provided handle type (locks, channels, one-shot futures) with

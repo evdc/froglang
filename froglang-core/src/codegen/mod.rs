@@ -4179,6 +4179,38 @@ impl Codegen {
         builder.symbol("frog_cow_verify", ffi::frog_cow_verify as *const u8);
         builder.symbol("frog_clone",       ffi::frog_clone       as *const u8);
         builder.symbol("frog_ctx_current", crate::runtime::host::frog_ctx_current as *const u8);
+        // `repr` leaves (plans/DATA.md stage 5) — see `desugar_notation` in typeck.rs.
+        builder.symbol("frog_int_repr",    ffi::frog_int_repr    as *const u8);
+        builder.symbol("frog_float_repr",  ffi::frog_float_repr  as *const u8);
+        builder.symbol("frog_bool_repr",   ffi::frog_bool_repr   as *const u8);
+        builder.symbol("frog_str_repr",    ffi::frog_str_repr    as *const u8);
+        builder.symbol("frog_str_join",    ffi::frog_str_join    as *const u8);
+        // `read` (plans/DATA.md stage 5) — see `TypeChecker::build_read` in typeck.rs.
+        builder.symbol("frog_read_open",      crate::runtime::read::frog_read_open      as *const u8);
+        builder.symbol("frog_read_close",     crate::runtime::read::frog_read_close     as *const u8);
+        builder.symbol("frog_read_failed",    crate::runtime::read::frog_read_failed    as *const u8);
+        builder.symbol("frog_read_offset",    crate::runtime::read::frog_read_offset    as *const u8);
+        builder.symbol("frog_read_msg",       crate::runtime::read::frog_read_msg       as *const u8);
+        builder.symbol("frog_read_is_int",    crate::runtime::read::frog_read_is_int    as *const u8);
+        builder.symbol("frog_read_is_float",  crate::runtime::read::frog_read_is_float  as *const u8);
+        builder.symbol("frog_read_is_bool",   crate::runtime::read::frog_read_is_bool   as *const u8);
+        builder.symbol("frog_read_is_str",    crate::runtime::read::frog_read_is_str    as *const u8);
+        builder.symbol("frog_read_is_none",   crate::runtime::read::frog_read_is_none   as *const u8);
+        builder.symbol("frog_read_is_list",   crate::runtime::read::frog_read_is_list   as *const u8);
+        builder.symbol("frog_read_is_range",  crate::runtime::read::frog_read_is_range  as *const u8);
+        builder.symbol("frog_read_is_struct", crate::runtime::read::frog_read_is_struct as *const u8);
+        builder.symbol("frog_read_expect",    crate::runtime::read::frog_read_expect    as *const u8);
+        builder.symbol("frog_read_int",       crate::runtime::read::frog_read_int       as *const u8);
+        builder.symbol("frog_read_float",     crate::runtime::read::frog_read_float     as *const u8);
+        builder.symbol("frog_read_bool",      crate::runtime::read::frog_read_bool      as *const u8);
+        builder.symbol("frog_read_str",       crate::runtime::read::frog_read_str       as *const u8);
+        builder.symbol("frog_read_field",     crate::runtime::read::frog_read_field     as *const u8);
+        builder.symbol("frog_read_arg",       crate::runtime::read::frog_read_arg       as *const u8);
+        builder.symbol("frog_read_is_call",   crate::runtime::read::frog_read_is_call   as *const u8);
+        builder.symbol("frog_read_list_len",  crate::runtime::read::frog_read_list_len  as *const u8);
+        builder.symbol("frog_read_list_at",   crate::runtime::read::frog_read_list_at   as *const u8);
+        builder.symbol("frog_read_range_lo",  crate::runtime::read::frog_read_range_lo  as *const u8);
+        builder.symbol("frog_read_range_hi",  crate::runtime::read::frog_read_range_hi  as *const u8);
 
         // Host functions (`FrogStateBuilder::func`, `plans/EMBEDDING.md`).
         // Registered before any frog type is resolved — each shim's JIT
@@ -4251,6 +4283,43 @@ impl Codegen {
         // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,
         // "Getting the ctx pointer without baking an address").
         declare_rt(&mut module, &mut func_ids, "frog_ctx_current", "frog_ctx_current", &[], Some(I64));
+        // `repr` leaves (plans/DATA.md stage 5). `__repr_int`/`__repr_float`/
+        // `__repr_bool`/`__repr_str`/`__str_join` are the `func_ids` keys
+        // `desugar_notation` synthesizes `Var(...)` callables under — never
+        // spellable in source, so they need no `compile_call` special case:
+        // they go through the ordinary named-call path at the bottom of
+        // `compile_call`, keyed by these aliases exactly like `"print"` is
+        // an alias for `frog_str_println` above.
+        declare_rt(&mut module, &mut func_ids, "frog_int_repr",   "__repr_int",     &[I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_float_repr", "__repr_float",   &[types::F64],    Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_bool_repr",  "__repr_bool",    &[types::I8],     Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_str_repr",   "__repr_str",     &[I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_str_join",   "__str_join",     &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_open",     "frog_read_open",     &[I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_close",    "frog_read_close",    &[],              None);
+        declare_rt(&mut module, &mut func_ids, "frog_read_failed",   "frog_read_failed",   &[],              Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_offset",   "frog_read_offset",   &[],              Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_msg",      "frog_read_msg",      &[],              Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_int",    "frog_read_is_int",    &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_float",  "frog_read_is_float",  &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_bool",   "frog_read_is_bool",   &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_str",    "frog_read_is_str",    &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_none",   "frog_read_is_none",   &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_list",   "frog_read_is_list",   &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_range",  "frog_read_is_range",  &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_struct", "frog_read_is_struct", &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_expect",    "frog_read_expect",    &[I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_int",      "frog_read_int",      &[I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_float",    "frog_read_float",    &[I64],           Some(types::F64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_bool",     "frog_read_bool",     &[I64],           Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_str",      "frog_read_str",      &[I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_field",    "frog_read_field",    &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_arg",      "frog_read_arg",      &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_call",  "frog_read_is_call",  &[I64, I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_list_len", "frog_read_list_len", &[I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_list_at",  "frog_read_list_at",  &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_range_lo", "frog_read_range_lo", &[I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_range_hi", "frog_read_range_hi", &[I64],           Some(I64));
 
         // Every host function shares this one import signature — see
         // `Ctx`'s `host_fns` field and `compile_call`'s host-call arm.
@@ -4802,6 +4871,13 @@ pub fn compile_and_run(src: &str) -> i64 {
     let ast = Parser::parse(src).expect("parse error");
     let mut tc = TypeChecker::new();
     let mut typed = tc.check_and_lower(ast).expect("type error");
+    // `plans/DATA.md` stage 5 — see the matching call in `state.rs`'s
+    // `eval_with_base` for why this runs before `number_nodes`. No
+    // `monomorphize_generics` call precedes it here (this entry point
+    // never monomorphizes at all — a pre-existing limitation, not one
+    // `repr` introduces), so `repr(x)` inside a generic function's body
+    // is unsupported through this path exactly as generics generally are.
+    tc.desugar_notation(&mut typed).expect("repr type error");
     crate::frontend::liveness::number_nodes(&mut typed);
 
     let mut codegen = Codegen::new();

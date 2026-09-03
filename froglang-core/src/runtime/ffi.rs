@@ -6,7 +6,7 @@ use super::gc::{FrogList, FrogStr, FrogVariant, GcHeap, RuntimeRoots, GC_HEAP, A
 /// Call `f` with a mutable reference to the active GcHeap.
 /// Uses the `FrogState`-owned heap if one is executing on this thread,
 /// otherwise falls back to the thread-local GC_HEAP.
-fn with_heap<F, R>(f: F) -> R
+pub(super) fn with_heap<F, R>(f: F) -> R
 where
     F: FnOnce(&mut GcHeap) -> R,
 {
@@ -136,21 +136,28 @@ pub extern "C" fn frog_str_print(s: i64) {
     }
 }
 
-/// Print a string as a quoted, escaped literal. Composite value formatting
-/// uses this so string fields remain unambiguous while plain `print(str)`
-/// keeps its existing raw-text behavior.
-#[no_mangle]
-pub extern "C" fn frog_str_repr_print(s: i64) {
+/// `s`, quoted and escaped as a frog string literal — the shared body of
+/// `frog_str_repr_print` (writes it to stdout) and `frog_str_repr`
+/// (`plans/DATA.md` stage 5: `repr`'s allocating twin, returning a fresh
+/// `FrogStr` instead). `crate::notation::escape_str`, not Rust's `{:?}`:
+/// `escape_debug` spells escapes froglang's lexer doesn't accept.
+fn escaped_str(s: i64) -> String {
     let ptr = s as *const FrogStr;
     unsafe {
         let len = (*ptr).len as usize;
         let data = (ptr as *const u8).add(std::mem::size_of::<FrogStr>());
         let bytes = std::slice::from_raw_parts(data, len);
-        // `crate::notation::escape_str`, not Rust's `{:?}`: `escape_debug`
-        // spells escapes froglang's lexer doesn't accept.
-        let _ = write!(std::io::stdout(), "{}", crate::notation::escape_str(&String::from_utf8_lossy(bytes)));
-        let _ = std::io::stdout().flush();
+        crate::notation::escape_str(&String::from_utf8_lossy(bytes))
     }
+}
+
+/// Print a string as a quoted, escaped literal. Composite value formatting
+/// uses this so string fields remain unambiguous while plain `print(str)`
+/// keeps its existing raw-text behavior.
+#[no_mangle]
+pub extern "C" fn frog_str_repr_print(s: i64) {
+    let _ = write!(std::io::stdout(), "{}", escaped_str(s));
+    let _ = std::io::stdout().flush();
 }
 
 /// Print a host-owned byte slice. Used by generated formatting code for
@@ -197,6 +204,91 @@ pub extern "C" fn frog_bool_print(b: i8) { print!("{}", b != 0); }
 // List printing lives in codegen (`print_list`), not here: the runtime has
 // no element-type information, so a runtime printer could only emit
 // `<struct>`/`<list>` placeholders. See plans/DATA.md stage 0.
+
+// ── `repr` leaves (plans/DATA.md stage 5) ───────────────────────────────────
+//
+// The allocating twins of `frog_{int,float,bool,str}_print` above: each
+// returns a fresh `FrogStr` instead of writing to stdout, for
+// `desugar_notation`'s scalar arms (`typeck.rs`) to concatenate.
+
+#[no_mangle]
+pub extern "C" fn frog_int_repr(n: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
+    let s = n.to_string();
+    with_heap(|heap| {
+        heap.maybe_collect();
+        heap.alloc_str(s.as_bytes()) as i64
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn frog_float_repr(n: f64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
+    let s = crate::notation::float_repr(n);
+    with_heap(|heap| {
+        heap.maybe_collect();
+        heap.alloc_str(s.as_bytes()) as i64
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn frog_bool_repr(b: i8) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
+    let s = if b != 0 { "true" } else { "false" };
+    with_heap(|heap| {
+        heap.maybe_collect();
+        heap.alloc_str(s.as_bytes()) as i64
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn frog_str_repr(s: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
+    let _roots = RuntimeRoots::hold(&[s]);
+    let escaped = escaped_str(s);
+    with_heap(|heap| {
+        heap.maybe_collect();
+        heap.alloc_str(escaped.as_bytes()) as i64
+    })
+}
+
+/// Concatenate a `List<Str>` with a separator between elements —
+/// `desugar_notation`'s `List<T>` arm reduces its per-element `repr`
+/// fragments this way instead of an O(depth) `+` chain. An **internal**
+/// builtin, not `stdlib`'s host `join`: base `FrogState::new()` has no
+/// stdlib, and `repr` must not be stdlib-only (`typeck.rs`'s
+/// `compile_call` dispatches on the callee name `"__str_join"`, exactly
+/// like `print`/`push`/`len`, and only `desugar_notation` ever synthesizes
+/// a call to it — it is never a name user source can spell).
+#[no_mangle]
+pub extern "C" fn frog_str_join(list: i64, sep: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
+    let _roots = RuntimeRoots::hold(&[list, sep]);
+    let len = frog_list_len(list);
+    let sep_ptr = sep as *const FrogStr;
+    let (sep_data, sep_len) = unsafe {
+        let l = (*sep_ptr).len as usize;
+        ((sep_ptr as *const u8).add(std::mem::size_of::<FrogStr>()), l)
+    };
+    let sep_bytes = unsafe { std::slice::from_raw_parts(sep_data, sep_len) };
+
+    let mut buf: Vec<u8> = Vec::new();
+    for i in 0..len {
+        if i > 0 { buf.extend_from_slice(sep_bytes); }
+        let elem = frog_list_get(list, i, 0);
+        let elem_ptr = elem as *const FrogStr;
+        unsafe {
+            let elem_len = (*elem_ptr).len as usize;
+            let elem_data = (elem_ptr as *const u8).add(std::mem::size_of::<FrogStr>());
+            buf.extend_from_slice(std::slice::from_raw_parts(elem_data, elem_len));
+        }
+    }
+
+    with_heap(|heap| {
+        heap.maybe_collect();
+        heap.alloc_str(&buf) as i64
+    })
+}
 
 // ── List operations ───────────────────────────────────────────────────────────
 
@@ -629,5 +721,68 @@ mod tests {
         assert_eq!(frog_list_get(list, 0, 0), 10);
         assert_eq!(frog_list_get(list, 1, 0), 20);
         assert_eq!(frog_list_get(list, 2, 0), 30);
+    }
+
+    /// Read a `FrogStr`'s bytes back into an owned Rust `String`, for
+    /// asserting on what the new `repr`-leaf FFI functions allocated.
+    fn read_str(ptr: i64) -> String {
+        let p = ptr as *const FrogStr;
+        unsafe {
+            let len = (*p).len as usize;
+            let data = (p as *const u8).add(std::mem::size_of::<FrogStr>());
+            String::from_utf8_lossy(std::slice::from_raw_parts(data, len)).into_owned()
+        }
+    }
+
+    #[test]
+    fn test_frog_int_repr() {
+        assert_eq!(read_str(frog_int_repr(42)), "42");
+        assert_eq!(read_str(frog_int_repr(-7)), "-7");
+    }
+
+    #[test]
+    fn test_frog_float_repr() {
+        assert_eq!(read_str(frog_float_repr(1.0)), "1.0");
+        assert_eq!(read_str(frog_float_repr(f64::INFINITY)), "inf");
+    }
+
+    #[test]
+    fn test_frog_bool_repr() {
+        assert_eq!(read_str(frog_bool_repr(1)), "true");
+        assert_eq!(read_str(frog_bool_repr(0)), "false");
+    }
+
+    #[test]
+    fn test_frog_str_repr_escapes_and_quotes() {
+        let s = b"a\nb";
+        let ptr = frog_alloc_str(s.as_ptr() as i64, s.len() as i64);
+        with_heap(|heap| heap.push_root(ptr, true));
+        assert_eq!(read_str(frog_str_repr(ptr)), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn test_frog_str_join() {
+        // stride 1, ptr_mask 1: one pointer-typed slot per element — the
+        // `List<Str>` layout `desugar_notation`'s `List<T>` arm produces.
+        let list = frog_alloc_list(3, 1, 1);
+        with_heap(|heap| heap.push_root(list, true));
+        for s in [&b"a"[..], &b"b"[..], &b"c"[..]] {
+            let ptr = frog_alloc_str(s.as_ptr() as i64, s.len() as i64);
+            frog_list_push(list, ptr);
+        }
+        let sep = b", ";
+        let sep_ptr = frog_alloc_str(sep.as_ptr() as i64, sep.len() as i64);
+        with_heap(|heap| heap.push_root(sep_ptr, true));
+        assert_eq!(read_str(frog_str_join(list, sep_ptr)), "a, b, c");
+    }
+
+    #[test]
+    fn test_frog_str_join_empty_list_is_empty_string() {
+        let list = frog_alloc_list(0, 1, 1);
+        with_heap(|heap| heap.push_root(list, true));
+        let sep = b", ";
+        let sep_ptr = frog_alloc_str(sep.as_ptr() as i64, sep.len() as i64);
+        with_heap(|heap| heap.push_root(sep_ptr, true));
+        assert_eq!(read_str(frog_str_join(list, sep_ptr)), "");
     }
 }

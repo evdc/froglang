@@ -16,6 +16,63 @@ removed rather than struck through — check `plans/*.md` git history if you wan
   narrow, and recurse `coerce_truthy` on the narrowed value to reuse its own (already-working)
   scalar rule. No codegen changes needed. `test_truthy_and_narrowing.rs` and the full suite still
   pass; spot-checked 2- and 3-member unions (`Int | Str | None`) by hand across `if`/`or`.
+- ~~**"Cheaper primitive-member union matches"** (was listed below as near-term).~~ **Done.**
+  The premise was already stale when written: `plans/RUNTIME.md` Part 1's tagged-pointer
+  representation had removed the boxing, so `Int | E` is an unboxed `(tag+ptr, scalar)` register
+  pair and the `fallible`/`infallible` benchmark pair now run within noise of each other.
+  What the audit did turn up in that area, both fixed:
+  - **Bug (crash): a union with a `Float` member could not be matched at all.** Any
+    `match`/`?`/`!`/`catch` on `Float | E` aborted in Cranelift's verifier (`iconst_bounds`,
+    "entered unreachable code"). `TypedExprKind::Conditional`'s missing-false-branch path built
+    its unreachable placeholder with `iconst`, which is integer-only, while the merge block a
+    `Float`-member match joins into is `F64`. `Int`/`Bool` members were fine, which is why it
+    survived — one-line fix to use the existing `placeholder_value` helper.
+  - **The rightmost arm of an exhaustive `match` carried a tag test that cannot fail.**
+    `fold_match_arm` folds right-to-left, so a `None` tail plus an unguarded arm means every
+    other member is handled to its left; the test is now dropped. A guarded last arm keeps
+    both test and guard, since the guard may have side effects. Two-member unions — the shape
+    `?`/`!`/`catch` desugar to — go from two branches per dispatch to one; `orders` drops from
+    496 to 463 CLIF instructions and 91 to 80 blocks. Wall-clock is unchanged (the branch
+    predicted perfectly), so this is a code-size and compile-work win, not a speed one.
+  - Tests: four new cases in `tests/test_union_repr.rs`, each also run under `FROG_GC_STRESS=1`.
+  - Added `FROG_DUMP_CLIF`, the sibling of `FROG_DUMP_LIVENESS`/`FROG_JIT_SYMBOLS`: without a
+    view of the emitted IR, a verifier panic names no froglang code at all.
+- ~~**Bug (parse): an `else`-less `if` parsed only as the last expression in a file.**~~
+  **Fixed.** `if cond then side_effect()` followed by any further statement failed with
+  "expected an operator" on the *next* line — at top level, in a `{}` block, and as a function
+  body alike. `Grammar::conditional` skipped newlines after the true branch before looking for
+  `else`, eating the separator the enclosing block was about to require. Nothing was wrong with
+  the semantics: the implicit `else none` (so the type is `T | None`) has always been there in
+  the type checker; this was purely the newline rule. Fixed with the existing
+  `Parser::peek_past_newlines_is`, which commits to the skip only when an `else` really
+  follows and otherwise rolls back onto the newline — the same primitive the `data ... is`
+  variant list already uses for the same ambiguity. Tests in `test_parser.rs` (structural, both
+  directions) and `test_run.rs` (statement-position behaviour).
+- ~~**A sweep of the rest of the newline/separator grammar.**~~ **Fixed.** Probing every
+  delimiter turned up four more gaps of the same kind — "when is a newline whitespace and when
+  is it a separator?" — answered with one rule: a newline is whitespace after a *required*
+  delimiter (the grammar demands more input, so it cannot mean "statement over") and inside
+  `( )`/`[ ]` (the closing bracket is an unambiguous terminator), and is a separator everywhere
+  else.
+  - **`;` did not separate *top-level* statements.** `print("a"); print("b")` was "expected
+    newline, found `;`", though the identical line inside `{ }` worked — `Grammar::block_expr`
+    accepted both separators, `Parser::statement` only `Newline`.
+  - **Newlines were not allowed inside `( )`.** `(1\n)` and `(\n1)` failed;
+    `Parser::expression_list` had long since made them insignificant inside `[ ]` and call
+    argument lists, and documented why. Extended to `func`/`data` parameter and field lists,
+    which had the same gap on the declaration side of the same parens.
+  - **Bug: `(x, y) -> x + y` did not parse** — a form the README documents. `grouping` gave up
+    at the comma; `arrow_func` had had the `Expression::Tuple` → parameters branch all along,
+    so only the way in was missing. `()` is now a zero-parameter lambda's list too. The `->` is
+    *required* after a parenthesised comma list — `Expression::Tuple` is also the list
+    literal's node, so an arrow-less one would quietly make `(1, 2)` mean `[1, 2]`; it is an
+    error naming the missing `->`, mirroring `type_atom`'s type-level wording.
+  - **`->`, `do`, `in`, `catch`, `provides` did not skip a following newline**, though `=`,
+    `then`, `else` and `is` did — nothing distinguished them, it was just an oversight. So
+    `x ->`⏎`body`, `for i in xs do`⏎`body` and `[for i in 0..3`⏎`do i * 2]` all work now.
+  - **Doc fix:** README described function types as `(T1, T2, ...) -> R`. The parser has only
+    ever accepted `(T1, T2 -> R)` — parens around the whole type, arrow included — which is
+    what makes `f: (Int -> Int)` unambiguous without lookahead.
 
 ### Corrections to formerly-stale docs (fixed 2026-09-01)
 
@@ -46,10 +103,13 @@ removed rather than struck through — check `plans/*.md` git history if you wan
 
 - **Better error messages** — span-aware, rustc-style rendered errors (`miette` or `ariadne`).
   Errors still print as raw `Debug` output. Still the single highest-leverage usability item.
-- **Cheaper primitive-member union matches** — `?`/`catch`/`is`/`match` on a union whose
-  non-error member is `Int`/`Float`/`Bool` still goes through the same boxed-union machinery as
-  the `Str`/struct/list case (the `orders` benchmark regression this caused is documented in
-  `README.md`'s Benchmarks section).
+- **A real line-joining rule** — the one parse gap deliberately left open by the sweep above.
+  A newline after a binary operator (`(1 +\n2)`), or before a `.` or a `catch`, still ends the
+  statement. Every other delimited context now tolerates newlines, so this is the last
+  inconsistency, but it is the one that is genuinely ambiguous: fixing it properly means a
+  bracket-depth counter in the lexer suppressing `Newline` inside `(`/`[` (and restoring it
+  inside a nested `{`), Python-style, rather than another local `skip_newlines`. Worth doing as
+  its own change, with its own tests.
 - **Operators desugaring to member calls** — `data Vec2(...) provides Num` still can't give you
   `+`; `join_operand_types`/`compile_binary` are hardcoded to the built-in numeric types.
 - **Structural `Show` and `Error.message`** — `provides Show for X` errors "Unknown trait 'Show'".

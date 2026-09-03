@@ -136,10 +136,10 @@ impl<'a> Parser<'a> {
         let mut exprs = vec![];
         let start = self.current_token.span;
         while !self.check(&Token::EOF) {
-            // Skip blank lines (including comment-only lines, which emit a bare Newline)
-            while self.check(&Token::Newline) {
-                let _ = self.advance();
-            }
+            // Skip blank lines (including comment-only lines, which emit a
+            // bare Newline) and any run of `;`, so `a;; b` and `a;\nb` are
+            // as unremarkable at the top level as they are inside `{ }`.
+            self.skip_newlines_and_semicolons();
             if self.check(&Token::EOF) { break; }
             let maybe_expr = self.statement();
             match maybe_expr {
@@ -159,6 +159,15 @@ impl<'a> Parser<'a> {
         let expr = self.expression(Precedence::Assign)?;
         // the final newline should be able to be elided
         if self.check(&Token::EOF) {
+            return Ok(expr);
+        }
+        // `;` separates statements exactly as a newline does — the same two
+        // separators `Grammar::block_expr` accepts inside `{ }`, which the
+        // top level had no reason to be stricter than. `block`'s loop eats
+        // any further run of separators, so `a; b`, `a;; b` and `a;\nb` all
+        // land here with one to consume.
+        if self.check(&Token::Semicolon) {
+            let _ = self.advance()?;
             return Ok(expr);
         }
         self.consume(Token::Newline)?;

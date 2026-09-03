@@ -254,10 +254,25 @@ fn test_nested_grouping() {
 
 #[test]
 fn test_empty_grouping() {
-    // Testing empty parentheses - should produce an error
+    // `()` is still an error, but a more specific one than "expected an
+    // expression": the only thing `()` can be is a zero-parameter lambda's
+    // parameter list, so the error names the `->` that would make it one.
     let result = Parser::new("()").expression(Precedence::Assign);
     let err = result.unwrap_err();
-    assert_eq!(err.item, ParseError::ExpectedExpression);
+    match err.item {
+        ParseError::Other(msg) => assert!(msg.contains("`->`"), "got {:?}", msg),
+        other => panic!("expected the parameter-list error, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_empty_parens_are_a_zero_parameter_lambda() {
+    // ... and with the `->` present, that is exactly what they are.
+    let result = Parser::new("() -> 1").expression(Precedence::Assign);
+    match result.expect("parse error").item {
+        Expression::Function(f) => assert!(f.params.is_empty(), "got {:?}", f.params),
+        other => panic!("expected Function, got {:?}", other),
+    }
 }
 
 #[test]
@@ -1095,4 +1110,165 @@ fn test_import_qualified() {
         }
         other => panic!("expected Import, got {:?}", other),
     }
+}
+// ── `else`-less `if` and the statement separator after it ────────────────────
+//
+// `if` is an expression, but it is genuinely useful in statement position
+// (`if cond then side_effect()`), and its type is already `T | None` — the
+// implicit `else none` lives in the type checker. What was missing was
+// purely syntactic: `Grammar::conditional` skipped newlines after the true
+// branch *before* looking for `else`, which ate the separator the enclosing
+// block was about to require. An `else`-less `if` therefore parsed only as
+// the very last expression in a file; anywhere else it swallowed the
+// newline and then failed on the next statement with "expected an
+// operator". `peek_past_newlines_is` makes the skip conditional on an
+// `else` actually following.
+
+/// The regression itself: two statements in, two statements out.
+#[test]
+fn else_less_if_does_not_swallow_the_following_statement() {
+    let block = Parser::parse("if 1 > 0 then f()\ng()").expect("parse error");
+    match block.item {
+        Expression::Block(stmts) => {
+            assert_eq!(stmts.len(), 2, "got {:?}", stmts);
+            assert!(matches!(stmts[0].item, Expression::Conditional(_)));
+            assert!(matches!(stmts[1].item, Expression::Call(_)));
+        }
+        other => panic!("expected Block, got {:?}", other),
+    }
+}
+
+/// Blank lines between the two statements are still just separators — the
+/// rollback has to land on the *first* newline, not consume some of them.
+#[test]
+fn else_less_if_tolerates_blank_lines_before_the_next_statement() {
+    let block = Parser::parse("let y = if 1 > 0 then 1\n\n\nlet z = 2").expect("parse error");
+    match block.item {
+        Expression::Block(stmts) => assert_eq!(stmts.len(), 2, "got {:?}", stmts),
+        other => panic!("expected Block, got {:?}", other),
+    }
+}
+
+/// The other direction, which is why the skip existed at all: an `else` on
+/// its own line still belongs to the `if` above it, and so does the `else`
+/// of each rung of a multi-line `else if` chain.
+#[test]
+fn a_newline_before_else_still_continues_the_conditional() {
+    let block = Parser::parse("let y =\n  if 1 > 0 then 1\n  else if 1 > 2 then 2\n  else 3\nlet z = 4")
+        .expect("parse error");
+    let stmts = match block.item {
+        Expression::Block(stmts) => stmts,
+        other => panic!("expected Block, got {:?}", other),
+    };
+    assert_eq!(stmts.len(), 2, "the chain is one statement, `let z` the other: {:?}", stmts);
+    let outer = match &stmts[0].item {
+        Expression::Assign(a) => match &a.value.item {
+            Expression::Conditional(c) => c.clone(),
+            other => panic!("expected Conditional, got {:?}", other),
+        },
+        other => panic!("expected Assign, got {:?}", other),
+    };
+    let inner = outer.false_branch.expect("outer `else` was dropped");
+    match &inner.item {
+        Expression::Conditional(c) => assert!(c.false_branch.is_some(), "inner `else` was dropped"),
+        other => panic!("expected a nested Conditional, got {:?}", other),
+    }
+}
+
+// ── statement separators, parenthesised parameter lists, line continuation ───
+//
+// Three groups of parse gaps found by sweeping the grammar for
+// inconsistencies, all fixed together because they are the same question
+// asked in different places: when is a newline (or a `;`) a separator, and
+// when is it whitespace?
+//
+//   * `;` separates top-level statements, as it always has inside `{ }`.
+//   * Newlines are insignificant inside `( )`, as they already were inside
+//     a call's argument list and `[ ]`.
+//   * A newline immediately after a *required* delimiter is whitespace,
+//     because the grammar demands more input and the newline cannot mean
+//     "statement over". `=`, `then`, `else` and `is` already did this;
+//     `->`, `do`, `in`, `catch` and `provides` did not.
+//
+// A newline *mid-expression* — after a binary operator, before `.` or
+// `catch` — is deliberately still a statement end. That one is genuinely
+// ambiguous and would need a real line-joining rule, not a local fix.
+
+fn stmt_count(src: &str) -> usize {
+    match Parser::parse(src).expect("parse error").item {
+        Expression::Block(stmts) => stmts.len(),
+        other => panic!("expected Block, got {:?}", other),
+    }
+}
+
+#[test]
+fn semicolons_separate_top_level_statements() {
+    assert_eq!(stmt_count("f(); g()"), 2);
+    assert_eq!(stmt_count("f();"), 1, "a trailing `;` ends a statement, it doesn't start one");
+    assert_eq!(stmt_count("f();; g()"), 2, "a run of separators is one separator");
+    assert_eq!(stmt_count("f();\ng()"), 2, "mixed `;` and newline");
+}
+
+#[test]
+fn newlines_are_insignificant_inside_parens() {
+    assert_eq!(stmt_count("let y = (\n  1\n)\nlet z = 2"), 2);
+}
+
+/// `(x, y) -> x + y` is in the README and did not parse — `grouping` gave
+/// up at the comma. It is the *only* meaning a parenthesised comma list
+/// has, so the `->` is required; `(1, 2)` on its own is an error naming it,
+/// not a silent synonym for the list literal `[1, 2]`.
+#[test]
+fn a_parenthesised_comma_list_is_a_lambda_parameter_list() {
+    for src in ["(x, y) -> x + y", "(x, y,) -> x + y", "() -> 1", "(x) -> x"] {
+        let parsed = Parser::new(src).expression(Precedence::Assign);
+        assert!(
+            matches!(parsed.map(|e| e.item), Ok(Expression::Function(_))),
+            "{} should parse as a lambda", src
+        );
+    }
+}
+
+#[test]
+fn a_parenthesised_comma_list_without_an_arrow_is_rejected() {
+    let err = Parser::new("(1, 2)").expression(Precedence::Assign).unwrap_err();
+    match err.item {
+        ParseError::Other(msg) => assert!(msg.contains("tuple values"), "got {:?}", msg),
+        other => panic!("expected the parameter-list error, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_newline_after_a_required_delimiter_is_whitespace() {
+    // Each of these is one statement; a second would mean the newline was
+    // read as a separator.
+    for src in [
+        "let f = x ->\n  x + 1",
+        "let f = (x, y) ->\n  x + y",
+        "for i in\n  xs do f(i)",
+        "for i in xs do\n  f(i)",
+        "let y = f() catch\n  0",
+        "data P(x: Int) provides\n  Eq",
+        "let ok = 1 not in\n  xs",
+    ] {
+        assert_eq!(stmt_count(src), 1, "{:?} should be one statement", src);
+    }
+}
+
+/// The complement, and the reason the fix is per-delimiter rather than
+/// "skip newlines everywhere": after a complete expression, a newline still
+/// ends the statement, so these are parse errors rather than continuations.
+#[test]
+fn a_newline_mid_expression_still_ends_the_statement() {
+    for src in ["let y = (1 +\n2)", "let y = xs\n.len()", "let y = f()\ncatch 0"] {
+        assert!(Parser::parse(src).is_err(), "{:?} should not parse as a continuation", src);
+    }
+}
+
+/// A declaration's parameter/field list may wrap, exactly as a *call's*
+/// argument list already could.
+#[test]
+fn declaration_parameter_lists_may_span_lines() {
+    assert_eq!(stmt_count("func f(\n  a: Int,\n  b: Int\n): Int = a + b"), 1);
+    assert_eq!(stmt_count("data P(\n  x: Int,\n  y: Int\n)"), 1);
 }

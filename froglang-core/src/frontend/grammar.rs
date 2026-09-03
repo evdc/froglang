@@ -56,6 +56,7 @@ impl Grammar {
     /// what `in` and `not` already handle individually.
     pub fn not_in(parser: &mut Parser, token: Spanned<Token>, left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
         parser.consume(Token::In)?;
+        parser.skip_newlines();  // required delimiter — see `arrow_func`
         let right = parser.expression(precedence.next())?;
         let in_expr = Spanned {
             span: left.span.merge(right.span),
@@ -159,10 +160,71 @@ impl Grammar {
         })
     }
 
-    pub fn grouping(parser: &mut Parser, _t: Spanned<Token>) -> ParseResult {
-        let expr = parser.expression(Precedence::Assign)?;
-        parser.consume(Token::RightParen)?;
-        Ok(expr)
+    /// `(expr)` — an ordinary parenthesised group — or `(a, b, ...)`, which
+    /// is only ever a lambda's parameter list (see `paren_params`).
+    ///
+    /// Newlines are insignificant between the parens, for the reason
+    /// `Parser::expression_list` gives for `[...]` and call arguments: the
+    /// terminator is unambiguous, so nothing in here could be mistaken for
+    /// the start of a new statement. That only covers the *element*
+    /// positions, though — a newline in the middle of an expression
+    /// (`(1 +\n2)`) still ends it, the same as everywhere else.
+    pub fn grouping(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
+        parser.skip_newlines();
+        // `()` is not an expression at all — the only thing it can be is a
+        // zero-parameter lambda's parameter list, so `paren_params` demands
+        // the `->` that makes it one.
+        if parser.check(&Token::RightParen) {
+            let closing = parser.advance()?;
+            return Self::paren_params(parser, t, Vec::new(), closing);
+        }
+
+        let first = parser.expression(Precedence::Assign)?;
+        parser.skip_newlines();
+        if !parser.check(&Token::Comma) {
+            parser.consume(Token::RightParen)?;
+            return Ok(first);
+        }
+
+        let mut items = vec![first];
+        while parser.check(&Token::Comma) {
+            parser.advance()?;
+            parser.skip_newlines();
+            // A trailing comma, as `expression_list` allows for `[...]`.
+            if parser.check(&Token::RightParen) { break; }
+            items.push(parser.expression(Precedence::Assign)?);
+            parser.skip_newlines();
+        }
+        let closing = parser.consume(Token::RightParen)?;
+        Self::paren_params(parser, t, items, closing)
+    }
+
+    /// The `(a, b, ...)` on the left of a `->`: a lambda's parameter list,
+    /// handed on as an `Expression::Tuple` for `Grammar::arrow_func` to turn
+    /// into `Parameter`s (it already has that branch — this is what was
+    /// missing on the way in, so the `(x, y) -> x + y` the README documents
+    /// used to fail with "expected `)`, found `,`").
+    ///
+    /// The `->` is *required* here rather than optional. `Expression::Tuple`
+    /// is also the list literal's node, so letting one escape without an
+    /// arrow would quietly make `(1, 2)` a synonym for `[1, 2]`; froglang
+    /// has no tuple values, and the error says so — the same wording
+    /// `Grammar::type_atom` uses for the type-level version.
+    fn paren_params(
+        parser: &mut Parser,
+        open: Spanned<Token>,
+        items: Vec<Spanned<Expression>>,
+        closing: Spanned<Token>,
+    ) -> ParseResult {
+        if !parser.check(&Token::Arrow) {
+            return Err(Spanned::new(
+                ParseError::Other(
+                    "Expected `->` after a parenthesised parameter list — tuple values are not supported".to_string()
+                ),
+                open.span.start, closing.span.end,
+            ));
+        }
+        Ok(Spanned::new(Expression::Tuple(items), open.span.start, closing.span.end))
     }
 
     pub fn block_expr(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
@@ -205,8 +267,16 @@ impl Grammar {
         parser.consume(Token::Then)?;
         parser.skip_newlines();
         let true_branch = parser.expression(Precedence::Assign)?;
-        parser.skip_newlines();
-        let false_branch = if parser.check(&Token::Else) {
+        // A newline after the true branch is ambiguous: it either continues
+        // this `if` onto a line starting with `else`, or it ends an
+        // `else`-less one and is the *statement separator* the enclosing
+        // block is about to require. Skipping it unconditionally resolved
+        // that the wrong way — `if c then f()` parsed only as the very last
+        // expression in a file, and anywhere else swallowed the separator
+        // and then choked on the next statement ("expected an operator").
+        // `peek_past_newlines_is` commits to the skip only when an `else`
+        // really does follow, and otherwise rolls back onto the newline.
+        let false_branch = if parser.peek_past_newlines_is(&Token::Else) {
             parser.consume(Token::Else).unwrap(); // just checked it
             parser.skip_newlines();
             Some(parser.expression(Precedence::Assign)?)
@@ -272,6 +342,12 @@ impl Grammar {
         parser.consume(Token::LeftParen)?;
 
         let mut params = Vec::new();
+        // Newlines are insignificant inside the parens, exactly as they are
+        // in a *call's* argument list (`Parser::expression_list`): the `)`
+        // is an unambiguous terminator, so a wrapped declaration
+        // (`func f(\n  a: Int,\n  b: Int\n): T`) reads the same as a wrapped
+        // call. Only the declaration side was missing it.
+        parser.skip_newlines();
         while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
             // `mut name: T` — see `MUTABILITY.md`. `mut` binds the
             // parameter, not the type, matching a `mut`
@@ -294,8 +370,10 @@ impl Grammar {
                 None
             };
             params.push(Parameter { name: param_name, ty, mutable });
+            parser.skip_newlines();
             if parser.check(&Token::Comma) {
                 parser.advance()?;
+                parser.skip_newlines();
             }
         }
         parser.consume(Token::RightParen)?;
@@ -437,6 +515,14 @@ impl Grammar {
             }
         };
         let params = params.iter().map(|name| Parameter { name: name.to_string(), ty: None, mutable: false }).collect();
+        // `->` is a *required* delimiter: an expression must follow it, so a
+        // newline here can never mean "the statement ended" and is always a
+        // continuation. Same rule as `=`, `then`, `else` and `is`, which
+        // already skipped; `->`, `do`, `in`, `catch` and `provides` were
+        // simply overlooked. (Contrast a newline mid-expression — after a
+        // binary operator, say — which really is ambiguous and still ends
+        // the statement.)
+        parser.skip_newlines();
         let body = parser.expression(Precedence::Assign)?;
         Ok(Spanned { 
             span: left.span.merge(body.span), 
@@ -461,6 +547,7 @@ impl Grammar {
     /// — parses its body fully, the same way `let`'s value and `->`'s own
     /// body do (`let_binding`, `arrow_func`).
     pub fn catch_expr(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
+        parser.skip_newlines();  // required delimiter — see `arrow_func`
         let handler = parser.expression(Precedence::Assign)?;
         Ok(Spanned {
             span: left.span.merge(handler.span),
@@ -776,14 +863,22 @@ impl Grammar {
             _ => unreachable!(),
         };
         parser.consume(Token::In)?;
+        parser.skip_newlines();  // required delimiter — see `arrow_func`
         let iterable = parser.expression(Precedence::Assign)?;
         let cond = if parser.check(&Token::If) {
             parser.advance()?;
+            parser.skip_newlines();
             Some(parser.expression(Precedence::Assign)?)
         } else {
             None
         };
+        // A newline *before* `do` is a continuation too — the header is
+        // incomplete until `do` arrives, so there is nothing for the
+        // newline to have ended. This is what lets a comprehension wrap:
+        // `[for i in 0..3\n do i * 2]`.
+        parser.skip_newlines();
         parser.consume(Token::Do)?;
+        parser.skip_newlines();
         let body = parser.expression(Precedence::Assign)?;
         let body_span = body.span;
         Ok(Spanned {
@@ -817,6 +912,8 @@ impl Grammar {
     fn field_list(parser: &mut Parser) -> Result<(Vec<FieldDecl>, Span), Spanned<ParseError>> {
         parser.consume(Token::LeftParen)?;
         let mut fields = Vec::new();
+        // Newlines insignificant inside the parens — see `func_signature`.
+        parser.skip_newlines();
         while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
             let snapshot = parser.snapshot();
             let name = if let Token::Identifier(s) = parser.current_token.item.clone() {
@@ -833,8 +930,10 @@ impl Grammar {
             };
             let ty = Self::type_expr(parser)?;
             fields.push(FieldDecl { name, ty });
+            parser.skip_newlines();
             if parser.check(&Token::Comma) {
                 parser.advance()?;
+                parser.skip_newlines();
             }
         }
         let closing = parser.consume(Token::RightParen)?;
@@ -921,6 +1020,7 @@ impl Grammar {
         let mut provides = Vec::new();
         if parser.check(&Token::Provides) {
             parser.advance()?;
+            parser.skip_newlines();  // required delimiter — see `arrow_func`
             loop {
                 let trait_tok = parser.identifier()?;
                 let trait_name = match &trait_tok.item {

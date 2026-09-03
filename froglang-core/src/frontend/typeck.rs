@@ -7809,6 +7809,33 @@ impl TypeChecker {
             },
         )?;
 
+        // The rightmost arm of an exhaustive `match` needs no tag test at
+        // all. `tail` is `None` only when there is no `else` *and* every arm
+        // to this one's right has already been folded in (the fold runs
+        // right-to-left), and exhaustiveness was checked before lowering
+        // began — so if control reaches this arm, the subject holds this
+        // arm's member and the test can only answer `true`. Emitting it
+        // anyway costs a `band`/`icmp`/`brif`, a block, and a dead
+        // placeholder value per match; on a two-member union — `Int | E`,
+        // the shape `?`/`!`/`catch` desugar to — that is *half* of all the
+        // tag tests in the program, in the hottest error-handling path
+        // there is.
+        //
+        // Note this is the *innermost* arm of the chain, not the first one
+        // reached: every arm to its left tests and branches around it, so
+        // control arrives here only after all of them have declined.
+        //
+        // A guarded last arm keeps its test: `tail` being `None` says the
+        // guard can only be `true`, but the guard is an arbitrary
+        // expression and may have side effects, so it still has to run.
+        //
+        // `base_cond` is dropped rather than emitted-and-ignored: it is an
+        // `IsVariant`/`TypeTag` on a `Var`, so there is nothing in it to
+        // observe.
+        if guard.is_none() && tail.is_none() {
+            return Ok(Self::arm_body_block(prelude, body, span));
+        }
+
         // A guard's binds must be extracted (the `prelude`) *before* the
         // guard itself runs — they can't be folded into a single
         // `base_cond and guard` boolean the way a bindless guard could,
@@ -7850,16 +7877,23 @@ impl TypeChecker {
             }
         };
 
-        let true_branch = if prelude.is_empty() {
-            body
-        } else {
-            let inner_ty = body.item.ty.clone();
-            let mut stmts = prelude;
-            stmts.push(body);
-            Spanned::from(TypedExpr { id: 0, ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
-        };
+        let true_branch = Self::arm_body_block(prelude, body, span);
 
         self.joined_conditional(cond, true_branch, tail, span)
+    }
+
+    /// One arm's pattern extraction followed by its body — a plain `Block`,
+    /// or the body alone when the pattern binds nothing.
+    fn arm_body_block(
+        prelude: Vec<Spanned<TypedExpr>>,
+        body: Spanned<TypedExpr>,
+        span: Span,
+    ) -> Spanned<TypedExpr> {
+        if prelude.is_empty() { return body; }
+        let inner_ty = body.item.ty.clone();
+        let mut stmts = prelude;
+        stmts.push(body);
+        Spanned::from(TypedExpr { id: 0, ty: inner_ty, kind: TypedExprKind::Block(stmts) }, span)
     }
 
     /// A `Conditional` typed as the join of its two branches, with each
@@ -7867,11 +7901,14 @@ impl TypeChecker {
     /// `Conditional` arm applies, which these hand-built ones need too.
     ///
     /// A `None` `false_branch` is `Never`-typed, not `None`-typed: the only
-    /// way `fold_match_arm` reaches this with no tail is when every
-    /// remaining arm has already been folded in (the fold runs
-    /// right-to-left) and the match was checked exhaustive before lowering
-    /// began — so that path is genuinely unreachable. `Never` vanishes from
-    /// the join; `None` would widen every guarded arm's type to `T | None`.
+    /// way `fold_match_arm` reaches this with no tail is on a *guarded*
+    /// rightmost arm — every remaining arm has already been folded in (the
+    /// fold runs right-to-left) and the match was checked exhaustive before
+    /// lowering began, so that path is genuinely unreachable, and only the
+    /// guard's side effects are keeping the branch alive at all (an
+    /// unguarded rightmost arm returns before it gets here). `Never`
+    /// vanishes from the join; `None` would widen every guarded arm's type
+    /// to `T | None`.
     fn joined_conditional(
         &mut self,
         cond: Spanned<TypedExpr>,

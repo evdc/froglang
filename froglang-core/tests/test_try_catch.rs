@@ -27,8 +27,10 @@
 // branch paired with a real value on the *other* side (`return`'s
 // pre-existing early-exit tests). Nothing before this phase built a
 // conditional where *both* branches are `Never` — which `lower_match`'s
-// last-arm-with-no-tail case does, whenever every match arm's body is
-// itself `Never`-typed (every arm is `return`/panic, as `?`/`!` build).
+// arm chain does whenever every match arm's body is itself `Never`-typed
+// (every arm is `return`/panic, as `?`/`!` build): the innermost arm is
+// then a bare `Never` expression and the one wrapping it has `Never` on
+// both sides.
 // The old codegen still tried to produce a value-carrying merge block for
 // it, leaving that block reachable only from a path nobody above ever
 // jumped into — "you have to fill your block before switching" from

@@ -5,10 +5,11 @@
 // repeatedly filter it into a batch and price every item in that batch,
 // where pricing means classifying the item into a discount variant, matching
 // on that variant, and validating the result through a fallible function
-// using `?`.  Per round this allocates a fresh list (GC pressure) and one
-// boxed union value per item for the discount, plus (on the — never taken —
-// error path) a boxed `PricingError`, on top of struct field access and
-// integer arithmetic in the inner loop.
+// using `?`.  Per round this allocates a fresh list (GC pressure), on top of
+// struct field access and integer arithmetic in the inner loop.  It used to
+// allocate one boxed union per item for the discount as well; `Discount` is
+// four scalar members and so lays out inline (RUNTIME.md Part 1), which is
+// what removed that per-item malloc.
 //
 // `Category` and `Discount` are `data X is A | B | ...` unions (ERRORS.md:
 // there is no separate enum mechanism, unions are the one sum type) and

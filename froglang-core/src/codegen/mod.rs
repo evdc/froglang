@@ -67,11 +67,13 @@ struct Ctx<'a> {
     /// `struct_fields` and `compile_expr_multi`.
     structs:       &'a StructDefs,
     /// Layout for every registered nominal union, from
-    /// `TypeChecker::union_defs`. A union value, unlike a struct, IS a
-    /// single GC-boxed heap pointer (see `runtime::gc::FrogVariant`) — this
-    /// is only consulted to resolve a field name to a slot offset
-    /// (`enum_field_leaf_types`), never to flatten a union value into more
-    /// than one `Value`.
+    /// `TypeChecker::union_defs`. Consulted to resolve a variant's field
+    /// name to a slot offset (`enum_field_leaf_types`); the *width* a union
+    /// value flattens to comes from `union_layout`/`struct_fields`, not from
+    /// here. An inline union (`union_is_inline`, the common case) is as many
+    /// `Value`s as its `UnionLayout` has columns, exactly like a struct;
+    /// only the boxed fallback is a single `runtime::gc::FrogVariant`
+    /// pointer.
     unions:        &'a UnionDefs,
     /// Anonymous-union "shapes" (keyed by their `Debug`-formatted member
     /// list — stable identity for the same union type) currently being
@@ -1550,11 +1552,13 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
 /// tag is guaranteed to be one of `members`' indices — and prints whichever
 /// member actually matched, each in its own block so only that one runs.
 fn print_union(members: &[Type], arg_vals: &[Value], bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
-    // A union-typed struct field (e.g. `Add(lhs: Node, rhs: Node)`'s own
-    // `lhs`/`rhs`) is stored as a single opaque boxed pointer, never
-    // flattened — that's exactly what lets a self-referential type like
-    // `Node` exist at all (see `hoist_data_decls`'s self-reference check,
-    // which only rejects an *unboxed* cycle). Printing recurses through
+    // A *self-referential* union-typed struct field (e.g. `Add(lhs: Node,
+    // rhs: Node)`'s own `lhs`/`rhs`) is stored as a single opaque boxed
+    // pointer rather than flattened into `UnionLayout`'s columns the way
+    // every other union is — that's exactly what lets a type like `Node`
+    // exist at all (see `union_is_inline`, and `hoist_data_decls`'s
+    // self-reference check, which only rejects an *unboxed* cycle). But the
+    // boxing is at run time only: printing recurses through
     // `print_union_member` → `print_value` back into `print_union` for that
     // same field type, so a genuinely recursive union would need unbounded
     // branch trees at codegen time — reject it clearly instead of
@@ -1852,9 +1856,10 @@ fn list_contains(elem_ty: &Type, needle: &[Value], haystack: Value, bcx: &mut Fu
 /// anything, and if it does, unpack both carriers and compare them with
 /// `eq_value`. Returns an `I8` boolean.
 fn eq_union(members: &[Type], l: &[Value], r: &[Value], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
-    // A union-typed struct field is stored as a single opaque boxed pointer,
-    // never flattened, which is what makes `data Node is Add(lhs: Node, ...)`
-    // representable — and what makes this walk re-derive the same union type
+    // A self-referential union-typed struct field is stored as a single
+    // opaque boxed pointer rather than flattened (`union_is_inline`), which
+    // is what makes `data Node is Add(lhs: Node, ...)` representable — and
+    // what makes this walk re-derive the same union type at codegen time
     // with no static bound on depth. `TypeChecker::check_comparable` predicts
     // this and reports it with a span; the guard stays as the backstop, in
     // the same shape as `print_union`'s.
@@ -2896,7 +2901,14 @@ fn compile_conditional(
                 }
             }
         } else if has_value {
-            let fv = bcx.ins().iconst(result_ty, 0);
+            // A value-typed `Conditional` with no false branch: only
+            // `fold_match_arm`'s guarded last arm builds one, and only when
+            // its `tail` is `None`, which the exhaustiveness check makes
+            // unreachable — so this value exists to satisfy the merge
+            // block's signature and is never read. `placeholder_value`, not
+            // `iconst`: `result_ty` is `F64` whenever the match is on a
+            // union with a `Float` member, and `iconst` is integer-only.
+            let fv = placeholder_value(bcx, result_ty);
             bcx.ins().jump(merge_bb, &[BlockArg::from(fv)]);
         } else {
             bcx.ins().jump(merge_bb, &[]);
@@ -4651,6 +4663,7 @@ impl Codegen {
                 &self.host_fns,
             );
 
+            dump_clif(&dbgname, &ctx);
             self.module
                 .define_function(*func_id, &mut ctx)
                 .unwrap_or_else(|e| panic!("define_function failed: {}", e));
@@ -4685,6 +4698,7 @@ impl Codegen {
             &self.host_fns,
         );
 
+        dump_clif(&entry_name, &ctx);
         self.module
             .define_function(main_id, &mut ctx)
             .unwrap_or_else(|e| panic!("define {} failed: {}", entry_name, e));
@@ -4705,6 +4719,24 @@ impl Codegen {
 
         (main_id, bindings)
     }
+}
+
+/// `FROG_DUMP_CLIF` — print one function's finished Cranelift IR to stderr
+/// just before it is compiled, and do nothing at all when that variable is
+/// unset.
+///
+/// The sibling of `FROG_DUMP_LIVENESS` (which shows what codegen was told)
+/// and `FROG_JIT_SYMBOLS` (which shows where the machine code landed): this
+/// is the middle step, and the only view of what codegen actually emitted.
+/// Cranelift's verifier reports a rejected function by panicking inside
+/// itself, with a backtrace that names no froglang code at all, so without
+/// this the emitting site has to be guessed. It is also how a claim like
+/// "this match now costs one branch, not two" gets checked, since the
+/// difference is invisible in a wall-clock measurement of a
+/// perfectly-predicted branch.
+fn dump_clif(name: &str, ctx: &cranelift_codegen::Context) {
+    if std::env::var_os("FROG_DUMP_CLIF").is_none() { return; }
+    eprintln!("=== {} ===\n{}", name, ctx.func.display());
 }
 
 impl Codegen {

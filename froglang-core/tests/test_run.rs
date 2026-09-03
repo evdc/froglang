@@ -707,3 +707,34 @@ fn test_mut_exclusivity_rejects_aliased_root() {
     let err = tc.check_and_lower(ast).expect_err("aliased mut root should be rejected");
     assert!(format!("{:?}", err).contains("can't be passed 'mut'"), "unexpected error: {:?}", err);
 }
+
+// ── `else`-less `if` in statement position ───────────────────────────────────
+//
+// `if cond then side_effect()` is the reason `if` needs to work as a
+// statement even though it is an expression. Its value is `T | None`
+// (implicit `else none`), so these assert through a `mut` binding rather
+// than on the `if`'s own result. See `test_parser.rs` for the parse the
+// separator after it used to break.
+
+#[test]
+fn else_less_if_runs_its_branch_in_statement_position() {
+    assert_eq!(compile_and_run("mut n = 0\nif 1 > 0 then n = 5\nn"), 5);
+}
+
+#[test]
+fn else_less_if_skips_its_branch_when_the_condition_is_false() {
+    assert_eq!(compile_and_run("mut n = 0\nif 1 > 2 then n = 5\nn"), 0);
+}
+
+#[test]
+fn else_less_if_in_a_block_body_leaves_the_following_statements_alone() {
+    assert_eq!(compile_and_run(
+        "func classify(x: Int): Int = {\n\
+           mut n = 1\n\
+           if x > 0 then n = n * 10\n\
+           if x > 100 then n = n * 10\n\
+           n\n\
+         }\n\
+         classify(5) + classify(500) + classify(0 - 1)"
+    ), 10 + 100 + 1);
+}

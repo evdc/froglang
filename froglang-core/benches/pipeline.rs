@@ -317,8 +317,10 @@ total
 ";
 
 /// Recursive boxed unions: build a complete binary `Tree` and walk it with
-/// `match`. Unlike a struct, a union value is always a heap-boxed
-/// `FrogVariant`, so this measures variant allocation, tag dispatch and
+/// `match`. `Tree` is self-referential, so it is one of the two shapes
+/// `codegen::union_is_inline` refuses to flatten and it keeps the heap-boxed
+/// `FrogVariant` representation — which is the point: this is the *boxed*
+/// half of the union story, and measures variant allocation, tag dispatch and
 /// destructuring on a deep object graph — and, because each tree stays
 /// wholly reachable while it is summed, a mark phase that has to chase
 /// pointers rather than scan a flat list.
@@ -376,9 +378,11 @@ total
 /// overhead in the mechanism: the union representation, the tag test `?`
 /// emits per call, and the `catch` landing pad.
 ///
-/// `Int | Bad` has a scalar member, so it should ride in an unboxed
-/// `{tag, payload}` register pair rather than allocating a `FrogVariant`
-/// per call. A sudden jump in this ratio most likely means some change made
+/// `Int | Bad` is two members and not self-referential, so it rides in an
+/// unboxed `(tag+ptr, scalar)` register pair (`codegen::UnionLayout`) rather
+/// than allocating a `FrogVariant` per call, and — being exhaustive with no
+/// `else` — costs one tag test per dispatch, not two. As of 2026-09-02 the
+/// ratio is ~1.0. A sudden jump in it most likely means some change made
 /// that union box again.
 const FALLIBLE: &str = "\
 data Bad(msg: Str) provides Error

@@ -20,6 +20,15 @@
 //!     second open question;
 //!   * a self-referential union still works, via the boxed path.
 //!
+//! Two later sections cover the *dispatch* over that representation rather
+//! than the representation itself, since both bugs they pin down are only
+//! reachable through a `match`:
+//!
+//!   * a `Float` member rides in a scalar column like any other primitive,
+//!     including through the `F64` merge block a `match` on it joins into;
+//!   * an exhaustive `match` emits no tag test for its rightmost arm, and
+//!     the arms around it still bind, guard and fall through correctly.
+//!
 //! Each runs under `FROG_GC_STRESS=1` as well as normally: a collection on
 //! every allocation is what turns a mis-encoded word from a latent bug into
 //! a failure, and the encoding is the whole point of the change.
@@ -271,5 +280,133 @@ for it in items do {
 print(total)
 "#,
         "8\n",
+    );
+}
+
+// ── a `Float` member's column ─────────────────────────────────────────────────
+
+/// A union's scalar columns are `I64`-typed words (`struct_fields` labels
+/// them `Type::Int`), so a `Float` member's payload is `bitcast` in and out
+/// of one. The merge block a `match` on such a union joins into is
+/// `F64`-typed, though, and every value flowing into it — including the
+/// placeholder for a branch that can't be taken — has to be `F64` too.
+/// Codegen used to materialise that placeholder with `iconst`, which is
+/// integer-only: any `match`/`?`/`!`/`catch` on a union with a `Float`
+/// member aborted in Cranelift's verifier before ever running. `Int` and
+/// `Bool` members were unaffected, which is why this went unnoticed —
+/// so the assertion worth making is that all three primitive members now
+/// work through the same path.
+#[test]
+fn a_float_member_matches_and_catches() {
+    both(
+        r#"error Bad(msg: Str)
+func f(x: Int): Float | Bad = if x < 0 then Bad(msg="neg") else 1.5
+func g(x: Int): Float | Bad = f(x)? + 1.0
+
+print(f(1) catch 0.0)
+print(f(0 - 1) catch 0.0)
+print(g(1) catch 0.0)
+print(f(1)!)
+print(match f(1) {
+  is Float(v) then v
+  is Bad(e) then 0.0
+})
+"#,
+        "1.5\n0.0\n2.5\n1.5\n1.5\n",
+    );
+}
+
+/// The same for a nominal union whose members carry `Float`s, including one
+/// that mixes a `Float` and an `Int` (so the value rides in the second
+/// scalar column rather than the first) and one with no payload at all.
+#[test]
+fn a_nominal_union_of_float_members_round_trips() {
+    both(
+        r#"data V is A(x: Float) | B(y: Float, z: Int) | Zero
+
+func val(v: V): Float = match v {
+  is A(x) then x
+  is B(y, z) then y + 1.0
+  is Zero then 0.0
+}
+
+for v in [A(x=1.5), B(y=2.5, z=1), Zero] do {
+  let churn = [for i in 0..300 do "e" + "f"]
+  print(val(v))
+}
+print(A(x=1.5))
+"#,
+        "1.5\n3.5\n0.0\nV.A(x=1.5)\n",
+    );
+}
+
+// ── the rightmost arm carries no tag test ─────────────────────────────────────
+
+/// An exhaustive `match` with no `else` needs no tag test on its last arm:
+/// the fold in `fold_match_arm` runs right-to-left, so a `None` tail means
+/// every other member is handled to this arm's left and the subject can
+/// only hold this one. Dropping the test is what makes a two-member union —
+/// `Int | E`, the shape `?`/`!`/`catch` desugar to — cost *one* branch per
+/// dispatch rather than two.
+///
+/// The behaviour that has to survive it: the dropped-test arm still runs
+/// its pattern extraction, so its binds are live in its body.
+#[test]
+fn the_last_arm_of_an_exhaustive_match_still_binds_its_pattern() {
+    both(
+        r#"data Shape is Circle(r: Int) | Rect(w: Int, h: Int)
+
+func area(s: Shape): Int = match s {
+  is Circle(r) then r * r * 3
+  is Rect(w, h) then w * h
+}
+
+print(area(Circle(r=2)))
+print(area(Rect(w=3, h=4)))
+
+let xs: List<Int | Str> = ["ab", 7]
+for x in xs do {
+  print(match x {
+    is Int(k) then k
+    is Str(s) then len(s)
+  })
+}
+"#,
+        "12\n12\n2\n7\n",
+    );
+}
+
+/// Guards are what make the last arm's dropped test load-bearing rather
+/// than cosmetic: a guarded arm never counts toward exhaustiveness, so
+/// control genuinely *falls through* it at runtime and lands on an untested
+/// last arm — which must therefore still be the right one, and must still
+/// bind. And the guard on the way past has to actually run: `tail` being
+/// `None` for the arm to its right says nothing about whether an earlier
+/// arm's guard is observable, and here it prints.
+///
+/// `Pos(n=5)` takes the guarded arm; `Pos(n=0)` evaluates the same guard,
+/// fails it, and falls through to the untested `is Pos(n)`; `Neg` never
+/// reaches the guard at all.
+#[test]
+fn a_failed_guard_falls_through_to_the_untested_last_arm() {
+    both(
+        r#"data Sign is Neg(n: Int) | Pos(n: Int)
+
+func noisy(n: Int): Bool = {
+  print("guard")
+  n > 0
+}
+
+func f(s: Sign): Int = match s {
+  is Neg(n) then 0 - n
+  is Pos(n) and noisy(n) then n
+  is Pos(n) then n - 100
+}
+
+print(f(Pos(n=5)))
+print(f(Pos(n=0)))
+print(f(Neg(n=3)))
+"#,
+        "guard\n5\nguard\n-100\n-3\n",
     );
 }

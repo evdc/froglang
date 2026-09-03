@@ -56,7 +56,9 @@ let f: (Int -> Int) = n -> n * 2
 - Named function declarations: `func f(x: T, y: T): T = body`
 - `return expr` — early exit from a function body
 - Function calls: `f(x, y)`
-- Conditionals: `if cond then a else b` (`else` optional)
+- Conditionals: `if cond then a else b`. `else` is optional — an `else`-less `if` has an
+  implicit `else none`, so it is typed `T | None`, and it works in statement position
+  (`if cond then side_effect()`) with the next statement on the following line
 - `match subject { is Pattern then expr ... }` — exhaustive on declared unions, catch-all
   required on anonymous ones; arms must be newline-separated
 - `?` — propagate a fallible value's `Error` member out of the enclosing function (postfix)
@@ -68,7 +70,19 @@ let f: (Int -> Int) = n -> n * 2
 - Ranges: `0..10`
 - Type annotations: `expr : Type`
 - Comments: `// ...`
-- Multi-line expressions: newlines are skipped after `=`, `then`, and `else`
+- Statements are separated by a newline or `;`, at the top level and inside `{ }` alike
+- Multi-line expressions. A newline is whitespace in exactly two places, and a statement
+  separator everywhere else:
+  - **After a required delimiter** — `=`, `then`, `else`, `->`, `do`, `in`, `is`, `catch`,
+    `provides` — since the grammar demands more input, so the newline can't mean "statement
+    over". Also *before* an `else` or a `do`, for the same reason (but only when one actually
+    follows: otherwise that newline is the separator ending an `else`-less `if`).
+  - **Inside `( )` and `[ ]`** — the closing bracket is an unambiguous terminator, so nothing
+    in there could start a new statement. Covers call arguments, list literals, and `func`/
+    `data` parameter and field lists.
+
+  A newline *mid-expression* — after a binary operator, or before `.` / `catch` — still ends
+  the statement. `(1 +` ⏎ `2)` is a parse error, not a continuation.
 
 ## Type system
 
@@ -79,7 +93,10 @@ Bidirectional type checker with unification, over a dedicated type-expression gr
 type of `return`, `panic`, and any expression that never produces a value)
 
 **Compound types:**
-- `(T1, T2, ...) -> R` — function types, inferred for lambdas, checked against annotations
+- `(T1, T2 -> R)` — function types, inferred for lambdas, checked against annotations. The
+  parens wrap the *whole* type, arrow included: `(Int -> Int)`, `(Int, Int -> Int)`. That is
+  what makes an annotation unambiguous without a lookahead — `f: Int -> Int` is rejected with
+  a message telling you to add them (see `Grammar::type_annotation`)
 - `List<T>` — homogeneous GC-managed lists
 - Type variables with optional trait bounds
 - `T1 | T2` — sum / union types
@@ -167,8 +184,12 @@ way". A union satisfies `Error` iff every member does, so `provides Error` on a 
   `let`, `return`, function args/return, struct fields, `if`/`match` branch joins) — this is
   the *only* way a union value comes into being; there is no explicit union constructor
 - Field access `u.f` on a union is legal iff every member has a compatibly-typed `.f`
-- `is`/`match` narrow a union to one member; on an anonymous union the runtime tag is a
-  boxed `FrogVariant` for every non-primitive, non-`None` member
+- `is`/`match` narrow a union to one member, dispatching on a runtime tag; an exhaustive
+  `match` tests every arm but the last, which needs none. Nominal and anonymous unions share
+  one representation (`plans/RUNTIME.md` Part 1): a union of at most six members that isn't
+  self-referential is flattened into pointer-then-scalar columns with the tag in the low 3
+  bits of column 0, so it allocates nothing — `Int | E` is a two-word register pair. Wider or
+  self-referential unions fall back to a boxed `FrogVariant`
 
 **Error handling** (see `ERRORS.md`): a fallible function returns `T | E` where `E: Error` —
 there is no separate `Result` type, so propagating an error into a broader error union is
@@ -212,8 +233,9 @@ Supported in codegen:
 - String allocation, concatenation, equality, `print`
 - List allocation, indexing, push, list comprehensions
 - Struct construction and field access (unboxed, flattened fields)
-- Union construction via implicit widening; boxed as `FrogVariant` except for `None` and
-  other nullary members, which are unboxed tagged immediates
+- Union construction via implicit widening; unboxed into tagged columns (`codegen::UnionLayout`)
+  for the inline case, boxed as a `FrogVariant` for a union that is self-referential or has
+  more than `MAX_INLINE_UNION_MEMBERS` members
 
 ## Runtime / GC
 
@@ -443,6 +465,9 @@ cargo test
 
 # Verbose GC tracing (allocations, marks, frees to stderr)
 cargo test --features gc_trace
+
+# Dump the Cranelift IR codegen emitted, per function, to stderr
+FROG_DUMP_CLIF=1 cargo run -- run program.frog
 ```
 
 ---
@@ -458,9 +483,20 @@ Roughly in priority order:
 
 ### Types and constructs
 
-- **Cheaper primitive-member union matches** — see the `orders` benchmark regression above;
-  `?`/`catch`/`is`/`match` on a union whose non-error member is `Int`/`Float`/`Bool` still
-  goes through the same boxed-union machinery as the `Str`/struct/list case.
+- ~~**Cheaper primitive-member union matches**~~ — **done**. The boxing half was already gone
+  when this was written: `plans/RUNTIME.md` Part 1's tagged-pointer representation flattens
+  every non-recursive union of at most `codegen::MAX_INLINE_UNION_MEMBERS` members into
+  `UnionLayout`'s columns, so `Int | E` is a `(tag+ptr, scalar)` register pair and `?`/`catch`
+  allocate nothing at all (`tests/test_union_repr.rs`, and the `fallible`/`infallible` benchmark
+  pair, which now run within noise of each other). Two real things were left, both fixed:
+  a `match`/`?`/`!`/`catch` on a union with a **`Float` member** aborted in Cranelift's verifier
+  (the unreachable branch's placeholder was built with the integer-only `iconst`, and the merge
+  block is `F64`); and an exhaustive `match` emitted a **tag test on its rightmost arm**, which
+  cannot fail — dropping it takes a two-member union's dispatch from two branches to one, and
+  `orders` from 496 to 463 CLIF instructions across 80 blocks instead of 91. Wall-clock is
+  unchanged: the redundant branch predicted perfectly. Still open here is the six-member
+  inline ceiling and the boxed self-referential case, both deliberate (`plans/RUNTIME.md`,
+  "As built").
 - ~~**Flow narrowing and `Truthy`**~~ — **done**: narrowing a union after a bindless `is` arm,
   the `Truthy` trait for condition-position coercion (`if`/`for`/`match` guards, `and`/`or`/`not`
   short-circuit, including on a union whose members are all `Truthy` — desugared to a per-member

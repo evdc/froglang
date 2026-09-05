@@ -1,4 +1,4 @@
-use crate::frontend::{expression::{DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, ImplDeclExpr, MatchArm, MatchExpr, Mutability, Parameter, Pattern, TraitDeclExpr, TraitMemberDecl, TypeParam, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
+use crate::frontend::{expression::{AnnotationDeclExpr, AnnotationUse, DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, ImplDeclExpr, MatchArm, MatchExpr, Mutability, Parameter, Pattern, TraitDeclExpr, TraitMemberDecl, TypeParam, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
 
 /// Result of parsing a type annotation. Parallel to `ParseResult`, but over
 /// the type grammar (`crate::frontend::type_expr`) rather than `Expression`.
@@ -234,8 +234,17 @@ impl Grammar {
             let _ = parser.advance();
         }
         while !parser.check(&Token::RightBrace) && !parser.check(&Token::EOF) {
+            // Both halves of `plans/DATA.md` Stage 6's attachment rule,
+            // exactly as `Parser::block`/`Parser::statement` apply them at
+            // the top level: a leading `#ann` run forward-attaches to the
+            // statement that follows, a same-line trailing run
+            // backward-attaches to the one just parsed. `#` has no
+            // expression-prefix rule of its own, so without peeling it off
+            // here it is a hard parse error anywhere inside `{ }`.
+            let leading = Self::leading_annotations(parser)?;
             let expr = parser.expression(Precedence::Assign)?;
-            stmts.push(expr);
+            let trailing = Self::trailing_annotations(parser)?;
+            stmts.push(Expression::decorate(leading, Expression::decorate(trailing, expr)));
             // stop if we see `}` next
             if parser.check(&Token::RightBrace) || parser.check(&Token::EOF) { break; }
             // require at least one separator (newline or `;`)
@@ -252,7 +261,13 @@ impl Grammar {
         if stmts.is_empty() {
             return Err(Spanned::new(ParseError::ExpectedExpression, t.span.start, closing.span.end));
         }
-        if stmts.len() == 1 {
+        // A lone statement is normally handed back unwrapped — `{ e }` and
+        // `e` mean the same thing. A *decorated* one can't be: its
+        // `Decorated` wrapper is only ever stripped by
+        // `TypeChecker::strip_and_validate_annotations`, which runs over a
+        // block's statement list, so unwrapping here would let it escape
+        // into expression position, where nothing knows what to do with it.
+        if stmts.len() == 1 && !matches!(stmts[0].item, Expression::Decorated(_)) {
             Ok(stmts.into_iter().next().unwrap())
         } else {
             Ok(Spanned { span: t.span.merge(closing.span), item: Expression::Block(stmts) })
@@ -915,6 +930,9 @@ impl Grammar {
         // Newlines insignificant inside the parens — see `func_signature`.
         parser.skip_newlines();
         while !parser.check(&Token::RightParen) && !parser.check(&Token::EOF) {
+            // Leading `#ann` — own line(s), before the field it forward-
+            // attaches to (`plans/DATA.md` Stage 6's attachment rule).
+            let leading = Self::leading_annotations(parser)?;
             let snapshot = parser.snapshot();
             let name = if let Token::Identifier(s) = parser.current_token.item.clone() {
                 parser.advance()?;
@@ -929,7 +947,28 @@ impl Grammar {
                 None
             };
             let ty = Self::type_expr(parser)?;
-            fields.push(FieldDecl { name, ty });
+            let default = if parser.check(&Token::Assign) {
+                // Reported before the `=` is consumed, and spanned on the
+                // field's own type rather than `parser.current_token` —
+                // the offending thing is the positional field, not the
+                // value someone tried to give it a default of.
+                if name.is_none() {
+                    return Err(Spanned::from(
+                        ParseError::Other("a positional field cannot have a default value — only a named field (`name: Type = default`) can".to_string()),
+                        ty.span,
+                    ));
+                }
+                parser.advance()?;
+                Some(Box::new(parser.expression(Precedence::Assign)?))
+            } else {
+                None
+            };
+            // Trailing `#ann` — same line as the field just parsed
+            // (backward attachment) — must be checked before the
+            // separator/newline logic below consumes anything past it.
+            let mut annotations = leading;
+            annotations.extend(Self::trailing_annotations(parser)?);
+            fields.push(FieldDecl { name, ty, default, annotations });
             parser.skip_newlines();
             if parser.check(&Token::Comma) {
                 parser.advance()?;
@@ -945,6 +984,97 @@ impl Grammar {
             ));
         }
         Ok((fields, closing.span))
+    }
+
+    /// `name` or `name.name.name` — an annotation's own declared name (which
+    /// may be dotted, `db.model`) or a use site's. Kept as one `String`
+    /// exactly the way a qualified enum variant name is (`grammar.rs`'s own
+    /// precedent, see `resolve_variant_callee`) — annotations have no
+    /// namespacing mechanism of their own, so a dot here is purely lexical.
+    fn dotted_name(parser: &mut Parser) -> Result<(String, Span), Spanned<ParseError>> {
+        let first = parser.identifier()?;
+        let mut name = match &first.item { Token::Identifier(s) => s.clone(), _ => unreachable!() };
+        let mut end = first.span;
+        while parser.check(&Token::Dot) {
+            parser.advance()?;
+            let part = parser.identifier()?;
+            name.push('.');
+            match &part.item { Token::Identifier(s) => name.push_str(s), _ => unreachable!() };
+            end = part.span;
+        }
+        Ok((name, first.span.merge(end)))
+    }
+
+    /// `#name`, `#name()`, or `#name(args)` — one annotation invocation.
+    /// Assumes the `#` has not yet been consumed. `args` reuses the same
+    /// comma-separated expression-list grammar a call's arguments do
+    /// (`Grammar::call`), so `#json(name="x")`'s `name="x"` parses as an
+    /// ordinary `Expression::Assign`, exactly like a struct constructor's
+    /// named argument — `TypeChecker::validate_annotation_use` is what
+    /// gives it its annotation-specific meaning.
+    pub fn annotation_use(parser: &mut Parser) -> Result<Spanned<AnnotationUse>, Spanned<ParseError>> {
+        let hash = parser.consume(Token::Hash)?;
+        let (name, name_span) = Self::dotted_name(parser)?;
+        let mut end = name_span;
+        let args = if parser.check(&Token::LeftParen) {
+            parser.advance()?;
+            let args = parser.expression_list(&Token::Comma, &Token::RightParen);
+            let closing = parser.consume(Token::RightParen)?;
+            end = closing.span;
+            args
+        } else {
+            Vec::new()
+        };
+        Ok(Spanned::from(AnnotationUse { name, args }, hash.span.merge(end)))
+    }
+
+    /// A run of `#ann` annotations, each on its own line, forward-attaching
+    /// to whatever follows — the leading half of `plans/DATA.md` Stage 6's
+    /// attachment rule. Returns an empty list (and leaves the parser
+    /// untouched past any skipped blank lines) if the current token isn't
+    /// `#`.
+    pub fn leading_annotations(parser: &mut Parser) -> Result<Vec<AnnotationUse>, Spanned<ParseError>> {
+        let mut anns = Vec::new();
+        loop {
+            parser.skip_newlines();
+            if !parser.check(&Token::Hash) { break; }
+            anns.push(Self::annotation_use(parser)?.item);
+        }
+        Ok(anns)
+    }
+
+    /// A run of `#ann` annotations immediately following — no newline
+    /// between them and whatever was just parsed — backward-attaching to
+    /// it. Since `Token::Newline` is an explicit token in this lexer (never
+    /// auto-skipped), "the current token is `Hash`" already means "still on
+    /// the same line": if a line break had occurred, `Newline` would be the
+    /// current token instead. Returns an empty list if there's nothing to
+    /// attach.
+    pub fn trailing_annotations(parser: &mut Parser) -> Result<Vec<AnnotationUse>, Spanned<ParseError>> {
+        let mut anns = Vec::new();
+        while parser.check(&Token::Hash) {
+            anns.push(Self::annotation_use(parser)?.item);
+        }
+        Ok(anns)
+    }
+
+    /// `annotation name(field: Type = default, ...)` — declares an
+    /// annotation usable as `#name(...)`. Fields reuse `field_list`
+    /// wholesale (so `= default` and even a field's own — meaningless but
+    /// harmless — `#ann` are parsed identically to a struct's), with no
+    /// parens at all meaning no fields (`annotation primary_key()` ≡
+    /// `annotation primary_key`).
+    pub fn annotation_decl(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let (name, name_span) = Self::dotted_name(parser)?;
+        let (fields, end_span) = if parser.check(&Token::LeftParen) {
+            Self::field_list(parser)?
+        } else {
+            (Vec::new(), name_span)
+        };
+        Ok(Spanned {
+            span: token.span.merge(end_span),
+            item: Expression::AnnotationDecl(AnnotationDeclExpr { name, fields }),
+        })
     }
 
     /// `data Name(field: Type, ...)` for a struct, or

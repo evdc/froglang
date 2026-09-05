@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::frontend::expression::{
-    Expression, FieldAccessExpr, ImportKind, LiteralExpr,
+    AnnotationUse, Expression, FieldAccessExpr, ImportKind, LiteralExpr,
 };
 use crate::frontend::parser::{ParseError, Parser};
 use crate::frontend::type_expr::TypeExpr;
@@ -34,6 +34,11 @@ pub enum ModuleError {
     /// `import` found nested inside a function body / if / for / etc,
     /// rather than at the direct top level of the file.
     ImportNotAtTopLevel { path: PathBuf },
+    /// `#ann import "..."`. Imports are erased by this pass, before the
+    /// typechecker (the only thing that knows what an annotation means)
+    /// ever runs, so an annotation on one could only be dropped
+    /// unvalidated — reject it instead of silently ignoring it.
+    AnnotatedImport { path: PathBuf },
 }
 
 impl std::fmt::Display for ModuleError {
@@ -74,7 +79,19 @@ impl std::fmt::Display for ModuleError {
             ModuleError::ImportNotAtTopLevel { path } => {
                 write!(f, "'import' is only allowed at the top level of a file (module '{}')", path.display())
             }
+            ModuleError::AnnotatedImport { path } => {
+                write!(f, "annotations are not supported on 'import' (module '{}')", path.display())
+            }
         }
+    }
+}
+
+/// Is `expr` an `import`, possibly under one or more `#ann` wrappers?
+fn wraps_import(expr: &Expression) -> bool {
+    match expr {
+        Expression::Import(_) => true,
+        Expression::Decorated(d) => wraps_import(&d.target.item),
+        _ => false,
     }
 }
 
@@ -153,14 +170,26 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
             Expression::Try(inner) | Expression::Unwrap(inner) => walk(&inner.item, path),
             Expression::Catch { value, handler } => { walk(&value.item, path)?; walk(&handler.item, path) }
             Expression::MutArg(name) => walk(&name.item, path),
-            Expression::DataDecl(_) | Expression::Literal(_) => Ok(()),
+            Expression::DataDecl(_) | Expression::AnnotationDecl(_) | Expression::Literal(_) => Ok(()),
+            Expression::Decorated(d) => {
+                for a in &d.annotations {
+                    for arg in &a.args { walk(&arg.item, path)?; }
+                }
+                walk(&d.target.item, path)
+            }
         }
     }
     for s in stmts {
         // The statement itself may legitimately be an Import (that's the
-        // valid top-level case) — only its *children* are checked.
+        // valid top-level case) — only its *children* are checked. An
+        // annotated import is a `Decorated` wrapping one, which `walk`
+        // would report as a *nested* import; it has its own, accurate
+        // error instead.
         match &s.item {
             Expression::Import(_) => {}
+            Expression::Decorated(d) if wraps_import(&d.target.item) => {
+                return Err(ModuleError::AnnotatedImport { path: path.to_path_buf() });
+            }
             other => walk(other, path)?,
         }
     }
@@ -436,6 +465,13 @@ fn collect_names_in(expr: &Expression, names: &mut HashSet<String>) {
         // to, never under their own name. Mangling the trait/type it names is
         // `rewrite`'s job, below.
         Expression::ImplDecl(_) => {}
+        // Module-scoped exactly like `DataDecl`/`TraitDecl` above.
+        Expression::AnnotationDecl(a) => { names.insert(a.name.clone()); }
+        // Must see through the wrapper, not fall into the `_ => {}` below —
+        // an annotated top-level `data`/`annotation` declaration's name
+        // would otherwise never be registered as one of this module's
+        // exports, and every reference to it would be left unmangled.
+        Expression::Decorated(d) => collect_names_in(&d.target.item, names),
         Expression::Block(stmts) | Expression::Tuple(stmts) => {
             for s in stmts { collect_names_in(&s.item, names); }
         }
@@ -507,6 +543,22 @@ fn rewrite_name(
     };
     if let Some(mangled) = replacement {
         *name = mangled.clone();
+    }
+}
+
+/// Rewrite every `#name(...)` use's own name (never its dotted arguments'
+/// field names, which live in a different, per-annotation namespace) —
+/// `plans/DATA.md` Stage 6. Deliberately *not* `rewrite_name`: an
+/// annotation's own name can itself be dotted (`db.model`), which is a
+/// single flat key in `subst` set by `collect_top_level_names`/
+/// `resolve_module`'s `self_prefix`, not an `alias.Member` qualified-import
+/// reference — `rewrite_name`'s dot-splitting would look "db" up as an
+/// import alias and silently fail to rewrite it.
+fn rewrite_annotation_uses(anns: &mut [AnnotationUse], subst: &HashMap<String, String>) {
+    for a in anns {
+        if let Some(mangled) = subst.get(&a.name) {
+            a.name = mangled.clone();
+        }
     }
 }
 
@@ -675,10 +727,12 @@ fn rewrite(
             }
             for p in &mut d.fields {
                 rewrite_type_expr(&mut p.ty, subst, qualified);
+                rewrite_annotation_uses(&mut p.annotations, subst);
             }
             for v in &mut d.variants {
                 for p in &mut v.fields {
                     rewrite_type_expr(&mut p.ty, subst, qualified);
+                    rewrite_annotation_uses(&mut p.annotations, subst);
                 }
             }
             // A `provides` clause names traits, which are module-scoped
@@ -781,6 +835,29 @@ fn rewrite(
         // — only *how* it's used at the call site is special, which
         // `TypeChecker::lower_call` handles, not this rewrite.
         Expression::MutArg(name) => rewrite(&mut name.item, subst, qualified, shadow, track_let_shadow),
+
+        Expression::AnnotationDecl(a) => {
+            if !track_let_shadow {
+                if let Some(mangled) = subst.get(&a.name) {
+                    a.name = mangled.clone();
+                }
+            }
+            for p in &mut a.fields {
+                rewrite_type_expr(&mut p.ty, subst, qualified);
+            }
+        }
+
+        // Stripped by `TypeChecker::strip_and_validate_annotations` before
+        // any of this runs in practice — module rewriting happens earlier,
+        // on the raw parsed AST, so a `Decorated` node can still reach
+        // here. Its annotation arguments are literal constants (no
+        // identifiers to mangle); only the annotation's own *name* (an
+        // `annotation`-namespace reference, mangled the same way its
+        // declaration site is above) and the wrapped declaration need it.
+        Expression::Decorated(d) => {
+            rewrite_annotation_uses(&mut d.annotations, subst);
+            rewrite(&mut d.target.item, subst, qualified, shadow, track_let_shadow)
+        }
     }
 }
 

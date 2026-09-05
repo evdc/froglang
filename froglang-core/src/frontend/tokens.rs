@@ -148,6 +148,13 @@ pub enum Token {
     #[lex("data")]
     Data,
 
+    /// `annotation name(field: Type = default, ...)` — `plans/DATA.md`
+    /// Stage 6. Only ever legal in prefix (statement-start) position, like
+    /// `data`/`trait`.
+    #[prefix(Grammar::annotation_decl)]
+    #[lex("annotation")]
+    Annotation,
+
     #[prefix(Grammar::error_decl)]
     #[lex("error")]
     Error,
@@ -227,6 +234,14 @@ pub enum Token {
     Question,
     #[lex(";")]
     Semicolon,
+
+    /// `#name(...)` — annotation sigil, `plans/DATA.md` Stage 6. No prefix
+    /// or infix rule of its own: it's only ever consumed explicitly, by
+    /// `Grammar::annotation_use`, from a handful of call sites that check
+    /// for it before falling into ordinary expression parsing (never as
+    /// part of the general Pratt table).
+    #[lex("#")]
+    Hash,
 
     /// `x catch y` / `x catch [e] -> body` — see `Grammar::catch_expr`.
     #[infix(Grammar::catch_expr, Precedence::Catch)]

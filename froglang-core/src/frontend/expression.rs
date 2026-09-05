@@ -153,6 +153,55 @@ pub struct ForLoopExpr {
 pub struct FieldDecl {
     pub name: Option<String>,
     pub ty:   Spanned<TypeExpr>,
+    /// `name: Type = default` — `plans/DATA.md` Stage 6's prerequisite.
+    /// Only legal on a *named* field (`Grammar::field_list` rejects it on a
+    /// positional one at parse time: there's no name for a construction
+    /// call to omit). The value must be a literal constant
+    /// (`TypeChecker::eval_const_expr`) — not an arbitrary expression.
+    pub default: Option<ExprRef>,
+    /// `#name(...)` annotations attached to this field — leading (own
+    /// line, before the field) and/or trailing (same line, after it). See
+    /// `Grammar::leading_annotations`/`trailing_annotations`.
+    pub annotations: Vec<AnnotationUse>,
+}
+
+/// `#name`, `#name(args)`, or `#name(value)` — one annotation invocation,
+/// either attached to a declaration (`Grammar::leading_annotations`/
+/// `trailing_annotations`, collected into `Expression::Decorated` or a
+/// `FieldDecl`'s own `annotations`) or itself the target of nothing at all
+/// if malformed. `args` uses the same bare-vs-`name=value` shape a
+/// struct-construction call's arguments do (`Expression::Assign` for a
+/// named one), plus two sugars `TypeChecker::validate_annotation_use`
+/// recognizes: a bare identifier naming a `Bool` field (`#json(skip)` ≡
+/// `skip=true`), and a single positional value when the annotation has
+/// exactly one field (`#rename("x")` ≡ `name="x"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnotationUse {
+    pub name: String,
+    pub args: Vec<Spanned<Expression>>,
+}
+
+/// `annotation name(field: Type = default, ...)` — declares an annotation
+/// usable as `#name(...)`. `name` may be dotted (`db.model`). Fields are
+/// always named (`Grammar::annotation_decl` rejects a positional one) and
+/// any `= default` must be a literal constant, exactly like an ordinary
+/// struct field's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnotationDeclExpr {
+    pub name: String,
+    pub fields: Vec<FieldDecl>,
+}
+
+/// One or more `#name(...)` annotations attached to `target` — the
+/// backward/forward attachment `plans/DATA.md` Stage 6 specifies, applied
+/// to any top-level (or block-level) statement. Stripped entirely by
+/// `TypeChecker::strip_and_validate_annotations` before hoisting/lowering
+/// ever sees `target`; never reaches `check_and_lower` in practice, but the
+/// match there must still be exhaustive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecoratedExpr {
+    pub annotations: Vec<AnnotationUse>,
+    pub target: ExprRef,
 }
 
 /// One variant of an enum declaration: `Circle(r: Int)`, a positional
@@ -360,6 +409,14 @@ pub enum Expression {
     /// match on it directly instead of a match-inside-a-match.
     Comprehension(ExprRef),
     DataDecl(DataDeclExpr),
+    /// `annotation name(field: Type = default, ...)` — `plans/DATA.md`
+    /// Stage 6. Hoisted by `TypeChecker::hoist_annotation_decls` before
+    /// anything else is checked, and lowers to nothing, same as `DataDecl`.
+    AnnotationDecl(AnnotationDeclExpr),
+    /// One or more `#name(...)` attached to `target`. Always stripped by
+    /// `TypeChecker::strip_and_validate_annotations` before lowering
+    /// begins — see `DecoratedExpr`.
+    Decorated(DecoratedExpr),
     /// `trait Name { ... }` — `TRAITS.md` Stage 5. Hoisted and registered by
     /// `TypeChecker::hoist_trait_decls` before anything else is checked (the
     /// same pre-pass treatment `data` gets), and lowers to nothing: a trait
@@ -481,6 +538,34 @@ impl Expression {
 
     pub fn return_value(value: Option<Spanned<Expression>>) -> Expression {
         Expression::Return(value.map(Box::new))
+    }
+
+    /// Attach `anns` to `target`, merging into an already-`Decorated` target
+    /// rather than nesting — `Parser::block`'s leading annotations and
+    /// `Parser::statement`'s trailing ones can both apply to the same
+    /// statement (as can `Grammar::block_expr`'s two, the same pair inside
+    /// `{ }`), and a flat `annotations` list is what
+    /// `TypeChecker::strip_and_validate_annotations` expects. `anns` is
+    /// prepended, since `block` calls this with whatever `statement`
+    /// already collected as trailing.
+    pub fn decorate(anns: Vec<AnnotationUse>, target: Spanned<Expression>) -> Spanned<Expression> {
+        if anns.is_empty() { return target; }
+        let span = target.span;
+        match target.item {
+            Expression::Decorated(mut d) => {
+                let mut merged = anns;
+                merged.append(&mut d.annotations);
+                d.annotations = merged;
+                Spanned { span, item: Expression::Decorated(d) }
+            }
+            other => Spanned {
+                span,
+                item: Expression::Decorated(DecoratedExpr {
+                    annotations: anns,
+                    target: Box::new(Spanned { span, item: other }),
+                }),
+            },
+        }
     }
 
     pub fn get_identifier(&self) -> Option<&str> {
@@ -647,6 +732,34 @@ impl fmt::Display for Expression {
                     }
                 }
                 Ok(())
+            }
+
+            Expression::AnnotationDecl(a) => {
+                write!(f, "annotation {}(", a.name)?;
+                for (i, p) in a.fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    match &p.name {
+                        Some(name) => write!(f, "{}: {}", name, p.ty.item)?,
+                        None => write!(f, "{}", p.ty.item)?,
+                    }
+                }
+                write!(f, ")")
+            }
+
+            Expression::Decorated(d) => {
+                for a in &d.annotations {
+                    write!(f, "#{}", a.name)?;
+                    if !a.args.is_empty() {
+                        write!(f, "(")?;
+                        for (i, arg) in a.args.iter().enumerate() {
+                            if i > 0 { write!(f, ", ")?; }
+                            write!(f, "{}", arg)?;
+                        }
+                        write!(f, ")")?;
+                    }
+                    write!(f, " ")?;
+                }
+                write!(f, "{}", d.target)
             }
 
             Expression::TraitDecl(t) => {

@@ -143,7 +143,7 @@ tier and the interop tier; the syntax changes are deliberately last.
 | 3 | **done** — Source map: fn-ptr → span, rustc-style error rendering | diagnostics (function printing still blocked on function values existing) | — |
 | 4 | `Sink` (implemented by `StrBuf`) — **`Linear`'s enforcement now exists** (`TRAITS.md` Part 7), `Sink` itself doesn't | every serializer | — |
 | 5 | **done** — `repr` / `read` at the typed-AST layer; the property test | Tier 1 | 1, 2, 4 |
-| 6 | Annotations: syntax, typed declarations, validation | Tier 2, host-side libs | — |
+| 6 | **done** — Annotations: syntax, typed declarations, validation | Tier 2, host-side libs | — |
 | 7 | Host exposure of the declaration table | ORM/DB use case | 6 |
 | 8 | JSON interop tier | Tier 2 | 5, 6 |
 | — | Deferred: collection literals, user reflection | — | generics |
@@ -583,7 +583,113 @@ binaries) unaffected.
 
 ---
 
-## Stage 6 — annotations
+## Stage 6 — annotations — **done**
+
+Built as a **core slice**, deliberately narrower than "validation + host exposure": parsing,
+`annotation` declarations, both attachment directions, and full typed validation all ship;
+*consuming* a validated annotation does not, because nothing exists yet to consume one — that's
+Stage 7 (host exposure) and Stage 8 (JSON), both still separate, later stages. A validated
+annotation is checked and then discarded. See `tests/test_hash_annotations.rs` (26 tests) for the
+full behavioral spec this section describes.
+
+### What shipped, and one deliberate narrowing
+
+- **The sigil, both attachment directions, both sugars, dotted names** — all exactly as sketched
+  below (`#db.model`, trailing `#unique`/`#json(skip)`, `#primary_key` with no parens,
+  `#json("lastName")` for a single-field annotation).
+- **`annotation name(field: Type = default, ...)` declarations**, hoisted two-pass like `data` (so
+  forward reference within one block works), reusing `Grammar::field_list` wholesale for the
+  field grammar.
+- **Validation**: unknown annotation, unknown field, wrong field type, missing required field,
+  duplicate field — all reported at the `#name(...)` use site (or, for a missing-required error,
+  at the decorated declaration, since there's no narrower span for "you didn't write this").
+- **Narrowed from the sketch**: placement is *unrestricted* rather than validated against a
+  target list (`data`/field/variant/`func`/param) — "Java-style `#target(Field)` restrictions are
+  deferred, the consumer errors on misplacement anyway" turned out to mean exactly that: with no
+  consumer built yet, there is nothing to define a valid-placement rule *against*. `#foo` on a
+  bare `let` typechecks (against its annotation's own field shape) and is simply discarded. Also
+  narrowed: whole-variant annotations (`#foo Circle(...)`) and function-parameter annotations
+  are not wired up — a variant's own *fields* get them for free (they reuse `field_list`), and a
+  top-level `func` declaration gets them for free (it's an ordinary `Assign`, and attachment is
+  generic over any top-level statement), but the variant-as-a-whole and per-parameter cases
+  would need their own grammar hookup, deferred as genuinely lower-value than what shipped.
+
+### Struct-field defaults — the stated dependency, and how it was scoped
+
+Built as literal-constant-only (`name: Type = <literal>`, unary-minus-on-a-number included), not
+arbitrary expressions — the same restriction the sketch below states for annotation field values
+("Fields must be literals; const-eval is restricted to literals initially"), extended to ordinary
+struct fields too so one small `ConstValue` enum and one `eval_const_expr` serve both. Named
+fields only (`Grammar::field_list` rejects `= default` on a positional field with a clear error) —
+a positional field's default couldn't be triggered by an omitted keyword argument anyway, since
+positional construction has no keywords to omit. Works on both a plain struct's fields and a
+nominal union variant's (`data Shape(color: Str = "black") is Circle(...) | Square(side: Int = 1)`).
+
+### Architecture
+
+- **`ConstValue`** (`typeck.rs`) — the five-shape compile-time constant (`Int`/`Float`/`Bool`/
+  `Str`/`None`) both a struct field's default and every annotation field value actually are.
+  `eval_const_expr` produces one from a literal (or `-`-prefixed numeric literal) `Expression`,
+  nothing else. `TypeChecker::const_value_to_typed` lifts one into an ordinary `TypedExpr` leaf
+  (`IntLit`/`FloatLit`/.../`NoneLit`) so it can be widened into a wider declared slot (`T?`, a
+  union member) through the *existing* `lower_widen` — no new widening machinery.
+- **`lower_widen` is not itself a type check** — for a non-union target it silently returns its
+  argument unchanged if the types don't already match, because every existing call site had
+  already checked compatibility (`widens_to`/`unify`/`unify_with_one_union_member`) before
+  calling it. This stage's own validation needed the identical check, so
+  `TypeChecker::widen_const_checked` wraps `const_value_to_typed` + that same three-way
+  compatibility test + `lower_widen`, and every one of this stage's validation sites goes through
+  it — never through `lower_widen` directly. Caught by a hand-written test
+  (`an_annotation_field_of_the_wrong_type_is_an_error`) that silently passed before this wrapper
+  existed: `#json(name=5)` against a `Str` field validated with no error at all.
+- **`annotation` declarations hoist two-pass**, exactly like `data` — `TypeChecker::
+  hoist_annotation_decls` registers every `annotation name(...)` in a block before any `#name(...)`
+  use in that same block is checked, so declaration order within one file doesn't matter (matching
+  `data`'s existing forward-reference story).
+- **Attachment desugars to one wrapper node, stripped before anything else runs.** `Grammar::
+  leading_annotations`/`trailing_annotations` (parser.rs's `block`/`statement`, and
+  `Grammar::field_list`) collect `#name(...)` runs and wrap the target in
+  `Expression::Decorated { annotations, target }` (or set a `FieldDecl`'s own `annotations`
+  directly, for the field/variant-field case). `TypeChecker::strip_and_validate_annotations`
+  — run once per block, immediately after `hoist_annotation_decls` and before `hoist_data_decls`/
+  `hoist_trait_names`/everything else — validates each annotation and unwraps `Decorated` back to
+  its bare `target`, so every other pass in the compiler (hoisting, lowering, codegen) only ever
+  sees the plain node it already knows how to handle. `Decorated` reaching `check_and_lower`
+  itself is `unreachable!()`.
+- **Same-line trailing detection needed no new mechanism.** `Token::Newline` is an explicit token
+  in this lexer (never auto-skipped), so "the current token is `Hash`" already means "still on the
+  same source line" — if a line break had occurred, `Newline` would be the current token instead.
+  `trailing_annotations` is exactly that one check in a loop.
+
+### A real bug found building this: module name-mangling
+
+`frontend::modules`' per-file rewrite pass mangles every top-level declared name (so two modules
+can each declare `Point` without colliding) — including, once `collect_names_in`/`rewrite`
+learned about `Expression::AnnotationDecl`/`Decorated`, an `annotation` declaration's own name.
+But the mangling pass only rewrote the *declaration* site (`a.name` inside the `AnnotationDecl`
+arm) — a `#name(...)` *use* site's `AnnotationUse.name` was never touched, at either the
+top-level `Decorated` wrapper or a `FieldDecl`'s own `annotations`. Symptom: any annotation used
+outside the exact file that declared it — the ordinary case for a shared `#json`/`#primary_key`
+library — read as `unknown annotation`, one file after its own declaration was silently renamed
+out from under it. Fixed by `rewrite_annotation_uses`, called from both sites, using a direct
+`subst` lookup rather than the existing `rewrite_name` helper: `rewrite_name` splits a dotted
+name into `alias.member` and resolves it through the *import*-qualification table, which is wrong
+for an annotation's own dotted identity (`db.model` is one flat key, not an aliased reference).
+Caught by a dedicated two-file test (`an_annotation_declared_and_used_in_an_imported_module_
+resolves`), not by any single-file test — worth remembering for the next feature that adds a new
+top-level declaration kind: `frontend::modules`' three separate `Expression`-matching walks
+(`check_no_nested_imports`, `collect_names_in`, `rewrite`) all need to learn about it, and only a
+cross-module test exercises the third.
+
+### Verification
+
+`tests/test_hash_annotations.rs` (26 tests): struct-field defaults (used, overridden, on an optional
+field, on a union variant field, wrong type, non-literal, positional-field rejection, no-default-
+still-errors); annotation validation (valid use, unknown annotation, wrong field type, missing
+required field, unknown field, duplicate field, both sugars, dotted names, unnamed-field
+rejection, redeclaration rejection); attachment (leading, trailing, stacked leading, leading+
+trailing together); and the two cross-module regression tests above. Full crate suite (46
+binaries) unaffected.
 
 ### Sigil and placement
 

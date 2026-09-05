@@ -2,10 +2,10 @@ use std::{collections::HashMap, fmt::Display, vec};
 
 use crate::frontend::{
     expression::{
-        AnnotatedExpr, AssignExpr, BinaryExpr, CallExpr, ConditionalExpr, Expression,
-        FieldAccessExpr, ForLoopExpr, FunctionExpr, IndexExpr, IsPatternExpr,
-        LiteralExpr, MatchArm, Mutability, Parameter, Pattern, RangeExpr, SliceExpr,
-        TraitMemberDecl, TypeParam, UnaryExpr,
+        AnnotatedExpr, AnnotationUse, AssignExpr, BinaryExpr, CallExpr,
+        ConditionalExpr, Expression, FieldAccessExpr, FieldDecl, ForLoopExpr,
+        FunctionExpr, IndexExpr, IsPatternExpr, LiteralExpr, MatchArm, Mutability, Parameter,
+        Pattern, RangeExpr, SliceExpr, TraitMemberDecl, TypeParam, UnaryExpr,
     },
     tokens::{Span, Spanned, Token},
 };
@@ -852,6 +852,50 @@ impl ScopeStack {
     }
 }
 
+/// A compile-time-constant scalar — `DATA.md` Stage 6's "annotations are
+/// typed values, not raw strings" restricted to literals: an annotation
+/// field's value, an annotation field's own `= default`, and an ordinary
+/// struct field's `= default` are all one of these, never an arbitrary
+/// expression. Never itself a union or struct — `eval_const_expr` only
+/// ever produces one of these five shapes, and matching it against a wider
+/// declared type (`T?`, an anonymous union) is `lower_widen`'s job once
+/// it's lifted into a `TypedExpr` via `TypeChecker::const_value_to_typed`.
+#[derive(Debug, Clone, PartialEq)]
+enum ConstValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    None,
+}
+
+/// Evaluate `e` as a `ConstValue`, or explain why it isn't one. Deliberately
+/// narrow — a literal, or unary `-` over a numeric literal — not a general
+/// const-evaluator: `DATA.md` Stage 6 states this restriction explicitly
+/// ("Fields must be literals; const-eval is restricted to literals
+/// initially"), and it's what lets an annotation/default value be validated
+/// with no dependency on scope, evaluation order, or codegen at all.
+fn eval_const_expr(e: &Expression) -> Result<ConstValue, String> {
+    const NOT_CONST: &str = "must be a literal constant (a number, string, true, false, or none)";
+    match e {
+        Expression::Literal(LiteralExpr { token }) => match token {
+            Token::Int(n) => Ok(ConstValue::Int(*n)),
+            Token::Float(f) => Ok(ConstValue::Float(*f)),
+            Token::True => Ok(ConstValue::Bool(true)),
+            Token::False => Ok(ConstValue::Bool(false)),
+            Token::String(s) => Ok(ConstValue::Str(s.clone())),
+            Token::None => Ok(ConstValue::None),
+            _ => Err(NOT_CONST.to_string()),
+        },
+        Expression::Unary(UnaryExpr { op: Token::Minus, expr }) => match &expr.item {
+            Expression::Literal(LiteralExpr { token: Token::Int(n) }) => Ok(ConstValue::Int(-n)),
+            Expression::Literal(LiteralExpr { token: Token::Float(f) }) => Ok(ConstValue::Float(-f)),
+            _ => Err(NOT_CONST.to_string()),
+        },
+        _ => Err(NOT_CONST.to_string()),
+    }
+}
+
 pub struct TypeChecker {
     /// Variable (value level) name -> Type, lexically scoped.
     ctx: ScopeStack,
@@ -953,6 +997,22 @@ pub struct TypeChecker {
     /// search is narrow by construction: only over traits declaring *that*
     /// name, typically one.
     member_traits: HashMap<String, Vec<String>>,
+    /// `DATA.md` Stage 6: registered `annotation Name(field: Type = default, ...)`
+    /// declarations — name -> its field list, in declared order. Consulted
+    /// by `validate_annotation_use` to typecheck a `#name(...)` use.
+    annotation_defs: HashMap<String, Vec<(String, Type)>>,
+    /// Literal default values for `annotation_defs`' fields, keyed the same
+    /// way, field name -> its evaluated `ConstValue`. Only fields that
+    /// declared `= default` appear; a field absent here is required at
+    /// every use site.
+    annotation_defaults: HashMap<String, HashMap<String, ConstValue>>,
+    /// Literal default values for ordinary `data`/`error` struct (and
+    /// variant) fields — `DATA.md` Stage 6's prerequisite. Keyed the same
+    /// way `provides`/`struct_templates` key a union member
+    /// (`"Shape.Circle"`), field name -> its evaluated `ConstValue`.
+    /// Consulted by `lower_record_args` when a construction call omits a
+    /// field that has one.
+    struct_field_defaults: HashMap<String, HashMap<String, ConstValue>>,
     /// Named function -> which of its parameters are `mut`
     /// (`MUTABILITY.md`), in declaration order. `Type::Function` itself
     /// carries no mutability — "a `mut` parameter does not escape" is the
@@ -1054,6 +1114,9 @@ pub struct TypeCheckerCheckpoint {
     generic_instantiations: HashMap<String, std::collections::HashSet<Type>>,
     generic_templates: HashMap<String, GenericTemplate>,
     emitted_instantiations: std::collections::HashSet<String>,
+    annotation_defs: HashMap<String, Vec<(String, Type)>>,
+    annotation_defaults: HashMap<String, HashMap<String, ConstValue>>,
+    struct_field_defaults: HashMap<String, HashMap<String, ConstValue>>,
 }
 
 impl Default for TypeChecker {
@@ -1145,14 +1208,14 @@ impl TypeChecker {
     }
 
     pub fn empty() -> Self {
-        let mut tc = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() };
+        let mut tc = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
         tc.seed_iterable_container_traits();
         tc.seed_base_prelude();
         tc
     }
 
     pub fn new() -> Self {
-        let mut tc = TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() };
+        let mut tc = TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
         tc.seed_iterable_container_traits();
         tc.seed_base_prelude();
         tc
@@ -1228,7 +1291,7 @@ impl TypeChecker {
                 Expression::Block(stmts) => stmts,
                 other => vec![Spanned::from(other, ast.span)],
             };
-            let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new() };
+            let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
             boot.hoist_trait_names(&stmts).expect("builtin Iterable/Container trait names must hoist");
             boot.hoist_trait_members(&stmts).expect("builtin Iterable/Container trait members must hoist");
             let iterable = boot.traits.remove("Iterable").expect("hoisted above");
@@ -1705,6 +1768,9 @@ impl TypeChecker {
             generic_instantiations: self.generic_instantiations.clone(),
             generic_templates: self.generic_templates.clone(),
             emitted_instantiations: self.emitted_instantiations.clone(),
+            annotation_defs: self.annotation_defs.clone(),
+            annotation_defaults: self.annotation_defaults.clone(),
+            struct_field_defaults: self.struct_field_defaults.clone(),
         }
     }
 
@@ -1728,6 +1794,9 @@ impl TypeChecker {
         self.generic_templates = cp.generic_templates;
         self.emitted_instantiations = cp.emitted_instantiations;
         self.func_mut_params = cp.func_mut_params;
+        self.annotation_defs = cp.annotation_defs;
+        self.annotation_defaults = cp.annotation_defaults;
+        self.struct_field_defaults = cp.struct_field_defaults;
     }
 
     /// Install additional global bindings (host functions,
@@ -3321,10 +3390,25 @@ impl TypeChecker {
                     }
                     self.type_param_scope = scope;
                 }
-                let mut fields = Vec::with_capacity(d.fields.len());
+                let mut fields: Vec<(String, Type)> = Vec::with_capacity(d.fields.len());
                 for (i, p) in d.fields.iter().enumerate() {
                     let ty = self.resolve_type_expr(&p.ty)?;
-                    fields.push((field_name_or_positional(&p.name, i), ty));
+                    let fname = field_name_or_positional(&p.name, i);
+                    // A field list is a map from name to layout slot
+                    // everywhere downstream (`struct_defs`, field access,
+                    // `lower_record_args`' named-argument matching), and
+                    // all of those take the first match — so a repeated
+                    // name leaves the second field unreachable, unwritable
+                    // by name, and silently occupying a slot. Positional
+                    // fields get their index as a synthetic name, which is
+                    // unique by construction, so only named ones can trip
+                    // this.
+                    if fields.iter().any(|(n, _)| *n == fname) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("Field '{}' is declared twice in {}", fname, d.name)
+                        }, p.ty.span));
+                    }
+                    fields.push((fname, ty));
                 }
                 self.type_param_scope = HashMap::new();
                 if d.variants.is_empty() {
@@ -3334,8 +3418,9 @@ impl TypeChecker {
                     // instantiation by `materialize_struct` instead.
                     self.struct_templates.insert(d.name.clone(), fields.clone());
                     if d.type_params.is_empty() {
-                        self.struct_defs.insert(Type::strukt(&d.name), fields);
+                        self.struct_defs.insert(Type::strukt(&d.name), fields.clone());
                     }
+                    self.register_field_extras(&d.name, &d.fields, &fields)?;
                 } else {
                     let mut seen_variants: HashMap<String, Span> = HashMap::new();
                     let mut variants = Vec::with_capacity(d.variants.len());
@@ -3346,10 +3431,36 @@ impl TypeChecker {
                             }, s.span));
                         }
                         seen_variants.insert(v.name.clone(), s.span);
-                        let mut vfields = Vec::with_capacity(v.fields.len());
+                        let mut vfields: Vec<(String, Type)> = Vec::with_capacity(v.fields.len());
                         for (i, p) in v.fields.iter().enumerate() {
                             let ty = self.resolve_type_expr(&p.ty)?;
-                            vfields.push((field_name_or_positional(&p.name, i), ty));
+                            let fname = field_name_or_positional(&p.name, i);
+                            // Same rule as the common fields above, plus:
+                            // a variant's marker struct is the common
+                            // fields followed by its own (see the `flat`
+                            // list below), so a name that collides with a
+                            // common one is just as much a duplicate.
+                            if vfields.iter().any(|(n, _)| *n == fname) {
+                                return Err(Spanned::from(TypeError {
+                                    msg: format!("Field '{}' is declared twice in {}.{}", fname, d.name, v.name)
+                                }, p.ty.span));
+                            }
+                            if fields.iter().any(|(n, _)| *n == fname) {
+                                // Positional fields on both sides are the
+                                // same collision wearing different clothes:
+                                // each side numbers its own slots from 0,
+                                // so `flat` would hold two fields named
+                                // "0". Say that, rather than report a
+                                // duplicate of a name the source never
+                                // wrote.
+                                let msg = if p.name.is_none() {
+                                    format!("{} declares positional common fields, so its variants' fields must be named (`field: Type`) — {}.{}'s positional slots would collide with them", d.name, d.name, v.name)
+                                } else {
+                                    format!("Field '{}' of {}.{} is already declared as a common field of {}", fname, d.name, v.name, d.name)
+                                };
+                                return Err(Spanned::from(TypeError { msg }, p.ty.span));
+                            }
+                            vfields.push((fname, ty));
                         }
                         variants.push((v.name.clone(), vfields));
                     }
@@ -3363,14 +3474,18 @@ impl TypeChecker {
                     // prelude) — `VariantInit`/`VariantField`/`IsVariant`
                     // all go through `union_defs` directly and are
                     // unaffected by this being additionally present here.
-                    for (vn, vfields) in &variants {
+                    for (v, (vn, vfields)) in d.variants.iter().zip(variants.iter()) {
                         let mut flat = fields.clone();
                         flat.extend(vfields.clone());
                         // A nominal union's variant marker struct is never
                         // generic, so template and layout coincide.
                         let vkey = format!("{}.{}", d.name, vn);
                         self.struct_templates.insert(vkey.clone(), flat.clone());
-                        self.struct_defs.insert(Type::strukt(&vkey), flat);
+                        self.struct_defs.insert(Type::strukt(&vkey), flat.clone());
+                        // Common fields, then the variant's own — same order
+                        // `flat` was built in above, so the two zip.
+                        let raw_flat: Vec<FieldDecl> = d.fields.iter().cloned().chain(v.fields.iter().cloned()).collect();
+                        self.register_field_extras(&vkey, &raw_flat, &flat)?;
                     }
                     let def = self.union_defs.get_mut(&d.name).expect("registered in the first pass, above");
                     def.common = fields;
@@ -3408,6 +3523,213 @@ impl TypeChecker {
             if let Expression::DataDecl(d) = &s.item {
                 self.check_struct_acyclic(&d.name, &mut Vec::new(), s.span)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Validate and register one `kind_name`'s field-level `#ann` uses and
+    /// literal `= default`s — shared by `hoist_data_decls`'s two call
+    /// sites (a plain struct's own fields, and a nominal union variant's
+    /// flattened common+own fields). `raw_fields` and `resolved` must be
+    /// the same length and in the same order — `hoist_data_decls` builds
+    /// both from the same source list, so they always are.
+    fn register_field_extras(&mut self, kind_name: &str, raw_fields: &[FieldDecl], resolved: &[(String, Type)]) -> Result<(), Spanned<TypeError>> {
+        for (p, (fname, fty)) in raw_fields.iter().zip(resolved.iter()) {
+            for ann in &p.annotations {
+                self.validate_annotation_use(ann, p.ty.span)?;
+            }
+            if let Some(default_expr) = &p.default {
+                // A field whose declared type is (or contains) one of the
+                // declaration's own type parameters has no single type to
+                // check a literal default against: `fty` here is the
+                // *template*, whose binder `TypeVar`s every instantiation
+                // replaces with fresh ones. Checking against the template
+                // would both succeed unconditionally (`unify` binds the
+                // binder var to the literal's type, permanently, for every
+                // later use of that var) and leave the construction site's
+                // fresh var unbound, which reaches codegen as a bare
+                // `TypeVar` and panics there. Reject it up front instead.
+                let mut vars = Vec::new();
+                self.free_vars(fty, &mut vars);
+                if !vars.is_empty() {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("field '{}' of {} has a generic type, so it cannot have a default value", fname, kind_name)
+                    }, default_expr.span));
+                }
+                let cv = eval_const_expr(&default_expr.item).map_err(|msg| Spanned::from(TypeError {
+                    msg: format!("default value for field '{}' of {}: {}", fname, kind_name, msg)
+                }, default_expr.span))?;
+                self.widen_const_checked(&cv, fty, default_expr.span).map_err(|e| Spanned::from(TypeError {
+                    msg: format!("default value for field '{}' of {} doesn't match its declared type: {}", fname, kind_name, e.item.msg)
+                }, default_expr.span))?;
+                self.struct_field_defaults.entry(kind_name.to_string()).or_default().insert(fname.clone(), cv);
+            }
+        }
+        Ok(())
+    }
+
+    /// First pass, `annotation` declarations: register every `annotation
+    /// name(field: Type = default, ...)` in `stmts` into `annotation_defs`/
+    /// `annotation_defaults`, so a `#name(...)` use anywhere in the same
+    /// block — including one that appears *before* its declaration,
+    /// exactly like `data` — resolves. Must run before
+    /// `strip_and_validate_annotations`, which is what actually validates
+    /// uses against what's registered here.
+    fn hoist_annotation_decls(&mut self, stmts: &[Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
+        for s in stmts {
+            // Look through any `#ann` wrapper: this pass runs *before*
+            // `strip_and_validate_annotations` (it has to — that pass
+            // validates uses against what this one registers), so an
+            // `annotation` declaration that itself carries an annotation
+            // is still wrapped in `Decorated` here. Missing it would
+            // silently drop the declaration entirely: the lowering loops
+            // skip `AnnotationDecl` unconditionally.
+            let mut item = &s.item;
+            while let Expression::Decorated(d) = item { item = &d.target.item; }
+            if let Expression::AnnotationDecl(a) = item {
+                if self.annotation_defs.contains_key(&a.name) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("annotation '{}' is already declared", a.name)
+                    }, s.span));
+                }
+                let mut fields: Vec<(String, Type)> = Vec::with_capacity(a.fields.len());
+                let mut defaults = HashMap::new();
+                for f in &a.fields {
+                    let Some(fname) = f.name.clone() else {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("annotation '{}' fields must be named (`field: Type`), not positional", a.name)
+                        }, f.ty.span));
+                    };
+                    // `validate_annotation_use` matches a provided value
+                    // against the *first* declaration of a name but then
+                    // type-checks positionally, so a duplicate would report
+                    // a bogus type mismatch on the second one rather than
+                    // the real problem.
+                    if fields.iter().any(|(n, _)| *n == fname) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("annotation '{}' declares field '{}' twice", a.name, fname)
+                        }, f.ty.span));
+                    }
+                    let ty = self.resolve_type_expr(&f.ty)?;
+                    if let Some(default_expr) = &f.default {
+                        let cv = eval_const_expr(&default_expr.item).map_err(|msg| Spanned::from(TypeError {
+                            msg: format!("default value for annotation field '{}': {}", fname, msg)
+                        }, default_expr.span))?;
+                        self.widen_const_checked(&cv, &ty, default_expr.span).map_err(|e| Spanned::from(TypeError {
+                            msg: format!("default value for annotation field '{}' doesn't match its declared type: {}", fname, e.item.msg)
+                        }, default_expr.span))?;
+                        defaults.insert(fname.clone(), cv);
+                    }
+                    fields.push((fname, ty));
+                }
+                self.annotation_defs.insert(a.name.clone(), fields);
+                self.annotation_defaults.insert(a.name.clone(), defaults);
+            }
+        }
+        Ok(())
+    }
+
+    /// Second pass: unwrap every `Expression::Decorated(annotations,
+    /// target)` in `stmts` back into its bare `target`, validating each
+    /// annotation against `annotation_defs` on the way. Runs once,
+    /// directly on the block's own top-level statement list (never
+    /// recurses into nested blocks — `check_and_lower_entry`/`lower_block`
+    /// call this and `hoist_annotation_decls` at their own level, same as
+    /// `hoist_data_decls`), so every hoist/lower pass downstream sees only
+    /// the plain `DataDecl`/`Assign`/etc nodes it already knows how to
+    /// handle — no call site anywhere else needs to know `Decorated`
+    /// exists.
+    fn strip_and_validate_annotations(&mut self, stmts: &mut [Spanned<Expression>]) -> Result<(), Spanned<TypeError>> {
+        for s in stmts.iter_mut() {
+            // `while`, not `if`: annotations can nest (an annotated
+            // `annotation` declaration, most concretely), and every layer
+            // has to be validated and unwrapped for the passes downstream
+            // to see the plain node.
+            while matches!(s.item, Expression::Decorated(_)) {
+                let placeholder = Expression::Literal(LiteralExpr { token: Token::None });
+                let taken = std::mem::replace(&mut s.item, placeholder);
+                let Expression::Decorated(d) = taken else { unreachable!("just checked above") };
+                for ann in &d.annotations {
+                    self.validate_annotation_use(ann, s.span)?;
+                }
+                s.item = d.target.item;
+            }
+        }
+        Ok(())
+    }
+
+    /// Typecheck one `#name(...)` use against its `annotation_defs` entry:
+    /// the annotation exists, every provided field is declared and
+    /// well-typed, every field without a provided value falls back to its
+    /// default (or is a "missing required field" error). Also recognizes
+    /// two sugars alongside plain `field=value`: a bare identifier naming a
+    /// declared `Bool` field (`#json(skip)` ≡ `skip=true`), and — only
+    /// when the annotation has exactly one field — a single positional
+    /// value (`#rename("x")` ≡ `name="x"`).
+    fn validate_annotation_use(&mut self, ann: &AnnotationUse, span: Span) -> Result<(), Spanned<TypeError>> {
+        let field_defs = self.annotation_defs.get(&ann.name).cloned().ok_or_else(|| Spanned::from(TypeError {
+            msg: format!("unknown annotation '#{}' — no `annotation {}(...)` is declared", ann.name, ann.name)
+        }, span))?;
+        let defaults = self.annotation_defaults.get(&ann.name).cloned().unwrap_or_default();
+
+        let mut provided: Vec<(String, ConstValue)> = Vec::with_capacity(ann.args.len());
+        for arg in &ann.args {
+            match &arg.item {
+                Expression::Assign(a) => {
+                    let Some(fname) = a.target.item.get_identifier() else {
+                        return Err(Spanned::from(TypeError {
+                            msg: "annotation field name must be a plain identifier".to_string()
+                        }, arg.span));
+                    };
+                    let cv = eval_const_expr(&a.value.item).map_err(|msg| Spanned::from(TypeError {
+                        msg: format!("annotation field '{}': {}", fname, msg)
+                    }, a.value.span))?;
+                    provided.push((fname.to_string(), cv));
+                }
+                Expression::Literal(LiteralExpr { token: Token::Identifier(fname) })
+                    if field_defs.iter().any(|(n, t)| n == fname && matches!(self.lookup(t), Type::Bool)) =>
+                {
+                    // `#json(skip)` sugar for `skip=true`.
+                    provided.push((fname.clone(), ConstValue::Bool(true)));
+                }
+                _ if ann.args.len() == 1 && field_defs.len() == 1 => {
+                    // Single positional value sugar: `#rename("x")`.
+                    let cv = eval_const_expr(&arg.item).map_err(|msg| Spanned::from(TypeError {
+                        msg: format!("annotation '{}': {}", ann.name, msg)
+                    }, arg.span))?;
+                    provided.push((field_defs[0].0.clone(), cv));
+                }
+                _ => return Err(Spanned::from(TypeError {
+                    msg: format!("annotation '#{}' requires named fields, e.g. #{}(field=value)", ann.name, ann.name)
+                }, arg.span)),
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for (fname, _) in &provided {
+            if !field_defs.iter().any(|(n, _)| n == fname) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("annotation '{}' has no field '{}'", ann.name, fname)
+                }, span));
+            }
+            if !seen.insert(fname.clone()) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("duplicate field '{}' in '#{}(...)'", fname, ann.name)
+                }, span));
+            }
+        }
+
+        for (fname, fty) in &field_defs {
+            let value = provided.iter().find(|(n, _)| n == fname).map(|(_, v)| v.clone())
+                .or_else(|| defaults.get(fname).cloned());
+            let Some(value) = value else {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("annotation '#{}' is missing required field '{}'", ann.name, fname)
+                }, span));
+            };
+            self.widen_const_checked(&value, fty, span).map_err(|e| Spanned::from(TypeError {
+                msg: format!("annotation '#{}' field '{}': {}", ann.name, fname, e.item.msg)
+            }, span))?;
         }
         Ok(())
     }
@@ -3508,13 +3830,25 @@ impl TypeChecker {
         }
         let mut ordered = Vec::with_capacity(field_defs.len());
         for (fname, fty) in field_defs {
-            let idx = fields.iter().position(|(n, _)| n == fname)
-                .ok_or_else(|| Spanned::from(TypeError {
-                    msg: format!("Missing field '{}' in construction of {}", fname, kind_name)
-                }, span))?;
-            let (fname, value) = fields.remove(idx);
-            let value = Box::new(self.lower_widen(*value, fty)?);
-            ordered.push((fname, value));
+            let idx = fields.iter().position(|(n, _)| n == fname);
+            let value = match idx {
+                Some(idx) => {
+                    let (_, value) = fields.remove(idx);
+                    Box::new(self.lower_widen(*value, fty)?)
+                }
+                // `plans/DATA.md` Stage 6's struct-field-default
+                // prerequisite: a field the call omitted falls back to its
+                // declared `= default` (a literal constant, already
+                // type-checked against `fty` when it was registered — see
+                // `register_field_extras`) rather than erroring.
+                None => match self.struct_field_defaults.get(kind_name).and_then(|m| m.get(fname)).cloned() {
+                    Some(default) => Box::new(self.lower_widen(Self::const_value_to_typed(&default, span), fty)?),
+                    None => return Err(Spanned::from(TypeError {
+                        msg: format!("Missing field '{}' in construction of {}", fname, kind_name)
+                    }, span)),
+                },
+            };
+            ordered.push((fname.clone(), value));
         }
         Ok(ordered)
     }
@@ -4229,6 +4563,8 @@ impl TypeChecker {
         let span = expr.span;
         match expr.item {
             Expression::Block(mut stmts) => {
+                self.hoist_annotation_decls(&stmts)?;
+                self.strip_and_validate_annotations(&mut stmts)?;
                 self.hoist_trait_names(&stmts)?;
                 self.hoist_data_decls(&stmts)?;
                 self.hoist_trait_members(&stmts)?;
@@ -4236,7 +4572,7 @@ impl TypeChecker {
                 let mut lowered = Vec::with_capacity(stmts.len());
                 let mut ty = Type::None;
                 for s in stmts {
-                    if matches!(s.item, Expression::DataDecl(_) | Expression::TraitDecl(_)) { continue; }
+                    if matches!(s.item, Expression::DataDecl(_) | Expression::TraitDecl(_) | Expression::AnnotationDecl(_)) { continue; }
                     let t = self.check_and_lower(s)?;
                     ty = t.item.ty.clone();
                     lowered.push(t);
@@ -5271,6 +5607,14 @@ impl TypeChecker {
             Expression::Comprehension(inner) => self.lower_comprehension(*inner, span),
             // Handled entirely by `hoist_data_decls` — never reaches codegen.
             Expression::DataDecl(_) => Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::IntLit(0) }, span)),
+            // Handled entirely by `hoist_annotation_decls` — never reaches codegen.
+            Expression::AnnotationDecl(_) => Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::IntLit(0) }, span)),
+            // Always stripped by `strip_and_validate_annotations` (run in
+            // `check_and_lower_entry`/`lower_block`, before any statement
+            // reaches this match) — never actually seen here.
+            Expression::Decorated(_) => unreachable!(
+                "Expression::Decorated is stripped by TypeChecker::strip_and_validate_annotations before any statement is lowered"
+            ),
             // Likewise handled entirely by `hoist_trait_names`/
             // `hoist_trait_members`. A trait declaration is a fact about the
             // type system; it produces no value and emits no code.
@@ -7400,6 +7744,8 @@ impl TypeChecker {
     // top-level program/REPL entry goes through
     // `check_and_lower_entry` instead, which does not scope.
     fn lower_block(&mut self, mut stmts: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        self.hoist_annotation_decls(&stmts)?;
+        self.strip_and_validate_annotations(&mut stmts)?;
         self.hoist_trait_names(&stmts)?;
         self.hoist_data_decls(&stmts)?;
         self.hoist_trait_members(&stmts)?;
@@ -7407,7 +7753,7 @@ impl TypeChecker {
         let lowered = self.in_scope(|t| -> Result<Vec<Spanned<TypedExpr>>, Spanned<TypeError>> {
             let mut lowered = Vec::with_capacity(stmts.len());
             for s in stmts {
-                if matches!(s.item, Expression::DataDecl(_) | Expression::TraitDecl(_)) { continue; }
+                if matches!(s.item, Expression::DataDecl(_) | Expression::TraitDecl(_) | Expression::AnnotationDecl(_)) { continue; }
                 lowered.push(t.check_and_lower(s)?);
             }
             Ok(lowered)
@@ -8498,6 +8844,60 @@ impl TypeChecker {
 
     fn str_lit(s: impl Into<String>, span: Span) -> Spanned<TypedExpr> {
         Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::StrLit(s.into()) }, span)
+    }
+
+    /// `TypedExpr` counterpart of `ConstValue` — the "natural" scalar type
+    /// (`Int`/`Float`/`Bool`/`Str`/`None`), never a union. Callers that need
+    /// the value in a wider slot (an annotation/struct field typed `T?`, a
+    /// union member) route it through `lower_widen` afterward, exactly like
+    /// an ordinary construction argument.
+    fn const_value_to_typed(v: &ConstValue, span: Span) -> Spanned<TypedExpr> {
+        let (ty, kind) = match v {
+            ConstValue::Int(n) => (Type::Int, TypedExprKind::IntLit(*n)),
+            ConstValue::Float(f) => (Type::Float, TypedExprKind::FloatLit(*f)),
+            ConstValue::Bool(b) => (Type::Bool, TypedExprKind::BoolLit(*b)),
+            ConstValue::Str(s) => (Type::Str, TypedExprKind::StrLit(s.clone())),
+            ConstValue::None => (Type::None, TypedExprKind::NoneLit),
+        };
+        Spanned::from(TypedExpr { id: 0, ty, kind }, span)
+    }
+
+    /// Check `v` against `target` the same way an ordinary construction
+    /// argument is checked (`lower_record_args`'s own compatibility test:
+    /// `widens_to` / `unify` / `unify_with_one_union_member`), then widen
+    /// it into `target`'s representation. `lower_widen` alone is *not*
+    /// a type check — for a non-union `target`, it silently returns its
+    /// input unchanged if the types don't match (it exists to be called
+    /// only after a value has already been checked compatible some other
+    /// way), so every one of this stage's own validation sites
+    /// (`register_field_extras`, `hoist_annotation_decls`,
+    /// `validate_annotation_use`) must go through this, never
+    /// `lower_widen` directly, or a mismatched literal (`#json(name=5)`
+    /// against a `Str` field) would validate silently.
+    fn widen_const_checked(&mut self, v: &ConstValue, target: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let base = Self::const_value_to_typed(v, span);
+        let resolved_value_ty = self.lookup(&base.item.ty);
+        let resolved_target_ty = self.lookup(target);
+        // `unify`/`unify_with_one_union_member` are used here as
+        // *predicates*, but both write to `substitutions` when they
+        // succeed. Every caller is a declaration-time check of a literal
+        // against a declared type, so any binding they produce would pin a
+        // type variable belonging to the *declaration* (a generic struct's
+        // binder, say) for the rest of the program, on the strength of one
+        // default value. `v` is always a concrete `ConstValue`, so nothing
+        // below — `lower_widen` included — needs those bindings; take a
+        // snapshot and put it back either way.
+        let snapshot = self.substitutions.clone();
+        let accepted = widens_to(&resolved_value_ty, &resolved_target_ty)
+            || self.unify(&base.item.ty, target)
+            || self.unify_with_one_union_member(&base.item.ty, target);
+        self.substitutions = snapshot;
+        if !accepted {
+            return Err(Spanned::from(TypeError {
+                msg: format!("expected {}, got {}", resolved_target_ty, resolved_value_ty)
+            }, span));
+        }
+        self.lower_widen(base, target)
     }
 
     /// Left-fold `parts` (every one `Str`-typed) into a `Str + Str + ...`

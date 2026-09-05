@@ -249,3 +249,31 @@ fn test_unboxed_variant_in_a_struct_field_survives_collection() {
     let (value, _) = s.eval("t.name + (if t.color is Blue then \"!\" else \"?\")").unwrap();
     assert!(matches!(&value, froglang_core::state::FrogValue::Str(s) if s == "hello!"), "got {:?}", value);
 }
+
+// ── duplicate field names ────────────────────────────────────────────────────
+
+#[test]
+fn test_duplicate_field_in_a_struct_is_an_error() {
+    // A field list is a name -> layout slot map everywhere downstream, and
+    // every lookup takes the first match, so the second `x` was silently
+    // unreachable and unwritable while still occupying a slot.
+    let err = type_error("data P(x: Int, x: Str)\nP(x=1)");
+    assert!(err.contains("Field 'x' is declared twice in P"), "{}", err);
+}
+
+#[test]
+fn test_duplicate_field_in_a_union_variant_is_an_error() {
+    let err = type_error("data U is A(x: Int, x: Str) | B(y: Int)\nA(x=1)");
+    assert!(err.contains("Field 'x' is declared twice in U.A"), "{}", err);
+}
+
+#[test]
+fn test_variant_field_shadowing_a_common_field_is_an_error() {
+    // A variant's marker struct is the common fields followed by its own,
+    // so a name declared on both sides is the same duplicate as above.
+    let err = type_error("data U(tag: Int) is A(tag: Str) | B(y: Int)\nA(tag=1)");
+    assert!(
+        err.contains("Field 'tag' of U.A is already declared as a common field of U"),
+        "{}", err,
+    );
+}

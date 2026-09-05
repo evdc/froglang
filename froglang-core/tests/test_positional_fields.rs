@@ -3,7 +3,13 @@
 //!
 //! A field list is all-named or all-positional, decided per list at parse
 //! time (`Grammar::field_list`), so a union's common fields and each
-//! variant's own fields choose independently. Internally a positional field
+//! variant's own fields choose independently — with one restriction: a
+//! variant's marker struct is the common fields followed by its own, and
+//! each list numbers its slots from 0, so positional fields on *both*
+//! sides would collide. A union with positional common fields therefore
+//! requires named variant fields (see
+//! `positional_variant_fields_collide_with_positional_common_fields`).
+//! Internally a positional field
 //! is keyed by its stringified declaration index (`"0"`, `"1"`, …) — see
 //! `field_name_or_positional` and `is_positional_fields` in `typeck.rs` —
 //! which is unambiguous because a lexed identifier can never be all digits.
@@ -201,4 +207,26 @@ fn calculator_program_evaluates_and_propagates_its_error() {
     // propagation. Div(Add(Lit(2), Lit(4)), Lit(3)) = 6/3 = 2, then a
     // second expression divides by zero and yields the error value.
     assert_eq!(run(&prog("calculator.frog")), "2\nDivideByZero()\n");
+}
+
+// ── duplicate field names ────────────────────────────────────────────────────
+
+#[test]
+fn positional_variant_fields_collide_with_positional_common_fields() {
+    // Both lists number their slots from 0, so the flattened marker struct
+    // for `U.A` would hold two fields named "0" — the second unreachable by
+    // name and silently occupying a layout slot. Rejected rather than
+    // reported as a duplicate of a name the source never wrote.
+    let out = run_raw("data U(Int) is A(Str) | B(Int)\nprint(\"unreachable\")\n");
+    assert_ne!(out.status, Some(0));
+    assert!(
+        out.stdout.contains("variants' fields must be named"),
+        "stdout: {}", out.stdout,
+    );
+}
+
+#[test]
+fn positional_variant_fields_are_fine_when_the_union_has_no_common_fields() {
+    let out = run("data U is A(Str) | B(Int)\nlet u = A(\"hi\")\nprint(u)\n");
+    assert_eq!(out, "U.A(\"hi\")\n");
 }

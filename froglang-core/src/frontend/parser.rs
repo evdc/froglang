@@ -141,9 +141,22 @@ impl<'a> Parser<'a> {
             // as unremarkable at the top level as they are inside `{ }`.
             self.skip_newlines_and_semicolons();
             if self.check(&Token::EOF) { break; }
+            // `#ann` before a statement forward-attaches to it
+            // (`plans/DATA.md` Stage 6) — must be peeled off here, before
+            // `statement`, since `#` has no expression-prefix rule of its
+            // own and would otherwise just be a parse error.
+            let leading = match Grammar::leading_annotations(self) {
+                Ok(a) => a,
+                Err(err) => {
+                    self.errors.push(err);
+                    self.synchronize();
+                    let _ = self.advance();
+                    continue;
+                }
+            };
             let maybe_expr = self.statement();
             match maybe_expr {
-                Ok(expr) => exprs.push(expr),
+                Ok(expr) => exprs.push(Expression::decorate(leading, expr)),
                 Err(err) => {
                     self.errors.push(err);
                     self.synchronize();     // leaves us pointing at a newline
@@ -157,6 +170,12 @@ impl<'a> Parser<'a> {
     pub fn statement(&mut self) -> ParseResult {
         // at the start, only expression statements are supported
         let expr = self.expression(Precedence::Assign)?;
+        // `#ann` immediately after (same line) backward-attaches to what
+        // was just parsed — the other half of Stage 6's attachment rule.
+        // Must run before the EOF/`;`/Newline check below: a trailing `#`
+        // is neither of those.
+        let trailing = Grammar::trailing_annotations(self)?;
+        let expr = Expression::decorate(trailing, expr);
         // the final newline should be able to be elided
         if self.check(&Token::EOF) {
             return Ok(expr);

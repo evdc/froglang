@@ -1221,7 +1221,8 @@ impl TypeChecker {
         tc
     }
 
-    /// `ReadError` (`plans/DATA.md` stage 5: `read`'s error type) — seeded
+    /// `ReadError` (`plans/DATA.md` stage 5: `read`'s error type) and
+    /// `JsonError` (stage 8: `json.parse`'s) — seeded
     /// directly rather than parsed from a prelude source string the way
     /// `stdlib::install`'s `ErrMsg`/`IndexError` are (`stdlib/mod.rs`'s
     /// `.prelude(...)` calls, which run through `FrogState::eval` and so
@@ -1244,11 +1245,22 @@ impl TypeChecker {
     /// directly, and `hoist_data_decls`' full two-pass machinery (binder
     /// scoping, variant handling, cycle checks) is aimed at exactly the
     /// generality this type doesn't need.
+    /// `JsonError` is here, and not behind an import, because the `json.`
+    /// namespace is (`lower_call`'s `json_builtin_target`) — a
+    /// return-type-directed `json.parse(s): Person | JsonError` has to be
+    /// able to *name* its error type in the annotation that drives it, and
+    /// making that name cost a second import would be ceremony with
+    /// nothing behind it.
     fn seed_base_prelude(&mut self) {
-        let fields = vec![("msg".to_string(), Type::Str), ("offset".to_string(), Type::Int)];
-        self.struct_templates.insert("ReadError".to_string(), fields.clone());
-        self.struct_defs.insert(Type::strukt("ReadError"), fields);
-        self.provides.insert("ReadError".to_string(), vec![Trait::Error]);
+        // Same two fields, same meaning, deliberately not the same type:
+        // `T | ReadError` and `T | JsonError` are different failures and a
+        // `catch` should be able to tell them apart.
+        for name in ["ReadError", "JsonError"] {
+            let fields = vec![("msg".to_string(), Type::Str), ("offset".to_string(), Type::Int)];
+            self.struct_templates.insert(name.to_string(), fields.clone());
+            self.struct_defs.insert(Type::strukt(name), fields);
+            self.provides.insert(name.to_string(), vec![Trait::Error]);
+        }
     }
 
     /// `Iterable<Item>`/`Container<Item>` (`RANGES.md` Stage 2) — seeded by
@@ -2090,6 +2102,11 @@ impl TypeChecker {
             // `read(s)` — `zero_self_target`'s sibling: the expected type
             // is what says what to read, not a value at the call site.
             (Expression::Call(c), _) if Self::is_read_call(&c) => self.lower_read(c, &expected, span),
+            // `json.parse(s)` — the same story one tier up (`plans/DATA.md`
+            // stage 8): the annotation says what shape to fill in, so it
+            // has to be intercepted here rather than after the expected
+            // type is gone.
+            (Expression::Call(c), _) if self.is_json_parse_call(&c) => self.lower_json_parse(c, &expected, span),
             (Expression::Tuple(elems), _) if expected.as_list_elem().is_some() => {
                 let elem_ty = expected.as_list_elem().expect("checked above").clone();
                 let mut items = Vec::with_capacity(elems.len());
@@ -2177,6 +2194,92 @@ impl TypeChecker {
             }
             _ => None,
         }
+    }
+
+    /// `json.<member>(...)` — the builtin `json` namespace (`plans/DATA.md`
+    /// stage 8), returning the member name.
+    ///
+    /// `json` is a *namespace*, not a value, so this has to match on the
+    /// callee's syntax before anything tries to lower `json` itself as an
+    /// expression — exactly the reason `Ord.compare(a, b)`'s trait-prefix
+    /// check sits where it does in `lower_call`, ahead of `lower_ufcs_call`.
+    /// And exactly like that check, it is *gated*: an actual binding named
+    /// `json` in scope wins, so `let json = ...` shadows the namespace
+    /// rather than being shadowed by it. Stage 8 chose a builtin namespace
+    /// over an `import "std/json"` module precisely so that `json.parse(s):
+    /// Person | JsonError` costs no ceremony; this gate is what keeps that
+    /// from also costing the name.
+    fn json_builtin_target(&self, c: &CallExpr) -> Option<String> {
+        let Expression::FieldAccess(fa) = &c.callable.item else { return None };
+        if fa.target.item.get_identifier() != Some("json") { return None }
+        if self.ctx.get("json").is_some() { return None }
+        Some(fa.field.clone())
+    }
+
+    /// `json.parse(s)` specifically — `is_read_call`'s twin, and for the
+    /// same reason: `lower_expected` needs to intercept it before the
+    /// expected type is lost.
+    fn is_json_parse_call(&self, c: &CallExpr) -> bool {
+        self.json_builtin_target(c).as_deref() == Some("parse")
+    }
+
+    /// The `json` namespace's members, once `lower_call` has established
+    /// that this really is one. `json.parse` reaching here at all means
+    /// there was no expected type to parse *into* — the same "return-type
+    /// directed, so say what's missing" shape `read` has just above.
+    fn lower_json_call(&mut self, member: &str, c: CallExpr, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        match member {
+            "to_str" => {
+                if c.args.len() != 1 {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
+                    }, callee_span));
+                }
+                let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
+                let arg_ty = self.lookup(&arg.item.ty);
+                // Deferred past a bare generic `TypeVar` for exactly the
+                // reason `is_repr`'s own checks are — see its comment; the
+                // re-check happens in `desugar_notation` once each
+                // monomorphized instantiation has a concrete type.
+                if !matches!(arg_ty, Type::TypeVar { .. }) {
+                    self.check_json_serializable(&arg_ty, arg.span)?;
+                }
+                // A placeholder, expanded by `desugar_notation` into
+                // `build_json`'s per-type fragments — `repr`'s exact
+                // arrangement, and for the same post-monomorphization
+                // reasons (see `desugar_notation`'s own doc comment).
+                let callable = Spanned::from(TypedExpr {
+                    id: 0,
+                    ty: Type::Function { params: vec![arg_ty], result: Box::new(Type::Str) },
+                    kind: TypedExprKind::Var("__json_to_str".to_string()),
+                }, callee_span);
+                Ok(Spanned::from(TypedExpr {
+                    id: 0, ty: Type::Str,
+                    kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] },
+                }, span))
+            }
+            "parse" => Err(Spanned::from(TypeError {
+                msg: "cannot infer what to parse; annotate the expected type, e.g. 'let x: T | JsonError = json.parse(s)'".to_string()
+            }, span)),
+            other => Err(Spanned::from(TypeError {
+                msg: format!("unknown json builtin 'json.{}' — the json namespace has 'to_str' and 'parse'", other)
+            }, callee_span)),
+        }
+    }
+
+    /// `json.to_str`'s gate. No new `Trait` variant: `Show` is already
+    /// structural over every `data` and already excludes `Type::Function`,
+    /// which is exactly the line JSON needs to draw too, and `DATA.md`
+    /// stage 8's own reasoning against a `Json`/`Serialize` trait is that a
+    /// granted trait nobody can opt out of (there is no `without` yet) is
+    /// worse than no trait at all.
+    fn check_json_serializable(&mut self, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        if !self.type_implements(ty, &Trait::Show) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("{} has no JSON form — json.to_str needs Show", ty)
+            }, span));
+        }
+        self.check_no_recursive_union(ty, span, "json.to_str", "formats it field-by-field")
     }
 
     /// `read(s)` — a bare call to the reserved name, exactly the shape
@@ -6542,6 +6645,13 @@ impl TypeChecker {
             }, span));
         }
 
+        // The builtin `json` namespace (`plans/DATA.md` stage 8), matched
+        // here — before the `FieldAccess`-callee branch far below would try
+        // to lower `json` as a value and die as an unbound variable.
+        if let Some(member) = self.json_builtin_target(&c) {
+            return self.lower_json_call(&member, c, callee_span, span);
+        }
+
         // Struct construction: `Person(name="Alice", age=42)` looks
         // like an ordinary call syntactically (there's no dedicated
         // construction grammar — see `Grammar::data_decl`'s doc
@@ -8720,34 +8830,58 @@ impl TypeChecker {
     /// `build_repr`'s expansion. Runs before `number_nodes`, so every
     /// synthesized node's `id: 0` is fine — the next pass assigns real ones.
     pub fn desugar_notation(&mut self, expr: &mut Spanned<TypedExpr>) -> Result<(), Spanned<TypeError>> {
+        /// Which of the two notations a placeholder is asking for. Local
+        /// to this function because that is exactly its lifetime: the
+        /// distinction exists between recognizing a placeholder and
+        /// expanding it, and nowhere else.
+        #[derive(Clone, Copy)]
+        enum Notation { Repr, Json }
+
         self.desugar_notation_children(&mut expr.item.kind)?;
-        let is_repr_call = matches!(
-            &expr.item.kind,
-            TypedExprKind::Call { callable, .. } if matches!(&callable.item.kind, TypedExprKind::Var(name) if name == "repr")
-        );
-        if !is_repr_call { return Ok(()); }
+        // Two placeholders, one pass: `repr(x)` and `json.to_str(x)` are
+        // the same walk over the same types with different fragments
+        // (`DATA.md`'s "one lowering serves repr, json.to_str, ... by
+        // swapping the fragments"), so they expand at the same point, under
+        // the same post-monomorphization guarantees, and `build_json`'s
+        // arms mirror `build_repr`'s one for one.
+        let placeholder = match &expr.item.kind {
+            TypedExprKind::Call { callable, .. } => match &callable.item.kind {
+                TypedExprKind::Var(name) if name == "repr" => Notation::Repr,
+                TypedExprKind::Var(name) if name == "__json_to_str" => Notation::Json,
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
         let TypedExprKind::Call { args, .. } = &expr.item.kind else { unreachable!("just matched above") };
-        let arg = args[0].value().expect("repr's placeholder always has exactly one Arg::Value").clone();
+        let arg = args[0].value().expect("the placeholder always has exactly one Arg::Value").clone();
         let span = expr.span;
         let ty = self.lookup(&arg.item.ty);
-        // `is_repr`'s own checks defer here, unrun, when the argument's
-        // type was still a bare generic `TypeVar` at that point (a call
-        // inside a generic function body) — this is where each concrete
-        // monomorphized instantiation finally gets checked, exactly once,
-        // against its own resolved type.
-        if !self.type_implements(&ty, &Trait::Show) {
-            return Err(Spanned::from(TypeError {
-                msg: format!("{} has no notation — 'repr' needs Show", ty)
-            }, arg.span));
+        // `is_repr`'s / `lower_json_call`'s own checks defer here, unrun,
+        // when the argument's type was still a bare generic `TypeVar` at
+        // that point (a call inside a generic function body) — this is
+        // where each concrete monomorphized instantiation finally gets
+        // checked, exactly once, against its own resolved type.
+        match placeholder {
+            Notation::Repr => {
+                if !self.type_implements(&ty, &Trait::Show) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!("{} has no notation — 'repr' needs Show", ty)
+                    }, arg.span));
+                }
+                self.check_no_recursive_union(&ty, arg.span, "repr", "formats it field-by-field")?;
+            }
+            Notation::Json => self.check_json_serializable(&ty, arg.span)?,
         }
-        self.check_no_recursive_union(&ty, arg.span, "repr", "formats it field-by-field")?;
         let temp_name = format!("__repr_v{}", self.next_id); self.next_id += 1;
         let temp_assign = Spanned::from(
             TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Assign { name: temp_name.clone(), value: Box::new(arg) } },
             span,
         );
         let temp_var = Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Var(temp_name) }, span);
-        let body = self.build_repr(&ty, temp_var, span)?;
+        let body = match placeholder {
+            Notation::Repr => self.build_repr(&ty, temp_var, span)?,
+            Notation::Json => self.build_json(&ty, temp_var, span)?,
+        };
         *expr = Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![temp_assign, body]) }, span);
         Ok(())
     }
@@ -9171,6 +9305,693 @@ impl TypeChecker {
             }, span));
         }
         Ok(tail.expect("an anonymous union always has at least two members"))
+    }
+
+    // ── `json.to_str` (`plans/DATA.md` stage 8) ─────────────────────────────
+    //
+    // The same walk as `build_repr` above, arm for arm, with different
+    // fragments — which is the concrete cash value of DATA.md's "one
+    // lowering serves `repr`, `json.to_str`, ... by swapping the
+    // fragments", and the reason `repr` was built as a typed-AST desugar
+    // rather than a fourth `print_value`-shaped codegen walk. Nothing here
+    // is a new mechanism: `str_cat`, `str_lit`, `build_str_join`,
+    // `Comprehension`, `IsVariant`/`VariantField`, `TypeTag`/`Narrow` are
+    // all `build_repr`'s, unchanged.
+    //
+    // Where the two genuinely differ, they differ because JSON is a
+    // different format, not because this is a different compiler:
+    //
+    //  - `Str` escapes with JSON's table (`__json_str`), never frog
+    //    notation's (`DATA.md`'s two tiers must not share a mechanism).
+    //  - `Float` has no spelling for `inf`/`nan`, so `__json_float` emits
+    //    `null` — `json.to_str` returns `Str`, not `Str | JsonError`.
+    //  - A struct is an object (`{"f":...}`) or, if its fields are
+    //    positional, an array.
+    //  - A nominal union is **externally tagged**: `{"Circle":{"r":1}}`.
+    //    Uniform across named, positional and nullary variants, ambiguous
+    //    for none of them, and it reserves no field name — internal
+    //    tagging cannot represent a positional or non-object payload at
+    //    all, so it could not be the default without there being two
+    //    incompatible default shapes. (`#json(tag="kind")` is the deferred
+    //    way to ask for the other one.)
+    //  - `Int` and `Bool` reuse `__repr_int`/`__repr_bool` outright: their
+    //    output is already JSON-legal, and a second pair of leaves that
+    //    happened to agree would just be two things to keep in agreement.
+
+    /// `json.to_str`'s per-type dispatch, mirroring `build_repr`'s
+    /// (including its arm *order*, which `Range`-before-struct depends on).
+    /// `ty` must already be `self.lookup`-resolved — same contract.
+    fn build_json(&mut self, ty: &Type, v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        if let Some(elem_ty) = ty.as_range_elem().cloned() {
+            self.materialize_struct(ty);
+            let start = Spanned::from(TypedExpr { id: 0, ty: elem_ty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(v.clone()), field: "start".to_string(), enum_name: None } }, span);
+            let end   = Spanned::from(TypedExpr { id: 0, ty: elem_ty.clone(), kind: TypedExprKind::FieldAccess { target: Box::new(v),         field: "end".to_string(),   enum_name: None } }, span);
+            let start_json = self.build_json(&elem_ty, start, span)?;
+            let end_json   = self.build_json(&elem_ty, end, span)?;
+            return Ok(Self::str_cat(vec![
+                Self::str_lit("{\"start\":", span), start_json,
+                Self::str_lit(",\"end\":", span), end_json,
+                Self::str_lit("}", span),
+            ], span));
+        }
+        // Unlike `build_repr_struct`, the name is not needed: JSON writes
+        // an object or an array, never `Name(...)`.
+        if ty.as_struct_name().is_some() {
+            return self.build_json_struct(ty, v, span);
+        }
+        if let Some(elem_ty) = ty.as_list_elem().cloned() {
+            return self.build_json_list(&elem_ty, v, span);
+        }
+        match ty {
+            Type::Union(members) => {
+                let members = members.clone();
+                self.build_json_union(&members, v, span)
+            }
+            Type::Str   => Ok(Self::repr_leaf_call("__json_str", Type::Str, v, span)),
+            Type::None  => Ok(Self::str_lit("null", span)),
+            Type::Int   => Ok(Self::repr_leaf_call("__repr_int", Type::Int, v, span)),
+            Type::Float => Ok(Self::repr_leaf_call("__json_float", Type::Float, v, span)),
+            Type::Bool  => Ok(Self::repr_leaf_call("__repr_bool", Type::Bool, v, span)),
+            // An empty list's element type, reached from `build_json_list`
+            // only when there provably are no elements — same reasoning as
+            // `build_repr`'s arm, which explains the asymmetry.
+            Type::TypeVar { .. } => Err(Spanned::from(TypeError {
+                msg: "cannot infer the type of json.to_str's argument; annotate the expected type".to_string()
+            }, span)),
+            other => Err(Spanned::from(TypeError { msg: format!("{} has no JSON form", other) }, span)),
+        }
+    }
+
+    /// `{"f":...,"g":...}`, or `[...]` if the fields are positional — a
+    /// "tuple struct" (`data Lit(Int)`) has no field names to key an object
+    /// by, and inventing `"0"`/`"1"` would put froglang's own internal
+    /// synthetic field-name keys on the wire.
+    fn build_json_struct(&mut self, ty: &Type, v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let fields = self.materialize_struct(ty);
+        let accessors = fields.iter().map(|(fname, fty)| {
+            let fv = Spanned::from(TypedExpr {
+                id: 0, ty: fty.clone(),
+                kind: TypedExprKind::FieldAccess { target: Box::new(v.clone()), field: fname.clone(), enum_name: None },
+            }, span);
+            (fname.clone(), fty.clone(), fv)
+        }).collect::<Vec<_>>();
+        self.build_json_fields(&accessors, span)
+    }
+
+    /// The shared "these fields, as an object or an array" body — used by
+    /// both an ordinary struct and a nominal union variant's payload, which
+    /// is the whole reason external tagging is uniform across variant
+    /// shapes.
+    fn build_json_fields(&mut self, fields: &[(String, Type, Spanned<TypedExpr>)], span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let names: Vec<(String, Type)> = fields.iter().map(|(n, t, _)| (n.clone(), t.clone())).collect();
+        // `is_positional_fields` is vacuously true for a nullary variant
+        // (`data Shape is ... | Blank()`), which would put `[]` on the wire
+        // for something that is conceptually a record with no fields. `{}`
+        // is the right empty payload, and keeps every *named* variant's
+        // shape an object whether or not it happens to have fields today.
+        let positional = !names.is_empty() && is_positional_fields(&names);
+        let (open, close) = if positional { ("[", "]") } else { ("{", "}") };
+        let mut parts = vec![Self::str_lit(open, span)];
+        for (i, (fname, fty, fv)) in fields.iter().enumerate() {
+            if i != 0 { parts.push(Self::str_lit(",", span)); }
+            if !positional {
+                // The key is JSON-escaped at build time, not at runtime:
+                // it is a compile-time-known declared name, so escaping it
+                // here folds into the surrounding `StrLit` and costs
+                // nothing at all at run time.
+                parts.push(Self::str_lit(format!("{}:", crate::runtime::json::dom::escape(fname)), span));
+            }
+            parts.push(self.build_json(fty, fv.clone(), span)?);
+        }
+        parts.push(Self::str_lit(close, span));
+        Ok(Self::str_cat(parts, span))
+    }
+
+    /// `[e0,e1,...]` — `build_repr_list`'s twin, down to the two
+    /// temporaries and the transient comprehension read. See its doc
+    /// comment for why both exist.
+    fn build_json_list(&mut self, elem_ty: &Type, v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        if matches!(elem_ty, Type::TypeVar { .. }) {
+            return Ok(Self::str_lit("[]", span));
+        }
+        let list_name = format!("__json_l{}", self.next_id); self.next_id += 1;
+        let elem_name = format!("__json_e{}", self.next_id); self.next_id += 1;
+        let list_ty = Type::list(elem_ty.clone());
+
+        let list_assign = Spanned::from(TypedExpr { id: 0, ty: list_ty.clone(), kind: TypedExprKind::Assign { name: list_name.clone(), value: Box::new(v) } }, span);
+        let list_var = Spanned::from(TypedExpr { id: 0, ty: list_ty, kind: TypedExprKind::Var(list_name) }, span);
+        let elem_var = Spanned::from(TypedExpr { id: 0, ty: elem_ty.clone(), kind: TypedExprKind::Var(elem_name.clone()) }, span);
+        let elem_json = self.build_json(elem_ty, elem_var, span)?;
+
+        let comprehension = Spanned::from(TypedExpr {
+            id: 0, ty: Type::list(Type::Str),
+            kind: TypedExprKind::Comprehension { var: elem_name, iterable: Box::new(list_var), cond: None, body: Box::new(elem_json), iter_via: None },
+        }, span);
+        let joined = Self::build_str_join(comprehension, Self::str_lit(",", span), span);
+        let cat = Self::str_cat(vec![Self::str_lit("[", span), joined, Self::str_lit("]", span)], span);
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![list_assign, cat]) }, span))
+    }
+
+    /// `build_repr_union`'s twin — same temp-binding, same nominal /
+    /// anonymous split.
+    fn build_json_union(&mut self, members: &[Type], v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let union_ty = Type::Union(members.to_vec());
+        let subj_name = format!("__json_u{}", self.next_id); self.next_id += 1;
+        let subj_assign = Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Assign { name: subj_name.clone(), value: Box::new(v) } }, span);
+
+        let resolved = self.resolve_union(&union_ty).map(|(n, d)| (n.to_string(), d.clone()));
+        let body = match resolved {
+            Some((enum_name, def)) => self.build_json_nominal_union(&enum_name, &def, &subj_name, &union_ty, span)?,
+            None => self.build_json_anon_union(members, &subj_name, &union_ty, span)?,
+        };
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![subj_assign, body]) }, span))
+    }
+
+    /// `{"Variant":<payload>}` — external tagging. The payload is the
+    /// variant's common-then-own fields through `build_json_fields`, so a
+    /// named variant is an object, a positional one an array, and a nullary
+    /// one the empty object `{}`. Right-to-left fold over `IsVariant` with
+    /// the last variant as the bare else, exactly `build_repr_nominal_union`.
+    fn build_json_nominal_union(&mut self, enum_name: &str, def: &UnionDef, subj_name: &str, subj_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let common = def.common.clone();
+        let variants = def.variants.clone();
+        let mut tail: Option<Spanned<TypedExpr>> = None;
+        for (idx, (vname, vfields)) in variants.iter().enumerate().rev() {
+            let subject_var = Spanned::from(TypedExpr { id: 0, ty: subj_ty.clone(), kind: TypedExprKind::Var(subj_name.to_string()) }, span);
+
+            let flat: Vec<(String, Type)> = common.iter().chain(vfields.iter()).cloned().collect();
+            let accessors = flat.iter().enumerate().map(|(i, (fname, fty))| {
+                let fv = if i < common.len() {
+                    Spanned::from(TypedExpr {
+                        id: 0, ty: fty.clone(),
+                        kind: TypedExprKind::FieldAccess { target: Box::new(subject_var.clone()), field: fname.clone(), enum_name: Some(enum_name.to_string()) },
+                    }, span)
+                } else {
+                    Spanned::from(TypedExpr {
+                        id: 0, ty: fty.clone(),
+                        kind: TypedExprKind::VariantField { target: Box::new(subject_var.clone()), enum_name: enum_name.to_string(), variant: vname.clone(), field: fname.clone() },
+                    }, span)
+                };
+                (fname.clone(), fty.clone(), fv)
+            }).collect::<Vec<_>>();
+            let payload = self.build_json_fields(&accessors, span)?;
+            let body = Self::str_cat(vec![
+                Self::str_lit(format!("{{{}:", crate::runtime::json::dom::escape(vname)), span),
+                payload,
+                Self::str_lit("}", span),
+            ], span);
+
+            if tail.is_none() {
+                tail = Some(body);
+                continue;
+            }
+            let cond = Spanned::from(TypedExpr {
+                id: 0, ty: Type::Bool,
+                kind: TypedExprKind::IsVariant { target: Box::new(subject_var), enum_name: enum_name.to_string(), variant: vname.clone(), tag: idx as u32 },
+            }, span);
+            tail = Some(Spanned::from(TypedExpr {
+                id: 0, ty: Type::Str,
+                kind: TypedExprKind::Conditional { cond: Box::new(cond), true_branch: Box::new(body), false_branch: tail.map(Box::new) },
+            }, span));
+        }
+        Ok(tail.expect("a nominal union always declares at least one variant"))
+    }
+
+    /// Anonymous unions serialize **permissively** — each member as its own
+    /// JSON, with no tag at all (`Int | None` is a number or `null`). Only
+    /// `json.parse` restricts them (`check_json_readable`), because only
+    /// reading needs to tell them apart again; writing does not, and
+    /// refusing to write a value froglang can perfectly well describe would
+    /// be a restriction with nothing behind it. `DATA.md` stage 8's
+    /// "serialization stays permissive".
+    fn build_json_anon_union(&mut self, members: &[Type], subj_name: &str, subj_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let mut tail: Option<Spanned<TypedExpr>> = None;
+        for (idx, member_ty) in members.iter().enumerate().rev() {
+            let subject_var = Spanned::from(TypedExpr { id: 0, ty: subj_ty.clone(), kind: TypedExprKind::Var(subj_name.to_string()) }, span);
+            let narrowed = if *member_ty == Type::None {
+                Self::str_lit("null", span)
+            } else {
+                let narrow_val = Spanned::from(TypedExpr {
+                    id: 0, ty: member_ty.clone(),
+                    kind: TypedExprKind::Narrow { value: Box::new(subject_var.clone()), tag: idx as u32 },
+                }, span);
+                self.build_json(member_ty, narrow_val, span)?
+            };
+
+            if tail.is_none() {
+                tail = Some(narrowed);
+                continue;
+            }
+            let cond = Spanned::from(TypedExpr {
+                id: 0, ty: Type::Bool,
+                kind: TypedExprKind::TypeTag { target: Box::new(subject_var), tag: idx as u32 },
+            }, span);
+            tail = Some(Spanned::from(TypedExpr {
+                id: 0, ty: Type::Str,
+                kind: TypedExprKind::Conditional { cond: Box::new(cond), true_branch: Box::new(narrowed), false_branch: tail.map(Box::new) },
+            }, span));
+        }
+        Ok(tail.expect("an anonymous union always has at least two members"))
+    }
+
+    // ── `json.parse` (`plans/DATA.md` stage 8) ──────────────────────────────
+    //
+    // `build_read_json` is to `build_json` what `build_read` is to
+    // `build_repr`, and it is built against the same runtime contract:
+    // `runtime/json`'s accessors are sticky-error-and-continue, so this
+    // synthesizes one unconditional happy-path expression per type with no
+    // early-exit control flow, and `lower_json_parse` checks
+    // `frog_json_failed()` exactly once at the top.
+    //
+    // Two things here have no counterpart in `build_read`:
+    //
+    //  - **Absent vs. `null`** (DATA.md stage 8's semantics decision 1).
+    //    A named field whose type admits `None` may be missing entirely;
+    //    `frog_json_has` (the one probe that does *not* mark failure) is
+    //    what asks. A *present* `null` needs no special case at all — the
+    //    field's own `T | None` dispatch already tests `frog_json_is_null`
+    //    — so the whole rule is one `Conditional` around the ordinary read.
+    //  - **External tagging**, which makes "is this the `Circle` variant?"
+    //    into "does this object have a `Circle` key?" — `frog_json_has`
+    //    again, in place of `read`'s `frog_read_is_call`.
+
+    /// `json.parse`'s per-type dispatch, `build_json`'s inverse and
+    /// `build_read`'s twin. `node` is a `Type::Int`-typed opaque handle
+    /// into `runtime::json`'s parsed document.
+    fn build_read_json(&mut self, ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        if let Some(elem_ty) = ty.as_range_elem().cloned() {
+            self.materialize_struct(ty);
+            let lo_node = Self::read_call2("frog_json_get", Type::Int, Type::Str, Type::Int, node.clone(), Self::str_lit("start", span), span);
+            let hi_node = Self::read_call2("frog_json_get", Type::Int, Type::Str, Type::Int, node, Self::str_lit("end", span), span);
+            let lo = self.build_read_json(&elem_ty, lo_node, span)?;
+            let hi = self.build_read_json(&elem_ty, hi_node, span)?;
+            let name = ty.as_struct_name().expect("Range is a struct name").to_string();
+            return Ok(Spanned::from(TypedExpr {
+                id: 0, ty: ty.clone(),
+                kind: TypedExprKind::StructInit { name, fields: vec![("start".to_string(), Box::new(lo)), ("end".to_string(), Box::new(hi))] },
+            }, span));
+        }
+        if let Some(name) = ty.as_struct_name().map(str::to_string) {
+            return self.build_read_json_struct(&name, ty, node, span);
+        }
+        if let Some(elem_ty) = ty.as_list_elem().cloned() {
+            return self.build_read_json_list(&elem_ty, node, span);
+        }
+        match ty {
+            Type::Union(members) => {
+                let members = members.clone();
+                let union_ty = Type::Union(members.clone());
+                self.build_read_json_union_as(&members, node, &union_ty, span)
+            }
+            Type::Str   => Ok(Self::read_leaf_call("frog_json_str", Type::Int, Type::Str, node, span)),
+            Type::None  => Ok(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, span)),
+            Type::Int   => Ok(Self::read_leaf_call("frog_json_int", Type::Int, Type::Int, node, span)),
+            Type::Float => Ok(Self::read_leaf_call("frog_json_float", Type::Int, Type::Float, node, span)),
+            Type::Bool  => Ok(Self::read_leaf_call("frog_json_bool", Type::Int, Type::Bool, node, span)),
+            other => Err(Spanned::from(TypeError { msg: format!("{} has no JSON form to parse", other) }, span)),
+        }
+    }
+
+    /// An object keyed by declared field name, or an array if the fields
+    /// are positional — `build_json_struct`'s inverse. Keys are fetched by
+    /// name, so key order in the input is irrelevant for free.
+    fn build_read_json_struct(&mut self, name: &str, ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let fields = self.materialize_struct(ty);
+        // The node is read once per field, so bind it — `node` may be an
+        // arbitrary accessor call, and re-evaluating `frog_json_get(...)`
+        // per field would re-navigate (and re-mark) each time.
+        let node_name = format!("__json_s{}", self.next_id); self.next_id += 1;
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+        let out = self.build_read_json_fields(&fields, &node_name, span)?;
+        let init = Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::StructInit { name: name.to_string(), fields: out } }, span);
+        Ok(Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Block(vec![node_assign, init]) }, span))
+    }
+
+    /// The shared "read these fields off this node" body — `build_json_fields`'
+    /// inverse, used by both a struct and a nominal variant's payload, and
+    /// where DATA.md stage 8's absent-vs-`null` rule lives.
+    fn build_read_json_fields(&mut self, fields: &[(String, Type)], node_name: &str, span: Span) -> Result<Vec<(String, Box<Spanned<TypedExpr>>)>, Spanned<TypeError>> {
+        let positional = !fields.is_empty() && is_positional_fields(fields);
+        let mut out = Vec::with_capacity(fields.len());
+        for (i, (fname, fty)) in fields.iter().enumerate() {
+            let fnode = if positional {
+                Self::read_call2("frog_json_at", Type::Int, Type::Int, Type::Int, Self::node_var(node_name, span), Self::int_lit(i as i64, span), span)
+            } else {
+                Self::read_call2("frog_json_get", Type::Int, Type::Str, Type::Int, Self::node_var(node_name, span), Self::str_lit(fname.clone(), span), span)
+            };
+            let fval = self.build_read_json(fty, fnode, span)?;
+            // Absent is permitted iff the type admits `None`, and yields
+            // `none` — serde's rule, and the only one under which an
+            // optional field is actually optional. A *present* `null` is
+            // already handled by `fty`'s own union dispatch, so this is
+            // only about absence. A positional field can't be absent
+            // (there is no name to be missing) — the array either has the
+            // element or it doesn't, which is a shape error.
+            let fval = if !positional && Self::admits_none(fty) {
+                let has = Self::read_call2("frog_json_has", Type::Int, Type::Str, Type::Bool, Self::node_var(node_name, span), Self::str_lit(fname.clone(), span), span);
+                let none_lit = Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, span);
+                let absent = self.lower_widen(none_lit, fty)?;
+                Spanned::from(TypedExpr {
+                    id: 0, ty: fty.clone(),
+                    kind: TypedExprKind::Conditional { cond: Box::new(has), true_branch: Box::new(fval), false_branch: Some(Box::new(absent)) },
+                }, span)
+            } else {
+                fval
+            };
+            out.push((fname.clone(), Box::new(fval)));
+        }
+        Ok(out)
+    }
+
+    /// Does `ty` have `none` among its possible values? Union
+    /// normalization flattens and dedups, so this is the whole question —
+    /// froglang structurally cannot express serde's `Option<Option<T>>`,
+    /// which is exactly why absent and `null` have to mean the same thing
+    /// (DATA.md stage 8's decision 1 and its rejection of a distinct
+    /// `missing`).
+    fn admits_none(ty: &Type) -> bool {
+        matches!(ty, Type::Union(members) if members.contains(&Type::None))
+    }
+
+    /// `[for i in 0..len(node) do read(at(node, i))]` — `build_read_list`'s
+    /// twin, including the `Range<Int>` (not `List<Int>`) iterable.
+    fn build_read_json_list(&mut self, elem_ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let node_name = format!("__json_n{}", self.next_id); self.next_id += 1;
+        let idx_name = format!("__json_i{}", self.next_id); self.next_id += 1;
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+
+        let len_call = Self::read_leaf_call("frog_json_len", Type::Int, Type::Int, Self::node_var(&node_name, span), span);
+        let range = Spanned::from(TypedExpr {
+            id: 0, ty: Type::range(Type::Int),
+            kind: TypedExprKind::Range { start: Box::new(Self::int_lit(0, span)), end: Box::new(len_call) },
+        }, span);
+        let elem_node = Self::read_call2("frog_json_at", Type::Int, Type::Int, Type::Int, Self::node_var(&node_name, span), Self::node_var(&idx_name, span), span);
+        let elem_val = self.build_read_json(elem_ty, elem_node, span)?;
+
+        let comprehension = Spanned::from(TypedExpr {
+            id: 0, ty: Type::list(elem_ty.clone()),
+            kind: TypedExprKind::Comprehension { var: idx_name, iterable: Box::new(range), cond: None, body: Box::new(elem_val), iter_via: None },
+        }, span);
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::list(elem_ty.clone()), kind: TypedExprKind::Block(vec![node_assign, comprehension]) }, span))
+    }
+
+    /// `build_read_union_as`'s twin, and it exists for the same reason —
+    /// see that function's doc comment for why `json.parse(s): Shape |
+    /// JsonError` has to be built against the *wide* type from the start
+    /// rather than widened into it afterward.
+    fn build_read_json_union_as(&mut self, members: &[Type], node: Spanned<TypedExpr>, target_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let union_ty = Type::Union(members.to_vec());
+        let node_name = format!("__json_u{}", self.next_id); self.next_id += 1;
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+
+        let resolved = self.resolve_union(&union_ty).map(|(n, d)| (n.to_string(), d.clone()));
+        let body = match resolved {
+            Some((enum_name, def)) => self.build_read_json_nominal_union(&enum_name, &def, &node_name, target_ty, span)?,
+            None => self.build_read_json_anon_union(members, &node_name, target_ty, span)?,
+        };
+        Ok(Spanned::from(TypedExpr { id: 0, ty: target_ty.clone(), kind: TypedExprKind::Block(vec![node_assign, body]) }, span))
+    }
+
+    /// External tagging's inverse: `frog_json_has(node, "Variant")` picks
+    /// the arm, `frog_json_get(node, "Variant")` is the payload. Every
+    /// variant is tested (the input might name none of them) with a real
+    /// `frog_json_expect` fallback, exactly as `build_read_nominal_union`
+    /// does and for the same reason. The `nominal_target` split is also
+    /// that function's — see its comment for why a `VariantInit` cannot
+    /// simply be stamped with a wider union.
+    fn build_read_json_nominal_union(&mut self, enum_name: &str, def: &UnionDef, node_name: &str, union_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let common = def.common.clone();
+        let variants = def.variants.clone();
+        let nominal_target = self.resolve_union(union_ty).map(|(n, _)| n) == Some(enum_name);
+        let Type::Union(target_members) = union_ty else {
+            unreachable!("build_read_json_nominal_union's union_ty is always a Type::Union")
+        };
+        let target_members = target_members.clone();
+
+        let mut constructions: Vec<Spanned<TypedExpr>> = Vec::with_capacity(variants.len());
+        for (idx, (vname, vfields)) in variants.iter().enumerate() {
+            let flat: Vec<(String, Type)> = common.iter().chain(vfields.iter()).cloned().collect();
+            // The payload object is bound once per arm: every field of the
+            // variant reads it, and re-navigating to it per field would
+            // re-mark on a malformed input as well as being wasteful.
+            let payload_name = format!("__json_p{}", self.next_id); self.next_id += 1;
+            let payload = Self::read_call2("frog_json_get", Type::Int, Type::Str, Type::Int, Self::node_var(node_name, span), Self::str_lit(vname.clone(), span), span);
+            let payload_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: payload_name.clone(), value: Box::new(payload) } }, span);
+            let fields_out = self.build_read_json_fields(&flat, &payload_name, span)?;
+
+            let variant_ty = Type::strukt(format!("{}.{}", enum_name, vname));
+            let init = Spanned::from(TypedExpr {
+                id: 0, ty: if nominal_target { union_ty.clone() } else { variant_ty.clone() },
+                kind: TypedExprKind::VariantInit { enum_name: enum_name.to_string(), variant: vname.clone(), tag: idx as u32, fields: fields_out },
+            }, span);
+            let built = if nominal_target { init } else {
+                let tag = target_members.iter().position(|m| *m == variant_ty)
+                    .expect("every variant of the union being parsed is a member of the target union") as u32;
+                Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Widen { value: Box::new(init), tag } }, span)
+            };
+            constructions.push(Spanned::from(TypedExpr {
+                id: 0, ty: union_ty.clone(), kind: TypedExprKind::Block(vec![payload_assign, built]),
+            }, span));
+        }
+
+        let last = constructions.len() - 1;
+        let fail = Self::read_call2("frog_json_expect", Type::Int, Type::Str, Type::Int, Self::node_var(node_name, span), Self::str_lit(format!("expected an object tagged with a variant of {}", enum_name), span), span);
+        let mut tail = Spanned::from(TypedExpr {
+            id: 0, ty: union_ty.clone(), kind: TypedExprKind::Block(vec![fail, constructions[last].clone()]),
+        }, span);
+        for idx in (0..variants.len()).rev() {
+            let vname = &variants[idx].0;
+            let test = Self::read_call2("frog_json_has", Type::Int, Type::Str, Type::Bool, Self::node_var(node_name, span), Self::str_lit(vname.clone(), span), span);
+            tail = Spanned::from(TypedExpr {
+                id: 0, ty: union_ty.clone(),
+                kind: TypedExprKind::Conditional { cond: Box::new(test), true_branch: Box::new(constructions[idx].clone()), false_branch: Some(Box::new(tail)) },
+            }, span);
+        }
+        Ok(tail)
+    }
+
+    /// Anonymous unions dispatch on the JSON *kind* of the node, one
+    /// `frog_json_is_*` per member — which only works while no two members
+    /// share a kind (`check_json_union_readable`).
+    fn build_read_json_anon_union(&mut self, members: &[Type], node_name: &str, union_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let Type::Union(target_members) = union_ty else {
+            unreachable!("build_read_json_anon_union's union_ty is always a Type::Union")
+        };
+        let target_members = target_members.clone();
+        // `members`, not `union_ty`: the *dispatch set* is what has to be
+        // unambiguous, and `lower_json_parse`'s `T | JsonError` hatch
+        // additionally carries `JsonError`, which is never dispatched on.
+        // Checked here, at the point of descent, rather than by walking the
+        // type up front — same reasoning as `check_union_readable`.
+        self.check_json_union_readable(&Type::Union(members.to_vec()), span)?;
+
+        let mut constructions: Vec<Spanned<TypedExpr>> = Vec::with_capacity(members.len());
+        for member_ty in members {
+            let value = if *member_ty == Type::None {
+                Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, span)
+            } else {
+                self.build_read_json(member_ty, Self::node_var(node_name, span), span)?
+            };
+            constructions.push(value);
+        }
+        let widened: Vec<Spanned<TypedExpr>> = constructions.into_iter().zip(members.iter())
+            .map(|(v, mty)| {
+                let tag = target_members.iter().position(|m| m == mty)
+                    .expect("every dispatch member is present in its own target union") as u32;
+                Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Widen { value: Box::new(v), tag } }, span)
+            })
+            .collect();
+
+        let last = widened.len() - 1;
+        let fail = Self::read_call2("frog_json_expect", Type::Int, Type::Str, Type::Int, Self::node_var(node_name, span), Self::str_lit(format!("expected {}", union_ty), span), span);
+        let mut tail = Spanned::from(TypedExpr {
+            id: 0, ty: union_ty.clone(), kind: TypedExprKind::Block(vec![fail, widened[last].clone()]),
+        }, span);
+        for idx in (0..members.len()).rev() {
+            let predicate = self.json_kind_predicate(&members[idx]);
+            let test = Self::read_leaf_call(predicate, Type::Int, Type::Bool, Self::node_var(node_name, span), span);
+            tail = Spanned::from(TypedExpr {
+                id: 0, ty: union_ty.clone(),
+                kind: TypedExprKind::Conditional { cond: Box::new(test), true_branch: Box::new(widened[idx].clone()), false_branch: Some(Box::new(tail)) },
+            }, span);
+        }
+        Ok(tail)
+    }
+
+    /// Does `ty` occupy JSON's *array* shape rather than its object shape?
+    /// A list does — and so does a positional ("tuple") struct, which
+    /// `build_json_fields` writes as `[...]` because it has no field names
+    /// to key an object by. The two must agree exactly: a value that
+    /// dispatches as an object but was written as an array cannot parse
+    /// back from its own `json.to_str` output.
+    ///
+    /// Field *names* decide it, and substituting a generic struct's
+    /// arguments never renames a field, so the stored template answers for
+    /// every instantiation — no `&mut self` materialization needed. A
+    /// nominal union's *variant* type (`Shape.Circle`) is a registered
+    /// struct here too, and correctly so: reached on its own it is written
+    /// as its bare payload by the same `build_json_fields`. Reached as a
+    /// member of its own union it is externally tagged and never asks this
+    /// question, because `build_read_json_nominal_union` dispatches on the
+    /// tag key instead.
+    fn json_is_array_shape(&self, ty: &Type) -> bool {
+        if ty.as_list_elem().is_some() { return true }
+        let Some(name) = ty.as_struct_name() else { return false };
+        // Vacuously positional for a nullary struct, which
+        // `build_json_fields` writes as `{}` — same guard, same reason.
+        matches!(self.struct_templates.get(name), Some(f) if !f.is_empty() && is_positional_fields(f))
+    }
+
+    /// Which `frog_json_is_*` predicate identifies `ty` on the wire. Two
+    /// members of an anonymous union that answer to the same predicate
+    /// cannot be told apart, so this doubles as the ambiguity key for
+    /// `check_json_union_readable`.
+    ///
+    /// `Int` and `Float` deliberately share `"number"` as an ambiguity key
+    /// even though `frog_json_is_int`/`_is_float` can distinguish them:
+    /// they do so by whether the *producer* wrote a `.`, and JSON has one
+    /// number type, so treating `1` in an `Int | Float` slot as decisive
+    /// would make the result depend on a spelling choice no schema
+    /// constrains. DATA.md stage 8's decision 3 rejects `Int | Float` for
+    /// exactly this. `Float` therefore dispatches on the *whole* number
+    /// kind (`frog_json_is_number`), matching what `frog_json_float`
+    /// accepts; `Int` keeps the strict `frog_json_is_int`, matching
+    /// `frog_json_int`. Since no union may hold both, the two never meet.
+    fn json_kind_predicate(&self, ty: &Type) -> &'static str {
+        match ty {
+            Type::Int   => "frog_json_is_int",
+            Type::Float => "frog_json_is_number",
+            Type::Bool  => "frog_json_is_bool",
+            Type::Str   => "frog_json_is_str",
+            Type::None  => "frog_json_is_null",
+            t if self.json_is_array_shape(t) => "frog_json_is_array",
+            _ => "frog_json_is_object",
+        }
+    }
+
+    /// The ambiguity key `check_json_union_readable` groups by — the
+    /// predicate name, except that every number is one group. See
+    /// `json_kind_predicate`.
+    fn json_dispatch_key(&self, ty: &Type) -> &'static str {
+        match ty {
+            Type::Int | Type::Float => "a number",
+            Type::Bool => "a boolean",
+            Type::Str  => "a string",
+            Type::None => "null",
+            t if self.json_is_array_shape(t) => "an array",
+            _ => "an object",
+        }
+    }
+
+    /// `json.parse`'s gate, `check_readable`'s twin.
+    fn check_json_readable(&self, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        self.check_no_recursive_union(ty, span, "json.parse", "constructs it field-by-field")?;
+        self.check_json_union_readable(ty, span)
+    }
+
+    /// An anonymous union is parseable only while its members occupy
+    /// distinct JSON shapes — `Int?` and `Int | Str` are fine, `Int |
+    /// Float` and `Circle | Rect` are not. Nominal unions are exempt: they
+    /// are externally tagged, so `frog_json_has` tells them apart by name
+    /// no matter how alike their payloads are, which is precisely what
+    /// DATA.md stage 8's "make Deserialize a property of nominal unions"
+    /// is pointing at.
+    fn check_json_union_readable(&self, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        let Type::Union(members) = ty else { return Ok(()) };
+        if self.resolve_union(ty).is_some() { return Ok(()) }
+        for (i, a) in members.iter().enumerate() {
+            for b in members.iter().skip(i + 1) {
+                if self.json_dispatch_key(a) == self.json_dispatch_key(b) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!(
+                            "json.parse can't tell {} and {} apart in {} — both are {} in JSON; wrap them in a 'data ... is ...' union instead",
+                            a, b, ty, self.json_dispatch_key(a)
+                        )
+                    }, span));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `json.parse(s): T | JsonError` — `lower_read`'s twin, structurally
+    /// identical down to the temp-binding that forces the happy path to run
+    /// (and so discover any sticky failure) *before* `frog_json_failed()`
+    /// is consulted. See `lower_read` for the reasoning behind each step.
+    fn lower_json_parse(&mut self, c: CallExpr, expected: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        if c.args.len() != 1 {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
+            }, span));
+        }
+        let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
+        let arg_span = arg.span;
+        let arg_ty = self.lookup(&arg.item.ty);
+        if arg_ty != Type::Str {
+            return Err(Spanned::from(TypeError {
+                msg: format!("json.parse's argument must be Str, got {}", arg_ty)
+            }, arg_span));
+        }
+
+        let json_error_ty = Type::strukt("JsonError");
+        let members = match expected {
+            Type::Union(ms) if ms.contains(&json_error_ty) => ms.clone(),
+            _ => return Err(Spanned::from(TypeError {
+                msg: "json.parse returns 'T | JsonError'; annotate e.g. 'let x: Person | JsonError = json.parse(s)'".to_string()
+            }, span)),
+        };
+        let t_members: Vec<Type> = members.into_iter().filter(|m| *m != json_error_ty).collect();
+        if t_members.is_empty() {
+            return Err(Spanned::from(TypeError {
+                msg: "json.parse needs a type to parse besides JsonError itself".to_string()
+            }, span));
+        }
+
+        let node_name = format!("__json_root{}", self.next_id); self.next_id += 1;
+        let result_name = format!("__json_result{}", self.next_id); self.next_id += 1;
+
+        let open_call = Self::read_leaf_call("frog_json_open", Type::Str, Type::Int, arg, span);
+        let open_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(open_call) } }, span);
+
+        let happy_widened = if t_members.len() == 1 {
+            let t = t_members.into_iter().next().expect("len checked above");
+            self.check_json_readable(&t, span)?;
+            let happy = self.build_read_json(&t, Self::node_var(&node_name, span), span)?;
+            self.lower_widen(happy, expected)?
+        } else {
+            let t = Type::Union(t_members.clone()).normalize();
+            self.check_json_readable(&t, span)?;
+            let Type::Union(normalized_members) = t else { unreachable!("normalize of >1 members is always a Union") };
+            self.build_read_json_union_as(&normalized_members, Self::node_var(&node_name, span), expected, span)?
+        };
+
+        let msg_call = Self::read_call0("frog_json_msg", Type::Str, span);
+        let offset_call = Self::read_call0("frog_json_offset", Type::Int, span);
+        let error_value = Spanned::from(TypedExpr {
+            id: 0, ty: json_error_ty.clone(),
+            kind: TypedExprKind::StructInit { name: "JsonError".to_string(), fields: vec![
+                ("msg".to_string(), Box::new(msg_call)), ("offset".to_string(), Box::new(offset_call)),
+            ] },
+        }, span);
+        let error_widened = self.lower_widen(error_value, expected)?;
+
+        let happy_name = format!("__json_happy{}", self.next_id); self.next_id += 1;
+        let happy_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: happy_name.clone(), value: Box::new(happy_widened) } }, span);
+        let happy_var = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Var(happy_name) }, span);
+
+        let failed_test = Self::read_call0("frog_json_failed", Type::Bool, span);
+        let dispatch = Spanned::from(TypedExpr {
+            id: 0, ty: expected.clone(),
+            kind: TypedExprKind::Conditional { cond: Box::new(failed_test), true_branch: Box::new(error_widened), false_branch: Some(Box::new(happy_var)) },
+        }, span);
+        let result_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: result_name.clone(), value: Box::new(dispatch) } }, span);
+        let close_call = Self::read_call0("frog_json_close", Type::None, span);
+        let result_var = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Var(result_name) }, span);
+
+        Ok(Spanned::from(TypedExpr {
+            id: 0, ty: expected.clone(),
+            kind: TypedExprKind::Block(vec![open_assign, happy_assign, result_assign, close_call, result_var]),
+        }, span))
     }
 
     // ── `read` (`plans/DATA.md` stage 5) ────────────────────────────────────

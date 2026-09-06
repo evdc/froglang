@@ -80,8 +80,37 @@ fn gen_scalar(rng: &mut Rng) -> Shape {
     }
 }
 
-fn gen_top(rng: &mut Rng) -> Shape {
-    match rng.range(10) {
+/// How many arms `gen_top` has. The test asserts its seed set hits every
+/// one of them (`ARMS` below) — a nested draw for the `T?` inner would
+/// make that check impossible to state, and in fact silently left the
+/// composite optionals unreachable at 40 seeds when they were nested, so
+/// each optional shape is its own arm here.
+const GEN_TOP_ARMS: u64 = 14;
+
+/// Returns the arm it drew alongside the shape, so the test can assert
+/// its seeds cover the palette rather than assume it.
+///
+/// Arms 9-13 are the `T?` shapes, spelled out one per inner type rather
+/// than drawn from a nested `gen_optional_inner`. Two exclusions there:
+///
+///  - **`Bool?`/`Float?`** — a pre-existing, unrelated bug (`!` + `==` on
+///    a `(Bool|Float mixed with another scalar) | <error type>` crashes
+///    Cranelift; reproduces with plain hand-written source, no
+///    `read`/`repr` involved at all — filed separately, not this stage's
+///    job to fix).
+///  - **`GenU?`** — an anonymous union flattens a nominal one into its
+///    variants, so a nominal union inside a `T?` is not currently
+///    readable (its variants are compared as plain structs and rejected
+///    as ambiguous). A real gap, but a diagnostic one, tracked separately
+///    from the law.
+///
+/// The composite optionals are the point of arms 11-13: `GenP?` in
+/// particular is what catches a JSON dispatch keyed on the wrong wire
+/// kind, since a positional struct is written as an *array* and a
+/// single-member parse (plain `GenP`) never dispatches at all.
+fn gen_top(rng: &mut Rng) -> (u64, Shape) {
+    let arm = rng.range(GEN_TOP_ARMS);
+    let shape = match arm {
         0 => Shape::Int,
         1 => Shape::Float,
         2 => Shape::Bool,
@@ -91,14 +120,13 @@ fn gen_top(rng: &mut Rng) -> Shape {
         6 => Shape::NamedStruct(vec![("a", gen_scalar(rng)), ("b", gen_scalar(rng))]),
         7 => Shape::PositionalStruct(vec![gen_scalar(rng), gen_scalar(rng)]),
         8 => Shape::Union(vec![("A", "v", gen_scalar(rng)), ("B", "w", gen_scalar(rng))]),
-        // `Bool`/`Float` deliberately excluded here — a pre-existing,
-        // unrelated bug (`!` + `==` on a `(Bool|Float mixed with another
-        // scalar) | <error type>` crashes Cranelift; reproduces with plain
-        // hand-written source, no `read`/`repr` involved at all — filed
-        // separately, not this stage's job to fix). `Int?`/`Str?` exercise
-        // the same `build_read_anon_union`/`Widen` path without hitting it.
-        _ => Shape::Optional(Box::new(if rng.bool() { Shape::Int } else { Shape::Str })),
-    }
+        9 => Shape::Optional(Box::new(Shape::Int)),
+        10 => Shape::Optional(Box::new(Shape::Str)),
+        11 => Shape::Optional(Box::new(Shape::List(Box::new(gen_scalar(rng))))),
+        12 => Shape::Optional(Box::new(Shape::NamedStruct(vec![("a", gen_scalar(rng)), ("b", gen_scalar(rng))]))),
+        _ => Shape::Optional(Box::new(Shape::PositionalStruct(vec![gen_scalar(rng), gen_scalar(rng)]))),
+    };
+    (arm, shape)
 }
 
 /// A safe ASCII string, occasionally with an escape-worthy character —
@@ -206,15 +234,17 @@ fn emit(shape: &Shape, rng: &mut Rng, decls: &mut Vec<String>) -> (String, Strin
     }
 }
 
-fn build_program(seed: u64) -> String {
+fn build_program(seed: u64) -> (u64, String) {
     let mut rng = Rng::new(seed);
-    let shape = gen_top(&mut rng);
+    let (arm, shape) = gen_top(&mut rng);
     let mut decls = Vec::new();
     let (ty, lit) = emit(&shape, &mut rng, &mut decls);
     let decls_src = decls.join("\n");
-    format!(
-        "{decls_src}\nlet x: {ty} = {lit}\nlet back: {ty} | ReadError = read(repr(x))\nprint(back! == x)\nprint(repr(x) == repr(back!))\n"
-    )
+    (arm, format!(
+        "{decls_src}\nlet x: {ty} = {lit}\n\
+         let back: {ty} | ReadError = read(repr(x))\nprint(back! == x)\nprint(repr(x) == repr(back!))\n\
+         let jback: {ty} | JsonError = json.parse(json.to_str(x))\nprint(jback! == x)\nprint(json.to_str(x) == json.to_str(jback!))\n"
+    ))
 }
 
 #[test]
@@ -223,9 +253,25 @@ fn the_law_holds_across_generated_programs() {
         Some(s) => vec![s],
         None => (1..=40).collect(),
     };
+    let sweep = seeds.len() > 1;
+    let mut seen = vec![false; GEN_TOP_ARMS as usize];
     for seed in seeds {
-        let src = build_program(seed);
+        let (arm, src) = build_program(seed);
+        seen[arm as usize] = true;
         let out = run(&src);
-        assert_eq!(out, "true\ntrue\n", "law failed for seed {seed}:\n{src}");
+        // Four lines: the notation law and its `repr`-stability corollary,
+        // then the same pair for JSON (`plans/DATA.md` stage 8). The same
+        // generated value drives both, so a type shape either round-trips
+        // through both tiers or the failure names which one broke.
+        assert_eq!(out, "true\ntrue\ntrue\ntrue\n", "law failed for seed {seed}:\n{src}");
+    }
+    // A property test whose generator can no longer reach a shape passes
+    // for the wrong reason, and this one silently stopped reaching the
+    // composite `T?` shapes once before. The default sweep therefore has
+    // to prove it covered the palette; a single `FROG_LAW_SEED` run is
+    // reproducing one case and is exempt.
+    if sweep {
+        let missed: Vec<usize> = seen.iter().enumerate().filter(|(_, hit)| !**hit).map(|(i, _)| i).collect();
+        assert!(missed.is_empty(), "the seed sweep never generated gen_top arm(s) {missed:?}");
     }
 }

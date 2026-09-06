@@ -106,7 +106,11 @@ fn node_handle(e: &Spanned<Expression>) -> i64 {
     e as *const Spanned<Expression> as i64
 }
 
-fn read_str_arg(s: i64) -> String {
+/// A `FrogStr*` argument as an owned Rust `String`. `pub(super)` because
+/// `runtime::json`'s accessors take their key/name arguments exactly the
+/// same way — a `StrLit` synthesized by the desugar — and there is no
+/// reason for two copies of this.
+pub(super) fn read_str_arg(s: i64) -> String {
     let ptr = s as *const FrogStr;
     unsafe {
         let len = (*ptr).len as usize;

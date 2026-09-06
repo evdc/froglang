@@ -467,7 +467,7 @@ impl FrogState {
 /// of these would silently never be called, since the special case wins
 /// before the generic `func_ids` lookup ever runs. Rejected at `build()`
 /// with a clear error instead.
-const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "panic", "panic!builtin", "gc_dump", "repr", "read"];
+const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "panic", "panic!builtin", "gc_dump", "repr", "read", "json"];
 
 /// Builds a `FrogState` with host (Rust) functions registered before the
 /// JIT module exists — required because `JITBuilder::symbol` only accepts

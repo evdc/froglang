@@ -13,6 +13,12 @@ autobenches = false
 # Enable verbose GC tracing to stderr (allocations, collections, marks, frees).
 # Usage: cargo test --features gc_trace
 gc_trace = []
+# Swap `json.parse`'s DOM backend from `serde_json` to `simd-json`
+# (`runtime/json/dom.rs`). Same observable behaviour — `tests/test_json.rs`
+# is expected to pass identically under both — but SIMD-accelerated parsing
+# on x86_64 (SSE4.2/AVX2) and aarch64 (NEON).
+# Usage: cargo test --features json_simd
+json_simd = ["dep:simd-json"]
 
 [dependencies]
 froglang-macros = { path = "../froglang-macros" }
@@ -22,6 +28,11 @@ cranelift-frontend = "0.135"
 cranelift-module   = "0.135"
 cranelift-jit      = "0.135"
 cranelift-native   = "0.135"
+# `json.to_str` / `json.parse`'s DOM (`plans/DATA.md` stage 8). Already in
+# the workspace lockfile via `playground-server`, so this costs no new
+# build. `simd-json` is the opt-in fast path — see the `json_simd` feature.
+serde_json = "1"
+simd-json = { version = "0.14", optional = true }
 
 [[bin]]
 name = "froglang-core"

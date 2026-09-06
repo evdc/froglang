@@ -4211,6 +4211,33 @@ impl Codegen {
         builder.symbol("frog_read_list_at",   crate::runtime::read::frog_read_list_at   as *const u8);
         builder.symbol("frog_read_range_lo",  crate::runtime::read::frog_read_range_lo  as *const u8);
         builder.symbol("frog_read_range_hi",  crate::runtime::read::frog_read_range_hi  as *const u8);
+        // `json` (plans/DATA.md stage 8) — `TypeChecker::build_json` (serialize)
+        // and `build_read_json` (parse). `__repr_int`/`__repr_bool` are reused
+        // as-is above: their output is already JSON-legal.
+        builder.symbol("frog_json_escape",     crate::runtime::json::frog_json_escape     as *const u8);
+        builder.symbol("frog_json_float_repr", crate::runtime::json::frog_json_float_repr as *const u8);
+        builder.symbol("frog_json_open",       crate::runtime::json::frog_json_open       as *const u8);
+        builder.symbol("frog_json_close",      crate::runtime::json::frog_json_close      as *const u8);
+        builder.symbol("frog_json_failed",     crate::runtime::json::frog_json_failed     as *const u8);
+        builder.symbol("frog_json_offset",     crate::runtime::json::frog_json_offset     as *const u8);
+        builder.symbol("frog_json_msg",        crate::runtime::json::frog_json_msg        as *const u8);
+        builder.symbol("frog_json_is_int",     crate::runtime::json::frog_json_is_int     as *const u8);
+        builder.symbol("frog_json_is_float",   crate::runtime::json::frog_json_is_float   as *const u8);
+        builder.symbol("frog_json_is_bool",    crate::runtime::json::frog_json_is_bool    as *const u8);
+        builder.symbol("frog_json_is_str",     crate::runtime::json::frog_json_is_str     as *const u8);
+        builder.symbol("frog_json_is_null",    crate::runtime::json::frog_json_is_null    as *const u8);
+        builder.symbol("frog_json_is_array",   crate::runtime::json::frog_json_is_array   as *const u8);
+        builder.symbol("frog_json_is_object",  crate::runtime::json::frog_json_is_object  as *const u8);
+        builder.symbol("frog_json_is_number",  crate::runtime::json::frog_json_is_number  as *const u8);
+        builder.symbol("frog_json_has",        crate::runtime::json::frog_json_has        as *const u8);
+        builder.symbol("frog_json_expect",     crate::runtime::json::frog_json_expect     as *const u8);
+        builder.symbol("frog_json_int",        crate::runtime::json::frog_json_int        as *const u8);
+        builder.symbol("frog_json_float",      crate::runtime::json::frog_json_float      as *const u8);
+        builder.symbol("frog_json_bool",       crate::runtime::json::frog_json_bool       as *const u8);
+        builder.symbol("frog_json_str",        crate::runtime::json::frog_json_str        as *const u8);
+        builder.symbol("frog_json_get",        crate::runtime::json::frog_json_get        as *const u8);
+        builder.symbol("frog_json_at",         crate::runtime::json::frog_json_at         as *const u8);
+        builder.symbol("frog_json_len",        crate::runtime::json::frog_json_len        as *const u8);
 
         // Host functions (`FrogStateBuilder::func`, `plans/EMBEDDING.md`).
         // Registered before any frog type is resolved — each shim's JIT
@@ -4320,6 +4347,34 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_read_list_at",  "frog_read_list_at",  &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_read_range_lo", "frog_read_range_lo", &[I64],           Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_read_range_hi", "frog_read_range_hi", &[I64],           Some(I64));
+        // `json` (plans/DATA.md stage 8) — `build_json`'s two Tier-2 write
+        // leaves, then `build_read_json`'s accessors, which mirror `read`'s
+        // above one for one. `__repr_int`/`__repr_bool` cover the other
+        // scalars: their output is already JSON-legal.
+        declare_rt(&mut module, &mut func_ids, "frog_json_escape",     "__json_str",          &[I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_float_repr", "__json_float",        &[types::F64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_open",       "frog_json_open",      &[I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_close",      "frog_json_close",     &[],         None);
+        declare_rt(&mut module, &mut func_ids, "frog_json_failed",     "frog_json_failed",    &[],         Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_offset",     "frog_json_offset",    &[],         Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_msg",        "frog_json_msg",       &[],         Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_is_int",     "frog_json_is_int",    &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_is_float",   "frog_json_is_float",  &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_is_bool",    "frog_json_is_bool",   &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_is_str",     "frog_json_is_str",    &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_is_null",    "frog_json_is_null",   &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_is_array",   "frog_json_is_array",  &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_is_object",  "frog_json_is_object", &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_is_number",  "frog_json_is_number", &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_has",        "frog_json_has",       &[I64, I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_expect",     "frog_json_expect",    &[I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_int",        "frog_json_int",       &[I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_float",      "frog_json_float",     &[I64],      Some(types::F64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_bool",       "frog_json_bool",      &[I64],      Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_json_str",        "frog_json_str",       &[I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_get",        "frog_json_get",       &[I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_at",         "frog_json_at",        &[I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_len",        "frog_json_len",       &[I64],      Some(I64));
 
         // Every host function shares this one import signature — see
         // `Ctx`'s `host_fns` field and `compile_call`'s host-call arm.

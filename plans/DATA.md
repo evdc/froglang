@@ -145,7 +145,7 @@ tier and the interop tier; the syntax changes are deliberately last.
 | 5 | **done** — `repr` / `read` at the typed-AST layer; the property test | Tier 1 | 1, 2, 4 |
 | 6 | **done** — Annotations: syntax, typed declarations, validation | Tier 2, host-side libs | — |
 | 7 | Host exposure of the declaration table | ORM/DB use case | 6 |
-| 8 | JSON interop tier | Tier 2 | 5, 6 |
+| 8 | **done** — JSON interop tier | Tier 2 | 5, 6 |
 | — | Deferred: collection literals, user reflection | — | generics |
 
 Stages 2, 3, 4, and 6 are independent of each other and of 0/1; they can land in any order or in
@@ -785,9 +785,168 @@ This covers the DB half of `DESIGN.md`'s example for the cost of a getter.
 name which is canonical for a value crossing the boundary, or `Person` → JSON will have two
 answers that differ on exactly the annotations.
 
+*Half-answered by stage 8*: froglang's JSON is `serde_json` (or `simd-json`), so the two sides
+already agree on everything below the annotation layer — escaping, float formatting, number
+parsing. The divergence this warned about is now precisely scoped to `#json(...)`, and it is not
+yet reachable, since stage 8 ships on defaults and stage 6 discards annotations rather than
+storing them. Both halves of that — the storage table and exposing it here — are this stage's
+work, which makes "the host reads froglang's annotations" the cheap answer rather than a
+reconciliation problem.
+
+Note also that `FrogValue` deep-copies values out **with type information only for scalars,
+`Str` and `List`** — `from_bits` returns `None` for `Named`/`Union`/`Function` — so the claim
+below is narrower than it reads, and a struct/union crossing the boundary needs work this stage
+would have to do.
+
 ---
 
-## Stage 8 — JSON
+## Stage 8 — JSON — **done**
+
+`json.to_str(x): Str` and `json.parse(s): T | JsonError` both ship, on a real Rust JSON
+library rather than a hand-written parser, and the JSON law
+(`json.parse(json.to_str(x))! == x`) is property-tested by the same generator that tests
+the notation law. See `tests/test_json.rs` (31 tests) for the behavioural spec.
+
+**The library is behind a compile-time seam** (`runtime/json/dom.rs`, ~140 lines):
+`serde_json` by default — portable, and already in the workspace lockfile via
+`playground-server`, so it costs no new build — and `simd-json`'s `OwnedValue` under
+`--features json_simd`, SIMD-accelerated on x86_64 and aarch64. `tests/test_json.rs`
+passes identically under both, which is the seam's contract: the feature is a performance
+choice and never a semantic one. Owned values, not `simd-json`'s faster borrowed
+`Tape`/`BorrowedValue`, because the latter borrow their strings out of the input buffer
+and would make the thread-local arena self-referential for no gain the compiler could
+use — every string it reads is copied onto the GC heap on the way out regardless.
+
+**`json.` is a builtin namespace, not a module.** No `import "std/json"`, no in-memory
+module machinery, and — the reason it was worth choosing — no *second* import just to
+spell `JsonError` in the annotation that drives `json.parse`'s return-type dispatch.
+`JsonError` is seeded in the base prelude beside `ReadError`. The namespace is recognized
+by callee shape in `lower_call`, before the `FieldAccess` callee is lowered as a value,
+exactly where the `Ord.compare(a, b)` trait-prefix form is recognized — and, like it, it
+is *gated* on the name being free, so `let json = ...` still shadows it.
+
+### Architecture — a second instance of stage 5, not a new mechanism
+
+Almost every piece here has a named counterpart built and proved in stage 5:
+
+| stage 8 | stage 5 |
+|---|---|
+| `runtime/json/mod.rs`'s handle arena + sticky errors | `runtime/read.rs`, whole file |
+| `build_json*` (serialize) | `build_repr*` |
+| `build_read_json*` (parse) | `build_read*` |
+| `lower_json_parse` | `lower_read` |
+| the `__json_to_str` placeholder → `desugar_notation` | `repr`'s placeholder, same pass |
+| `JsonError` in the prelude | `ReadError`, same seeding |
+
+That is the concrete cash value of this document's own "one lowering serves `repr`,
+`json.to_str`, ... by swapping the fragments": `json.to_str` is a **fragment swap** on
+`repr`'s existing typed-AST walk, expanded by the same `desugar_notation` pass under the
+same post-monomorphization guarantees, reusing `str_cat`/`str_lit`/`build_str_join`/
+`Comprehension`/`IsVariant`/`TypeTag` unchanged. No intermediate DOM is built to
+serialize; the library is used on the write path only for the one string-escaping leaf.
+Had `repr` been a fourth `print_value`-shaped codegen walk, this stage would have needed a
+fifth.
+
+`Int` and `Bool` reuse `__repr_int`/`__repr_bool` outright — their output is already
+JSON-legal, and a second pair of leaves that merely happened to agree would just be two
+things to keep in agreement. Only `Str` and `Float` get Tier-2 twins, and both for reasons
+about JSON the format: the two tiers must not share an escape table, and JSON has no
+spelling for `inf`/`nan`.
+
+### The wire format
+
+| froglang | JSON |
+|---|---|
+| `Int` | number (integer) |
+| `Float` | number; **non-finite → `null`** — `to_str` returns `Str`, not `Str \| JsonError`, so `null` is the only total answer |
+| `Bool` / `None` | `true`/`false` / `null` |
+| `Str` | string, with **JSON's escapes**, never `notation::escape_str` |
+| named struct | object, declared order, key = declared name |
+| positional struct | array — a "tuple struct" has no field names, and froglang's internal synthetic `"0"`/`"1"` keys have no business on the wire |
+| `List<T>` | array |
+| `Range<T>` | `{"start":…,"end":…}` |
+| nominal union | **externally tagged**: `{"Circle":{"r":1.5}}`, `{"Both":[3,7]}`, `{"Blank":{}}`. Common fields ride in the variant payload. |
+| anonymous union | untagged, each member as its own JSON |
+
+### The four semantics questions, answered
+
+1. **`null` vs missing** — absent *or* `null` is permitted iff the field's type admits
+   `None`, and yields `none`; either on a non-optional field is a `JsonError`. Serde's
+   rule. This **refines what this section originally said**: `#json(required)` is not what
+   *creates* the error, it will *narrow* the rule by adding one for an optional field. And
+   the implementation is smaller than the sketch — a present `null` needs no special case
+   at all, because the field's own `T | None` dispatch already tests `frog_json_is_null`,
+   so the entire rule is one `Conditional` on `frog_json_has` around the ordinary read.
+2. **Union wire shape** — **external tagging is the default**, uniformly. Internal tagging
+   cannot represent a positional variant or a non-object payload at all, so making it the
+   default would mean two incompatible shapes *at* the default. `#json(tag="kind")` is the
+   deferred way to ask for the other one. (Resolves this doc's open question.)
+3. **Anonymous unions** — parse rejects them **when two members share a JSON shape**,
+   rather than always. Stricter than a naive kind check exactly where this section asked
+   for strictness, and more permissive where there is no actual ambiguity: `Int | Str` and
+   `Int?` parse; `Int | Float` and `Circle | Rect` (anonymous) are rejected with a message
+   naming both members and the shape they collide on. `Int`/`Float` count as *one* shape
+   even though the DOM can tell `1` from `1.0`, because that distinction is a spelling
+   choice of the producer that no schema constrains — which is this section's own argument
+   for rejecting `Int | Float`, applied precisely rather than by blanket rule. Nominal
+   unions are exempt: external tagging tells them apart by name however alike their
+   payloads are, which is what "make Deserialize a property of nominal unions" was
+   pointing at. Serialization stays permissive.
+4. **Is `Serialize` automatic?** Yes, and with **no new `Trait` variant**: `json.to_str`
+   gates on `Trait::Show`, which is already structural over every `data` and already
+   excludes function types — exactly the line JSON needs. A `provides`-granted `Json`
+   trait would be meaningless until `without` exists, and a granted trait nobody can opt
+   out of is worse than none. `data Password(hash: Str)` stays serializable and stays a
+   named follow-up.
+
+### What it took beyond the sketch
+
+- **A backend disagreement, caught by the seam's own test.** `serde_json`'s `as_f64`
+  converts an integer node; `simd-json`'s `ValueAsScalar::as_f64` returns `None` for one
+  (`cast_f64` is the converting method). JSON has one number type, so `1` is the only
+  spelling a whole-valued float has on the wire from any other producer, and both backends
+  have to accept it. Found on the first run of `runtime::json`'s unit tests under
+  `--features json_simd` — which is the entire argument for having written those before
+  any codegen existed.
+- **`is_positional_fields` is vacuously true for a nullary variant**, which would have put
+  `[]` on the wire for `Shape.Blank()`. `{}` is the right empty payload, and keeps every
+  named variant's shape an object whether or not it happens to have fields today.
+- **JSON object keys are escaped at build time, not run time** — a declared field name is
+  compile-time known, so escaping it in the desugar folds it into the surrounding
+  `StrLit` and costs nothing at all at run time.
+- **`JsonError.offset` is exact for a parse error and `0` for a shape mismatch.** A frog
+  `Expression` node carries its own source `Position`, which is what lets `read` point
+  `ReadError.offset` at the offending part of the input; a parsed JSON value carries no
+  such thing in either backend. The message names the field and the expected type, which
+  is the granularity that actually diagnoses. Fabricating an offset would be worse than
+  admitting there isn't one.
+- **The `!` union-into-union gap is still there** and `json.parse` hits it identically to
+  `read`: `json.parse(s): Shape | JsonError` where `Shape` is itself a union parses fine
+  (`build_read_json_union_as` uses stage 5's build-wide-from-the-start technique), but
+  `back!` on the result does not. Pre-existing, in the `!` desugaring, and reproducible
+  with `read` and no JSON in sight — routed around in the tests, not fixed here.
+
+### Deferred, deliberately
+
+`#json(name=…)`, `#json(skip)`, `#json(required)`, `#json(tag=…)`. Stage 6 validates a
+`#json(...)` annotation and then **discards** it — nothing is stored — so honoring one
+needs an annotation-storage table first, which is groundwork stage 7 (host exposure) wants
+anyway. The defaults above were chosen so that every one of those annotations *narrows* a
+default rather than replacing it.
+
+### Verification
+
+`tests/test_json.rs` (31) — every wire-format row asserted **literally**, not merely
+round-tripped (a round-trip test passes just as happily against a private encoding nobody
+else can read, and JSON's whole point is that somebody else reads it), plus one named test
+per semantics decision; `runtime::json` and `runtime::json::dom` unit tests (14); the JSON
+law folded into `tests/test_notation_law.rs`'s existing generated programs, so the same
+generated value drives both tiers. All green under `FROG_GC_STRESS=1` and under
+`--features json_simd`. Full crate suite (46 binaries) unaffected.
+
+---
+
+## Stage 8 — the original sketch
 
 Generated per type at the typed-AST layer, annotation-configured, explicitly lossy. The
 serialize direction is `print_value`'s walk with different fragments. The **deserialize direction
@@ -941,8 +1100,18 @@ TRAITS.md stages 2–3 land. Runtime reflection declined.**
 - ~~**`\u{...}` in the lexer, or `repr` rejects unspellable strings?**~~ *Settled, stage 2*: the
   lexer has `\u{...}`, so no string is unspellable.
 - ~~**Should unknown escapes become a parse error?**~~ *Settled, stage 2*: yes.
-- **Which JSON stack is canonical** for a value crossing the embedding boundary.
-- **Default union tagging** — external or internal.
+- **Which JSON stack is canonical** for a value crossing the embedding boundary. *Narrowed,
+  stage 8*: froglang's own JSON now **is** a serde-family stack — `serde_json` by default,
+  `simd-json` under `json_simd` — so a host and a froglang program no longer disagree about
+  escaping, float formatting, or number parsing. What is still open is the *shape* question, and
+  only for annotations: once `#json(name=…)`/`#json(tag=…)` are honored, a host that reads the
+  same `Person` through `serde` derives will disagree with froglang on exactly those. Stage 7's
+  declaration table is where that gets reconciled, and the answer is likely "the host reads
+  froglang's annotations", not "pick a winner".
+- ~~**Default union tagging** — external or internal.~~ *Settled, stage 8*: **external**
+  (`{"Circle":{"r":1.5}}`), uniformly. Internal tagging cannot represent a positional variant or
+  a non-object payload at all, so making it the default would mean two incompatible shapes at the
+  default; `#json(tag="kind")` is the deferred way to ask for the other one.
 - **Is `StrBuf` the same object as a `Sink` trait**, or does `Sink` come later as an abstraction
   over it? Deciding at design time is cheaper than retrofitting.
 - ~~**Does closing `project_list_aliasing_gap` become a prerequisite** for asserting the law?~~

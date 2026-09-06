@@ -198,7 +198,7 @@ fn test_str_union_member_survives_gc_pressure() {
          is Str(s) then 0\n\
          })\n\
          total"
-    ), (0..8000i64).step_by(2).sum());
+    ), (0..8000i64).step_by(2).sum::<i64>());
 }
 
 #[test]

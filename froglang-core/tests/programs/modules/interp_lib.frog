@@ -1,0 +1,5 @@
+// A module-level binding referenced from inside an interpolation, so the
+// import rewriter has to see through the string literal to mangle it.
+let scale = 10
+
+func label(n: Int): Str = "n=${n * scale}"

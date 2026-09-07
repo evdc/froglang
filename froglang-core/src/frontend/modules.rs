@@ -132,7 +132,7 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
                 for a in &c.args { walk(&a.item, path)?; }
                 Ok(())
             }
-            Expression::Tuple(es) | Expression::Block(es) => {
+            Expression::Tuple(es) | Expression::Block(es) | Expression::Interp(es) => {
                 for e in es { walk(&e.item, path)?; }
                 Ok(())
             }
@@ -670,7 +670,10 @@ fn rewrite(
             }
         }
 
-        Expression::Tuple(es) | Expression::Block(es) => {
+        // An interpolation is ordinary code and holds ordinary references:
+        // `"total: ${helper(x)}"` in an imported module must have `helper`
+        // mangled exactly as the same call outside a string would be.
+        Expression::Tuple(es) | Expression::Block(es) | Expression::Interp(es) => {
             for e in es {
                 rewrite(&mut e.item, subst, qualified, shadow, track_let_shadow);
             }

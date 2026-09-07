@@ -1,7 +1,7 @@
 use std::iter::Peekable;
 use std::str::Chars;
 
-use crate::frontend::tokens::{Token, Position, Spanned};
+use crate::frontend::tokens::{StrPart, Token, Position, Spanned};
 
 // The spanned is redundant, but having the outer type still be a Result makes handling much easier.
 type LexResult = Result<Spanned<Token>, Spanned<LexerError>>;
@@ -28,6 +28,11 @@ pub enum LexerError {
     /// `\u{...}` that isn't a hex scalar value froglang can hold: empty, too
     /// long, unterminated, or a surrogate.
     InvalidUnicodeEscape,
+    /// A `${` in a string literal whose matching `}` never arrived.
+    /// Distinct from `UnterminatedString` because the fix is different, and
+    /// because a missing `}` swallows the closing quote — reporting "no
+    /// closing quote" would point at the wrong character.
+    UnterminatedInterpolation,
 }
 
 impl std::fmt::Display for LexerError {
@@ -36,8 +41,9 @@ impl std::fmt::Display for LexerError {
             LexerError::UnexpectedCharacter => write!(f, "unexpected character"),
             LexerError::UnterminatedString  => write!(f, "unterminated string literal"),
             LexerError::InvalidNumber       => write!(f, "invalid number literal"),
-            LexerError::InvalidEscape       => write!(f, "unknown escape sequence in string literal (known: \\n \\t \\r \\\\ \\\" \\0 \\u{{...}})"),
+            LexerError::InvalidEscape       => write!(f, "unknown escape sequence in string literal (known: \\n \\t \\r \\\\ \\\" \\0 \\$ \\u{{...}})"),
             LexerError::InvalidUnicodeEscape => write!(f, "invalid unicode escape — expected \\u{{...}} with 1-6 hex digits"),
+            LexerError::UnterminatedInterpolation => write!(f, "unterminated '${{' in string literal — expected a closing '}}'"),
         }
     }
 }
@@ -46,12 +52,34 @@ impl std::fmt::Display for LexerError {
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     current_line: u32,
-    pub current_col: u32
+    pub current_col: u32,
+    /// Whether `${` inside a string literal begins an interpolation.
+    ///
+    /// True for source. False for *data* — `read`'s input (`runtime::read`)
+    /// is frog notation, not frog code, and a data string that happens to
+    /// contain `${` is just those two characters. Without this, adding
+    /// interpolation would have silently turned a class of previously
+    /// readable data into a parse error.
+    interpolate: bool,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
-        Lexer { input: input.chars().peekable(), current_line: 0, current_col: 0 }
+        Lexer { input: input.chars().peekable(), current_line: 0, current_col: 0, interpolate: true }
+    }
+
+    /// A lexer for frog *notation* rather than frog *source*: identical
+    /// except that `${` in a string literal is not interpolation. See
+    /// `interpolate`.
+    pub fn for_data(input: &'a str) -> Self {
+        Lexer { interpolate: false, ..Lexer::new(input) }
+    }
+
+    /// A lexer whose first character is reported as being at `start` rather
+    /// than at 0:0 — how an interpolated fragment's spans stay anchored to
+    /// the file it came from (see `StrPart::Expr`).
+    pub fn new_at(input: &'a str, start: Position) -> Self {
+        Lexer { current_line: start.line, current_col: start.col, ..Lexer::new(input) }
     }
 
     pub fn next_token(&mut self) -> LexResult {
@@ -70,7 +98,19 @@ impl<'a> Lexer<'a> {
                 Token::Newline
             }
             Some(c) => match c {
-                '"' => Token::String(self.read_string().map_err(|e| self.error_at(e, start))?),
+                '"' => {
+                    let mut parts = self.read_string().map_err(|e| self.error_at(e, start))?;
+                    // One literal piece and nothing else is an ordinary
+                    // string, and stays one: `Token::InterpString` exists
+                    // only where interpolation was actually written.
+                    match parts.len() {
+                        1 => match parts.pop().expect("length checked") {
+                            StrPart::Lit(s) => Token::String(s),
+                            part            => Token::InterpString(vec![part]),
+                        },
+                        _ => Token::InterpString(parts),
+                    }
+                }
                 '0'..='9' => self.read_number(c).map_err(|e| self.error_at(e, start))?,
                 '/' => if let Some('/') = self.input.peek() {
                     self.input.next(); // consume second '/'
@@ -240,7 +280,59 @@ impl<'a> Lexer<'a> {
             .ok_or(LexerError::InvalidUnicodeEscape)
     }
 
-    fn read_string(&mut self) -> Result<String, LexerError> {
+    /// The source between a `${` (already consumed) and its matching `}`.
+    ///
+    /// Brace-counting, with one wrinkle: a nested string literal is copied
+    /// **verbatim**, escapes and all, rather than scanned for braces — so
+    /// `"${ pick("}") }"` counts the right ones. Copying it verbatim is also
+    /// what makes nesting work at no cost: the fragment parser re-lexes that
+    /// substring, and if it interpolates in turn, this same function runs on
+    /// it one level down.
+    fn read_interpolation(&mut self) -> Result<String, LexerError> {
+        let mut src = String::new();
+        let mut depth = 1usize;
+        loop {
+            let c = self.advance().ok_or(LexerError::UnterminatedInterpolation)?;
+            match c {
+                '{' => { depth += 1; src.push(c); }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { return Ok(src); }
+                    src.push(c);
+                }
+                '"' => {
+                    src.push(c);
+                    loop {
+                        // Running out of input here is reported as an
+                        // unterminated *interpolation*, not an unterminated
+                        // string: `"oops ${n"` reaches this loop because the
+                        // outer literal's own closing quote looks exactly
+                        // like the start of a nested one, and the missing
+                        // `}` is the actual mistake.
+                        let c = self.advance().ok_or(LexerError::UnterminatedInterpolation)?;
+                        src.push(c);
+                        match c {
+                            // An escape consumes the next character, so an
+                            // escaped quote doesn't end the nested literal.
+                            '\\' => src.push(self.advance().ok_or(LexerError::UnterminatedInterpolation)?),
+                            '"'  => break,
+                            _    => {}
+                        }
+                    }
+                }
+                _ => src.push(c),
+            }
+        }
+    }
+
+    /// A string literal's pieces, with the opening quote already consumed.
+    ///
+    /// Returns one `StrPart` per alternating literal run and `${...}`. A
+    /// literal with no interpolation yields exactly one `Lit`, which
+    /// `next_token` collapses back to a plain `Token::String` — so nothing
+    /// downstream sees a new shape unless interpolation was actually used.
+    fn read_string(&mut self) -> Result<Vec<StrPart>, LexerError> {
+        let mut parts: Vec<StrPart> = Vec::new();
         let mut s = String::new();
         // A bad escape doesn't abandon the literal: the scan runs to the
         // closing quote and reports the first error afterwards. Returning
@@ -251,10 +343,20 @@ impl<'a> Lexer<'a> {
         while let Some(c) = self.input.peek() {
             if *c == '"' {
                 self.advance();      // consume the closing "
-                return match error { Some(e) => Err(e), None => Ok(s) };
+                if let Some(e) = error { return Err(e); }
+                if !s.is_empty() || parts.is_empty() { parts.push(StrPart::Lit(s)); }
+                return Ok(parts);
             }
             let ch = self.advance().unwrap();   // safe, just peeked
-            if ch == '\\' {
+            if ch == '$' && self.interpolate && self.input.peek() == Some(&'{') {
+                self.advance();                  // consume the '{'
+                // `current_pos` is the position of the *next* character,
+                // which is exactly where the fragment's source begins.
+                let start = self.current_pos();
+                let src = self.read_interpolation()?;
+                if !s.is_empty() { parts.push(StrPart::Lit(std::mem::take(&mut s))); }
+                parts.push(StrPart::Expr { src, start });
+            } else if ch == '\\' {
                 let escaped = self.advance().ok_or(LexerError::UnterminatedString)?;
                 let decoded = match escaped {
                     'n' => Ok('\n'),
@@ -263,6 +365,11 @@ impl<'a> Lexer<'a> {
                     '\\' => Ok('\\'),
                     '"' => Ok('"'),
                     '0' => Ok('\0'),
+                    // `\$` is how a literal `${` is written now that `${`
+                    // interpolates, and how `notation::escape_str` spells
+                    // one so that `repr`'s output still reads back as the
+                    // string it came from.
+                    '$' => Ok('$'),
                     'u' => self.read_unicode_escape(),
                     // An unknown escape used to keep the literal character,
                     // which is the mechanism that made a mis-escaped `repr`

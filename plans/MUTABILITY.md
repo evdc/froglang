@@ -1,7 +1,8 @@
 # Mutability and Value Semantics
 
 Status: **implemented**, stages 1-4 and 6 of the plan below (`let`/`mut`, places, `mut`
-parameters, move-on-last-use, and `push`). Stage 5 (closures) waits on closures existing at all;
+parameters, move-on-last-use, and `push`). Stage 5 (closures) is **done** as of 2026-09-06 —
+see `plans/CLOSURES.md`, and §5 below for what it cost;
 stage 7 (COW via a `shared` header bit) is deliberately not attempted — see stage 6's "as built"
 for why it isn't needed for correctness. The *decisions* in "Foundational choices" are what stayed
 stable throughout; "Where the language actually is" below is now historical (it describes the
@@ -23,7 +24,7 @@ struct representation and the absence of a standard library. Probed against the 
 | `let p = ps[0]; p.x = 77` | `ps[0]` unchanged | reading out of a list copies |
 | `ys[0] = 99` | parse error | **no user-facing list mutation exists** |
 | `o.i.v = 5` | parse error | no nested-path assignment |
-| `let f = z -> z + n` | codegen panic | **no closures**, so no captured mutable state |
+| `let f = z -> z + n` | codegen panic *(fixed 2026-09-06)* | **no closures**, so no captured mutable state |
 | `x = 5` with no prior `let` | binds a new `x` | `let` is optional decoration |
 | `let x = 1` then `x = "hi"` | rebinds at `Str` | assignment can change a binding's type |
 
@@ -355,6 +356,16 @@ costs nothing, since comprehensions already cover construction. Shipping `xs.pus
 reference semantics "temporarily" is the decision that cannot be reversed.
 
 ### 5. Closures capture by value
+
+**As built** (2026-09-06, `plans/CLOSURES.md`): decided exactly as written below, and it turned
+out to be load-bearing in a way this section did not anticipate. By-value capture is the precise
+condition under which *lambda lifting* — rewriting a captured name into an extra parameter — is
+semantics-preserving with no escape analysis, and lifting is how froglang has first-class
+functions at all without a closure object. So the rule that was chosen to keep aliasing out is
+also what made the implementation cheap. Capturing a `mut` binding is rejected outright rather
+than silently snapshotted, which is the same decision one notch stricter; a lambda reads its
+captures at the point it is created, implemented as a snapshot binding rather than as a rule
+anyone has to remember. The accumulator cost predicted below is exactly the cost paid.
 
 There are no closures today, which makes this free to decide and expensive to decide later. A
 lambda copies what it captures at the point it is created; a captured binding's later mutation is

@@ -1,0 +1,5 @@
+import "./interp_lib.frog" { label }
+
+let tag = "x"
+// "x:n=20" — six characters.
+len("${tag}:${label(2)}")

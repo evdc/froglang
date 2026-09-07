@@ -103,7 +103,10 @@ pub struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     pub fn new(input: &'a str) -> Self {
-        let mut lexer = Lexer::new(input);
+        Parser::from_lexer(Lexer::new(input))
+    }
+
+    fn from_lexer(mut lexer: Lexer<'a>) -> Self {
         let mut errors = Vec::new();
         // If the very first token is a lex error, record it and seed EOF so
         // parsing can proceed (and immediately halt) instead of panicking.
@@ -123,13 +126,43 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse(input: &'a str) -> Result<Spanned<Expression>, Vec<Spanned<ParseError>>> {
-        let mut p = Parser::new(input);
+        Parser::parse_with(Parser::new(input))
+    }
+
+    /// `parse`, but for frog *notation* rather than frog source: `${` in a
+    /// string literal is two ordinary characters here. See
+    /// `Lexer::for_data` — `runtime::read` is the caller.
+    pub fn parse_data(input: &'a str) -> Result<Spanned<Expression>, Vec<Spanned<ParseError>>> {
+        Parser::parse_with(Parser::from_lexer(Lexer::for_data(input)))
+    }
+
+    fn parse_with(mut p: Parser<'a>) -> Result<Spanned<Expression>, Vec<Spanned<ParseError>>> {
         let block = p.block().unwrap();
         if p.errors.is_empty() {
             Ok(block)
         } else {
             Err(p.errors)
         }
+    }
+
+    /// One expression parsed out of a substring of a larger file, reporting
+    /// spans as though it were still at `start` in that file — the inside of
+    /// a `${...}` (`Grammar::interp_string`).
+    ///
+    /// Unlike `parse`, trailing input is an error rather than the start of a
+    /// second statement: `${a b}` has no reading, and saying so beats
+    /// silently keeping `a`.
+    pub fn fragment(input: &'a str, start: crate::frontend::tokens::Position) -> ParseResult {
+        let mut p = Parser::from_lexer(Lexer::new_at(input, start));
+        let parsed = p.expression(Precedence::Assign);
+        // A lex error seeds `errors` and leaves the token stream at EOF, so
+        // it has to be preferred over whatever `expression` then reported.
+        if let Some(err) = p.errors.first() { return Err(err.clone()); }
+        let expr = parsed?;
+        if !p.check(&Token::EOF) {
+            return Err(p.current_token.clone().map(|t| ParseError::ExpectedButFound(Token::EOF, t)));
+        }
+        Ok(expr)
     }
 
     pub fn block(&mut self) -> ParseResult {

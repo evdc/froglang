@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, vec};
+use std::{collections::{HashMap, HashSet}, fmt::Display, vec};
 
 use crate::frontend::{
     expression::{
@@ -1074,6 +1074,52 @@ pub struct TypeChecker {
     /// persists across entries) instead of silently recompiling it.
     /// Checkpointed like everything else above.
     emitted_instantiations: std::collections::HashSet<String>,
+    /// Tier 1 function values: every top-level function declaration that
+    /// takes at least one function-typed parameter, retained so a call
+    /// site — in this entry or a later one — can clone and specialize it
+    /// on the *identity* of the function it was passed. The exact
+    /// counterpart of `generic_templates`, one level down: that one keys
+    /// on a type, this one on a name.
+    ///
+    /// Keyed by the symbol the declaration compiles under, since that is
+    /// what a `Var` in callable position carries.
+    fn_templates: HashMap<String, FnTemplate>,
+    /// The capture parameters a lifted function gained, in the order they
+    /// were appended to its parameter list — what every call site must
+    /// pass after the declared arguments.
+    ///
+    /// Persisted (and checkpointed) because a REPL entry that *calls* a
+    /// function declared in an earlier entry has no other way to learn
+    /// its real arity: the lifting happened in a tree that entry never
+    /// sees. Empty for the overwhelming majority of functions, which
+    /// capture nothing.
+    lifted_captures: HashMap<String, Vec<(String, Type)>>,
+    /// Specialized symbols (`apply$$inc`) already compiled in this
+    /// session — the `emitted_instantiations` of tier 1, and checked for
+    /// the same reason: `codegen::func_ids` persists across entries, so a
+    /// second entry specializing the same callee on the same function
+    /// argument must reuse the first entry's body rather than redefine it.
+    emitted_specializations: std::collections::HashSet<String>,
+    /// Every name ever declared `mut`, recorded as `lower_assign` binds it.
+    ///
+    /// `lower_function_values` needs to know whether a captured name is a
+    /// mutable binding, and by the time it runs the answer is gone: the
+    /// typed AST spells a `let` declaration and a later reassignment as
+    /// the same `Assign` node, and `ScopeStack`'s `mutable` flag survives
+    /// only for bindings still in scope at the end of the entry — never
+    /// for a function-local one. Deriving it from the tree instead
+    /// ("assigned twice") cannot tell a re-`let` in an inner scope from a
+    /// reassignment, and rejected a legal shadow.
+    ///
+    /// Name-keyed and never scoped, so on its own it over-approximates: a
+    /// `mut n` anywhere in the session would make every `n` uncapturable.
+    /// `lower_function_values` narrows that back down by checking `ctx`
+    /// first — a name still resolvable there as definitely immutable (a
+    /// live `let`, however it shadows) wins over this set; only a name
+    /// whose scope has already closed (a genuine function-local `mut`)
+    /// falls back to this over-approximation, which costs a spurious error
+    /// but never a miscompile.
+    mut_names: std::collections::HashSet<String>,
 }
 
 /// One generalized (`TRAITS.md` Stage 2) `func`/let-bound-lambda
@@ -1092,6 +1138,62 @@ struct GenericTemplate {
     params:       Vec<(String, Type, bool)>,
     return_type:  Type,
     body:         Spanned<TypedExpr>,
+}
+
+/// What `TypeChecker::as_fn_decl` reads off a top-level function
+/// declaration statement: its name, its parameters, and its body.
+type FnDecl<'a> = (&'a str, &'a [(String, Type, bool)], &'a Spanned<TypedExpr>);
+
+/// One higher-order function declaration, retained by `fn_templates` so
+/// `specialize_function_values` can clone it once per distinct tuple of
+/// function arguments it is called with. Deliberately *not* a
+/// `GenericTemplate` with empty binders: there is no type substitution
+/// here at all, only name substitution, and sharing the struct would
+/// invite the two passes to be confused for one another.
+#[derive(Debug, Clone)]
+struct FnTemplate {
+    params:      Vec<(String, Type, bool)>,
+    return_type: Type,
+    body:        Spanned<TypedExpr>,
+    span:        Span,
+}
+
+/// Which notation a placeholder call is asking for.
+///
+/// All three are built during lowering as a `Call` on a synthetic `Var`
+/// (`Notation::callee`) and expanded by `TypeChecker::desugar_notation`
+/// after monomorphization, when every type in the tree is finally
+/// substituted — see that function's doc comment for why the expansion
+/// cannot happen earlier.
+///
+/// `Interp` is `Repr` except at `Str`, where it inserts the string raw
+/// rather than quoting it (`"hi ${name}"` is `hi Bob`). That one-type
+/// difference is the entire reason it exists as a third notation instead of
+/// being decided in `lower_interp`: inside a generic function the piece's
+/// type is still a `TypeVar` at lowering time, so a decision made there
+/// would quote `show("hi")`'s argument and not `show(1)`'s — the choice has
+/// to be made per instantiation, which is exactly what this pass does.
+#[derive(Clone, Copy, PartialEq)]
+enum Notation { Repr, Json, Interp }
+
+impl Notation {
+    /// The synthetic callee name that marks a placeholder of this notation.
+    /// Unspellable for the two internal ones; `repr` is a real builtin.
+    fn callee(self) -> &'static str {
+        match self {
+            Notation::Repr   => "repr",
+            Notation::Json   => "__json_to_str",
+            Notation::Interp => "__interp",
+        }
+    }
+
+    /// How to describe a missing `Show` for this notation.
+    fn needs_show(self, ty: &Type) -> String {
+        match self {
+            Notation::Interp => format!("{} has no notation — interpolation needs Show", ty),
+            _                => format!("{} has no notation — 'repr' needs Show", ty),
+        }
+    }
 }
 
 pub struct TypeCheckerCheckpoint {
@@ -1114,6 +1216,10 @@ pub struct TypeCheckerCheckpoint {
     generic_instantiations: HashMap<String, std::collections::HashSet<Type>>,
     generic_templates: HashMap<String, GenericTemplate>,
     emitted_instantiations: std::collections::HashSet<String>,
+    fn_templates: HashMap<String, FnTemplate>,
+    lifted_captures: HashMap<String, Vec<(String, Type)>>,
+    emitted_specializations: std::collections::HashSet<String>,
+    mut_names: std::collections::HashSet<String>,
     annotation_defs: HashMap<String, Vec<(String, Type)>>,
     annotation_defaults: HashMap<String, HashMap<String, ConstValue>>,
     struct_field_defaults: HashMap<String, HashMap<String, ConstValue>>,
@@ -1208,14 +1314,14 @@ impl TypeChecker {
     }
 
     pub fn empty() -> Self {
-        let mut tc = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
+        let mut tc = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
         tc.seed_iterable_container_traits();
         tc.seed_base_prelude();
         tc
     }
 
     pub fn new() -> Self {
-        let mut tc = TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
+        let mut tc = TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
         tc.seed_iterable_container_traits();
         tc.seed_base_prelude();
         tc
@@ -1303,7 +1409,7 @@ impl TypeChecker {
                 Expression::Block(stmts) => stmts,
                 other => vec![Spanned::from(other, ast.span)],
             };
-            let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
+            let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
             boot.hoist_trait_names(&stmts).expect("builtin Iterable/Container trait names must hoist");
             boot.hoist_trait_members(&stmts).expect("builtin Iterable/Container trait members must hoist");
             let iterable = boot.traits.remove("Iterable").expect("hoisted above");
@@ -1780,6 +1886,10 @@ impl TypeChecker {
             generic_instantiations: self.generic_instantiations.clone(),
             generic_templates: self.generic_templates.clone(),
             emitted_instantiations: self.emitted_instantiations.clone(),
+            fn_templates: self.fn_templates.clone(),
+            lifted_captures: self.lifted_captures.clone(),
+            emitted_specializations: self.emitted_specializations.clone(),
+            mut_names: self.mut_names.clone(),
             annotation_defs: self.annotation_defs.clone(),
             annotation_defaults: self.annotation_defaults.clone(),
             struct_field_defaults: self.struct_field_defaults.clone(),
@@ -1805,6 +1915,10 @@ impl TypeChecker {
         self.generic_instantiations = cp.generic_instantiations;
         self.generic_templates = cp.generic_templates;
         self.emitted_instantiations = cp.emitted_instantiations;
+        self.fn_templates = cp.fn_templates;
+        self.lifted_captures = cp.lifted_captures;
+        self.emitted_specializations = cp.emitted_specializations;
+        self.mut_names = cp.mut_names;
         self.func_mut_params = cp.func_mut_params;
         self.annotation_defs = cp.annotation_defs;
         self.annotation_defaults = cp.annotation_defaults;
@@ -4714,22 +4828,14 @@ impl TypeChecker {
             TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)
             | TypedExprKind::StrLit(_) | TypedExprKind::NoneLit => Ok(()),
 
-            // A function has no runtime representation — no closure
-            // object, no function pointer, no indirect call — so a name
-            // that reaches here in *value* position (rather than as a
-            // call's callable, which the `Call` arm never recurses into)
-            // has nothing to compile to. `let f = g` is the one way to
-            // give a function a second name, and `lower_assign` handles it
-            // as a compile-time alias without ever building this node.
-            TypedExprKind::Var(name) => match self.lookup(&expr.item.ty) {
-                Type::Function { .. } => Err(Spanned::from(TypeError {
-                    msg: format!(
-                        "'{}' is a function — it can be called, or given another name with 'let', but not used as a value",
-                        Self::source_name(name),
-                    ),
-                }, expr.span)),
-                _ => Ok(()),
-            },
+            // A function in value position used to be rejected here.
+            // `lower_function_values` compiles those away now — hoisting
+            // the lambda, capturing by value, specializing the callee —
+            // and reports whatever it could not resolve
+            // (`reject_function_values`), which is a judgement this early
+            // pass has no way to make: it runs before monomorphization,
+            // so it cannot yet see which calls resolve to what.
+            TypedExprKind::Var(_) => Ok(()),
 
             TypedExprKind::Unary { expr: inner, .. } => self.validate_codegen_constraints(inner),
 
@@ -4745,21 +4851,15 @@ impl TypeChecker {
                 Ok(())
             },
 
-            // A function literal is compilable only as a declaration's own
-            // value (`func f(...) = ...`, `let f = x -> x`), which is what
-            // gives it a name to compile under. Anywhere else it's the same
-            // missing runtime representation as the `Var` arm above.
             TypedExprKind::Assign { value, .. } => match &value.item.kind {
                 TypedExprKind::Function { body, .. } => self.validate_codegen_constraints(body),
                 _ => self.validate_codegen_constraints(value),
             },
 
-            TypedExprKind::Function { body, .. } => {
-                self.validate_codegen_constraints(body)?;
-                Err(Spanned::from(TypeError {
-                    msg: "a function literal can only be bound to a name, e.g. 'let f = x -> x' — it can't be used as a value".to_string(),
-                }, expr.span))
-            },
+            // A function literal away from a declaration used to be
+            // rejected here; `lower_function_values` hoists it to a
+            // top-level declaration of its own instead. See the `Var` arm.
+            TypedExprKind::Function { body, .. } => self.validate_codegen_constraints(body),
 
             TypedExprKind::Call { callable, args, .. } => {
                 // Not `validate_codegen_constraints(callable)`: a bare name
@@ -5409,6 +5509,1138 @@ impl TypeChecker {
         });
     }
 
+    // ── Tier 1 function values ────────────────────────────────────────────
+    //
+    // froglang has no closure object, no function pointer and no indirect
+    // call, and this pass is what lets it have first-class functions
+    // anyway: every function value whose callee is statically known is
+    // compiled away, leaving only top-level declarations and direct calls
+    // — precisely the shape `codegen::compile_entry`'s two passes already
+    // handle (Pass 1 declares top-level `Assign { value: Function }`
+    // statements; Pass 2 compiles each body with `vars` seeded only from
+    // its parameters). `liveness.rs` and `linear.rs` already *assume* that
+    // invariant, so this pass strengthens what they rely on.
+    //
+    // Three transforms, in order:
+    //
+    //  1. **Lambda lifting** (`hoist_expr`) — every `Function` node that
+    //     isn't already a top-level declaration's value is hoisted to top
+    //     level under a fresh name; a nested `func`/`let f = ...` leaves a
+    //     rename behind for the rest of its block, a lambda in expression
+    //     position is replaced by a `Var` naming the hoisted declaration.
+    //  2. **Capture propagation** (`resolve_captures`) — each declaration's
+    //     free value names become trailing parameters, and every call site
+    //     passes them. Run to a fixed point: if `f` calls `g` and `g` gained
+    //     captures `f` doesn't bind, `f` gains them too.
+    //  3. **Specialization** (`specialize_calls`) — a call to a function
+    //     with function-typed parameters is rewritten to a clone of that
+    //     function with each one substituted by the concrete callee, so
+    //     `f(x)` inside the body becomes a direct call.
+    //
+    // Whatever function value survives all three is one whose callee is
+    // *not* statically known — it escaped — and `reject_function_values`
+    // reports it as the tier-2 case it is.
+    //
+    // The whole thing mirrors `monomorphize_generics` deliberately, one
+    // level down: that pass clones a template per distinct *type*, this one
+    // per distinct *name*. Running after it is what makes that split work —
+    // two different lambdas of the same type both land in `map$Int$Int`,
+    // and this pass then separates them. The reverse order cannot work, and
+    // no iteration back is needed: substituting a name never creates a new
+    // type instantiation.
+    pub fn lower_function_values(&mut self, typed: &mut Spanned<TypedExpr>) -> Result<(), Spanned<TypeError>> {
+        let mut stmts: Vec<Spanned<TypedExpr>> = match std::mem::replace(&mut typed.item.kind, TypedExprKind::IntLit(0)) {
+            TypedExprKind::Block(s) => s,
+            other => vec![Spanned::from(TypedExpr { id: 0, ty: typed.item.ty.clone(), kind: other }, typed.span)],
+        };
+
+        // Held aside so hoisted declarations land *before* it and the
+        // entry's result value is unaffected — `monomorphize_generics`
+        // does the same, for the same reason.
+        let mut tail = stmts.pop();
+
+        // A lambda in argument position takes its parameter types from the
+        // expected type, so its `Function` node is built carrying the
+        // fresh `TypeVar`s unification later pins — resolved in
+        // `self.substitutions` and nowhere else. Hoisting it to a top-level
+        // declaration makes those types a *signature*, which codegen reads
+        // directly, so they have to be real first.
+        // `monomorphize_generics` resolves the same way for the same
+        // reason, but it returns early when nothing is generic, so this
+        // cannot rely on it having run.
+        for s in stmts.iter_mut().chain(tail.iter_mut()) {
+            self.substitute_types_deep(s, &HashMap::new());
+        }
+
+        // Which names a capture may not name: anything declared `mut`
+        // (`mut_names`, recorded during lowering — see its doc comment for
+        // why the tree can't answer this), plus anything written through
+        // as a place or handed to a `mut` parameter.
+        //
+        // `mut_names` is name-keyed and never forgets, so a `mut` in one
+        // function's body (or an earlier REPL entry) would otherwise poison
+        // every same-named binding anywhere else, including one that is
+        // provably, currently a `let` — `self.ctx` still resolves it. So a
+        // name still live in `ctx` as definitely immutable is trusted over
+        // the historical record; only a name `ctx` can't answer for (its
+        // scope already closed — a genuine function-local `mut`) falls back
+        // to the over-approximation.
+        let mut mutated: HashSet<String> = self.mut_names.iter()
+            .filter(|n| self.ctx.is_mutable(n) != Some(false))
+            .cloned()
+            .collect();
+        for s in stmts.iter().chain(tail.iter()) { Self::collect_mutated_names(s, &mut mutated); }
+
+        // ── 1. Hoist ─────────────────────────────────────────────────────
+        let mut hoisted: Vec<Spanned<TypedExpr>> = Vec::new();
+        let mut failed: Option<Spanned<TypeError>> = None;
+        {
+            let mut scopes: Vec<HashMap<String, Option<String>>> = vec![HashMap::new()];
+            // Rebuilt, like a nested block's: a top-level declaration can
+            // expand into its capture snapshots plus itself.
+            let mut rebuilt: Vec<Spanned<TypedExpr>> = Vec::with_capacity(stmts.len());
+            for s in stmts.iter_mut().chain(tail.iter_mut()) {
+                let is_decl = matches!(&s.item.kind, TypedExprKind::Assign { value, .. }
+                    if matches!(value.item.kind, TypedExprKind::Function { .. }));
+                if is_decl {
+                    // Already top level: it keeps its name and its place,
+                    // so only its body is walked — but it still needs its
+                    // captures snapshotted, since a call to it can sit in
+                    // a scope that shadows one of them.
+                    let span = s.span;
+                    let TypedExprKind::Assign { value, .. } = &mut s.item.kind else { unreachable!() };
+                    let mut inner: Vec<HashMap<String, Option<String>>> = {
+                        let TypedExprKind::Function { params, .. } = &value.item.kind else { unreachable!() };
+                        vec![params.iter().map(|(n, _, _)| (n.clone(), None)).collect()]
+                    };
+                    let TypedExprKind::Function { body, .. } = &mut value.item.kind else { unreachable!() };
+                    self.hoist_expr(body, &mut inner, &mut hoisted, &mutated, &mut failed);
+                    let TypedExprKind::Assign { value, .. } = &mut s.item.kind else { unreachable!() };
+                    if let Err(e) = self.snapshot_captures(value, &mutated, span, &mut rebuilt) {
+                        failed = Some(e);
+                    }
+                } else {
+                    self.hoist_expr(s, &mut scopes, &mut hoisted, &mutated, &mut failed);
+                }
+                rebuilt.push(std::mem::replace(s, Spanned::from(
+                    TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, s.span)));
+            }
+            // The tail was walked through the same loop, so it is the last
+            // entry in `rebuilt`; take it back out.
+            if tail.is_some() { tail = rebuilt.pop(); }
+            stmts = rebuilt;
+        }
+        if let Some(e) = failed { return Err(e); }
+        stmts.extend(hoisted);
+
+        // ── 2. Specialization ────────────────────────────────────────────
+        // Before captures, not after: a specialized clone that calls the
+        // lambda it was specialized on is an ordinary caller of a
+        // capturing function, so step 3's fixed point threads that
+        // lambda's captures through it with no forwarding logic of its
+        // own. The other order would need one.
+        self.specialize_calls(&mut stmts, &mut tail);
+
+        // ── 3. Captures ──────────────────────────────────────────────────
+        self.resolve_captures(&mut stmts, &mut tail, &mutated)?;
+
+        if let Some(t) = tail { stmts.push(t); }
+
+        // ── 4. Whatever is left is tier 2 ────────────────────────────────
+        for s in stmts.iter() { self.reject_function_values(s)?; }
+
+        typed.item.ty = stmts.last().map(|s| s.item.ty.clone()).unwrap_or(Type::None);
+        typed.item.kind = TypedExprKind::Block(stmts);
+        Ok(())
+    }
+
+    /// Names written *through* somewhere in `expr`: a `PlaceAssign` root
+    /// or a `mut` argument's root. Complements `mut_names`, which covers
+    /// the declaration side; between them a captured name that anything
+    /// can write is rejected. Deliberately scope-blind — see `mut_names`.
+    fn collect_mutated_names(expr: &Spanned<TypedExpr>, out: &mut HashSet<String>) {
+        match &expr.item.kind {
+            TypedExprKind::PlaceAssign { place, .. } => { out.insert(place.root.clone()); },
+            TypedExprKind::Call { args, .. } => {
+                for a in args {
+                    if let Arg::Mut(p) = a { out.insert(p.root.clone()); }
+                }
+            },
+            _ => {},
+        }
+        for child in Self::children(expr) { Self::collect_mutated_names(child, out); }
+    }
+
+    /// Hoist every `Function` node reachable from `expr` to the top level,
+    /// pushing each one onto `out` as an `Assign { name, value: Function }`
+    /// statement and leaving a reference behind in its place.
+    ///
+    /// `scopes` is a lexical stack of *rewrites*: `Some(hoisted)` means a
+    /// reference to this name now denotes the hoisted declaration,
+    /// `None` means an inner binder has shadowed whatever the outer scope
+    /// said. Tracking the shadowing is the whole reason this is a walk of
+    /// its own rather than a `walk_vars_mut` callback — that one is
+    /// scope-blind, which is fine for its own job (template symbols are
+    /// unspellable, so nothing can shadow them) and wrong here, where the
+    /// names being rewritten are ordinary user identifiers.
+    ///
+    /// A hoisted declaration's own name is registered *before* its body is
+    /// walked, so a recursive call inside it resolves to the hoisted name
+    /// too.
+    fn hoist_expr(
+        &mut self,
+        expr: &mut Spanned<TypedExpr>,
+        scopes: &mut Vec<HashMap<String, Option<String>>>,
+        out: &mut Vec<Spanned<TypedExpr>>,
+        mutated: &HashSet<String>,
+        failed: &mut Option<Spanned<TypeError>>,
+    ) {
+        match &mut expr.item.kind {
+            TypedExprKind::Var(name) => {
+                if let Some(hoisted) = Self::scope_lookup(scopes, name) {
+                    *name = hoisted;
+                }
+            },
+
+            // Statement sequences are the only place a declaration can
+            // appear, so they're the only place a rewrite is introduced.
+            // Processed in order, since a name binds for the rest of the
+            // block and not before it.
+            TypedExprKind::Block(stmts) => {
+                scopes.push(HashMap::new());
+                // Rebuilt rather than mutated in place: a declaration can
+                // expand into several statements (its capture snapshots)
+                // or into none at all (it is hoisted away).
+                let mut replaced: Vec<Spanned<TypedExpr>> = Vec::with_capacity(stmts.len());
+                for s in stmts.iter_mut() {
+                    let decl = match &s.item.kind {
+                        TypedExprKind::Assign { name, value } if matches!(value.item.kind, TypedExprKind::Function { .. }) =>
+                            Some(name.clone()),
+                        _ => None,
+                    };
+                    match decl {
+                        Some(name) => {
+                            let hoisted = self.fresh_lifted_name(&name);
+                            scopes.last_mut().expect("just pushed").insert(name, Some(hoisted.clone()));
+                            let mut decl_node = std::mem::replace(s, Spanned::from(
+                                TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, s.span));
+                            let TypedExprKind::Assign { name: decl_name, value } = &mut decl_node.item.kind else { unreachable!() };
+                            *decl_name = hoisted;
+                            self.hoist_function_value(value, scopes, out, mutated, failed);
+                            // The snapshots stand where the declaration
+                            // did, so they are evaluated at exactly the
+                            // point the function value was created.
+                            let mut snaps = Vec::new();
+                            if let Err(e) = self.snapshot_captures(value, mutated, decl_node.span, &mut snaps) {
+                                *failed = Some(e);
+                            }
+                            replaced.extend(snaps);
+                            out.push(decl_node);
+                        },
+                        None => {
+                            self.hoist_expr(s, scopes, out, mutated, failed);
+                            // A non-function `let` shadows any hoisted
+                            // name it reuses for the rest of the block.
+                            if let TypedExprKind::Assign { name, .. } = &s.item.kind {
+                                scopes.last_mut().expect("just pushed").insert(name.clone(), None);
+                            }
+                            replaced.push(std::mem::replace(s, Spanned::from(
+                                TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, s.span)));
+                        },
+                    }
+                }
+                scopes.pop();
+                *stmts = replaced;
+            },
+
+            // A lambda in expression position — a call argument, most of
+            // the time. It becomes a reference to its own hoisted
+            // declaration, which is exactly the "statically known callee"
+            // shape specialization then consumes.
+            TypedExprKind::Function { .. } => {
+                let hoisted = self.fresh_lifted_name("lambda");
+                let ty = expr.item.ty.clone();
+                let span = expr.span;
+                let mut value = std::mem::replace(expr, Spanned::from(
+                    TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Var(hoisted.clone()) }, span));
+                self.hoist_function_value(&mut value, scopes, out, mutated, failed);
+                // No snapshot: a lambda literal is created *at* the
+                // expression it stands in, and that is the only place the
+                // hoisted name is ever referenced, so reading its captures
+                // at the call site already reads them at creation time.
+                if let Err(e) = self.check_captures_immutable(&value, mutated) { *failed = Some(e); }
+                out.push(Spanned::from(TypedExpr {
+                    id: 0,
+                    ty,
+                    kind: TypedExprKind::Assign { name: hoisted, value: Box::new(value) },
+                }, span));
+            },
+
+            TypedExprKind::ForLoop { var, iterable, cond, body, iter_via }
+            | TypedExprKind::Comprehension { var, iterable, cond, body, iter_via } => {
+                // The iterable is evaluated *outside* the loop variable's
+                // scope, so it is walked before the frame is pushed.
+                self.hoist_expr(iterable, scopes, out, mutated, failed);
+                let mut frame = HashMap::new();
+                frame.insert(var.clone(), None);
+                if let Some(iv) = iter_via.as_ref() { frame.insert(iv.iter_var.clone(), None); }
+                scopes.push(frame);
+                if let Some(c) = cond { self.hoist_expr(c, scopes, out, mutated, failed); }
+                self.hoist_expr(body, scopes, out, mutated, failed);
+                if let Some(iv) = iter_via { self.hoist_expr(&mut iv.next_call, scopes, out, mutated, failed); }
+                scopes.pop();
+            },
+
+            _ => {
+                for child in Self::children_mut(expr) {
+                    self.hoist_expr(child, scopes, out, mutated, failed);
+                }
+            },
+        }
+    }
+
+    /// Walk into a hoisted declaration's `Function` value: its parameters
+    /// open a fresh scope, so nothing outside can be rewritten by a name
+    /// the parameters shadow.
+    fn hoist_function_value(
+        &mut self,
+        value: &mut Spanned<TypedExpr>,
+        scopes: &mut Vec<HashMap<String, Option<String>>>,
+        out: &mut Vec<Spanned<TypedExpr>>,
+        mutated: &HashSet<String>,
+        failed: &mut Option<Spanned<TypeError>>,
+    ) {
+        let TypedExprKind::Function { params, body, .. } = &mut value.item.kind else {
+            unreachable!("hoist_function_value is only ever called on a Function value")
+        };
+        scopes.push(params.iter().map(|(n, _, _)| (n.clone(), None)).collect());
+        self.hoist_expr(body, scopes, out, mutated, failed);
+        scopes.pop();
+    }
+
+    /// The free value names of a `Function` value — the ones it captures.
+    fn captured_names(&self, value: &Spanned<TypedExpr>) -> Vec<(String, Type)> {
+        let TypedExprKind::Function { params, body, .. } = &value.item.kind else {
+            unreachable!("captured_names is only ever called on a Function value")
+        };
+        let mut bound: Vec<HashSet<String>> = vec![params.iter().map(|(n, _, _)| n.clone()).collect()];
+        let mut free = Vec::new();
+        // An empty `known`: this is about a body's *own* free names, and a
+        // capture that arrives by calling something else is already an
+        // unspellable synthetic name that needs no snapshot.
+        self.collect_free_vars(body, &mut bound, &HashMap::new(), &mut free);
+        free.sort_by(|a, b| a.0.cmp(&b.0));
+        free
+    }
+
+    /// Capture is by value, so a captured binding must be immutable —
+    /// which is also what makes lifting one into a parameter
+    /// semantics-preserving without any escape analysis.
+    fn check_captures_immutable(&self, value: &Spanned<TypedExpr>, mutated: &HashSet<String>) -> Result<(), Spanned<TypeError>> {
+        for (n, _) in self.captured_names(value) {
+            if mutated.contains(&n) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!(
+                        "closures capture by value; '{}' is a mut binding — copy it into a `let` first",
+                        n,
+                    ),
+                }, value.span));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind each of `value`'s captures to a fresh unspellable name and
+    /// rewrite the body to read that instead, emitting the bindings onto
+    /// `out` to stand where the declaration did.
+    ///
+    /// Without this the capture would be passed at each *call site* as a
+    /// plain `Var(n)`, and a call site is free to shadow `n`:
+    ///
+    /// ```text
+    /// let n = 1
+    /// let f = x -> x + n
+    /// let g = { let n = 1000; f(0) }   // f must still see 1
+    /// ```
+    ///
+    /// Reading the snapshot at the declaration instead is both the fix for
+    /// that and the definition of by-value capture: the lambda sees its
+    /// captures as of where it was created, not where it is called.
+    fn snapshot_captures(
+        &mut self,
+        value: &mut Spanned<TypedExpr>,
+        mutated: &HashSet<String>,
+        span: Span,
+        out: &mut Vec<Spanned<TypedExpr>>,
+    ) -> Result<(), Spanned<TypeError>> {
+        self.check_captures_immutable(value, mutated)?;
+        let caps = self.captured_names(value);
+        if caps.is_empty() { return Ok(()); }
+
+        let mut renames: HashMap<String, String> = HashMap::new();
+        for (n, ty) in &caps {
+            let snap = format!("{}$snap{}", n, self.next_id);
+            self.next_id += 1;
+            out.push(Spanned::from(TypedExpr {
+                id: 0,
+                ty: ty.clone(),
+                kind: TypedExprKind::Assign {
+                    name: snap.clone(),
+                    value: Box::new(Spanned::from(TypedExpr {
+                        id: 0, ty: ty.clone(), kind: TypedExprKind::Var(n.clone()),
+                    }, span)),
+                },
+            }, span));
+            renames.insert(n.clone(), snap);
+        }
+
+        let TypedExprKind::Function { params, body, .. } = &mut value.item.kind else { unreachable!() };
+        let mut bound: Vec<HashSet<String>> = vec![params.iter().map(|(n, _, _)| n.clone()).collect()];
+        Self::rename_free_vars(body, &mut bound, &renames);
+        Ok(())
+    }
+
+    /// The innermost rewrite for `name`, or `None` if it isn't rewritten
+    /// (never was, or an inner binder shadowed it).
+    fn scope_lookup(scopes: &[HashMap<String, Option<String>>], name: &str) -> Option<String> {
+        scopes.iter().rev().find_map(|frame| frame.get(name)).cloned().flatten()
+    }
+
+    /// A top-level symbol for a hoisted declaration. `$` keeps it in the
+    /// same unspellable namespace `monomorphize_generics`' mangled names
+    /// live in, and `next_id` (checkpointed) keeps it unique across REPL
+    /// entries as well as within one.
+    fn fresh_lifted_name(&mut self, base: &str) -> String {
+        let name = format!("{}$lift{}", base, self.next_id);
+        self.next_id += 1;
+        name
+    }
+
+    /// Every direct subexpression of `expr`, in evaluation order — the
+    /// read-only counterpart of `walk_vars_mut`'s traversal, factored out
+    /// so the several walks this pass needs don't each restate the node
+    /// inventory. `Function` bodies and `IterVia::next_call` are included:
+    /// a walk that skipped them would miss exactly the nested cases this
+    /// pass exists to find.
+    fn children(expr: &Spanned<TypedExpr>) -> Vec<&Spanned<TypedExpr>> {
+        let mut out: Vec<&Spanned<TypedExpr>> = Vec::new();
+        match &expr.item.kind {
+            TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)
+            | TypedExprKind::StrLit(_) | TypedExprKind::NoneLit | TypedExprKind::Var(_) => {},
+            TypedExprKind::Unary { expr: e, .. } => out.push(e),
+            TypedExprKind::Binary { left, right, .. } => { out.push(left); out.push(right); },
+            TypedExprKind::Conditional { cond, true_branch, false_branch } => {
+                out.push(cond); out.push(true_branch);
+                if let Some(fb) = false_branch { out.push(fb); }
+            },
+            TypedExprKind::Assign { value, .. } => out.push(value),
+            TypedExprKind::Function { body, .. } => out.push(body),
+            TypedExprKind::Call { callable, args } => {
+                out.push(callable);
+                for a in args { out.extend(a.subexprs()); }
+            },
+            TypedExprKind::Index { target, index } => { out.push(target); out.push(index); },
+            TypedExprKind::Slice { target, start, end } => {
+                out.push(target);
+                if let Some(s) = start { out.push(s); }
+                if let Some(e) = end { out.push(e); }
+            },
+            TypedExprKind::Range { start, end } => { out.push(start); out.push(end); },
+            TypedExprKind::List(elems) => out.extend(elems.iter()),
+            TypedExprKind::Block(stmts) => out.extend(stmts.iter()),
+            TypedExprKind::ForLoop { iterable, cond, body, iter_via, .. }
+            | TypedExprKind::Comprehension { iterable, cond, body, iter_via, .. } => {
+                out.push(iterable);
+                if let Some(c) = cond { out.push(c); }
+                out.push(body);
+                if let Some(iv) = iter_via { out.push(&iv.next_call); }
+            },
+            TypedExprKind::StructInit { fields, .. } | TypedExprKind::VariantInit { fields, .. } => {
+                for (_, v) in fields { out.push(v); }
+            },
+            TypedExprKind::FieldAccess { target, .. } => out.push(target),
+            TypedExprKind::PlaceAssign { place, value } => {
+                out.extend(place.index_exprs());
+                out.push(value);
+            },
+            TypedExprKind::IsVariant { target, .. } => out.push(target),
+            TypedExprKind::VariantField { target, .. } => out.push(target),
+            TypedExprKind::Return(v) => if let Some(v) = v { out.push(v) },
+            TypedExprKind::Widen { value, .. } | TypedExprKind::Narrow { value, .. } => out.push(value),
+            TypedExprKind::TypeTag { target, .. } => out.push(target),
+            TypedExprKind::Truthy(v) | TypedExprKind::Coerce(v) => out.push(v),
+        }
+        out
+    }
+
+    /// Replace every call that passes a statically-known function with a
+    /// call to a clone of the callee that has that function substituted
+    /// in — so the parameter disappears and `f(x)` inside the body becomes
+    /// an ordinary direct call to the function it was passed.
+    ///
+    /// The same transform `monomorphize_generics` performs, keyed on a
+    /// name instead of a type, and it reuses that pass's structure: retain
+    /// the declaration as a template, emit one clone per distinct
+    /// instantiation under a mangled symbol, strip the un-substituted
+    /// declaration (it can never be compiled — a function-typed parameter
+    /// has no runtime representation), and run to a fixed point, since a
+    /// clone's own body can contain the first specializable call to
+    /// something else.
+    ///
+    /// Infallible: a call this can't specialize is simply left alone, and
+    /// whatever function value is still standing afterwards is reported by
+    /// `reject_function_values` with the context to say *why*.
+    fn specialize_calls(&mut self, stmts: &mut Vec<Spanned<TypedExpr>>, tail: &mut Option<Spanned<TypedExpr>>) {
+        // Both branches matter. Registering a higher-order declaration is
+        // the point; *un*-registering one that this entry redeclares
+        // without function parameters is what keeps a REPL honest — these
+        // maps are keyed by name and persist, so a stale template would
+        // otherwise strip the new declaration as if it were still the old
+        // one. (`monomorphize_generics` sidesteps this by keying on a
+        // unique symbol instead; a function's name is not its identity.)
+        // `emitted_specializations` is keyed by *source* names too — the
+        // callee's and each substituted function's — so a redeclaration of
+        // either one has to evict every entry mentioning it, or a stale
+        // clone from the old declaration keeps answering calls under the
+        // new one (`func inc(n)=n+1` ... `func inc(n)=n+100` must not keep
+        // `apply$$inc` pointing at the `+1` clone).
+        let redeclared: std::collections::HashSet<&str> = stmts.iter().chain(tail.iter())
+            .filter_map(|s| Self::as_fn_decl(s).map(|(n, _, _)| n))
+            .collect();
+        if !redeclared.is_empty() {
+            self.emitted_specializations.retain(|mangled| {
+                let (callee, args) = mangled.split_once("$$").unwrap_or((mangled.as_str(), ""));
+                !redeclared.contains(callee) && !args.split('$').any(|a| redeclared.contains(a))
+            });
+        }
+
+        for s in stmts.iter().chain(tail.iter()) {
+            let Some((name, params, body)) = Self::as_fn_decl(s) else { continue };
+            if !params.iter().any(|(_, t, _)| matches!(self.lookup(t), Type::Function { .. })) {
+                self.fn_templates.remove(name);
+                continue;
+            }
+            let TypedExprKind::Assign { value, .. } = &s.item.kind else { unreachable!("as_fn_decl matched") };
+            let TypedExprKind::Function { return_type, .. } = &value.item.kind else { unreachable!("as_fn_decl matched") };
+            self.fn_templates.insert(name.to_string(), FnTemplate {
+                params: params.to_vec(),
+                return_type: return_type.clone(),
+                body: body.clone(),
+                span: s.span,
+            });
+        }
+        if self.fn_templates.is_empty() { return; }
+
+        // Each round scans everything compiled so far — including the
+        // clones the previous round emitted, which is what makes a
+        // function parameter forwarded to a second higher-order function
+        // resolve.
+        let mut emitted: Vec<Spanned<TypedExpr>> = Vec::new();
+        loop {
+            let mut wanted: Vec<(String, Vec<(usize, String)>)> = Vec::new();
+            for s in stmts.iter().chain(tail.iter()).chain(emitted.iter()) {
+                // A template's own body is about to be stripped; the calls
+                // that matter in it are the ones in its clones.
+                if Self::as_fn_decl(s).is_some_and(|(n, _, _)| self.fn_templates.contains_key(n)) { continue }
+                self.scan_specializations(s, &mut wanted);
+            }
+            let mut fresh = Vec::new();
+            for (callee, subs) in wanted {
+                let mangled = Self::specialized_name(&callee, &subs);
+                // Already compiled — in an earlier round, or in an earlier
+                // entry. Nothing to build, but the call sites here still
+                // have to be pointed at it, which is why the rewrite below
+                // runs unconditionally rather than only when something new
+                // was emitted.
+                if !self.emitted_specializations.insert(mangled.clone()) { continue }
+                fresh.push(self.build_specialization(&callee, &subs, &mangled));
+            }
+            let done = fresh.is_empty();
+            emitted.extend(fresh);
+            for s in stmts.iter_mut().chain(tail.iter_mut()).chain(emitted.iter_mut()) {
+                self.rewrite_specialized_calls(s);
+            }
+            if done { break }
+        }
+        stmts.extend(emitted);
+
+        // An un-substituted higher-order declaration must never reach
+        // codegen: `make_sig` has no Cranelift type for a function-typed
+        // parameter. Its template survives in `fn_templates` for a later
+        // entry to specialize, exactly as a generic's does.
+        stmts.retain(|s| !Self::as_fn_decl(s).is_some_and(|(n, _, _)| self.fn_templates.contains_key(n)));
+        if tail.as_ref().is_some_and(|t| Self::as_fn_decl(t).is_some_and(|(n, _, _)| self.fn_templates.contains_key(n))) {
+            let span = tail.as_ref().expect("just checked").span;
+            *tail = Some(Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, span));
+        }
+    }
+
+    /// Collect every call in `expr` that can be specialized right now:
+    /// the callee is a retained template, and every one of its
+    /// function-typed parameters is given a plain name. A call that
+    /// doesn't qualify (an argument that is itself an unresolved function
+    /// parameter, say) is skipped — a later round, after the enclosing
+    /// function is itself specialized, will see it resolved.
+    fn scan_specializations(&self, expr: &Spanned<TypedExpr>, out: &mut Vec<(String, Vec<(usize, String)>)>) {
+        if let TypedExprKind::Call { callable, args } = &expr.item.kind {
+            if let TypedExprKind::Var(callee) = &callable.item.kind {
+                if let Some(t) = self.fn_templates.get(callee.as_str()) {
+                    let mut subs = Vec::new();
+                    let mut complete = true;
+                    for (i, (_, pty, _)) in t.params.iter().enumerate() {
+                        if !matches!(self.lookup(pty), Type::Function { .. }) { continue }
+                        match args.get(i).and_then(Arg::value).map(|a| &a.item.kind) {
+                            Some(TypedExprKind::Var(g)) => subs.push((i, g.clone())),
+                            _ => complete = false,
+                        }
+                    }
+                    if complete && !subs.is_empty() {
+                        let entry = (callee.clone(), subs);
+                        if !out.contains(&entry) { out.push(entry); }
+                    }
+                }
+            }
+        }
+        for child in Self::children(expr) { self.scan_specializations(child, out); }
+    }
+
+    /// `apply$$inc`. Deterministic in the program alone, so the emitted
+    /// module is diffable run to run — the same property
+    /// `monomorphize_generics` sorts its worklist to get.
+    fn specialized_name(callee: &str, subs: &[(usize, String)]) -> String {
+        let args = subs.iter().map(|(_, g)| g.as_str()).collect::<Vec<_>>().join("$");
+        format!("{}$${}", callee, args)
+    }
+
+    /// Clone `callee`'s template with each function-typed parameter
+    /// replaced by the name it was passed, and that parameter dropped from
+    /// the signature.
+    fn build_specialization(&mut self, callee: &str, subs: &[(usize, String)], mangled: &str) -> Spanned<TypedExpr> {
+        let t = self.fn_templates.get(callee).cloned().expect("scan only proposes retained templates");
+        let renames: HashMap<String, String> = subs.iter()
+            .map(|(i, g)| (t.params[*i].0.clone(), g.clone()))
+            .collect();
+
+        let mut body = t.body.clone();
+        let mut bound: Vec<HashSet<String>> = vec![
+            t.params.iter().enumerate()
+                .filter(|(i, _)| !subs.iter().any(|(si, _)| si == i))
+                .map(|(_, (n, _, _))| n.clone())
+                .collect(),
+        ];
+        Self::rename_free_vars(&mut body, &mut bound, &renames);
+
+        let params: Vec<(String, Type, bool)> = t.params.iter().enumerate()
+            .filter(|(i, _)| !subs.iter().any(|(si, _)| si == i))
+            .map(|(_, p)| p.clone())
+            .collect();
+        let fn_ty = Type::Function {
+            params: params.iter().map(|(_, t, _)| t.clone()).collect(),
+            result: Box::new(t.return_type.clone()),
+        };
+        Spanned::from(TypedExpr {
+            id: 0,
+            ty: fn_ty.clone(),
+            kind: TypedExprKind::Assign {
+                name: mangled.to_string(),
+                value: Box::new(Spanned::from(TypedExpr {
+                    id: 0,
+                    ty: fn_ty,
+                    kind: TypedExprKind::Function { params, return_type: t.return_type.clone(), body: Box::new(body) },
+                }, t.body.span)),
+            },
+        }, t.span)
+    }
+
+    /// Point every specializable call at the clone built for it and drop
+    /// the function arguments, which the clone no longer takes. Idempotent:
+    /// once rewritten, the callee is a specialization rather than a
+    /// template, so a later round leaves it alone.
+    fn rewrite_specialized_calls(&self, expr: &mut Spanned<TypedExpr>) {
+        let mut subs: Vec<(usize, String)> = Vec::new();
+        if let TypedExprKind::Call { callable, args } = &mut expr.item.kind {
+            if let TypedExprKind::Var(callee) = &callable.item.kind {
+                if let Some(t) = self.fn_templates.get(callee.as_str()) {
+                    let mut complete = true;
+                    for (i, (_, pty, _)) in t.params.iter().enumerate() {
+                        if !matches!(self.lookup(pty), Type::Function { .. }) { continue }
+                        match args.get(i).and_then(Arg::value).map(|a| &a.item.kind) {
+                            Some(TypedExprKind::Var(g)) => subs.push((i, g.clone())),
+                            _ => complete = false,
+                        }
+                    }
+                    // Only point at a clone that exists. A call the
+                    // *current* round has not built yet — the forwarded
+                    // `inner(g, x)` inside a freshly-emitted `outer`
+                    // clone, say — must keep naming its template so the
+                    // next round's scan can still see it; rewriting it
+                    // early renamed it to a symbol nothing would ever
+                    // define. The cross-entry case reads the same way:
+                    // `emitted_specializations` persists, so a clone an
+                    // earlier entry compiled counts as existing.
+                    let mangled = Self::specialized_name(callee, &subs);
+                    if complete && !subs.is_empty() && self.emitted_specializations.contains(&mangled) {
+                        let drop: HashSet<usize> = subs.iter().map(|(i, _)| *i).collect();
+                        let mut i = 0;
+                        args.retain(|_| { i += 1; !drop.contains(&(i - 1)) });
+                        if let Type::Function { params, .. } = &mut callable.item.ty {
+                            let mut i = 0;
+                            params.retain(|_| { i += 1; !drop.contains(&(i - 1)) });
+                        }
+                        if let TypedExprKind::Var(name) = &mut callable.item.kind { *name = mangled; }
+                    } else {
+                        subs.clear();
+                    }
+                }
+            }
+        }
+        for child in Self::children_mut(expr) { self.rewrite_specialized_calls(child); }
+    }
+
+    /// Report any function value still standing after the three
+    /// transforms. Reaching here means its callee is not statically known
+    /// — it escaped the scope that created it — which is the tier-2 case
+    /// this pass deliberately does not implement.
+    ///
+    /// This replaces the blanket rejection
+    /// `validate_codegen_constraints` used to make, and is run *after* the
+    /// pass rather than before it precisely so it describes what is left
+    /// rather than what was written.
+    fn reject_function_values(&self, expr: &Spanned<TypedExpr>) -> Result<(), Spanned<TypeError>> {
+        let escaped = |what: &str, span| Err(Spanned::from(TypeError {
+            msg: format!(
+                "this function value {} — froglang can only pass a function where the compiler \
+                 can see which one is called, so it can't be stored, returned, or reassigned",
+                what,
+            ),
+        }, span));
+
+        match &expr.item.kind {
+            // A declaration's own value is the one legal position.
+            TypedExprKind::Assign { value, .. } if matches!(value.item.kind, TypedExprKind::Function { .. }) => {
+                let TypedExprKind::Function { params, body, return_type } = &value.item.kind else { unreachable!() };
+                if let Some((n, _, _)) = params.iter().find(|(_, t, _)| matches!(self.lookup(t), Type::Function { .. })) {
+                    return Err(Spanned::from(TypeError {
+                        msg: format!(
+                            "parameter '{}' is a function, but this function is never called with one the \
+                             compiler can name — pass a `func` or a lambda literal directly at the call site",
+                            n,
+                        ),
+                    }, value.span));
+                }
+                if matches!(self.lookup(return_type), Type::Function { .. }) {
+                    return escaped("is returned from a function", value.span);
+                }
+                self.reject_function_values(body)
+            },
+
+            // A bare name in callable position is the supported case, and
+            // every other position is covered by the `Var` arm below —
+            // `validate_codegen_constraints`' `Call` arm makes exactly the
+            // same distinction, for the same reason.
+            TypedExprKind::Call { callable, args } => {
+                if !matches!(callable.item.kind, TypedExprKind::Var(_)) {
+                    self.reject_function_values(callable)?;
+                }
+                for a in args.iter().flat_map(Arg::subexprs) { self.reject_function_values(a)?; }
+                Ok(())
+            },
+
+            TypedExprKind::Var(name) if matches!(self.lookup(&expr.item.ty), Type::Function { .. }) => {
+                // A hoisted lambda is named after nothing the user wrote
+                // (`lambda$lift7`), so the message describes it instead —
+                // the span already points at the literal.
+                let subject = match name.contains("$lift") {
+                    true => "this function literal is used as a value".to_string(),
+                    false => format!("'{}' is a function used as a value here", Self::source_name(name)),
+                };
+                Err(Spanned::from(TypeError {
+                    msg: format!(
+                        "{} — froglang can only pass a function where the compiler can see which one \
+                         is called, so it can't be stored, returned, or reassigned",
+                        subject,
+                    ),
+                }, expr.span))
+            },
+
+            TypedExprKind::Function { .. } => escaped("has nowhere to be compiled to", expr.span),
+
+            TypedExprKind::Return(Some(v)) if matches!(self.lookup(&v.item.ty), Type::Function { .. }) =>
+                escaped("is returned from a function", v.span),
+
+            _ => {
+                for child in Self::children(expr) { self.reject_function_values(child)?; }
+                Ok(())
+            },
+        }
+    }
+
+    /// Turn every function's free value names into trailing parameters,
+    /// and make every call site pass them.
+    ///
+    /// Three steps, in this order for a reason:
+    ///
+    ///  1. compute each function's captures, to a fixed point. A call to a
+    ///     function that captures `n` *uses* `n` at the call site, so
+    ///     `collect_free_vars` treats it as an occurrence of `n` and the
+    ///     ordinary free-variable machinery propagates the capture outward
+    ///     — including the shadowing rules, which is why this is not a
+    ///     separate graph walk over the call graph;
+    ///  2. append `Var(n)` arguments at every call site;
+    ///  3. append the parameters and rename the body's free occurrences of
+    ///     `n` to the parameter's synthetic name.
+    ///
+    /// Step 2 before step 3 is what makes the transitive case fall out:
+    /// the argument `Var(n)` step 2 inserts into a *capturing* function's
+    /// body is itself a free occurrence of `n` there, so step 3 rewrites
+    /// it to that function's own capture parameter without any special
+    /// case for forwarding.
+    fn resolve_captures(
+        &mut self,
+        stmts: &mut [Spanned<TypedExpr>],
+        tail: &mut Option<Spanned<TypedExpr>>,
+        mutated: &HashSet<String>,
+    ) -> Result<(), Spanned<TypeError>> {
+        // Seeded from earlier entries: a call here to a function declared
+        // in an earlier REPL entry must pass whatever captures that entry's
+        // lifting gave it.
+        let mut captures: HashMap<String, Vec<(String, Type)>> = self.lifted_captures.clone();
+        // ...but a function this entry *redeclares* starts over: the
+        // captures are recomputed from the body below, and keeping the
+        // previous declaration's would append phantom arguments at every
+        // call site. Same name-is-not-identity hazard `specialize_calls`
+        // notes.
+        // Cleared from the persistent map too, not just this run's copy:
+        // a redeclaration that captures nothing must leave nothing behind
+        // for the *next* entry's call sites to pass.
+        for s in stmts.iter().chain(tail.iter()) {
+            let Some((name, _, _)) = Self::as_fn_decl(s) else { continue };
+            captures.remove(name);
+            self.lifted_captures.remove(name);
+        }
+
+        // ── 1. Captures, to a fixed point ────────────────────────────────
+        loop {
+            let mut changed = false;
+            for s in stmts.iter().chain(tail.iter()) {
+                let Some((name, params, body)) = Self::as_fn_decl(s) else { continue };
+                let mut bound: Vec<HashSet<String>> = vec![params.iter().map(|(n, _, _)| n.clone()).collect()];
+                let mut free: Vec<(String, Type)> = Vec::new();
+                self.collect_free_vars(body, &mut bound, &captures, &mut free);
+                if free.is_empty() { continue; }
+                free.sort_by(|a, b| a.0.cmp(&b.0));
+                let entry = captures.entry(name.to_string()).or_default();
+                for (n, ty) in free {
+                    if entry.iter().any(|(e, _)| *e == n) { continue; }
+                    if mutated.contains(&n) {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!(
+                                "closures capture by value; '{}' is a mut binding — copy it into a `let` first",
+                                n,
+                            ),
+                        }, s.span));
+                    }
+                    entry.push((n, ty));
+                    changed = true;
+                }
+                entry.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            if !changed { break; }
+        }
+
+        captures.retain(|_, v| !v.is_empty());
+        if captures.is_empty() { return Ok(()); }
+
+        // ── 2. Pass the captures at every call site ──────────────────────
+        for s in stmts.iter_mut().chain(tail.iter_mut()) {
+            Self::append_capture_args(s, &captures);
+        }
+
+        // ── 3. Receive them as parameters ────────────────────────────────
+        for s in stmts.iter_mut().chain(tail.iter_mut()) {
+            let TypedExprKind::Assign { name, value } = &mut s.item.kind else { continue };
+            let Some(caps) = captures.get(name.as_str()) else { continue };
+            let name = name.clone();
+            let TypedExprKind::Function { params, body, .. } = &mut value.item.kind else { continue };
+            let mut bound: Vec<HashSet<String>> = vec![params.iter().map(|(n, _, _)| n.clone()).collect()];
+            let renames: HashMap<String, String> =
+                caps.iter().map(|(n, _)| (n.clone(), Self::capture_param(n))).collect();
+            Self::rename_free_vars(body, &mut bound, &renames);
+            for (n, ty) in caps {
+                params.push((Self::capture_param(n), ty.clone(), false));
+            }
+            // The declaration's own type has to grow with its parameter
+            // list: `codegen::compile_call` reads the callee's parameter
+            // types off the *callable node's* type, not off the callee's
+            // declaration, so leaving this stale silently mis-coerces
+            // every captured argument.
+            if let Type::Function { params: pt, .. } = &mut value.item.ty {
+                pt.extend(caps.iter().map(|(_, t)| t.clone()));
+            }
+            s.item.ty = value.item.ty.clone();
+            // No `func_mut_params` update: that map is consulted only by
+            // `lower_call`, which has long since run — `monomorphize_generics`
+            // registers nothing for its own mangled instantiations either,
+            // for the same reason. Capture parameters are never `mut`
+            // anyway, so a callee's extra return values are unchanged.
+            self.lifted_captures.insert(name, caps.clone());
+        }
+        Ok(())
+    }
+
+    /// `(name, params, body)` if this statement is a function declaration.
+    fn as_fn_decl(s: &Spanned<TypedExpr>) -> Option<FnDecl<'_>> {
+        let TypedExprKind::Assign { name, value } = &s.item.kind else { return None };
+        let TypedExprKind::Function { params, body, .. } = &value.item.kind else { return None };
+        Some((name, params, body))
+    }
+
+    /// The parameter a capture of `name` arrives as. `$` makes it
+    /// unspellable, so no user binding at any call site can shadow it —
+    /// the same guarantee `Binding::symbol`'s `name#42` relies on.
+    fn capture_param(name: &str) -> String { format!("{}$cap", name) }
+
+    /// Collect the free *value* names of `expr` — names it reads that
+    /// nothing in `bound` declares.
+    ///
+    /// Function-typed names are never free: after hoisting every function
+    /// is a top-level declaration called by symbol, so a reference to one
+    /// is not a value read at all. That single rule is also what keeps
+    /// builtins (`print`, `panic`) and host functions out, since they are
+    /// bound at `Type::Function` too.
+    ///
+    /// A call to a function in `known` counts as an occurrence of each of
+    /// that function's captures, which is what propagates a capture out of
+    /// the function that introduced it and into the ones that call it.
+    fn collect_free_vars(
+        &self,
+        expr: &Spanned<TypedExpr>,
+        bound: &mut Vec<HashSet<String>>,
+        known: &HashMap<String, Vec<(String, Type)>>,
+        out: &mut Vec<(String, Type)>,
+    ) {
+        let note = |name: &str, ty: Type, bound: &Vec<HashSet<String>>, out: &mut Vec<(String, Type)>| {
+            if bound.iter().any(|f| f.contains(name)) { return; }
+            if out.iter().any(|(n, _)| n == name) { return; }
+            out.push((name.to_string(), ty));
+        };
+
+        match &expr.item.kind {
+            TypedExprKind::Var(name) => {
+                let ty = self.lookup(&expr.item.ty);
+                if !matches!(ty, Type::Function { .. }) { note(name, ty, bound, out); }
+            },
+
+            TypedExprKind::Block(stmts) => {
+                bound.push(HashSet::new());
+                for s in stmts {
+                    self.collect_free_vars(s, bound, known, out);
+                    if let TypedExprKind::Assign { name, .. } = &s.item.kind {
+                        bound.last_mut().expect("just pushed").insert(name.clone());
+                    }
+                }
+                bound.pop();
+            },
+
+            TypedExprKind::ForLoop { var, iterable, cond, body, iter_via }
+            | TypedExprKind::Comprehension { var, iterable, cond, body, iter_via } => {
+                self.collect_free_vars(iterable, bound, known, out);
+                let mut frame = HashSet::from([var.clone()]);
+                if let Some(iv) = iter_via { frame.insert(iv.iter_var.clone()); }
+                bound.push(frame);
+                if let Some(c) = cond { self.collect_free_vars(c, bound, known, out); }
+                self.collect_free_vars(body, bound, known, out);
+                if let Some(iv) = iter_via { self.collect_free_vars(&iv.next_call, bound, known, out); }
+                bound.pop();
+            },
+
+            // Post-hoist there are none of these left in a body, but the
+            // fixed point re-runs over trees this pass has already
+            // rewritten, so the arm has to be right rather than absent.
+            TypedExprKind::Function { params, body, .. } => {
+                bound.push(params.iter().map(|(n, _, _)| n.clone()).collect());
+                self.collect_free_vars(body, bound, known, out);
+                bound.pop();
+            },
+
+            // A `mut` argument reads *and writes* its root binding, so the
+            // root is a use like any other — and one that
+            // `collect_mutated_names` has already marked, so a capture of
+            // it is rejected rather than silently passed by value.
+            TypedExprKind::PlaceAssign { place, .. } => {
+                let ty = self.lookup(&expr.item.ty);
+                note(&place.root, ty, bound, out);
+                for child in Self::children(expr) { self.collect_free_vars(child, bound, known, out); }
+            },
+
+            _ => {
+                if let TypedExprKind::Call { callable, args } = &expr.item.kind {
+                    if let TypedExprKind::Var(callee) = &callable.item.kind {
+                        for (n, ty) in known.get(callee).into_iter().flatten() {
+                            note(n, ty.clone(), bound, out);
+                        }
+                    }
+                    for a in args {
+                        if let Arg::Mut(p) = a {
+                            let ty = self.lookup(&expr.item.ty);
+                            note(&p.root, ty, bound, out);
+                        }
+                    }
+                }
+                for child in Self::children(expr) { self.collect_free_vars(child, bound, known, out); }
+            },
+        }
+    }
+
+    /// Append `Var(n)` arguments to every call of a capturing function.
+    /// Scope-blind on purpose: the names inserted here are then resolved
+    /// by `rename_free_vars`, which is not.
+    fn append_capture_args(expr: &mut Spanned<TypedExpr>, captures: &HashMap<String, Vec<(String, Type)>>) {
+        if let TypedExprKind::Call { callable, args } = &mut expr.item.kind {
+            if let TypedExprKind::Var(callee) = &callable.item.kind {
+                if let Some(caps) = captures.get(callee.as_str()) {
+                    let span = expr.span;
+                    for (n, ty) in caps {
+                        args.push(Arg::Value(Spanned::from(TypedExpr {
+                            id: 0, ty: ty.clone(), kind: TypedExprKind::Var(n.clone()),
+                        }, span)));
+                    }
+                    // The callable's own type gained parameters too — see
+                    // the matching comment in `resolve_captures`.
+                    if let Type::Function { params, .. } = &mut callable.item.ty {
+                        params.extend(caps.iter().map(|(_, t)| t.clone()));
+                    }
+                }
+            }
+        }
+        for child in Self::children_mut(expr) { Self::append_capture_args(child, captures); }
+    }
+
+    /// Rename every *free* occurrence of a name per `map`. The scope
+    /// tracking is the point: a `let n = ...` or a loop variable inside the
+    /// body shadows the outer name, and those occurrences must be left
+    /// alone.
+    ///
+    /// Two callers, both renaming a name that is free by construction:
+    /// `resolve_captures` maps a captured name to its capture parameter,
+    /// and `specialize_calls` maps a function-typed parameter to the
+    /// function it was passed.
+    fn rename_free_vars(
+        expr: &mut Spanned<TypedExpr>,
+        bound: &mut Vec<HashSet<String>>,
+        map: &HashMap<String, String>,
+    ) {
+        match &mut expr.item.kind {
+            TypedExprKind::Var(name) => {
+                if bound.iter().any(|f| f.contains(name.as_str())) { return; }
+                if let Some(to) = map.get(name.as_str()) { *name = to.clone(); }
+            },
+
+            TypedExprKind::Block(stmts) => {
+                bound.push(HashSet::new());
+                for s in stmts.iter_mut() {
+                    Self::rename_free_vars(s, bound, map);
+                    if let TypedExprKind::Assign { name, .. } = &s.item.kind {
+                        bound.last_mut().expect("just pushed").insert(name.clone());
+                    }
+                }
+                bound.pop();
+            },
+
+            TypedExprKind::ForLoop { var, iterable, cond, body, iter_via }
+            | TypedExprKind::Comprehension { var, iterable, cond, body, iter_via } => {
+                Self::rename_free_vars(iterable, bound, map);
+                let mut frame = HashSet::from([var.clone()]);
+                if let Some(iv) = iter_via.as_ref() { frame.insert(iv.iter_var.clone()); }
+                bound.push(frame);
+                if let Some(c) = cond { Self::rename_free_vars(c, bound, map); }
+                Self::rename_free_vars(body, bound, map);
+                if let Some(iv) = iter_via { Self::rename_free_vars(&mut iv.next_call, bound, map); }
+                bound.pop();
+            },
+
+            TypedExprKind::Function { params, body, .. } => {
+                bound.push(params.iter().map(|(n, _, _)| n.clone()).collect());
+                Self::rename_free_vars(body, bound, map);
+                bound.pop();
+            },
+
+            _ => {
+                // A place's root is a name like any other. It can only be
+                // a capture in the rejected `mut` case, but renaming it
+                // here keeps the walk total rather than subtly partial.
+                if let TypedExprKind::PlaceAssign { place, .. } = &mut expr.item.kind {
+                    if !bound.iter().any(|f| f.contains(place.root.as_str())) {
+                        if let Some(to) = map.get(place.root.as_str()) { place.root = to.clone(); }
+                    }
+                }
+                if let TypedExprKind::Call { args, .. } = &mut expr.item.kind {
+                    for a in args.iter_mut() {
+                        let Arg::Mut(p) = a else { continue };
+                        if bound.iter().any(|f| f.contains(p.root.as_str())) { continue }
+                        if let Some(to) = map.get(p.root.as_str()) { p.root = to.clone(); }
+                    }
+                }
+                for child in Self::children_mut(expr) { Self::rename_free_vars(child, bound, map); }
+            },
+        }
+    }
+
+    /// `children`, mutably. Kept as a separate inventory rather than
+    /// generic over mutability because the borrow checker will not let one
+    /// function return either — and because the two really are the same
+    /// list, a divergence between them is a bug either walk would expose.
+    fn children_mut(expr: &mut Spanned<TypedExpr>) -> Vec<&mut Spanned<TypedExpr>> {
+        let mut out: Vec<&mut Spanned<TypedExpr>> = Vec::new();
+        match &mut expr.item.kind {
+            TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)
+            | TypedExprKind::StrLit(_) | TypedExprKind::NoneLit | TypedExprKind::Var(_) => {},
+            TypedExprKind::Unary { expr: e, .. } => out.push(e),
+            TypedExprKind::Binary { left, right, .. } => { out.push(left); out.push(right); },
+            TypedExprKind::Conditional { cond, true_branch, false_branch } => {
+                out.push(cond); out.push(true_branch);
+                if let Some(fb) = false_branch { out.push(fb); }
+            },
+            TypedExprKind::Assign { value, .. } => out.push(value),
+            TypedExprKind::Function { body, .. } => out.push(body),
+            TypedExprKind::Call { callable, args } => {
+                out.push(callable);
+                for a in args { out.extend(a.subexprs_mut()); }
+            },
+            TypedExprKind::Index { target, index } => { out.push(target); out.push(index); },
+            TypedExprKind::Slice { target, start, end } => {
+                out.push(target);
+                if let Some(s) = start { out.push(s); }
+                if let Some(e) = end { out.push(e); }
+            },
+            TypedExprKind::Range { start, end } => { out.push(start); out.push(end); },
+            TypedExprKind::List(elems) => out.extend(elems.iter_mut()),
+            TypedExprKind::Block(stmts) => out.extend(stmts.iter_mut()),
+            TypedExprKind::ForLoop { iterable, cond, body, iter_via, .. }
+            | TypedExprKind::Comprehension { iterable, cond, body, iter_via, .. } => {
+                out.push(iterable);
+                if let Some(c) = cond { out.push(c); }
+                out.push(body);
+                if let Some(iv) = iter_via { out.push(&mut iv.next_call); }
+            },
+            TypedExprKind::StructInit { fields, .. } | TypedExprKind::VariantInit { fields, .. } => {
+                for (_, v) in fields { out.push(v); }
+            },
+            TypedExprKind::FieldAccess { target, .. } => out.push(target),
+            TypedExprKind::PlaceAssign { place, value } => {
+                out.extend(place.index_exprs_mut());
+                out.push(value);
+            },
+            TypedExprKind::IsVariant { target, .. } => out.push(target),
+            TypedExprKind::VariantField { target, .. } => out.push(target),
+            TypedExprKind::Return(v) => if let Some(v) = v { out.push(v) },
+            TypedExprKind::Widen { value, .. } | TypedExprKind::Narrow { value, .. } => out.push(value),
+            TypedExprKind::TypeTag { target, .. } => out.push(target),
+            TypedExprKind::Truthy(v) | TypedExprKind::Coerce(v) => out.push(v),
+        }
+        out
+    }
+
     /// Walk `declared` and `concrete` in lockstep (same shape by
     /// construction — `concrete` is `lookup(instantiate(declared, ..))`
     /// resolved at some call site) and record, for every `TypeVar` in
@@ -5694,6 +6926,7 @@ impl TypeChecker {
 
         match expr.item {
             Expression::Literal(lit)         => self.lower_literal(lit, span),
+            Expression::Interp(parts)        => self.lower_interp(parts, span),
             Expression::Unary(u)             => self.lower_unary(u, span),
             Expression::Binary(b)            => self.lower_binary(b, span),
             Expression::Conditional(c)       => self.lower_conditional(c, span),
@@ -5746,6 +6979,104 @@ impl TypeChecker {
                 msg: "'mut' may only mark an argument at a call site, e.g. f(mut x)".to_string()
             }, span)),
         }
+    }
+
+    /// A checked notation placeholder — shared by an explicit `repr(...)`
+    /// call and by string interpolation, which must format a value exactly
+    /// as `repr` does (bar `Str`) or the two notations drift.
+    ///
+    /// A placeholder, not the finished node: `desugar_notation` (run from
+    /// `FrogState::eval_with_base`/`codegen::compile_and_run`, after
+    /// monomorphization) replaces every one of these with the actual
+    /// per-type expansion, once every type in the tree is fully substituted
+    /// — see its own doc comment for why that ordering matters. The
+    /// `callable`'s `Function` type carries no `func_ids` entry (nothing
+    /// ever looks "repr" up there): the node never reaches codegen under
+    /// this name.
+    fn notation_placeholder(
+        &mut self,
+        notation: Notation,
+        arg: Spanned<TypedExpr>,
+        callee_span: Span,
+    ) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let span = arg.span;
+        let arg_ty = self.lookup(&arg.item.ty);
+        // A bare (still-generic) `TypeVar` defers both checks to
+        // `desugar_notation` time, once monomorphization has produced
+        // a concretely-typed clone of this call site to check instead
+        // — the same "don't reject at the unresolved binder, check
+        // each instantiation" rule `join_operand_types` already
+        // applies to every binary operator's own trait bound
+        // (`Trait::Num`/`Trait::Eq`/`Trait::Ord`). Without this,
+        // `func show<T>(x: T): Str = repr(x)` could never type-check
+        // for *any* concrete `T`, since `Show` isn't yet inferable as
+        // a bound the way `<T: Num>`/`<T: Eq>` are.
+        if !matches!(arg_ty, Type::TypeVar { .. }) {
+            if !self.type_implements(&arg_ty, &Trait::Show) {
+                return Err(Spanned::from(TypeError { msg: notation.needs_show(&arg_ty) }, arg.span));
+            }
+            // Same prediction `check_printable` makes for `print`, at
+            // the same span — see `is_repr`'s own comment on why this
+            // happens here rather than in `validate_codegen_constraints`.
+            self.check_no_recursive_union(&arg_ty, arg.span, "repr", "formats it field-by-field")?;
+        }
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![arg_ty.clone()], result: Box::new(Type::Str) },
+            kind: TypedExprKind::Var(notation.callee().to_string()),
+        }, callee_span);
+        Ok(Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Str,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] },
+        }, span))
+    }
+
+    /// `"a ${x} b"` (`Expression::Interp`) — each piece converted to text,
+    /// then concatenated.
+    ///
+    /// The conversion rule is `print`'s, not `repr`'s: a `Str` piece goes in
+    /// **raw**, so `"hi ${name}"` is `hi Bob` rather than `hi "Bob"`, and
+    /// every other type is formatted exactly as `repr` formats it. That
+    /// reuse is the whole point — a struct interpolates as it prints, `Show`
+    /// is required at the same span, and a string *nested* inside a list is
+    /// still quoted, because that is `repr`'s business rather than
+    /// interpolation's.
+    ///
+    /// Which of those two a piece gets is decided by `desugar_notation`, not
+    /// here: inside a generic function body the piece's type is still an
+    /// unresolved `TypeVar` at this point, so deciding here would quote
+    /// `show("hi")` and not `show(1)` from the one body. See `Notation`.
+    ///
+    /// Concatenation is a left fold of `Str + Str` — the same nodes the
+    /// surface syntax would have produced — so codegen learns nothing new,
+    /// at the cost of one intermediate string per piece. Worth revisiting
+    /// with an n-ary runtime concat if interpolation lands in a hot loop.
+    fn lower_interp(&mut self, parts: Vec<Spanned<Expression>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let mut acc: Option<Spanned<TypedExpr>> = None;
+        for part in parts {
+            let part_span = part.span;
+            // The literal runs between the interpolations are already
+            // `Str` and already themselves — only a `${...}` needs
+            // converting (`Grammar::interp_string` builds both).
+            let literal_text = matches!(&part.item, Expression::Literal(LiteralExpr { token: Token::String(_) }));
+            let lowered = self.check_and_lower(part)?;
+            let piece = match literal_text {
+                true  => lowered,
+                false => self.notation_placeholder(Notation::Interp, lowered, part_span)?,
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(prev) => Spanned::from(TypedExpr {
+                    id: 0,
+                    ty: Type::Str,
+                    kind: TypedExprKind::Binary { op: Token::Plus, left: Box::new(prev), right: Box::new(piece) },
+                }, span),
+            });
+        }
+        // Only reachable for a literal with no pieces at all, which the
+        // lexer spells as a plain `Token::String` — kept total anyway.
+        Ok(acc.unwrap_or_else(|| Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::StrLit(String::new()) }, span)))
     }
 
     fn lower_literal(&mut self, lit: LiteralExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -6202,6 +7533,7 @@ impl TypeChecker {
                             // function types that distinction matters: the
                             // body's type is not the variable's type.
                             let value = self.lower_expected(*a.value, &annotated_ty)?;
+                            if mutable { self.mut_names.insert(name.clone()); }
                             self.ctx.insert_mut(name.clone(), annotated_ty.clone(), mutable);
                             (TypedExprKind::Assign { name, value: Box::new(value) }, annotated_ty)
                         },
@@ -6495,6 +7827,7 @@ impl TypeChecker {
                                 // one alone.
                                 if let Some(sym) = symbol { decl_name = sym; }
                             } else {
+                                if mutable { self.mut_names.insert(name.clone()); }
                                 self.ctx.insert_mut(name.clone(), ty.clone(), mutable);
                             }
                             // Authoritative overwrite: covers the
@@ -6789,42 +8122,7 @@ impl TypeChecker {
                 }, callee_span));
             }
             let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
-            let arg_ty = self.lookup(&arg.item.ty);
-            // A bare (still-generic) `TypeVar` defers both checks to
-            // `desugar_notation` time, once monomorphization has produced
-            // a concretely-typed clone of this call site to check instead
-            // — the same "don't reject at the unresolved binder, check
-            // each instantiation" rule `join_operand_types` already
-            // applies to every binary operator's own trait bound
-            // (`Trait::Num`/`Trait::Eq`/`Trait::Ord`). Without this,
-            // `func show<T>(x: T): Str = repr(x)` could never type-check
-            // for *any* concrete `T`, since `Show` isn't yet inferable as
-            // a bound the way `<T: Num>`/`<T: Eq>` are.
-            if !matches!(arg_ty, Type::TypeVar { .. }) {
-                if !self.type_implements(&arg_ty, &Trait::Show) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("{} has no notation — 'repr' needs Show", arg_ty)
-                    }, arg.span));
-                }
-                // Same prediction `check_printable` makes for `print`, at
-                // the same span — see `is_repr`'s own comment on why this
-                // happens here rather than in `validate_codegen_constraints`.
-                self.check_no_recursive_union(&arg_ty, arg.span, "repr", "formats it field-by-field")?;
-            }
-            // A placeholder, not the finished node: `desugar_notation`
-            // (run from `FrogState::eval_with_base`/`codegen::compile_and_run`,
-            // after monomorphization) replaces every one of these with the
-            // actual per-type expansion, once every type in the tree is
-            // fully substituted — see its own doc comment for why that
-            // ordering matters. `callable`'s `Function` type carries no
-            // `func_ids` entry (nothing ever looks "repr" up there): the
-            // node never reaches codegen under this name.
-            let callable = Spanned::from(TypedExpr {
-                id: 0,
-                ty: Type::Function { params: vec![arg_ty.clone()], result: Box::new(Type::Str) },
-                kind: TypedExprKind::Var("repr".to_string()),
-            }, callee_span);
-            (TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] }, Type::Str)
+            (self.notation_placeholder(Notation::Repr, arg, callee_span)?.item.kind, Type::Str)
         } else if is_push {
             if c.args.len() != 2 {
                 return Err(Spanned::from(TypeError {
@@ -8830,13 +10128,6 @@ impl TypeChecker {
     /// `build_repr`'s expansion. Runs before `number_nodes`, so every
     /// synthesized node's `id: 0` is fine — the next pass assigns real ones.
     pub fn desugar_notation(&mut self, expr: &mut Spanned<TypedExpr>) -> Result<(), Spanned<TypeError>> {
-        /// Which of the two notations a placeholder is asking for. Local
-        /// to this function because that is exactly its lifetime: the
-        /// distinction exists between recognizing a placeholder and
-        /// expanding it, and nowhere else.
-        #[derive(Clone, Copy)]
-        enum Notation { Repr, Json }
-
         self.desugar_notation_children(&mut expr.item.kind)?;
         // Two placeholders, one pass: `repr(x)` and `json.to_str(x)` are
         // the same walk over the same types with different fragments
@@ -8846,8 +10137,9 @@ impl TypeChecker {
         // arms mirror `build_repr`'s one for one.
         let placeholder = match &expr.item.kind {
             TypedExprKind::Call { callable, .. } => match &callable.item.kind {
-                TypedExprKind::Var(name) if name == "repr" => Notation::Repr,
-                TypedExprKind::Var(name) if name == "__json_to_str" => Notation::Json,
+                TypedExprKind::Var(name) if name == Notation::Repr.callee()   => Notation::Repr,
+                TypedExprKind::Var(name) if name == Notation::Json.callee()   => Notation::Json,
+                TypedExprKind::Var(name) if name == Notation::Interp.callee() => Notation::Interp,
                 _ => return Ok(()),
             },
             _ => return Ok(()),
@@ -8862,15 +10154,20 @@ impl TypeChecker {
         // where each concrete monomorphized instantiation finally gets
         // checked, exactly once, against its own resolved type.
         match placeholder {
-            Notation::Repr => {
+            Notation::Repr | Notation::Interp => {
                 if !self.type_implements(&ty, &Trait::Show) {
-                    return Err(Spanned::from(TypeError {
-                        msg: format!("{} has no notation — 'repr' needs Show", ty)
-                    }, arg.span));
+                    return Err(Spanned::from(TypeError { msg: placeholder.needs_show(&ty) }, arg.span));
                 }
                 self.check_no_recursive_union(&ty, arg.span, "repr", "formats it field-by-field")?;
             }
             Notation::Json => self.check_json_serializable(&ty, arg.span)?,
+        }
+        // Interpolating a `Str` inserts it as text — the one place the two
+        // notations differ, and the reason this decision waits until here
+        // (`Notation`'s doc comment). Everything else formats as `repr`.
+        if placeholder == Notation::Interp && ty == Type::Str {
+            *expr = arg;
+            return Ok(());
         }
         let temp_name = format!("__repr_v{}", self.next_id); self.next_id += 1;
         let temp_assign = Spanned::from(
@@ -8879,7 +10176,7 @@ impl TypeChecker {
         );
         let temp_var = Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Var(temp_name) }, span);
         let body = match placeholder {
-            Notation::Repr => self.build_repr(&ty, temp_var, span)?,
+            Notation::Repr | Notation::Interp => self.build_repr(&ty, temp_var, span)?,
             Notation::Json => self.build_json(&ty, temp_var, span)?,
         };
         *expr = Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![temp_assign, body]) }, span);

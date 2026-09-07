@@ -310,6 +310,17 @@ impl FrogState {
             self.tc.restore(cp);
             return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
         }
+        // Tier 1 function values: hoist every lambda and nested `func` to
+        // the top level, turn captures into parameters, and specialize
+        // every higher-order callee on the function it was passed. Must
+        // run after monomorphization (a generic higher-order function is
+        // specialized per *type* first, then per function argument) and
+        // before `desugar_notation`, whose synthesized `Var` callables
+        // this pass must not see.
+        if let Err(e) = self.tc.lower_function_values(&mut typed) {
+            self.tc.restore(cp);
+            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
+        }
         // `plans/DATA.md` stage 5: expand every `repr(...)` placeholder
         // left by `TypeChecker::lower_call`'s `is_repr` arm into its
         // per-type notation. Must run after monomorphization (every type

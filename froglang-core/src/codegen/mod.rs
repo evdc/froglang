@@ -4932,6 +4932,12 @@ pub fn compile_and_run(src: &str) -> i64 {
     // never monomorphizes at all — a pre-existing limitation, not one
     // `repr` introduces), so `repr(x)` inside a generic function's body
     // is unsupported through this path exactly as generics generally are.
+    // Tier 1 function values — see the matching call in `state.rs`. Like
+    // `repr` above, this runs without a preceding `monomorphize_generics`
+    // here, so a *generic* higher-order function is unsupported through
+    // this entry point exactly as generics generally are; a monomorphic
+    // one works.
+    tc.lower_function_values(&mut typed).expect("function value error");
     tc.desugar_notation(&mut typed).expect("repr type error");
     crate::frontend::liveness::number_nodes(&mut typed);
 

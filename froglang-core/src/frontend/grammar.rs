@@ -1,4 +1,4 @@
-use crate::frontend::{expression::{AnnotationDeclExpr, AnnotationUse, DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, ImplDeclExpr, MatchArm, MatchExpr, Mutability, Parameter, Pattern, TraitDeclExpr, TraitMemberDecl, TypeParam, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, Token}, type_expr::TypeExpr};
+use crate::frontend::{expression::{AnnotationDeclExpr, AnnotationUse, DataDeclExpr, Expression, FieldDecl, ImportExpr, ImportKind, ImplDeclExpr, MatchArm, MatchExpr, Mutability, Parameter, Pattern, TraitDeclExpr, TraitMemberDecl, TypeParam, VariantDecl}, parser::{ParseError, ParseResult, Parser, Precedence}, tokens::{Span, Spanned, StrPart, Token}, type_expr::TypeExpr};
 
 /// Result of parsing a type annotation. Parallel to `ParseResult`, but over
 /// the type grammar (`crate::frontend::type_expr`) rather than `Expression`.
@@ -31,6 +31,30 @@ impl Grammar {
     pub fn literal(_parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
         // a literal expression has the same span as its token
         Ok(token.map(Expression::literal))
+    }
+
+    /// `"a ${x} b"` — an interpolated string literal, which the lexer has
+    /// already split into pieces (`StrPart`). Each `${...}` piece is parsed
+    /// here, by re-entering the parser on its source: interpolation adds no
+    /// expression grammar of its own, so anything legal in an expression is
+    /// legal in a `${}`, including a nested interpolated string.
+    ///
+    /// Literal pieces become ordinary string literals, so `Expression::Interp`
+    /// is a uniform list of expressions and the type checker's only job is
+    /// deciding how each one becomes text.
+    pub fn interp_string(_parser: &mut Parser, token: Spanned<Token>) -> ParseResult {
+        let span = token.span;
+        let Token::InterpString(parts) = token.item else {
+            unreachable!("Grammar::interp_string is only reachable from Token::InterpString")
+        };
+        let mut exprs = Vec::with_capacity(parts.len());
+        for part in parts {
+            exprs.push(match part {
+                StrPart::Lit(s) => Spanned::from(Expression::literal(Token::String(s)), span),
+                StrPart::Expr { src, start } => Parser::fragment(&src, start)?,
+            });
+        }
+        Ok(Spanned::from(Expression::Interp(exprs), span))
     }
 
     pub fn unary(parser: &mut Parser, token: Spanned<Token>) -> ParseResult {

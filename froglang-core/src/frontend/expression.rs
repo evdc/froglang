@@ -385,6 +385,13 @@ pub enum ImportKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Literal(LiteralExpr),
+    /// `"a ${x} b"` — the pieces of an interpolated string literal, in
+    /// order, with the literal runs already represented as string literals
+    /// of their own (`Grammar::interp_string`). `TypeChecker::lower_interp`
+    /// turns each piece into text and concatenates: a `Str` piece goes in
+    /// as-is, anything else through the same `repr` expansion `print` uses,
+    /// so the two never disagree about how a value looks.
+    Interp(Vec<Spanned<Expression>>),
     /// `return`, or `return value`. Typed `Never` — see `frontend::typeck`'s
     /// `return_types` stack — so it unifies with whatever real value sits
     /// next to it on the other side of an `if`/`match` join.
@@ -587,6 +594,20 @@ impl fmt::Display for Expression {
                 write!(f, "{}", lit.token)
             }
             
+            // Rendered back as source. A piece that is a string literal was
+            // literal text in the original (`Grammar::interp_string`), so it
+            // prints unquoted; anything else was a `${...}`.
+            Expression::Interp(parts) => {
+                write!(f, "\"")?;
+                for part in parts {
+                    match &part.item {
+                        Expression::Literal(LiteralExpr { token: Token::String(s) }) => write!(f, "{}", s)?,
+                        other => write!(f, "${{{}}}", other)?,
+                    }
+                }
+                write!(f, "\"")
+            }
+
             Expression::Unary(unary) => {
                 write!(f, "{}{}", unary.op, unary.expr)
             }

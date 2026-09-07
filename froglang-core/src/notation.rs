@@ -37,8 +37,16 @@ pub fn float_repr(f: f64) -> String {
 pub fn escape_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            // `${` would interpolate when this literal is read back as
+            // *source*, so it — and only it — needs the escape. A lone `$`
+            // is still just a dollar sign, and stays one, which keeps the
+            // common case (`"$5.00"`) unmarked. The data reader
+            // (`Parser::parse_data`) doesn't interpolate at all, and
+            // accepts `\$` regardless, so one spelling satisfies both.
+            '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),

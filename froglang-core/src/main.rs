@@ -87,10 +87,22 @@ fn check(src: &str, path: Option<&std::path::Path>) {
     let ast = Spanned::from(Expression::Block(stmts), span);
 
     let mut tc = TypeChecker::new();
-    match tc.check_and_lower(ast) {
-        Ok(typed) => println!(":: {}", typed.item.ty),
+    let mut typed = match tc.check_and_lower(ast) {
+        Ok(typed) => typed,
         Err(e)    => { println!("Type error: {}", e); process::exit(1); }
+    };
+    // `check` should not accept a program `run` rejects. Function values
+    // are decided by a pass that runs *after* lowering (it needs every
+    // type substituted), so checking them means running it — which is
+    // also why `monomorphize_generics` has to come first, exactly as in
+    // `FrogState::eval_with_base`.
+    if let Err(e) = tc.monomorphize_generics(&mut typed)
+        .and_then(|()| tc.lower_function_values(&mut typed))
+    {
+        println!("Type error: {}", e);
+        process::exit(1);
     }
+    println!(":: {}", typed.item.ty);
 }
 
 fn run(src: &str, path: Option<&std::path::Path>) {

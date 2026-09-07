@@ -62,7 +62,8 @@ Structural facts behind that table:
   argument, list-element, or expression-head position.
 - **`{}` is already a parse error** and **`{x}` already collapses to `x`** (`grammar.rs:160-169`).
 - **There is no interpolating string form.** The roadmap's `'${...}'` is aspirational, so the
-  context-sensitivity hazard it would create for `repr` is future-only.
+  context-sensitivity hazard it would create for `repr` is future-only. *(No longer true as of
+  2026-09-06 — see the "Future constraint" note below, and `plans/INTERPOLATION.md`.)*
 - **`Str` is immutable**, so any string-building derive is O(n²) without a new buffer type.
 
 ---
@@ -293,8 +294,16 @@ the mechanism that makes the failure silent. Rejecting unknown escapes is a smal
 that turns a class of silent wrongness into a parse error, and it is exactly the kind of thing a
 language for generated code should do.
 
-**Future constraint**: if an interpolating string form (`'${...}'`) is added, `repr` must emit
-the non-interpolating form or escape `$`. Note it in the interpolation design when it happens.
+**Future constraint** *(resolved 2026-09-06 — `plans/INTERPOLATION.md`)*: if an interpolating
+string form (`'${...}'`) is added, `repr` must emit the non-interpolating form or escape `$`.
+Note it in the interpolation design when it happens.
+
+**As built**: every `"..."` interpolates, so `escape_str` escapes `${` — and only `${`, so a
+lone `$` stays unmarked — with `\$` added to the lexer's escape set on the same change, per
+this module's rule that the two halves move together. The law needed one more thing this note
+did not anticipate: `read` shares the parser, so **data** would have started interpolating
+too. `Lexer::for_data`/`Parser::parse_data` keep notation non-interpolating, which is what
+holds `read(repr(x)) == x` for a string containing `${`.
 
 ### What it took
 

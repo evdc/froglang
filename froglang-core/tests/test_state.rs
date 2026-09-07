@@ -416,21 +416,31 @@ fn test_using_a_function_as_a_value_is_a_type_error() {
     }
 }
 
-/// The same for a function *literal* outside a declaration — an argument,
-/// a list element, or the callee of an immediately-invoked lambda.
+/// A function *literal* outside a declaration used to be rejected
+/// wholesale. `TypeChecker::lower_function_values` compiles the
+/// statically-known cases away instead — see `tests/test_closures.rs` —
+/// so an immediately-invoked lambda and one passed as an argument both
+/// work, and only an escaping one is still an error.
 #[test]
-fn test_using_a_function_literal_as_a_value_is_a_type_error() {
+fn test_a_function_literal_is_usable_where_its_callee_is_statically_known() {
+    let mut s = FrogState::new();
+    assert_eq!(int(&s.eval("(x -> x + 1)(5)").unwrap().0), 6);
+
+    let mut s = FrogState::new();
+    assert_eq!(int(&s.eval("func apply2(h, v) = h(v)\napply2(x -> x + 1, 4)").unwrap().0), 5);
+}
+
+/// ...and an escaping one is not: a list element outlives the scope that
+/// built it, so nothing could name the callee at the point it is called.
+#[test]
+fn test_a_function_literal_that_escapes_is_a_type_error() {
     use froglang_core::state::FrogError;
 
-    for src in ["(x -> x + 1)(5)",
-                "func apply2(h, v) = h(v)\napply2(x -> x + 1, 4)",
-                "let xs = [x -> x]"] {
-        let mut s = FrogState::new();
-        match s.eval(src) {
-            Err(FrogError::Type(msg)) => assert!(
-                msg.contains("function literal"), "unexpected error for {:?}: {}", src, msg),
-            other => panic!("expected a Type error for {:?}, got {:?}", src, other),
-        }
+    let mut s = FrogState::new();
+    match s.eval("let xs = [x -> x]") {
+        Err(FrogError::Type(msg)) => assert!(
+            msg.contains("can see which one is called"), "unexpected error: {}", msg),
+        other => panic!("expected a Type error, got {:?}", other),
     }
 }
 

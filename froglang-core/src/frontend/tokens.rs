@@ -7,6 +7,20 @@ use crate::frontend::grammar::{Grammar, ParseRule};
 use crate::frontend::parser::Precedence;
 
 
+/// One piece of an interpolated string literal (`Token::InterpString`).
+///
+/// The expression pieces are kept as **unparsed source**, not as tokens: the
+/// authority on what an expression is is the parser, and re-entering it on a
+/// substring costs nothing while keeping one grammar. `start` is where that
+/// substring begins in the real file, so a fragment's spans (and therefore
+/// its diagnostics) point at the code the user actually wrote rather than at
+/// the string literal as a whole.
+#[derive(Debug, PartialEq, Clone)]
+pub enum StrPart {
+    Lit(String),
+    Expr { src: String, start: Position },
+}
+
 #[derive(Debug, PartialEq, Clone)]
 #[derive(ParseRules, Lex)]
 pub enum Token {
@@ -16,6 +30,14 @@ pub enum Token {
     Int(i64),
     #[prefix(Grammar::literal)]
     String(String),
+    /// A string literal containing at least one `${...}` — the lexer splits
+    /// it into alternating literal and expression pieces rather than
+    /// producing a single `String`, and `Grammar::interp_string` parses each
+    /// expression piece with a fragment parser. A literal with no `${` is
+    /// still a plain `Token::String`, so nothing downstream of the two
+    /// grammar rules has to know interpolation exists.
+    #[prefix(Grammar::interp_string)]
+    InterpString(Vec<StrPart>),
     #[prefix(Grammar::literal)]
     Identifier(String),
 

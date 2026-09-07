@@ -49,10 +49,14 @@ let f: (Int -> Int) = n -> n * 2
 
 **Supported expression forms:**
 - Literals: `Int`, `Float` (including `1e100`, `inf`, `nan`), `Bool` (`true`/`false`), `Str`, `none`
+- String interpolation: `"n is ${n}"` — any expression, formatted exactly as `print` would.
+  See "String interpolation" below
 - Arithmetic / comparison / logical operators with correct precedence
 - Unary `-` and `not`
 - Let bindings with optional type annotation: `let x: Int = 5`
-- Lambdas: `x -> x + 1`, `(x, y) -> x + y`
+- Lambdas: `x -> x + 1`, `(x, y) -> x + y`. A lambda may be passed as an argument and may
+  capture enclosing `let` bindings — by value, so capturing a `mut` is an error. See
+  "First-class functions" below for what that does and doesn't buy
 - Named function declarations: `func f(x: T, y: T): T = body`
 - `return expr` — early exit from a function body
 - Function calls: `f(x, y)`
@@ -123,6 +127,96 @@ what `if x` means for a non-`Bool`, deliberately stays compiler-internal: making
 implementable would let any impl redefine control flow.)
 
 Bound propagation: `x -> x + x` infers as `(Num t) => t -> t`.
+
+## String interpolation
+
+Any string literal may contain `${...}`, holding any expression:
+
+```
+let name = "Ann"
+let xs = [1, 2, 3]
+print("hi ${name}, ${len(xs)} items, first is ${xs[0]}")   // hi Ann, 3 items, first is 1
+print("${ if len(xs) > 2 then "many" else "few" }")         // many
+```
+
+There is nothing special about what goes inside: it is parsed by the ordinary expression
+parser, so calls, field access, blocks, and nested interpolated strings all work, and an
+error inside one points at the offending token rather than at the literal.
+
+**A value formats exactly as `print` formats it.** A `Str` goes in as text (`"hi ${name}"`
+is `hi Ann`, not `hi "Ann"`); everything else uses `repr` (`plans/DATA.md`), so a struct
+interpolates as `P(name="Ann", age=4)` and a string *nested* inside a list is still quoted.
+Interpolating a type with no notation is the same error as calling `repr` on it:
+
+```
+func f(x: Int): Int = x
+print("${f}")
+// error: (Int -> Int) has no notation — interpolation needs Show
+```
+
+**`${` is the only sequence that changed meaning.** A lone `$` is still a dollar sign
+(`"$5.00 and 100% $ free"` needs no escaping); write `\${` for a literal one. Because
+`repr`'s output must read back as source, `repr` escapes `${` and only `${`:
+
+```
+print(repr("a\${x} b"))     // "a\${x} b"
+```
+
+Data read by `read` is *notation, not code*, and does not interpolate — a `${` arriving in
+data stays two ordinary characters (`Parser::parse_data`), so `read(repr(x)) == x` continues
+to hold for every string.
+
+Interpolation compiles to `Str + Str` concatenation, one intermediate string per piece; it
+is a lexer change plus a typed-AST desugar, and codegen learns nothing new. See
+`plans/INTERPOLATION.md`.
+
+## First-class functions
+
+A function can be passed as an argument, a lambda can capture, and a `func` can be nested:
+
+```
+func apply(f: (Int -> Int), x: Int): Int = f(x)
+func inc(n: Int): Int = n + 1
+
+print(apply(inc, 2))            // 3
+print(apply(y -> y * 10, 2))    // 20
+
+let base = 100
+let shift = x -> x + base       // captures `base`
+print(apply(shift, 2))          // 102
+```
+
+**There is still no closure object, no function pointer, and no indirect call.** Instead,
+`TypeChecker::lower_function_values` compiles function values away before codegen sees
+them: every lambda is hoisted to a top-level declaration, every captured name becomes an
+ordinary by-value parameter, and a higher-order callee is cloned once per function it is
+passed — so `f(x)` in `apply`'s body is a *direct* call to whatever was passed. Same idea as
+Futhark's defunctionalization or Rust's per-closure monomorphization, and it is why nothing
+in the GC or the calling convention had to change.
+
+The price is a restriction: **the compiler must be able to name the callee at every call
+site.** A function value that escapes the scope that created it — returned from a function,
+stored in a list or a struct field, or bound to a `mut` — is rejected, naming why:
+
+```
+func mk(): (Int -> Int) = x -> x + 1
+// error: this function value is returned from a function — froglang can only pass a
+//        function where the compiler can see which one is called
+
+mut total = 0
+let f = x -> x + total
+// error: closures capture by value; 'total' is a mut binding — copy it into a `let` first
+```
+
+Capture is by value and immutable *by design*, not by omission: it keeps froglang's mutable
+value semantics intact (no aliasing arrives through a captured variable), and it is exactly
+the condition under which lifting a capture into a parameter is semantics-preserving without
+escape analysis. A lambda sees its captures as of where it was created, not where it is
+called.
+
+Escaping closures — a real `(code pointer, captured environment)` value, traced by the GC —
+are deliberately unbuilt. See `tests/test_closures.rs`, whose rejection cases pin that
+boundary.
 
 ## Traits
 
@@ -478,8 +572,10 @@ Roughly in priority order:
 
 ### Usability
 
-- **Better error messages** — span-aware, rustc-style rendered errors (consider `miette`
-  or `ariadne`). Currently errors print as raw debug output.
+- ~~**Better error messages**~~ — **done**: span-aware, rustc-style rendered errors, with a
+  caret under the offending source (`src/diagnostics.rs`). The one place still printing a
+  raw `Debug` form is `frog check`'s own two `println!`s in `main.rs`.
+- **`Dict`/`Map`** — no such type yet, and the largest remaining gap for ordinary programs.
 
 ### Types and constructs
 

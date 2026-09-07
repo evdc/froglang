@@ -99,10 +99,51 @@ removed rather than struck through — check `plans/*.md` git history if you wan
 - **`mut xs = []; print(xs)` printing `<?>` placeholders**: no longer reproducible (tried the
   original repro plus two variants) — fixed silently at some point, undocumented.
 
+### Newly done, 2026-09-06
+
+- ~~**First-class functions.**~~ **Done, tier 1** — `plans/CLOSURES.md`, `tests/test_closures.rs`
+  (50 tests), README's "First-class functions". A function can be passed as an argument, a
+  lambda can capture enclosing `let` bindings, and a `func` can be nested. No closure object,
+  function pointer, or indirect call was added: `TypeChecker::lower_function_values` hoists
+  every lambda to a top-level declaration, turns each capture into a by-value parameter, and
+  clones a higher-order callee per function it is passed, so codegen only ever sees direct
+  calls. This also fixed two crash-on-valid-code bugs listed below — a nested `func` panicked
+  with `no entry found for key`, and a function reading a top-level `let` with `unbound
+  variable in codegen` — since both are the same missing feature (a free name becomes a
+  parameter). Capture is by value and immutable by design; capturing a `mut` is rejected with
+  the fix in the message. **Escaping** function values (returned, stored in a list/struct
+  field, bound to a `mut`) remain rejected — that is tier 2, deliberately unbuilt.
+- ~~**String interpolation.**~~ **Done** — `plans/INTERPOLATION.md`, `tests/test_interpolation.rs`,
+  README's "String interpolation". Every `"..."` interpolates `${expr}`, holding any expression;
+  a value formats exactly as `print` formats it (a `Str` raw, everything else via `repr`), so the
+  three spellings of the notation can't drift. As predicted, this was cheap because `DATA.md`
+  Stage 5's `repr` is a typed-AST desugar over *types*: it is a lexer change, a grammar rule, and
+  one lowering, with codegen and the runtime untouched. Two things the prediction missed —
+  `read` shares the parser, so **data** had to be kept non-interpolating (`Parser::parse_data`)
+  or `read(repr(x)) == x` would break for any string containing `${`; and the raw-vs-quoted
+  choice has to be made in `desugar_notation` rather than at lowering, because inside a generic
+  body the piece's type is still an unresolved `TypeVar` (it printed `<"hi">` for `show("hi")`
+  until it moved). Format specifiers and user-implementable `Show` are still open.
+- ~~**`frog check` accepted programs `frog run` rejected.**~~ **Fixed** as part of the above:
+  `check` ran only `check_and_lower`, never any post-lowering validation, so it printed a type
+  for programs that then failed to compile. It now runs monomorphization and the function-value
+  pass too.
+- **Correction to this file and to README's "Up Next":** both led their usability section with
+  *"Better error messages — errors still print as raw `Debug` output"*, called it the
+  single highest-leverage item, and were **stale** — `plans/DATA.md` Stage 3 shipped the
+  rustc-style renderer (`src/diagnostics.rs`, `render_span`), and errors have carried a
+  filename, source line and caret since. The one place still printing a raw `Spanned<TypeError>`
+  is `frog check`'s own two `println!`s in `main.rs`, which is a small, specific fix rather
+  than a project-level priority.
+
 ### Near-term (usability + gaps most likely to bite real code)
 
-- **Better error messages** — span-aware, rustc-style rendered errors (`miette` or `ariadne`).
-  Errors still print as raw `Debug` output. Still the single highest-leverage usability item.
+- **`Dict`/`Map`** — no type exists yet (`{"a": 1}` doesn't parse); purely a stdlib task now
+  that generics are done, though it also wants a structural `Hash` trait (the way `Eq` already
+  is) and the map-literal syntax is still an open bikeshed (see "Other Ideas" below). With
+  first-class functions done, this is the largest remaining hole for ordinary programs.
+- **`frog check`'s own diagnostics** — it prints `Spanned<TypeError>`'s `Debug` form where
+  `run` renders a caret. One call site, `main.rs`.
 - **A real line-joining rule** — the one parse gap deliberately left open by the sweep above.
   A newline after a binary operator (`(1 +\n2)`), or before a `.` or a `catch`, still ends the
   statement. Every other delimited context now tolerates newlines, so this is the last
@@ -115,9 +156,6 @@ removed rather than struck through — check `plans/*.md` git history if you wan
 - **Structural `Show` and `Error.message`** — `provides Show for X` errors "Unknown trait 'Show'".
 - **Impls for generic types** — `data Box<A> provides Shape` errors "Unknown type 'A'" when the
   `provides` clause references the type parameter.
-- **`Dict`/`Map`** — no type exists yet (`{"a": 1}` doesn't parse); purely a stdlib task now that
-  generics are done, though the map-literal syntax itself is still an open bikeshed (see "Other
-  Ideas" below).
 
 ### Path to a self-hosting compiler — updated gap list
 
@@ -138,10 +176,11 @@ removed rather than struck through — check `plans/*.md` git history if you wan
 - Elide the COW mark when passing a list to a non-`mut` parameter — the last quadratic cliff in
   MVS (`MUTABILITY.md` Stage 7, "Sharp corners").
 - Small-leaf-function inlining — ~20% on `orders.frog` from hand-inlining two call sites.
-- Top-level `let` bindings aren't capturable from functions — typeck accepts the reference,
-  codegen panics with "unbound variable". `life.frog`/`words.frog` both had to work around it by
-  threading constants through as parameters. Needs either real capture or a clean typeck rejection
-  — the codegen panic is the actual bug, not the missing feature.
+- ~~Top-level `let` bindings aren't capturable from functions~~ — **fixed 2026-09-06** by the
+  first-class-functions work above: a free name in a function body becomes a by-value parameter,
+  which is real capture rather than the clean rejection this entry offered as the alternative.
+  `life.frog`/`words.frog` no longer need to thread constants through as parameters, though
+  neither has been rewritten to stop doing so.
 - `#[frog_fn]`'s `Str` argument marshalling copies into an owned `String` per call
   (`__frog_shim_starts_with` is 14% of `benches/words.frog`); a `&str`-based ABI would remove it.
 - `RUNTIME.md`'s open item: list-stride overhead is 7.5ns/elem vs. Rust's 2.6ns, unexplained —

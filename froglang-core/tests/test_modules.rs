@@ -25,7 +25,16 @@ fn run_module_entry_at(path: &Path) -> i64 {
     let ast = Spanned::from(Expression::Block(stmts), span);
 
     let mut tc = TypeChecker::new();
-    let typed = tc.check_and_lower(ast).expect("type error");
+    let mut typed = tc.check_and_lower(ast).expect("type error");
+    // The same three passes, in the same order, as `FrogState::eval_with_base`
+    // — this helper used to stop at `check_and_lower`, which meant a module
+    // could not use anything that lowers to a placeholder (`repr`, `json`,
+    // interpolation) or anything the function-value pass provides (a nested
+    // `func`, a function reading a top-level `let`) without panicking in
+    // codegen rather than failing as a test.
+    tc.monomorphize_generics(&mut typed).expect("monomorphization error");
+    tc.lower_function_values(&mut typed).expect("function value error");
+    tc.desugar_notation(&mut typed).expect("notation error");
 
     let mut codegen = Codegen::new();
     let mut string_arena: Vec<Vec<u8>> = Vec::new();
@@ -64,6 +73,16 @@ fn resolve_err(name: &str) -> ModuleError {
 #[test]
 fn test_named_import() {
     assert_eq!(run_module_entry("named_import.frog"), 7);
+}
+
+/// A `${...}` holds ordinary references, so the rewriter has to descend
+/// into one: `label` is imported, and `scale` — read from inside an
+/// interpolation in the library — is module-local and mangled. Either one
+/// left unrewritten is an unbound-variable error rather than a wrong
+/// answer. len("x:n=20") = 6.
+#[test]
+fn test_interpolation_across_a_module_boundary() {
+    assert_eq!(run_module_entry("interp_import.frog"), 6);
 }
 
 /// `import "./utils.frog" as utils` — qualified access via `utils.add`,

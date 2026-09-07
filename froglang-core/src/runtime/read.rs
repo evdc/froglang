@@ -127,7 +127,10 @@ pub extern "C" fn frog_read_open(s: i64) -> i64 {
     let _roots = RuntimeRoots::hold(&[s]);
     let src = read_str_arg(s);
 
-    let (root, err) = match Parser::parse(&src) {
+    // `parse_data`, not `parse`: this is frog *notation*, where `${` in a
+    // string is two ordinary characters rather than an interpolation. Read
+    // data is not code, and must not be executed as any.
+    let (root, err) = match Parser::parse_data(&src) {
         Ok(Spanned { item: Expression::Block(mut stmts), .. }) if stmts.len() == 1 => {
             (Box::new(stmts.pop().expect("len checked above")), None)
         }

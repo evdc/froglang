@@ -139,7 +139,7 @@ pub const MAX_INLINE_UNION_MEMBERS: usize = 6;
 /// The runtime tag for member `index` of an inline union's *normalized*
 /// member list. `Type::normalize` flattens, dedups and sorts, so this is
 /// stable for a given type regardless of how it was spelled.
-pub(crate) fn member_tag(index: usize) -> u32 {
+pub fn member_tag(index: usize) -> u32 {
     (index + 1) as u32
 }
 
@@ -296,25 +296,30 @@ fn member_leaf_types(member: &Type, structs: &StructDefs) -> Vec<Type> {
     struct_fields(member, structs).into_iter().map(|(_, t)| t).collect()
 }
 
-/// Partition one member's leaves into `(pointer leaves, scalar leaves)`,
-/// each as `(leaf_index, leaf_type)` so a caller can put them back in
-/// declaration order.
-fn partition_member_leaves(member: &Type, structs: &StructDefs) -> (Vec<(usize, Type)>, Vec<(usize, Type)>) {
+/// Partition one member's already-flattened leaves into `(pointer leaves,
+/// scalar leaves)`, each as `(leaf_index, leaf_type)` so a caller can put
+/// them back in declaration order.
+fn partition_leaves(leaves: &[Type]) -> (Vec<(usize, Type)>, Vec<(usize, Type)>) {
     let mut ptrs = Vec::new();
     let mut scalars = Vec::new();
-    for (i, t) in member_leaf_types(member, structs).into_iter().enumerate() {
-        if is_heap_ty(&t) { ptrs.push((i, t)); } else { scalars.push((i, t)); }
+    for (i, t) in leaves.iter().enumerate() {
+        if is_heap_ty(t) { ptrs.push((i, t.clone())); } else { scalars.push((i, t.clone())); }
     }
     (ptrs, scalars)
 }
 
-/// Compute `members`'s inline layout. Only valid when `union_is_inline`.
-pub fn union_layout(members: &[Type], structs: &StructDefs) -> UnionLayout {
+/// Compute an inline union's layout directly from each member's already-
+/// flattened leaf list — the core every `StructDefs`-based caller below
+/// reduces to after calling `member_leaf_types`. Exposed so a host-side
+/// derive (`froglang_macros`) can build a layout purely compositionally,
+/// from its own `leaves()`, with no `StructDefs` lookup at all — see
+/// `plans/EMBEDDING.md`.
+pub fn union_layout_of_leaves(member_leaves: &[Vec<Type>]) -> UnionLayout {
     let mut ptrs = 0usize;
     let mut scalars = 0usize;
     let mut dedicated_tag = false;
-    for m in members {
-        let (p, s) = partition_member_leaves(m, structs);
+    for leaves in member_leaves {
+        let (p, s) = partition_leaves(leaves);
         ptrs = ptrs.max(p.len());
         scalars = scalars.max(s.len());
         if let Some((_, first)) = p.first() {
@@ -330,11 +335,18 @@ pub fn union_layout(members: &[Type], structs: &StructDefs) -> UnionLayout {
     UnionLayout { ptrs, ptrs_used, scalars, dedicated_tag }
 }
 
-/// For each of `member`'s leaves, in declaration order, the slot it occupies
-/// in the enclosing inline union — plus whether that slot's low bits also
-/// hold the tag (so a reader must mask, and a writer must `bor` the tag in).
-pub(crate) fn member_slot_map(member: &Type, layout: &UnionLayout, structs: &StructDefs) -> Vec<(usize, bool)> {
-    let leaves = member_leaf_types(member, structs);
+/// Compute `members`'s inline layout. Only valid when `union_is_inline`.
+pub fn union_layout(members: &[Type], structs: &StructDefs) -> UnionLayout {
+    let member_leaves: Vec<Vec<Type>> = members.iter().map(|m| member_leaf_types(m, structs)).collect();
+    union_layout_of_leaves(&member_leaves)
+}
+
+/// For each leaf in `leaves` (one member's flattened leaf list, in
+/// declaration order), the slot it occupies in the enclosing inline union
+/// — plus whether that slot's low bits also hold the tag (so a reader must
+/// mask, and a writer must `bor` the tag in). The leaf-list-only core
+/// `member_slot_map`/a host-side derive both reduce to.
+pub fn member_slot_map_of_leaves(leaves: &[Type], layout: &UnionLayout) -> Vec<(usize, bool)> {
     let mut out = vec![(0usize, false); leaves.len()];
     let (mut p, mut s) = (0usize, 0usize);
     for (i, t) in leaves.iter().enumerate() {
@@ -348,6 +360,13 @@ pub(crate) fn member_slot_map(member: &Type, layout: &UnionLayout, structs: &Str
         }
     }
     out
+}
+
+/// For each of `member`'s leaves, in declaration order, the slot it occupies
+/// in the enclosing inline union — plus whether that slot's low bits also
+/// hold the tag (so a reader must mask, and a writer must `bor` the tag in).
+pub(crate) fn member_slot_map(member: &Type, layout: &UnionLayout, structs: &StructDefs) -> Vec<(usize, bool)> {
+    member_slot_map_of_leaves(&member_leaf_types(member, structs), layout)
 }
 
 /// Pack one member's flattened leaf values into an inline union's slots.
@@ -402,23 +421,24 @@ fn pack_union_member(
 }
 
 /// Runtime analog of `pack_union_member`, for building an inline union's
-/// slots directly from Rust (`host.rs`'s `ToFrog for Result<T, E>`) rather
-/// than emitting Cranelift IR. `leaf_vals` are already in wire format —
-/// unlike `pack_union_member`'s `Value`s, there is no `to_i64_repr`
-/// conversion to do here, only slot placement and tag OR-ing.
-pub(crate) fn pack_union_member_runtime(
-    members: &[Type],
-    member_ty: &Type,
+/// slots directly from Rust (`host.rs`'s marshalling impls) rather than
+/// emitting Cranelift IR. `leaf_vals` are already in wire format — unlike
+/// `pack_union_member`'s `Value`s, there is no `to_i64_repr` conversion to
+/// do here, only slot placement and tag OR-ing. Takes every member's
+/// already-flattened leaf list directly, so a host-side derive can call
+/// this with no `StructDefs` lookup at all — see `plans/EMBEDDING.md`.
+pub fn pack_union_member_runtime_of_leaves(
+    member_leaves: &[Vec<Type>],
+    member_index: usize,
     tag: u32,
     leaf_vals: &[i64],
-    structs: &StructDefs,
 ) -> Vec<i64> {
-    let layout = union_layout(members, structs);
-    let map = member_slot_map(member_ty, &layout, structs);
+    let layout = union_layout_of_leaves(member_leaves);
+    let map = member_slot_map_of_leaves(&member_leaves[member_index], &layout);
     debug_assert_eq!(
         map.len(), leaf_vals.len(),
         "union member {} contributes {} leaves but {} values were supplied",
-        member_ty, map.len(), leaf_vals.len(),
+        member_index, map.len(), leaf_vals.len(),
     );
     let mut slots: Vec<Option<i64>> = vec![None; layout.width()];
     for (i, (slot, shares_tag)) in map.iter().enumerate() {
@@ -433,6 +453,46 @@ pub(crate) fn pack_union_member_runtime(
     }
     slots.into_iter().map(|o| o.unwrap_or(0)).collect()
 }
+
+/// The inverse of `pack_union_member_runtime_of_leaves`: recover
+/// `member_index`'s flattened leaf values from an inline union's `slots`,
+/// masking the tag off any pointer leaf that shared a column with it.
+pub fn unpack_union_member_runtime_of_leaves(
+    member_leaves: &[Vec<Type>],
+    member_index: usize,
+    slots: &[i64],
+) -> Vec<i64> {
+    let layout = union_layout_of_leaves(member_leaves);
+    let map = member_slot_map_of_leaves(&member_leaves[member_index], &layout);
+    map.iter()
+        .map(|(slot, shares_tag)| {
+            let w = slots[*slot];
+            if *shares_tag { w & !(gc::TAG_MASK) } else { w }
+        })
+        .collect()
+}
+
+/// Given a union's normalized `members` (in tag order — `member_tag(i)` is
+/// member `i`'s runtime tag) and a `(marker type, leaf list)` association
+/// built in *declaration* order — the shape a derive macro naturally has,
+/// since it only knows source order, not the sorted order `Type::normalize`
+/// produces at run time — reorder into normalized order so a caller can
+/// index `pack_union_member_runtime_of_leaves`/
+/// `unpack_union_member_runtime_of_leaves` by normalized index. Used by
+/// `froglang_macros`' `#[derive(FrogUnion)]`; panics if some normalized
+/// member has no declared counterpart, which cannot happen for a
+/// correctly-generated declaration.
+pub fn reorder_member_leaves_by_marker(members: &[Type], declared: &[(Type, Vec<Type>)]) -> Vec<Vec<Type>> {
+    members.iter().map(|m| {
+        declared.iter().find(|(marker, _)| marker == m)
+            .unwrap_or_else(|| panic!(
+                "union member {} not found among declared variants {:?}",
+                m, declared.iter().map(|(t, _)| t).collect::<Vec<_>>(),
+            ))
+            .1.clone()
+    }).collect()
+}
+
 
 /// The inverse of `pack_union_member`: recover `member_ty`'s flattened leaf
 /// values from an inline union's `slots`, in declaration order.
@@ -511,7 +571,7 @@ fn is_multi_leaf_type(ty: &Type, structs: &StructDefs) -> bool {
 /// and the one-scalar-union-shape-per-aggregate restriction that came with
 /// it. A scalar column is *not* marked: a raw `Int` carries no tag bits and
 /// could otherwise be mistaken for an address.
-fn gc_mask<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> i64 {
+pub fn gc_mask<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> i64 {
     let mut mask: i64 = 0;
     for (i, t) in leafs.into_iter().enumerate() {
         if is_heap_ty(t) { mask |= 1i64 << i; }
@@ -558,19 +618,35 @@ pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
         // reads pointer-ness off the column and needs no tag at all.
         Type::Union(members) if union_is_inline(members, structs) => {
             let l = union_layout(members, structs);
-            let mut out = Vec::with_capacity(l.width());
-            for i in 0..l.ptr_end() {
-                // A column no member ever puts a pointer in is labelled a
-                // plain `Int`, so nothing downstream scans it, roots it, or
-                // spills it — see `UnionLayout::slot_is_scannable`.
-                let col = if l.slot_is_scannable(i) { ty.clone() } else { Type::Int };
-                out.push((format!("$p{}", i), col));
-            }
-            for i in 0..l.scalars  { out.push((format!("$s{}", i), Type::Int)); }
-            out
+            union_columns(&l, ty).into_iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    let name = if i < l.ptr_end() { format!("$p{}", i) } else { format!("$s{}", i - l.ptr_end()) };
+                    (name, col)
+                })
+                .collect()
         },
         _ => vec![(String::new(), ty.clone())],
     }
+}
+
+/// The column *types* an inline union of layout `l` flattens to: pointer
+/// columns first — slot 0 carrying the member tag — then scalar columns. A
+/// column no member ever puts a pointer in is labelled a plain `Int`, so
+/// nothing downstream scans it, roots it, or spills it (`UnionLayout::
+/// slot_is_scannable`); every other pointer column is labelled `union_ty`
+/// itself (`is_heap_ty` is true for it). This is `struct_fields`'s inline-
+/// union arm factored out so a host-side derive's `leaves()` (`host.rs`)
+/// can compute the same columns from a `UnionLayout` it built itself via
+/// `union_layout_of_leaves`, with no `StructDefs` involved.
+pub fn union_columns(l: &UnionLayout, union_ty: &Type) -> Vec<Type> {
+    let mut out = Vec::with_capacity(l.width());
+    for i in 0..l.ptr_end() {
+        let col = if l.slot_is_scannable(i) { union_ty.clone() } else { Type::Int };
+        out.push(col);
+    }
+    for _ in 0..l.scalars { out.push(Type::Int); }
+    out
 }
 
 /// Pick out, from one value's flattened leaves, the raw bits an embedder

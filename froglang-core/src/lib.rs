@@ -17,3 +17,9 @@ pub mod stdlib;
 /// `plans/EMBEDDING.md`. Re-exported here so `#[froglang_core::frog_fn]`
 /// works without a separate `froglang_macros` dependency.
 pub use froglang_macros::frog_fn;
+
+/// Maps a Rust struct/enum onto a frog `data`/`error` declaration for
+/// host-function marshalling — see `host::{FromFrog, ToFrog, FrogDecl}` and
+/// `plans/EMBEDDING.md`. Re-exported alongside `frog_fn` for the same
+/// reason.
+pub use froglang_macros::{FrogData, FrogUnion};

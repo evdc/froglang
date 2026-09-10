@@ -235,6 +235,7 @@ impl FrogState {
         FrogStateBuilder {
             hosts: Vec::new(),
             prelude: Vec::new(),
+            data_audits: Vec::new(),
             dict_backend: std::sync::Arc::new(crate::runtime::dict::HashbrownBackend),
         }
     }
@@ -515,7 +516,16 @@ const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "keys", "values
 pub struct FrogStateBuilder {
     hosts:   Vec<crate::host::HostFn>,
     prelude: Vec<String>,
+    data_audits: Vec<DataAudit>,
     dict_backend: std::sync::Arc<dyn crate::runtime::dict::DictBackend>,
+}
+
+/// What `FrogStateBuilder::data::<T>()` records for `build()`'s layout
+/// audit — see that method's doc comment.
+struct DataAudit {
+    rust_type_name: &'static str,
+    frog_type: Type,
+    leaves: Vec<Type>,
 }
 
 impl FrogStateBuilder {
@@ -533,6 +543,36 @@ impl FrogStateBuilder {
     /// rather than a separate Rust-side type-definition API.
     pub fn prelude(mut self, src: impl Into<String>) -> Self {
         self.prelude.push(src.into());
+        self
+    }
+
+    /// Register a Rust struct or enum that marshals to/from a frog `data`
+    /// type — see `#[derive(FrogData)]`/`#[derive(FrogUnion)]`
+    /// (`froglang_macros`), which implement `FrogDecl` alongside
+    /// `ToFrog`/`FromFrog`. `T::frog_decl()`, if `Some`, is appended to the
+    /// prelude (an ordinary `.prelude(...)` call under the hood — the
+    /// generated `data`/`error` declaration reuses the same parser/typeck
+    /// path); a `#[frog(declared)]` type returns `None` and must already be
+    /// declared by an earlier `.prelude(...)`/`.data(...)` call.
+    ///
+    /// `T::leaves()` is computed compositionally (`FromFrog`/`ToFrog`'s doc
+    /// comments) with no `StructDefs` lookup — that is what keeps
+    /// marshalling AOT-clean, but it means a mistake (a field reordered on
+    /// one side and not the other, a hand-written impl that forgot to
+    /// override `leaves()` for a compound type) would otherwise surface as
+    /// a silent slot-layout desync at the first call. `build()` audits
+    /// every type registered here against the real, registered
+    /// `codegen::struct_fields` output once the prelude has run, and fails
+    /// loudly if they disagree — see `build()`.
+    pub fn data<T: crate::host::ToFrog + crate::host::FrogDecl>(mut self) -> Self {
+        if let Some(decl) = T::frog_decl() {
+            self.prelude.push(decl);
+        }
+        self.data_audits.push(DataAudit {
+            rust_type_name: std::any::type_name::<T>(),
+            frog_type: T::frog_type(),
+            leaves: T::leaves(),
+        });
         self
     }
 
@@ -596,6 +636,63 @@ impl FrogStateBuilder {
         // `print` is, not gated behind a builder call.
         for src in &self.prelude {
             state.eval(src)?;
+        }
+
+        // `data::<T>()`'s one-time layout audit: every registered type's
+        // compositional `leaves()` must agree with what the frog side
+        // actually flattens it to (`codegen::struct_fields`, which already
+        // covers both structs and inline unions). A `#[frog(declared)]`
+        // type must already be present in `struct_defs` by now — from an
+        // earlier `.prelude(...)`/`.data(...)` call — or this reports it as
+        // unknown rather than silently marshalling against a layout that
+        // doesn't exist.
+        //
+        // The same comparison serves two callers, so it lives in one
+        // closure: `what` names the thing being audited in the error.
+        let check_leaves = |what: &str, frog_type: &Type, claimed: &[Type]| -> Result<(), FrogError> {
+            let real_leaves: Vec<Type> = crate::codegen::struct_fields(frog_type, state.tc.struct_defs())
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect();
+            if real_leaves != claimed {
+                return Err(FrogError::Type(format!(
+                    "{} (frog type {}): leaves() reports {:?} but the registered frog \
+                     layout is {:?} — declaration and marshalling disagree. If this type wasn't \
+                     declared via #[frog(declared)], check its field order; if it was, make sure \
+                     the frog declaration it maps onto was registered earlier (an explicit \
+                     .prelude(...) or an earlier .data(...) call).",
+                    what, frog_type, claimed, real_leaves,
+                )));
+            }
+            Ok(())
+        };
+
+        for audit in &self.data_audits {
+            check_leaves(&format!("host type {}", audit.rust_type_name), &audit.frog_type, &audit.leaves)?;
+        }
+
+        // Host *signatures* get the same audit, in both directions: a type
+        // that only ever appears in a `#[frog_fn]` signature — a
+        // `Result<T, E>`, a `Vec<T>`, a `#[frog(declared)]` struct never
+        // passed to `.data::<T>()` — is registered nowhere else, so without
+        // this its layout desync would surface as silently corrupt slots at
+        // the first call rather than as an error here. Parameters are
+        // checked against `FromFrog::leaves()` and the result against
+        // `ToFrog::leaves()` (the descriptor carries both), so a hand-written
+        // pair that disagrees between the two directions is caught too.
+        for host in &self.hosts {
+            if host.param_leaves.len() != host.params.len() {
+                return Err(FrogError::Type(format!(
+                    "host function '{}': descriptor lists {} parameter types but {} parameter leaf \
+                     lists — a hand-written HostFn must fill `param_leaves` from the same \
+                     `FromFrog::leaves()` calls `#[frog_fn]` emits.",
+                    host.name, host.params.len(), host.param_leaves.len(),
+                )));
+            }
+            for (i, (pty, pleaves)) in host.params.iter().zip(&host.param_leaves).enumerate() {
+                check_leaves(&format!("host function '{}' parameter {}", host.name, i), pty, pleaves)?;
+            }
+            check_leaves(&format!("host function '{}' return type", host.name), &host.ret, &host.ret_leaves)?;
         }
 
         // Install each host function's frog-visible name and type into the

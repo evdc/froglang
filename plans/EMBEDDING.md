@@ -1,9 +1,12 @@
 # Host-function embedding API
 
-Status: **implemented** (2026-08-24) — `FrogState::builder()`, `#[frog_fn]`,
-`froglang_core::host::{HostFn, FromFrog, ToFrog}`. Scalars, `Str`, and `List<T>` marshal today;
-structs/unions/`Result<T, E>` are deferred (see "What's deferred" at the end) even though the
-codegen ABI itself already handles them uniformly.
+Status: **implemented** (updated 2026-09-10) — `FrogState::builder()`, `#[frog_fn]`,
+`froglang_core::host::{HostFn, FromFrog, ToFrog, FrogDecl}`, and `#[derive(FrogData)]`/
+`#[derive(FrogUnion)]` (`froglang_macros`). Scalars, `Str`, `List<T>`, `Dict<K,V>`,
+`Option<T>`/`Result<T, E>`, and now arbitrary structs and inline (≤ 6-variant, non-recursive)
+nominal unions marshal both directions. Still deferred: boxed/wider nominal unions, `mut`
+parameters, generic host functions, and reading a struct/union *out* through `FrogValue` (see
+"What's deferred" at the end).
 
 ## Why
 
@@ -150,6 +153,32 @@ unknown number of values one at a time while building its result — `GcHeap` gr
 accessor so `FrogCtx::scope()` could snapshot a mark and truncate back to it on `Drop`, the same
 discipline `RuntimeRoots` uses, generalized to an incrementally-growing set.
 
+## AOT considerations
+
+Struct/union marshalling (above) was designed to preserve two invariants the eventual
+`cranelift-object` backend (`roadmap.md`'s "path to a self-hosting compiler") depends on:
+
+- **No runtime type tables.** `leaves()` is compositional — each impl computes it from its own
+  field/variant types, never from `ctx.structs()`/`ctx.unions()` (which `FrogCtx` carries and
+  `Result<T, E>`'s *old* impl used to consult). An AOT binary therefore needs no serialized
+  `StructDefs`/`UnionDefs` to marshal a host type; the only thing consulted at runtime is the
+  fixed, per-type leaf list baked into the derive's generated code. `FrogCtx::structs()`/
+  `unions()` are consequently unused by any shipped `ToFrog`/`FromFrog` impl again — left in place
+  (per the original design note) rather than removed, since retrofitting them back in later would
+  mean re-touching every call site.
+- **No baked addresses.** Nothing here emits an address into JIT code; a host type's identity
+  crosses the boundary as a `Type` value (built from `Display`-rendered frog source in
+  `frog_decl()`, or compared by `Type`'s own `PartialEq`/`Ord` at marshalling time), the same way
+  every other host-function signature already does (`plans/EMBEDDING.md`'s original "AOT-clean"
+  design point). The two pre-existing un-clean sites — string literals and `print_fragment`
+  (`codegen/mod.rs`, both `bytes.as_ptr() as i64`) — are untouched and unrelated.
+- **`build()`'s audit needs the same declarations at AOT-compile time and at link time.** The
+  audit runs against whatever `TypeChecker` the prelude produced, which for the JIT is the one
+  `build()` itself constructs. An AOT driver consuming the same `FrogStateBuilder` (its `prelude`/
+  `data` lists are plain data, available before any compilation happens) can and should run the
+  identical audit ahead of time, so a layout mismatch is a build-time error there too rather than
+  a runtime one discovered only by whoever links the artifact.
+
 ## Verification
 
 `tests/test_host_fns.rs` — scalar round trip; `Str` in and out with an explicit
@@ -168,17 +197,32 @@ Scope was deliberately cut down from the original design's "full type surface in
 and unions" to what's implemented today (scalars, `Str`, `List<T>`), because the marshalling
 complexity for the rest turned out to be real, not incidental:
 
-- ~~**`Result<T, E>` ↔ `T | E`.**~~ **Done** (updated 2026-09-01) — `impl<T: ToFrog, E: ToFrog>
-  ToFrog for Result<T, E>` exists in `host.rs`, with documented constraints (`T::SLOTS ==
-  E::SLOTS == 1`, `T`'s type ≠ `E`'s type, no `()` payload). The stdlib's whole `ErrMsg` story
-  (every fallible file/string host function) already depends on it.
-- **Struct/union marshalling in general**, i.e. `#[derive(FrogData)]`/`#[derive(FrogUnion)]`
-  mapping a Rust struct/enum onto a registered frog `data` type by field order. The raw ABI
-  handles any type uniformly today (`struct_fields` already flattens both); what's missing is
-  purely the Rust-side derive macro. Until it exists, a struct/union-shaped host signature has no
-  ergonomic way to be declared — the escape hatch is writing a `HostFn` and its shim by hand,
-  which is possible (nothing in `compile_host_call` assumes `#[frog_fn]` produced it) but
-  undocumented tedium.
+- ~~**`Result<T, E>` ↔ `T | E`.**~~ **Done**, now on the general compositional footing below —
+  both directions (`FromFrog` too, not just `ToFrog`), any leaf shape (not just single-slot
+  members), and `Result<T, ()>`'s old restriction is subsumed by `Option<T>` (also both
+  directions) rather than lifted on `Result` itself — a payload-less union member is a genuinely
+  different case (zero leaves) from `()` as a standalone type (one leaf), and conflating them was
+  the root cause, not an oversight in the old preconditions.
+- ~~**Struct/union marshalling in general.**~~ **Done** (updated 2026-09-10) —
+  `#[derive(FrogData)]`/`#[derive(FrogUnion)]` (`froglang_macros`) map a Rust struct/enum onto a
+  frog `data`/`error` declaration by field order, plus `FrogStateBuilder::data::<T>()` to register
+  one (appends `T::frog_decl()` to the prelude, or — under `#[frog(declared)]` — maps onto a
+  declaration already registered some other way). `FromFrog`/`ToFrog` dropped their `const SLOTS`/
+  `IS_PTR` in favor of `fn leaves() -> Vec<Type>`, composed purely from the impl tree (a struct's
+  `leaves()` is the concatenation of its fields' `leaves()`; a union's is computed via
+  `codegen::union_layout_of_leaves` from each variant's) — **no `StructDefs`/`UnionDefs` lookup at
+  marshalling time**, which is what keeps this AOT-clean (see "AOT considerations" below).
+  `build()` audits every `.data::<T>()` type's `leaves()` against the real, registered
+  `codegen::struct_fields` output once, so a mismatch (a hand-written impl that forgot to override
+  `leaves()` for a compound type, a field reordered on one side and not the other) is a clear
+  `FrogError::Type` at `build()`, not a silent slot desync at the first call — this is exactly the
+  bug `stdlib::ErrMsg`'s `leaves()` override exists to avoid (see its doc comment): its `frog_type()`
+  is a compound `Named` type, not itself a leaf, so the trait's default `leaves()` (`vec![Self::
+  frog_type()]`) misclassifies its one `Str` field as a non-pointer scalar. Still open: only the
+  *inline* union layout (`codegen::MAX_INLINE_UNION_MEMBERS`, currently 6; `FrogUnion` asserts this
+  against the real exported constant, not a hardcoded number) — a boxed/self-referential nominal
+  union (frog's own recourse for a wider or recursive `data ... is ...`) has no derive support yet,
+  nor does `FrogValue` gain a way to read one back out (see the next point, still open).
 - **`mut` parameters on host functions.** `make_sig` already appends copy-out returns for a `mut`
   frog parameter; a host function's `out` buffer would just need the same trailing slots. Not
   wired up.
@@ -190,7 +234,22 @@ complexity for the rest turned out to be real, not incidental:
   stack-slot buffer today, even `host_add(a: i64, b: i64) -> i64`, which could in principle pass
   scalars directly in registers. Not measured; likely small relative to whatever work the host
   function actually does.
-- **`FrogValue` still collapses `Struct`/`Union` to `None`** (`state.rs`) — unrelated to this work,
-  but the other half of "embeddable": those types can't cross *outward* to the host either.
+- **`FrogValue` still collapses `Struct`/`Union` to `None`** (`state.rs`) — the other half of
+  "embeddable": a struct/union *host function result* marshals back into Rust fine (that's what
+  the tests above exercise — a host fn destructures it or matches on it before returning a plain
+  scalar), but a top-level frog expression or REPL binding whose value is a struct or union still
+  can't be read out as a `FrogValue` — `build_main_body`'s final-statement path only ever returns
+  its first flattened leaf, and `FrogValue::from_bits` only ever reads one `i64`. Fixing this needs
+  `build_main_body`/`FrogState::eval` to carry every leaf of the final result (the way a `let`
+  binding already does, `state.rs:438-452`) through to a new `FrogValue::from_slots`, plus new
+  `Struct`/`Variant` variants. Not attempted here: it touches the REPL entry's core result-value
+  plumbing, a different risk class from the marshalling work above, which only ever added new
+  trait impls behind the existing `compile_host_call`/`FrogCtx` machinery.
+- **Boxed (self-referential or > `MAX_INLINE_UNION_MEMBERS`-variant) nominal unions** on the host
+  side — no `#[derive(FrogUnion)]` support (it rejects too many variants at compile time via a
+  `const _: () = assert!(...)` against the real exported constant), and no `FrogCtx` helpers for
+  `frog_alloc_variant`/`frog_variant_tag`/`frog_variant_get` (`runtime/ffi.rs`) analogous to
+  `alloc_list`/`alloc_dict`. Matters for the self-hosting case in particular: a frog-declared AST
+  union (e.g. an expression type) will routinely exceed six variants.
 - **Host functions as capability grants** (`plans/CONCURRENCY.md`) — the builder is the natural
   place for a future `.grant(Fs)` once `can`/`without` exists.

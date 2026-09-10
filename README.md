@@ -4,6 +4,15 @@
 and a mark-sweep GC. Designed to be embeddable in Rust applications, fast compilation, decent runtime performance.
 Inspirations include Go (but better usability) and Lua.
 
+🐸 froglang is a programming language in development. 
+Design points:
+- static types + bidirectional type inference
+- [mutable value semantics](https://research.google/pubs/mutable-value-semantics/)
+- fast compilation, decent runtime performance (currently uses Cranelift)
+- systems-ish (e.g., errors-as-values), but features a GC, like Go
+- lightweight, ergonomic syntax
+- embeddable in Rust apps or standalone (WIP)
+
 ```
 🐸 froglang repl
 >> func fib(n: Int): Int = if n <= 1 then n else fib(n - 1) + fib(n - 2)
@@ -18,7 +27,7 @@ Inspirations include Go (but better usability) and Lua.
 
 ---
 
-## Syntax
+## Show me some code
 
 ```
 // Named function declarations with typed parameters and return type
@@ -33,18 +42,13 @@ func hypotenuse(a: Int, b: Int): Int = {
   a2 + b2
 }
 
-// Inline block with semicolons
-func clamp_pos(x: Int): Int = { let z = 0; if x < 0 then z else x }
+// There are structs and enums (value types)
+// email here is of type `Str | None`, for which `Str?` is an alias
+// This is a union (comparable to Typescript), rather than a "wrapper" like Option<T> in Rust
+data Person(name: Str, age: Int, email: Str?)
 
-// Multi-line if-then-else
-func ack(m: Int, n: Int): Int =
-  if m == 0 then n + 1
-  else if n == 0 then ack(m - 1, 1)
-  else ack(m - 1, ack(m, n - 1))
-
-// Top-level let bindings
-let x = 42
-let f: (Int -> Int) = n -> n * 2
+let alice = Person(name = "alice", age = 42)
+print(alice.email)  // none
 ```
 
 **Supported expression forms:**
@@ -410,9 +414,25 @@ let mut state = FrogState::builder().func(shout_host()).build()?;
 let (value, _) = state.eval(r#"shout("hi")"#)?;
 ```
 
-Parameter and return types must implement `FromFrog`/`ToFrog`
-(`froglang_core::host`) — implemented for `Int`/`Float`/`Bool`/`None`/`Str`/`List<T>` today;
-structs and unions are on the ABI but not yet wired up on the Rust marshalling side.
+Parameter and return types must implement `FromFrog`/`ToFrog` (`froglang_core::host`) —
+implemented for `Int`/`Float`/`Bool`/`None`/`Str`/`List<T>`/`Dict<K,V>`/`Option<T>`/`Result<T,E>`,
+and for an arbitrary struct or (inline, ≤ 6-variant) nominal union via `#[derive(FrogData)]`/
+`#[derive(FrogUnion)]`:
+
+```rust
+use froglang_core::{frog_fn, FrogData, state::FrogState};
+
+#[derive(FrogData)]
+struct Point { x: i64, y: i64 }
+
+#[frog_fn]
+fn manhattan(p: Point) -> i64 { p.x.abs() + p.y.abs() }
+
+let mut state = FrogState::builder().data::<Point>().func(manhattan_host()).build()?;
+let (value, _) = state.eval("manhattan(Point(x=-3, y=4))")?;
+```
+
+A boxed (self-referential or wider) nominal union isn't supported by the derive yet.
 
 ---
 

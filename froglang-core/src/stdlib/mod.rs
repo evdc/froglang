@@ -31,8 +31,19 @@ mod str;
 pub(crate) struct ErrMsg(pub String);
 
 impl ToFrog for ErrMsg {
-    const IS_PTR: bool = true;
     fn frog_type() -> Type { Type::strukt("ErrMsg") }
+    // `leaves()` cannot use the trait's default (`vec![Self::frog_type()]`):
+    // that default is only correct for a type that *is* a leaf column in
+    // frog's own flattening (`Int`/`Str`/`List`/... — anything
+    // `codegen::is_heap_ty`/`overlay_safe` already knows how to classify on
+    // sight). `ErrMsg`'s `frog_type()` is `Type::strukt("ErrMsg")`, a
+    // compound (`Named`) type that is not itself a leaf — its *real* wire
+    // column, per `codegen::struct_fields`, is its one field's type. Naming
+    // that explicitly here is exactly what `#[derive(FrogData)]`
+    // (`plans/EMBEDDING.md`) automates for an arbitrary struct by composing
+    // each field's own `leaves()`; this hand-written impl states the same
+    // fact by hand for frog's one built-in struct-shaped error type.
+    fn leaves() -> Vec<Type> { vec![Type::Str] }
     fn to_frog(self, ctx: &mut FrogCtx, out: &mut [i64]) {
         out[0] = ctx.alloc_str(&self.0);
     }

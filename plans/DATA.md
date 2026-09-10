@@ -1035,8 +1035,14 @@ TRAITS.md stages 2–3 land. Runtime reflection declined.**
 
 ## Deferred
 
-- **Dict / Set literal syntax.** Revisit when generics land, since `Dict<K,V>` is blocked on them
-  anyway. The analysis so far, for the record:
+- ~~**Dict / Set literal syntax.**~~ **Decided and shipped, 2026-09-09**: the runner-up below,
+  `["key": value]` (`[:]` for empty) — one character instead of `Dict{...}`'s five. The
+  ascription collision it costs (`[x : Int]`) is handled by a parser-level colon-suppression
+  flag scoped to a `[...]` literal's own element list (reset around any nested `(...)`/`{...}`
+  group, so `["a": (x: Int)]` still ascribes) — see `Parser::colon_suppressed` and
+  `Grammar::tuple`. Print order is insertion order, as this section required. `Set` did not
+  ship (see `project_dict_map` / roadmap's "Newly done, 2026-09-09"). The analysis that led
+  here, kept for the record:
   - `{...}` is unavailable: froglang is expression-oriented, so blocks appear in expression
     position and `let d = {` is genuinely ambiguous. JS escapes this only via its
     statement/expression distinction, which froglang does not have.
@@ -1046,20 +1052,19 @@ TRAITS.md stages 2–3 land. Runtime reflection declined.**
     nominal head is needed anyway. It also makes `let x = { let a = 1; a }` fail with "unexpected
     `let` in dict literal", misdiagnosing a natural mistake, and turns every future
     block-introducing keyword (`with`, `scope`, `catch`) into a grammar edit.
-  - Leading candidate: **typed collection literals** — `Dict{"a": 1}`, `Set{1,2,3}`, `Dict{}` —
-    which need no grammar restriction, extend to user collections, compose with generics
+  - Runner-up (shipped): `[k: v]`, one character instead of five, at the cost of `[x : Int]`
+    colliding with ascription and one delimiter carrying two collection types.
+  - Not chosen: **typed collection literals** — `Dict{"a": 1}`, `Set{1,2,3}`, `Dict{}` — which
+    need no grammar restriction, extend to user collections, compose with generics
     (`Dict<Str,Int>{}`), and state the rule that resolves the key-vs-name confusion: **parens +
     `=` is the nominal form where the left side is a declared name (`Person(name="Alice")`);
     braces + `:` is the keyed form where the left side is an evaluated expression.** Bare
-    `{k: v}` sugar stays available as a purely additive later change.
-  - Runner-up: `[k: v]`, one character instead of five, at the cost of `[x : Int]` colliding with
-    ascription and one delimiter carrying two collection types.
+    `{k: v}` sugar stays available as a purely additive later change — still an option if `Set`
+    or user-collection literals get built.
   - Rejected: `do ... end` (triple-books `do`, which is already comprehension syntax and
     `CONCURRENCY.md`'s effect-perform keyword, and costs tokens on the most common construct);
     `()` for blocks (collides with the tuples/records `DESIGN.md` wants, and over-subscribes
     parens further).
-  - Whatever is chosen: **print order must be deterministic** (insertion order) or `repr` is
-    useless for diffs and golden tests, even though dict equality is order-independent.
 - **User-facing `reflect`.** See above; wanted eventually, blocked on TRAITS.md stages 2–3.
 - **Records and tuples** (`DESIGN.md`'s `(foo=1, hello="world")`). If they land, their notation
   must be their literal too, and `DESIGN.md` line 98 already flags the grouping-paren collision.

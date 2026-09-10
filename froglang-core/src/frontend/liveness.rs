@@ -88,6 +88,9 @@ fn number_kind(kind: &mut TypedExprKind, next: &mut NodeId) {
         TypedExprKind::List(elems) => {
             for e in elems { number(e, next); }
         }
+        TypedExprKind::Dict(pairs) => {
+            for (k, v) in pairs { number(k, next); number(v, next); }
+        }
         TypedExprKind::Block(stmts) => {
             for s in stmts { number(s, next); }
         }
@@ -308,6 +311,7 @@ fn dump_walk_kind(kind: &TypedExprKind, liveness: &Liveness) {
         }
         TypedExprKind::Range { start, end } => { dump_walk(start, liveness); dump_walk(end, liveness); }
         TypedExprKind::List(elems) => for e in elems { dump_walk(e, liveness); },
+        TypedExprKind::Dict(pairs) => for (k, v) in pairs { dump_walk(k, liveness); dump_walk(v, liveness); },
         TypedExprKind::Block(stmts) => for s in stmts { dump_walk(s, liveness); },
         TypedExprKind::ForLoop { iterable, cond, body, .. }
         | TypedExprKind::Comprehension { iterable, cond, body, .. } => {
@@ -442,6 +446,18 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
 
         // `compile_list_lit` pushes each element in source order.
         TypedExprKind::List(elems) => fold_reverse(elems, live_out, ctx, out),
+
+        // `compile_dict_lit` evaluates each pair's key then value, pairs in
+        // source order — reverse that here the same way `fold_reverse` does
+        // for a flat list.
+        TypedExprKind::Dict(pairs) => {
+            let mut lo = live_out.clone();
+            for (k, v) in pairs.iter().rev() {
+                lo = transfer(v, &lo, ctx, out);
+                lo = transfer(k, &lo, ctx, out);
+            }
+            lo
+        }
 
         // Both compile in declared-field order (`compile_expr_multi:1583`
         // for `StructInit`; `compile_variant_init` for `VariantInit`).
@@ -711,6 +727,7 @@ mod tests {
             }
             TypedExprKind::Range { start, end } => { collect_ids(start, out); collect_ids(end, out); }
             TypedExprKind::List(elems) => for e in elems { collect_ids(e, out); },
+            TypedExprKind::Dict(pairs) => for (k, v) in pairs { collect_ids(k, out); collect_ids(v, out); },
             TypedExprKind::Block(stmts) => for s in stmts { collect_ids(s, out); },
             TypedExprKind::ForLoop { iterable, cond, body, .. }
             | TypedExprKind::Comprehension { iterable, cond, body, .. } => {
@@ -851,6 +868,7 @@ mod tests {
             }
             TypedExprKind::Range { start, end } => { collect_var_ids(start, name, out); collect_var_ids(end, name, out); }
             TypedExprKind::List(elems) => for e in elems { collect_var_ids(e, name, out); },
+            TypedExprKind::Dict(pairs) => for (k, v) in pairs { collect_var_ids(k, name, out); collect_var_ids(v, name, out); },
             TypedExprKind::Block(stmts) => for s in stmts { collect_var_ids(s, name, out); },
             TypedExprKind::ForLoop { iterable, cond, body, .. }
             | TypedExprKind::Comprehension { iterable, cond, body, .. } => {

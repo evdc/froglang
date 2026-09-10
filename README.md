@@ -489,12 +489,10 @@ choice: a `Result<T, E>` whose `Ok` is `()` isn't representable in today's marsh
 `froglang_core::host`'s `ToFrog for Result<T, E>` doc comment), so returning something real sidesteps
 it rather than routing around it with a placeholder.
 
-**Not yet built**: `Dict`/`Map` and generic `map`/`filter`/`fold` both need real generics
-(`List<T>` is a compiler-special-cased "builtin hack", not user-definable yet — see `roadmap.md`);
-frog already has `for`/list-comprehension syntax covering much of what `map`/`filter` would buy in
-the meantime. Struct/nominal-union marshalling beyond `ErrMsg`'s one fixed shape, and host
-functions that mutate their arguments, are embedding-API gaps (`plans/EMBEDDING.md`), not stdlib
-gaps.
+**Not yet built**: generic `map`/`filter`/`fold` — frog already has `for`/list-comprehension
+syntax covering much of what they'd buy in the meantime. `Dict`/`Map` is done (see "Dict/Map"
+below). Struct/nominal-union marshalling beyond `ErrMsg`'s one fixed shape, and host functions
+that mutate their arguments, are embedding-API gaps (`plans/EMBEDDING.md`), not stdlib gaps.
 
 ---
 
@@ -575,7 +573,7 @@ Roughly in priority order:
 - ~~**Better error messages**~~ — **done**: span-aware, rustc-style rendered errors, with a
   caret under the offending source (`src/diagnostics.rs`). The one place still printing a
   raw `Debug` form is `frog check`'s own two `println!`s in `main.rs`.
-- **`Dict`/`Map`** — no such type yet, and the largest remaining gap for ordinary programs.
+- ~~**`Dict`/`Map`**~~ — **done**, see "Types and constructs" below.
 
 ### Types and constructs
 
@@ -613,6 +611,12 @@ Roughly in priority order:
 - ~~**User-definable generics**~~ — **done**: both generic functions and generic structs
   (`data Pair<A, B>(...)`) work with real monomorphization (`plans/TRAITS.md` Stage 3). This was
   previously the top blocker for `Dict`/`Map` and for self-hosting; see "Embedding" below.
+- ~~**`Dict`/`Map`**~~ — **done**: `["key": value]` literal (`[:]` empty), backed by a
+  `hashbrown`-based `FrogDict` swappable via `FrogStateBuilder::dict_backend`. `Int`/`Float`/
+  `Bool`/`Str` keys only for now (a new structural `Trait::Hash`, deliberately narrower than
+  `Eq`/`Show` — there's no runtime polymorphic hashing to widen it to compound keys with).
+  Indexing, `.get`, `k in d`, `==`, `len`, mutation, `.keys()`/`.values()`/`for`, `.remove`,
+  and `repr`/`read`/JSON round-trip all ship (`tests/test_dict.rs`).
 
 ### Embedding
 
@@ -623,7 +627,7 @@ Roughly in priority order:
   struct/union marshalling and generic host functions are listed as follow-ups there.
 - ~~Minimal stdlib~~ — **done for strings/file IO, see "Standard library" above**:
   `FrogState::with_stdlib()`, `Result<T, E>` ↔ `T | E` marshalling (`ToFrog for Result<T, E>`
-  in `froglang_core::host`), and the shared `ErrMsg` error type. Still needed for a real
-  self-hosting compiler: `Dict`/`Map` and generic `map`/`filter`/`fold` — no longer blocked on
-  generics (user-definable generics are done), just unbuilt — and nominal struct/union
-  marshalling beyond `ErrMsg`'s one fixed shape (`plans/EMBEDDING.md`'s follow-ups).
+  in `froglang_core::host`), and the shared `ErrMsg` error type. `HashMap<K, V>` ↔ `Dict<K, V>`
+  marshalling ships too (`host.rs`). Still needed for a real self-hosting compiler: generic
+  `map`/`filter`/`fold`, and nominal struct/union marshalling beyond `ErrMsg`'s one fixed shape
+  (`plans/EMBEDDING.md`'s follow-ups).

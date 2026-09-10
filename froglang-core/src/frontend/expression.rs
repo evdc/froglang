@@ -403,6 +403,13 @@ pub enum Expression {
     Function(FunctionExpr),
     Call(CallExpr),
     Tuple(Vec<Spanned<Expression>>),
+    /// `["key": value, ...]` — a dict/map literal, `[:]` for the empty
+    /// dict. A distinct node from `Tuple` (`[1, 2, 3]`) rather than a
+    /// post-hoc reinterpretation of it: `Grammar::tuple` decides which one
+    /// it's building by whether a `:` follows the first element, and the
+    /// two never mix within one literal (see `Grammar::tuple`'s doc
+    /// comment).
+    DictLit(Vec<(Spanned<Expression>, Spanned<Expression>)>),
     Block(Vec<Spanned<Expression>>),
     Annotated(AnnotatedExpr),
     Index(IndexExpr),
@@ -533,6 +540,10 @@ impl Expression {
 
     pub fn comprehension(for_loop: Spanned<Expression>) -> Expression {
         Expression::Comprehension(Box::new(for_loop))
+    }
+
+    pub fn dict_lit(pairs: Vec<(Spanned<Expression>, Spanned<Expression>)>) -> Expression {
+        Expression::DictLit(pairs)
     }
 
     pub fn field_access(target: Spanned<Expression>, field: String) -> Expression {
@@ -674,7 +685,20 @@ impl fmt::Display for Expression {
                     write!(f, ")")
                 }
             }
-            
+
+            Expression::DictLit(pairs) => {
+                if pairs.is_empty() {
+                    write!(f, "[:]")
+                } else {
+                    write!(f, "[")?;
+                    for (i, (k, v)) in pairs.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "{}: {}", k, v)?;
+                    }
+                    write!(f, "]")
+                }
+            }
+
             Expression::Block(statements) => {
                 if statements.is_empty() {
                     write!(f, "{{}}")

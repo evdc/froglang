@@ -14,7 +14,7 @@ macro_rules! gc_trace {
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ObjKind { Str = 0, List = 1, Variant = 2 }
+pub enum ObjKind { Str = 0, List = 1, Variant = 2, Dict = 3 }
 
 // ── GC header (prefix for every heap object) ─────────────────────────────────
 
@@ -97,6 +97,55 @@ pub struct FrogVariant {
     pub nslots:   u32,
     pub ptr_mask: u64,
     _data: [i64; 0],  // zero-sized marker; slots live at (ptr + size_of::<FrogVariant>())
+}
+
+// ── FrogDict — mutable, separate entries buffer + a swappable hash index ──────
+//
+// `Dict<K, V>`'s runtime representation. Entries are stored tightly packed,
+// in insertion order, `stride = kstride + vstride` `i64` slots each — no
+// tombstones: `runtime::dict::frog_dict_remove` compacts immediately by
+// shifting everything after the removed entry down one slot-block and
+// rebuilding `index` from scratch, so `len` is always exactly the number of
+// slot-blocks in use and every index in `0..len` is live. This trades
+// removal for simplicity (`O(n)` per removal, same as the rebuild it does
+// anyway) rather than a lazy-compaction tombstone scheme.
+//
+// `key_kind` (a `runtime::dict::KeyKind`) and `kstride` are fixed by the
+// dict's key type at construction: `kstride` is always 1 in v1 (every
+// supported key type — `Int`/`Float`/`Bool`/`Str` — is one `i64` slot), but
+// carried as a field rather than assumed so `runtime::dict::hash_key`/
+// `key_eq`'s scalar case and a wider structural-key case (`Trait::Hash`'s
+// deferred widening) share one entry layout.
+//
+// `ptr_mask` marks scannable columns across one whole entry (key columns
+// first, then value columns) — same convention as `FrogList::ptr_mask`,
+// one bit per `stride` slot rather than one bit per element.
+//
+// `index` is a type-erased `Box<Box<dyn runtime::dict::DictIndex>>` — see
+// `runtime::dict::dict_index_mut`/`dict_index_set` for the only sound way
+// to read or write it. Double-boxed because `dyn DictIndex` is a fat
+// pointer (data + vtable): a single `Box<dyn DictIndex>` can't be
+// round-tripped through the single-word `*mut ()` this field has to be to
+// stay a plain, GC-header-shaped heap object. The index is never
+// GC-traced — the collector only ever reaches `entries` through `mark`'s
+// `ptr_mask` walk below — and is freed explicitly by `free_obj`.
+#[repr(C)]
+pub struct FrogDict {
+    pub header:   GcHeader,
+    pub len:      u32,   // live entries (== populated slot-blocks in `entries`)
+    pub cap:      u32,   // entry capacity (in slot-blocks) of the `entries` buffer
+    pub kstride:  u32,
+    pub vstride:  u32,
+    pub ptr_mask: u64,
+    pub key_kind: u32,   // runtime::dict::KeyKind
+    pub entries:  *mut i64,
+    /// One cached `runtime::dict::hash_key` result per live entry (same
+    /// length/order as `entries`, `cap` slots allocated) — computed once at
+    /// insert and reused by `remove`'s index rebuild and by `clone_obj`,
+    /// so neither has to re-hash every surviving key (re-scanning a `Str`
+    /// key's bytes) just to relocate it.
+    pub hashes:   *mut u64,
+    pub index:    *mut (),
 }
 
 // ── Word encoding ─────────────────────────────────────────────────────────────
@@ -443,6 +492,13 @@ pub struct GcHeap {
     /// per `mark` call: `mark` is invoked once per root, so a fresh `Vec`
     /// each time is a `malloc`/`free` pair per root per collection.
     mark_worklist:   Vec<*mut GcHeader>,
+    /// Builds the hash index every `FrogDict` this heap allocates uses —
+    /// the "swappable from the host" seam (`plans/DATA.md`'s Dict design):
+    /// an embedder can install a different `DictBackend` (e.g. a sorted
+    /// index) via `FrogStateBuilder::dict_backend`, and every dict this
+    /// heap creates afterward picks it up with no other change. Defaults
+    /// to `runtime::dict::HashbrownBackend`.
+    pub dict_backend: std::sync::Arc<dyn crate::runtime::dict::DictBackend>,
 }
 
 thread_local! {
@@ -534,6 +590,7 @@ impl GcHeap {
             free_lists:      vec![std::ptr::null_mut(); MAX_FREE_WORDS + 1],
             stress:          std::env::var_os("FROG_GC_STRESS").is_some(),
             mark_worklist:   Vec::new(),
+            dict_backend:    std::sync::Arc::new(crate::runtime::dict::HashbrownBackend),
         }
     }
 
@@ -803,6 +860,18 @@ impl GcHeap {
                     }
                 }
             }
+            ObjKind::Dict => {
+                let dict = obj as *mut FrogDict;
+                let mask = (*dict).ptr_mask;
+                if mask == 0 { return; }
+                let stride = ((*dict).kstride + (*dict).vstride).max(1) as usize;
+                for i in 0..(*dict).len as usize {
+                    for bit in 0..stride {
+                        if mask & (1u64 << bit) == 0 { continue; }
+                        f(*(*dict).entries.add(i * stride + bit));
+                    }
+                }
+            }
             ObjKind::Variant => {
                 let variant = obj as *mut FrogVariant;
                 let mask = (*variant).ptr_mask;
@@ -866,7 +935,7 @@ impl GcHeap {
             // asks for, at the point of *consumption* (one place) rather
             // than at every point of production.
             debug_assert!(
-                std::ptr::read(&(*obj).kind) as u8 <= ObjKind::Variant as u8,
+                std::ptr::read(&(*obj).kind) as u8 <= ObjKind::Dict as u8,
                 "GC followed {:p}, which is not a heap object — a word reached the collector \
                  under the wrong encoding (see gc.rs's \"Word encoding\")",
                 obj,
@@ -874,7 +943,7 @@ impl GcHeap {
             if (*obj).marked { continue; }
             (*obj).marked = true;
             gc_trace!("mark  {:p} ({})", obj,
-                match (*obj).kind { ObjKind::Str => "Str", ObjKind::List => "List", ObjKind::Variant => "Variant" });
+                match (*obj).kind { ObjKind::Str => "Str", ObjKind::List => "List", ObjKind::Variant => "Variant", ObjKind::Dict => "Dict" });
             match (*obj).kind {
                 ObjKind::List => {
                     let list = obj as *mut FrogList;
@@ -887,6 +956,23 @@ impl GcHeap {
                             for bit in 0..stride {
                                 if mask & (1u64 << bit) == 0 { continue; }
                                 let w = *(*list).data.add(base + bit);
+                                if is_heap_ptr(w) {
+                                    worklist.push(heap_ptr(w));
+                                }
+                            }
+                        }
+                    }
+                }
+                ObjKind::Dict => {
+                    let dict = obj as *mut FrogDict;
+                    let mask = (*dict).ptr_mask;
+                    if mask != 0 {
+                        let stride = ((*dict).kstride + (*dict).vstride).max(1) as usize;
+                        for i in 0..(*dict).len as usize {
+                            let base = i * stride;
+                            for bit in 0..stride {
+                                if mask & (1u64 << bit) == 0 { continue; }
+                                let w = *(*dict).entries.add(base + bit);
                                 if is_heap_ptr(w) {
                                     worklist.push(heap_ptr(w));
                                 }
@@ -981,6 +1067,29 @@ impl GcHeap {
                 gc_trace!("sweep free {:p} Variant {} bytes", obj, total);
                 self.free_bytes(obj as *mut u8, total);
                 total
+            }
+            ObjKind::Dict => {
+                let dict_ptr = obj as *mut FrogDict;
+                let cap = (*dict_ptr).cap as usize;
+                let stride = ((*dict_ptr).kstride + (*dict_ptr).vstride).max(1) as usize;
+                let entries_size = cap * stride * std::mem::size_of::<i64>();
+                let hashes_size = cap * std::mem::size_of::<u64>();
+                let dict_size = words_for(std::mem::size_of::<FrogDict>()) * 8;
+                gc_trace!("sweep free {:p} Dict {} bytes", obj, dict_size + entries_size + hashes_size);
+                // Not part of `bytes_allocated`/`free_bytes`'s accounting —
+                // an ordinary Rust `Box`, not a bump-allocated GC block (see
+                // `FrogDict`'s doc comment on why it's double-boxed).
+                drop(Box::from_raw((*dict_ptr).index as *mut Box<dyn crate::runtime::dict::DictIndex>));
+                let entries = (*dict_ptr).entries as *mut u8;
+                let hashes = (*dict_ptr).hashes as *mut u8;
+                self.free_bytes(obj as *mut u8, dict_size);
+                if entries_size > 0 {
+                    self.free_bytes(entries, entries_size);
+                }
+                if hashes_size > 0 {
+                    self.free_bytes(hashes, hashes_size);
+                }
+                dict_size + entries_size + hashes_size
             }
         }
     }
@@ -1105,6 +1214,51 @@ impl GcHeap {
         ptr
     }
 
+    /// Allocate a GC-managed, empty `FrogDict` with room for `cap` entries,
+    /// each `kstride + vstride` `i64` slots wide. `ptr_mask` marks
+    /// scannable columns across one whole entry (key columns first, then
+    /// value columns), exactly `alloc_list`'s convention. The entries
+    /// buffer is separately allocated (not a GC object), and a fresh empty
+    /// index is built from `self.dict_backend` — see `FrogDict`'s doc
+    /// comment for why the index is stored double-boxed.
+    pub fn alloc_dict(&mut self, cap: usize, kstride: usize, vstride: usize, ptr_mask: u64, key_kind: u32) -> *mut FrogDict {
+        let stride = (kstride + vstride).max(1);
+        let entries_size = cap * stride * std::mem::size_of::<i64>();
+        let entries = if entries_size > 0 { self.alloc_bytes(entries_size) as *mut i64 } else { std::ptr::null_mut() };
+        let hashes_size = cap * std::mem::size_of::<u64>();
+        let hashes = if hashes_size > 0 { self.alloc_bytes(hashes_size) as *mut u64 } else { std::ptr::null_mut() };
+
+        let dict_size = words_for(std::mem::size_of::<FrogDict>()) * 8;
+        let ptr = self.alloc_bytes(dict_size) as *mut FrogDict;
+
+        let index = self.dict_backend.new_index(cap);
+        let boxed: Box<Box<dyn crate::runtime::dict::DictIndex>> = Box::new(index);
+
+        unsafe {
+            (*ptr).header = GcHeader {
+                next:   self.head,
+                marked: false,
+                kind:   ObjKind::Dict,
+                shared: false,
+            };
+            (*ptr).len       = 0;
+            (*ptr).cap       = cap as u32;
+            (*ptr).kstride   = kstride as u32;
+            (*ptr).vstride   = vstride as u32;
+            (*ptr).ptr_mask  = ptr_mask;
+            (*ptr).key_kind  = key_kind;
+            (*ptr).entries   = entries;
+            (*ptr).hashes    = hashes;
+            (*ptr).index     = Box::into_raw(boxed) as *mut ();
+        }
+
+        self.head = ptr as *mut GcHeader;
+        self.bytes_allocated += dict_size + entries_size + hashes_size;
+        gc_trace!("alloc Dict {} bytes -> {:p}  (total: {} bytes)",
+            dict_size + entries_size + hashes_size, ptr, self.bytes_allocated);
+        ptr
+    }
+
     /// Deep-clone the heap object at `obj`, returning a pointer with no
     /// aliasing to the original — the runtime primitive value semantics for
     /// `List` needs (MUTABILITY.md tier 1: "copy on write-through-a-non-unique
@@ -1182,6 +1336,53 @@ impl GcHeap {
                 self.pop_roots(1);
                 new_list as *mut GcHeader
             }
+            ObjKind::Dict => {
+                let src = obj as *mut FrogDict;
+                let len = (*src).len as usize;
+                let kstride = (*src).kstride as usize;
+                let vstride = (*src).vstride as usize;
+                let stride = (kstride + vstride).max(1);
+                let mask = (*src).ptr_mask;
+                let key_kind = (*src).key_kind;
+                let new_dict = self.alloc_dict(len, kstride, vstride, mask, key_kind);
+                self.push_root(new_dict as i64, true);
+                if len > 0 {
+                    std::ptr::copy_nonoverlapping((*src).entries, (*new_dict).entries, len * stride);
+                }
+                (*new_dict).len = len as u32;
+                if len > 0 {
+                    // A key's hash never changes when its owning `Str`
+                    // object is cloned below (clone preserves content, and
+                    // `hash_key` hashes content), so the source's cached
+                    // hashes carry straight over — no need to recompute one
+                    // per entry (re-scanning a `Str` key's bytes) just to
+                    // rebuild the index.
+                    std::ptr::copy_nonoverlapping((*src).hashes, (*new_dict).hashes, len);
+                }
+                if mask != 0 {
+                    for i in 0..len {
+                        let base = i * stride;
+                        for bit in 0..stride {
+                            if mask & (1u64 << bit) == 0 { continue; }
+                            let w = *(*new_dict).entries.add(base + bit);
+                            if is_heap_ptr(w) {
+                                let cloned = self.clone_obj(heap_ptr(w));
+                                *(*new_dict).entries.add(base + bit) = (cloned as i64) | (w & TAG_MASK);
+                            }
+                        }
+                    }
+                }
+                // Rebuild the index over the copied (and now possibly
+                // re-pointed, for a `Str` key) entries — cheaper than
+                // trying to carry the source index's internal layout
+                // across, and this is the only place a `FrogDict`'s index
+                // is ever built from existing entries rather than empty.
+                let index = crate::runtime::dict::dict_index_mut(new_dict);
+                let mut pairs = (0..len).map(|i| (*(*new_dict).hashes.add(i), i as u32));
+                index.rebuild(&mut pairs);
+                self.pop_roots(1);
+                new_dict as *mut GcHeader
+            }
             ObjKind::Variant => {
                 let src = obj as *mut FrogVariant;
                 let tag = (*src).tag;
@@ -1255,6 +1456,22 @@ impl GcHeap {
                             if i > 0 { eprint!(", "); }
                             eprint!("{}", *data.add(i));
                         }
+                        eprintln!("]");
+                    }
+                    ObjKind::Dict => {
+                        let d = current as *const FrogDict;
+                        let len = (*d).len as usize;
+                        let stride = ((*d).kstride + (*d).vstride).max(1) as usize;
+                        eprint!("  [{:p}] Dict  len={:<4} cap={:<4} kstride={:<2} vstride={:<2}  [",
+                            current, len, (*d).cap, (*d).kstride, (*d).vstride);
+                        let show = len.min(8);
+                        for i in 0..show {
+                            if i > 0 { eprint!(", "); }
+                            // Only the key slot of each entry is shown —
+                            // a full struct-aware dump isn't implemented.
+                            eprint!("{}", *(*d).entries.add(i * stride));
+                        }
+                        if len > 8 { eprint!(", …"); }
                         eprintln!("]");
                     }
                 }

@@ -85,6 +85,14 @@ pub enum Trait {
     /// aliasing" checks are the whole point of granting it; the variant here
     /// is just what lets a `data` declaration state the fact.
     Linear,
+    /// Structural, like `Eq`/`Show` — but deliberately narrow for now:
+    /// `Int`/`Float`/`Bool`/`Str` only, not recursed into `List`/struct/
+    /// union members. `Dict<K, V>` requires `K: Hash`, since there is no
+    /// runtime polymorphic hashing or equality (`codegen::eq_value` is
+    /// emitted per statically-known type) — widening this to structural
+    /// keys is real future work (synthesized per-`K` hash/eq functions),
+    /// not a rule this enum encodes yet. See `lower_dict_lit`.
+    Hash,
     /// A trait declared in source by `trait Name { ... }` (`TRAITS.md`
     /// Stage 5). Carries its own name because there is no fixed set of
     /// them — this is what "`Trait` becomes an open interned name rather
@@ -114,6 +122,7 @@ impl Display for Trait {
             Trait::Error  => write!(f, "Error"),
             Trait::Truthy => write!(f, "Truthy"),
             Trait::Linear => write!(f, "Linear"),
+            Trait::Hash   => write!(f, "Hash"),
             Trait::User(name) => write!(f, "{}", name),
         }
     }
@@ -304,6 +313,17 @@ pub const LIST_NAME: &str = "List";
 /// field template at all — that asymmetry is deliberate, not an oversight.
 pub const RANGE_NAME: &str = "Range";
 
+/// The `Dict` type constructor's name, as it appears in `Type::Named`.
+///
+/// Follows `List`'s model, not `Range`'s: builtin-boxed with no
+/// `struct_templates` field entry (`initial_struct_type_params` registers
+/// its arity only, so `Dict<K,V>` type-parses, but there is no flattened
+/// leaf layout to derive — see `LIST_NAME`'s doc comment for why `List`
+/// can't ride the generic-struct machinery `Range` uses). A `Dict` value
+/// is a single GC-boxed pointer (`runtime::gc::FrogDict`), exactly like a
+/// `List` is a single pointer to `FrogList`.
+pub const DICT_NAME: &str = "Dict";
+
 impl Type {
     /// `Type::Named { name: LIST_NAME, args: vec![elem] }`. Prefer this
     /// over constructing `Type::Named` directly for a list.
@@ -315,6 +335,12 @@ impl Type {
     /// over constructing `Type::Named` directly for a range.
     pub fn range(elem: Type) -> Type {
         Type::Named { name: RANGE_NAME.to_string(), args: vec![elem] }
+    }
+
+    /// `Type::Named { name: DICT_NAME, args: vec![key, value] }`. Prefer
+    /// this over constructing `Type::Named` directly for a dict.
+    pub fn dict(key: Type, value: Type) -> Type {
+        Type::Named { name: DICT_NAME.to_string(), args: vec![key, value] }
     }
 
     /// `Type::Named { name, args: vec![] }` — a plain struct/nullary type.
@@ -339,14 +365,27 @@ impl Type {
         }
     }
 
+    /// `Some((key, value))` iff this is `Dict<key, value>`.
+    pub fn as_dict_kv(&self) -> Option<(&Type, &Type)> {
+        match self {
+            Type::Named { name, args } if name == DICT_NAME => {
+                match (args.first(), args.get(1)) {
+                    (Some(k), Some(v)) => Some((k, v)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// `Some(name)` iff this is a zero-argument `Named` type other than
-    /// `List` — i.e. a plain struct. (`List` is excluded so a caller that
-    /// wants "the struct name" never mistakes a bare `List` for one; no
-    /// zero-arg `List` value exists anyway since it's always applied to
-    /// exactly one element type.)
+    /// `List`/`Dict` — i.e. a plain struct. (Excluded so a caller that
+    /// wants "the struct name" never mistakes a bare `List`/`Dict` for
+    /// one; no zero-arg `List`/`Dict` value exists anyway since both are
+    /// always applied to their element/key/value type arguments.)
     pub fn as_struct_name(&self) -> Option<&str> {
         match self {
-            Type::Named { name, .. } if name != LIST_NAME => Some(name.as_str()),
+            Type::Named { name, .. } if name != LIST_NAME && name != DICT_NAME => Some(name.as_str()),
             _ => None,
         }
     }
@@ -407,6 +446,10 @@ impl Type {
 
     pub fn is_range(&self) -> bool {
         matches!(self, Type::Named { name, .. } if name == RANGE_NAME)
+    }
+
+    pub fn is_dict(&self) -> bool {
+        matches!(self, Type::Named { name, .. } if name == DICT_NAME)
     }
 
     pub fn is_struct(&self) -> bool {
@@ -1256,6 +1299,11 @@ impl TypeChecker {
         let mut m = HashMap::new();
         m.insert(LIST_NAME.to_string(), vec!["T".to_string()]);
         m.insert(RANGE_NAME.to_string(), vec!["T@Range".to_string()]);
+        // `Dict` follows `List`, not `Range`: arity only, no field template
+        // (see `DICT_NAME`'s doc comment) — this entry exists purely so
+        // `resolve_type_expr`'s `TypeExpr::Apply` arm can arity-check
+        // `Dict<K, V>`.
+        m.insert(DICT_NAME.to_string(), vec!["K".to_string(), "V".to_string()]);
         m
     }
 
@@ -1285,7 +1333,7 @@ impl TypeChecker {
     /// letting it fall through to a bare "unknown trait".
     fn initial_traits() -> HashMap<String, TraitDef> {
         let mut m = HashMap::new();
-        for t in [Trait::Num, Trait::Eq, Trait::Ord, Trait::Show, Trait::Error, Trait::Linear] {
+        for t in [Trait::Num, Trait::Eq, Trait::Ord, Trait::Show, Trait::Error, Trait::Linear, Trait::Hash] {
             let name = t.to_string();
             m.insert(name.clone(), TraitDef { name, builtin: Some(t), members: Vec::new(), type_params: Vec::new() });
         }
@@ -1485,6 +1533,18 @@ impl TypeChecker {
                 seen.pop();
                 ok
             },
+            // `Dict<K, V>` is `Eq`/`Show` iff both `K` and `V` are — same
+            // "structural, args undetermined counts as satisfied" rule as
+            // `List` above. Equality is order-independent (`eq_dict`);
+            // `repr` prints in insertion order (`build_repr_dict`).
+            Type::Named { name, args } if name == DICT_NAME && matches!(tr, Trait::Eq | Trait::Show) => {
+                if seen.contains(ty) { return true; }
+                seen.push(ty.clone());
+                let ok = args.iter()
+                    .all(|a| matches!(a, Type::TypeVar { .. }) || self.type_implements_rec(a, tr, seen));
+                seen.pop();
+                ok
+            },
             // Structs get structural `==`/`!=`, desugared into a per-field
             // conjunction at lowering time — see `TypeChecker::desugar_struct_eq`
             // in `check_and_lower`'s `Binary` arm — so a struct satisfies
@@ -1493,7 +1553,7 @@ impl TypeChecker {
             // for a non-generic struct's empty `args`). The `args` check is
             // not redundant with the field check: a binder that appears in
             // no field still has to be `Eq` for the instantiation to be.
-            Type::Named { name, args } if name != LIST_NAME && matches!(tr, Trait::Eq | Trait::Show) => {
+            Type::Named { name, args } if name != LIST_NAME && name != DICT_NAME && matches!(tr, Trait::Eq | Trait::Show) => {
                 if seen.contains(ty) { return true; }
                 if !args.iter().all(|a| self.type_implements_rec(a, tr, seen)) { return false; }
                 seen.push(ty.clone());
@@ -1514,7 +1574,11 @@ impl TypeChecker {
                 Trait::Eq     => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None),
                 Trait::Show   => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None),
                 Trait::Ord    => matches!(ty, Type::Int | Type::Float | Type::Str),
-                Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None) || ty.is_list(),
+                Trait::Truthy => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str | Type::None) || ty.is_list() || ty.is_dict(),
+                // Deliberately narrow — see `Trait::Hash`'s doc comment.
+                // Not recursed into `List`/struct/union members; a `Dict`
+                // key must be one of these four scalar types directly.
+                Trait::Hash   => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
                 // Handled by the granted arm above, before any of this.
                 Trait::Error | Trait::Linear | Trait::User(_) => false,
             }
@@ -2264,9 +2328,21 @@ impl TypeChecker {
                     None => lowered,
                 };
                 let resolved = self.lookup(&lowered.item.ty);
+                // Either side being an unresolved `TypeVar` is enough to
+                // try binding it via `unify` — not just the value's own
+                // type. The other direction (`expected` still a fresh
+                // var) is exactly what a `Dict`'s value slot looks like
+                // before its first write ever pins it down: `mut d = [:];
+                // d[k] = "x"` has `expected` still `~t1` here, `resolved`
+                // already the concrete `Str` — the value side of the pair
+                // this branch used to leave unhandled, since a `List`
+                // never has an analogous "index-assign to grow" path to
+                // exercise it (`xs[i] = v` requires `i` already in
+                // bounds; `d[k] = v` doesn't).
                 let accepted = self.is_subtype(&resolved, &expected)
                     || widens_to(&resolved, &expected)
                     || (matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, &expected))
+                    || (matches!(expected, Type::TypeVar { .. }) && self.unify(&resolved, &expected))
                     || self.unify_with_one_union_member(&resolved, &expected);
                 if !accepted {
                     return Err(Spanned::from(TypeError {
@@ -4905,6 +4981,14 @@ impl TypeChecker {
                 Ok(())
             },
 
+            TypedExprKind::Dict(pairs) => {
+                for (k, v) in pairs {
+                    self.validate_codegen_constraints(k)?;
+                    self.validate_codegen_constraints(v)?;
+                }
+                Ok(())
+            },
+
             TypedExprKind::Block(stmts) => {
                 for s in stmts { self.validate_codegen_constraints(s)?; }
                 Ok(())
@@ -5238,6 +5322,13 @@ impl TypeChecker {
                 for e in elems { self.collect_generic_var_types(e, seen); }
             },
 
+            TypedExprKind::Dict(pairs) => {
+                for (k, v) in pairs {
+                    self.collect_generic_var_types(k, seen);
+                    self.collect_generic_var_types(v, seen);
+                }
+            },
+
             TypedExprKind::Block(stmts) => {
                 for s in stmts { self.collect_generic_var_types(s, seen); }
             },
@@ -5380,6 +5471,13 @@ impl TypeChecker {
 
             TypedExprKind::List(elems) => {
                 for e in elems.iter_mut() { Self::walk_vars_mut(e, f); }
+            },
+
+            TypedExprKind::Dict(pairs) => {
+                for (k, v) in pairs.iter_mut() {
+                    Self::walk_vars_mut(k, f);
+                    Self::walk_vars_mut(v, f);
+                }
             },
 
             TypedExprKind::Block(stmts) => {
@@ -5947,6 +6045,7 @@ impl TypeChecker {
             },
             TypedExprKind::Range { start, end } => { out.push(start); out.push(end); },
             TypedExprKind::List(elems) => out.extend(elems.iter()),
+            TypedExprKind::Dict(pairs) => out.extend(pairs.iter().flat_map(|(k, v)| [k, v])),
             TypedExprKind::Block(stmts) => out.extend(stmts.iter()),
             TypedExprKind::ForLoop { iterable, cond, body, iter_via, .. }
             | TypedExprKind::Comprehension { iterable, cond, body, iter_via, .. } => {
@@ -6615,6 +6714,7 @@ impl TypeChecker {
             },
             TypedExprKind::Range { start, end } => { out.push(start); out.push(end); },
             TypedExprKind::List(elems) => out.extend(elems.iter_mut()),
+            TypedExprKind::Dict(pairs) => out.extend(pairs.iter_mut().flat_map(|(k, v)| [k, v])),
             TypedExprKind::Block(stmts) => out.extend(stmts.iter_mut()),
             TypedExprKind::ForLoop { iterable, cond, body, iter_via, .. }
             | TypedExprKind::Comprehension { iterable, cond, body, iter_via, .. } => {
@@ -6735,6 +6835,13 @@ impl TypeChecker {
                 for e in elems.iter_mut() { self.substitute_types_deep(e, mapping); }
             },
 
+            TypedExprKind::Dict(pairs) => {
+                for (k, v) in pairs.iter_mut() {
+                    self.substitute_types_deep(k, mapping);
+                    self.substitute_types_deep(v, mapping);
+                }
+            },
+
             TypedExprKind::Block(stmts) => {
                 for s in stmts.iter_mut() { self.substitute_types_deep(s, mapping); }
             },
@@ -6759,7 +6866,7 @@ impl TypeChecker {
 
             TypedExprKind::PlaceAssign { place, value } => {
                 for seg in place.path.iter_mut() {
-                    if let PlaceSeg::Index { index, elem_ty } = seg {
+                    if let PlaceSeg::Index { index, elem_ty, .. } = seg {
                         self.substitute_types_deep(index, mapping);
                         *elem_ty = self.lookup(elem_ty).substitute(mapping);
                     }
@@ -6855,6 +6962,10 @@ impl TypeChecker {
             if let Some(elem) = ty.as_list_elem() {
                 return walk(elem, tc, seen, span, verb, advice);
             }
+            if let Some((k, v)) = ty.as_dict_kv() {
+                walk(k, tc, seen, span, verb, advice)?;
+                return walk(v, tc, seen, span, verb, advice);
+            }
             // Only composite types can close a cycle, and only they are
             // worth naming in the error. `seen` is a DFS *stack*, popped on
             // the way out, so two sibling fields of the same struct type are
@@ -6934,6 +7045,7 @@ impl TypeChecker {
             Expression::Function(f)          => self.lower_function(f, span),
             Expression::Call(c)              => self.lower_call(c, span),
             Expression::Tuple(elems)         => self.lower_tuple(elems, span),
+            Expression::DictLit(pairs)       => self.lower_dict_lit(pairs, span),
             Expression::Block(stmts)         => self.lower_block(stmts, span),
             Expression::Annotated(a)         => self.lower_annotated(a, span),
             Expression::Index(idx)           => self.lower_index(idx, span),
@@ -7238,11 +7350,24 @@ impl TypeChecker {
             }
             return Ok(bool_binary(left, right));
         }
+        // `k in d` — key membership, not a value scan (`Dict`'s hash index
+        // makes this `frog_dict_find(d, k) >= 0`, not `eq_value`-per-entry
+        // the way `List`'s does).
+        if let Some((key_ty, _)) = resolved_right.as_dict_kv() {
+            let key_ty = key_ty.clone();
+            if !self.unify(&left.item.ty, &key_ty) {
+                let resolved_left = self.lookup(&left.item.ty);
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Operator 'in' got incompatible types: expected Dict key {}, got {}", key_ty, resolved_left)
+                }, left_span));
+            }
+            return Ok(bool_binary(left, right));
+        }
         if let Some(call) = self.lower_container_has(&resolved_right, left, right, span)? {
             return Ok(call);
         }
         Err(Spanned::from(TypeError {
-            msg: format!("Operator 'in' requires Str, List, Range, or a type providing Container on the right side, got {}", resolved_right)
+            msg: format!("Operator 'in' requires Str, List, Dict, Range, or a type providing Container on the right side, got {}", resolved_right)
         }, right_span))
     }
 
@@ -7448,20 +7573,45 @@ impl TypeChecker {
                 },
                 RawPlaceSeg::Index(idx_expr) => {
                     let resolved = self.lookup(&cur_ty);
+                    let idx_span = idx_expr.span;
+                    if let Some((key_ty, val_ty)) = resolved.as_dict_kv() {
+                        let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
+                        let lowered_idx = self.check_and_lower(idx_expr)?;
+                        if !self.unify(&lowered_idx.item.ty, &key_ty) {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!("Dict key must be {}, got {}", self.lookup(&key_ty), self.lookup(&lowered_idx.item.ty))
+                            }, idx_span));
+                        }
+                        // See the matching check in `lower_index` — an empty
+                        // dict's key TypeVar is otherwise never validated
+                        // against Hash, so `d[[1, 2]] = v` would reach
+                        // codegen's `unreachable!()` instead of erroring here.
+                        let resolved_key_ty = self.lookup(&key_ty);
+                        if !self.type_implements(&resolved_key_ty, &Trait::Hash) {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!(
+                                    "{} does not provide Hash, so it can't be a Dict key — only Int, Float, Bool, and Str can, for now",
+                                    resolved_key_ty
+                                )
+                            }, idx_span));
+                        }
+                        path.push(PlaceSeg::Index { index: Box::new(lowered_idx), elem_ty: self.lookup(&val_ty), is_dict: true });
+                        cur_ty = val_ty;
+                        continue;
+                    }
                     let elem_ty = match resolved.as_list_elem() {
                         Some(inner) => inner.clone(),
                         None => return Err(Spanned::from(TypeError {
-                            msg: format!("Can't index into {}, expected a List", resolved)
+                            msg: format!("Can't index into {}, expected a List or Dict", resolved)
                         }, span)),
                     };
-                    let idx_span = idx_expr.span;
                     let lowered_idx = self.check_and_lower(idx_expr)?;
                     if !self.unify(&lowered_idx.item.ty, &Type::Int) {
                         return Err(Spanned::from(TypeError {
                             msg: format!("List index must be Int, got {}", self.lookup(&lowered_idx.item.ty))
                         }, idx_span));
                     }
-                    path.push(PlaceSeg::Index { index: Box::new(lowered_idx), elem_ty: self.lookup(&elem_ty) });
+                    path.push(PlaceSeg::Index { index: Box::new(lowered_idx), elem_ty: self.lookup(&elem_ty), is_dict: false });
                     cur_ty = elem_ty;
                 },
             }
@@ -8062,6 +8212,22 @@ impl TypeChecker {
             &c.callable.item,
             Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "to_list"
         );
+        // `keys`/`values`/`remove` are builtin `Dict<K, V>` operations,
+        // polymorphic over `K`/`V` for the same reason `len`/`push`/`get`
+        // are (no generics system for a `default_context()` entry to
+        // express that) — same special-casing, one more name each.
+        let is_keys = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "keys"
+        );
+        let is_values = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "values"
+        );
+        let is_remove = matches!(
+            &c.callable.item,
+            Expression::Literal(LiteralExpr { token: Token::Identifier(name) }) if name == "remove"
+        );
 
         let (kind, ty) = if let Some(name) = struct_name {
             // `TRAITS.md` Stage 3a: a generic struct's binders are
@@ -8172,6 +8338,32 @@ impl TypeChecker {
             }
             let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
             return self.finish_to_list(arg, callee_span, span);
+        } else if is_keys || is_values {
+            if c.args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", c.args.len())
+                }, callee_span));
+            }
+            let arg = self.check_and_lower(c.args.into_iter().next().expect("arity checked just above"))?;
+            return self.finish_keys_values(arg, is_keys, callee_span, span);
+        } else if is_remove {
+            if c.args.len() != 2 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 2, got {}", c.args.len())
+                }, callee_span));
+            }
+            let mut arg_iter = c.args.into_iter();
+            let d_arg = arg_iter.next().expect("arity checked just above");
+            let k_arg = arg_iter.next().expect("arity checked just above");
+            let d_span = d_arg.span;
+            let d_inner = match d_arg.item {
+                Expression::MutArg(inner) => *inner,
+                _ => return Err(Spanned::from(TypeError {
+                    msg: "remove's first argument must be marked 'mut'".to_string()
+                }, d_span)),
+            };
+            let (place, leaf_ty) = self.lower_place(d_inner, d_span)?;
+            return self.finish_remove(place, leaf_ty, d_span, k_arg, span);
         } else if matches!(&c.callable.item, Expression::FieldAccess(_)) {
             // `x.f(args)` where `f` isn't a struct/union field of
             // `typeof(x)` — resolved by `lower_ufcs_call` per
@@ -8262,6 +8454,138 @@ impl TypeChecker {
         }, span))
     }
 
+    /// `remove(mut d, k)` / `d.remove(k)` — `Dict<K,V> -> V | KeyError`,
+    /// removing the entry if present. Same `Arg::Mut(place)` shape as
+    /// `finish_push`; codegen (`compile_call`'s `remove` arm) reads the
+    /// value out *before* calling `frog_dict_remove`, since removal
+    /// compacts the entries buffer and invalidates every later index.
+    /// Built as typed nodes directly (not the raw-`Expression`-splice
+    /// trick `finish_get`/`get_rest_stmts_dict` use) so it can call
+    /// `lower_widen`/`notation_placeholder` on values it already has
+    /// typed, rather than re-deriving them from source text. That's only
+    /// possible because a `remove` receiver — like `push`'s — is always a
+    /// `mut` place, never an arbitrary expression, so reading it twice
+    /// (once for `k in d`, once for `d[k]`) via `TypedExprKind::Var(root)`
+    /// is exactly what re-evaluating the same source `d` would do, with
+    /// no risk of a double side effect.
+    ///
+    /// v1 only accepts a bare-identifier receiver (`place.path` empty):
+    /// `Var(root)` reads the *whole current binding*, which is only
+    /// equivalent to the source place when there's no field/index path
+    /// atop it. Widening that to `d.field.remove(k)` needs a real
+    /// "read this place as a value" node this codebase doesn't have yet
+    /// (see this method's `path.is_empty()` check).
+    fn finish_remove(&mut self, place: Place, leaf_ty: Type, d_span: Span, k_arg: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let d_ty = self.lookup(&leaf_ty);
+        let Some((key_ty, val_ty)) = d_ty.as_dict_kv() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("remove's first argument must be a Dict, got {}", d_ty)
+            }, d_span));
+        };
+        let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
+
+        if !place.path.is_empty() {
+            return Err(Spanned::from(TypeError {
+                msg: "remove doesn't yet support a receiver with a field/index path — \
+                      bind the Dict to its own 'mut' variable first".to_string()
+            }, d_span));
+        }
+        let root = place.root.clone();
+
+        let k_span = k_arg.span;
+        if k_arg.item.get_identifier().is_some_and(|n| n == root) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("'{}' can't be passed 'mut' and also appear as another argument in the same call", root)
+            }, k_span));
+        }
+        let k_lowered = self.check_and_lower(k_arg)?;
+        if !self.unify(&k_lowered.item.ty, &key_ty) {
+            return Err(Spanned::from(TypeError {
+                msg: format!("Dict key must be {}, got {}", self.lookup(&key_ty), self.lookup(&k_lowered.item.ty))
+            }, k_span));
+        }
+
+        // Bind the key to a temp up front — evaluated exactly once, then
+        // referenced by name everywhere below (`k in d`, `d[k]`,
+        // `repr(k)`, and the removal call itself).
+        let k_name = format!("__rm_k${}", self.next_id);
+        self.next_id += 1;
+        let k_assign = Spanned::from(TypedExpr {
+            id: 0, ty: key_ty.clone(),
+            kind: TypedExprKind::Assign { name: k_name.clone(), value: Box::new(k_lowered) },
+        }, k_span);
+        let read_k = || Spanned::from(TypedExpr { id: 0, ty: key_ty.clone(), kind: TypedExprKind::Var(k_name.clone()) }, k_span);
+        let read_d = || Spanned::from(TypedExpr { id: 0, ty: d_ty.clone(), kind: TypedExprKind::Var(root.clone()) }, d_span);
+
+        let result_ty = Type::Union(vec![val_ty.clone(), Type::strukt("KeyError")]).normalize();
+
+        // `k in d`
+        let has_key = Spanned::from(TypedExpr {
+            id: 0, ty: Type::Bool,
+            kind: TypedExprKind::Binary { op: Token::In, left: Box::new(read_k()), right: Box::new(read_d()) },
+        }, span);
+
+        // Read the value out *before* removing — `frog_dict_remove`
+        // compacts the entries buffer, invalidating every entry index at
+        // or after the removed one (`FrogDict`'s doc comment).
+        let index_expr = Spanned::from(TypedExpr {
+            id: 0, ty: val_ty.clone(),
+            kind: TypedExprKind::Index { target: Box::new(read_d()), index: Box::new(read_k()) },
+        }, span);
+        let index_widened = self.lower_widen(index_expr, &result_ty)?;
+        let v_name = format!("__rm_v${}", self.next_id);
+        self.next_id += 1;
+        let v_assign = Spanned::from(TypedExpr {
+            id: 0, ty: result_ty.clone(),
+            kind: TypedExprKind::Assign { name: v_name.clone(), value: Box::new(index_widened) },
+        }, span);
+        let read_v = Spanned::from(TypedExpr { id: 0, ty: result_ty.clone(), kind: TypedExprKind::Var(v_name) }, span);
+
+        // The actual removal — a hardcoded internal builtin, never spelled
+        // in source, exactly the `push` shape (`Arg::Mut(place)`) but with
+        // no return value; `compile_call`'s `__dict_remove_entry` arm just
+        // calls `frog_dict_remove`.
+        let remove_callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![d_ty.clone(), key_ty.clone()], result: Box::new(Type::None) },
+            kind: TypedExprKind::Var("__dict_remove_entry".to_string()),
+        }, d_span);
+        let remove_call = Spanned::from(TypedExpr {
+            id: 0, ty: Type::None,
+            kind: TypedExprKind::Call {
+                callable: Box::new(remove_callable),
+                args: vec![Arg::Mut(place), Arg::Value(read_k())],
+            },
+        }, span);
+
+        let true_branch = Spanned::from(TypedExpr {
+            id: 0, ty: result_ty.clone(),
+            kind: TypedExprKind::Block(vec![v_assign, remove_call, read_v]),
+        }, span);
+
+        // `KeyError(key=repr(k))`
+        let key_repr = self.notation_placeholder(Notation::Repr, read_k(), k_span)?;
+        let key_error = Spanned::from(TypedExpr {
+            id: 0, ty: Type::strukt("KeyError"),
+            kind: TypedExprKind::StructInit { name: "KeyError".to_string(), fields: vec![("key".to_string(), Box::new(key_repr))] },
+        }, span);
+        let key_error_widened = self.lower_widen(key_error, &result_ty)?;
+
+        let cond = Spanned::from(TypedExpr {
+            id: 0, ty: result_ty.clone(),
+            kind: TypedExprKind::Conditional {
+                cond: Box::new(has_key),
+                true_branch: Box::new(true_branch),
+                false_branch: Some(Box::new(key_error_widened)),
+            },
+        }, span);
+
+        Ok(Spanned::from(TypedExpr {
+            id: 0, ty: result_ty,
+            kind: TypedExprKind::Block(vec![k_assign, cond]),
+        }, span))
+    }
+
     /// The tail of a `len` call once its argument is already lowered —
     /// shared by `lower_call`'s `is_len` branch (`len(xs)`) and
     /// `lower_ufcs_call` (`xs.len()`). Like `finish_push`, synthesizes the
@@ -8270,9 +8594,9 @@ impl TypeChecker {
     fn finish_len(&mut self, arg: Spanned<TypedExpr>, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let arg_span = arg.span;
         let arg_ty = self.lookup(&arg.item.ty);
-        if !arg_ty.is_list() && arg_ty != Type::Str {
+        if !arg_ty.is_list() && !arg_ty.is_dict() && arg_ty != Type::Str {
             return Err(Spanned::from(TypeError {
-                msg: format!("len's argument must be a List or Str, got {:?}", arg_ty)
+                msg: format!("len's argument must be a List, Dict, or Str, got {:?}", arg_ty)
             }, arg_span));
         }
         let callable = Spanned::from(TypedExpr {
@@ -8283,6 +8607,35 @@ impl TypeChecker {
         Ok(Spanned::from(TypedExpr {
             id: 0,
             ty: Type::Int,
+            kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] },
+        }, span))
+    }
+
+    /// `keys`/`values` (`is_keys`/`is_values` in `lower_call`, and the UFCS
+    /// arm in `lower_ufcs_call`) — `Dict<K,V> -> List(K)` or `List(V)`, in
+    /// insertion order (`FrogDict`'s doc comment: no tombstones, so
+    /// `0..len` already *is* insertion order). Same "synthesize the
+    /// callable directly" shape as `finish_len`; `wants_keys` picks the
+    /// callee name codegen dispatches on.
+    fn finish_keys_values(&mut self, arg: Spanned<TypedExpr>, wants_keys: bool, callee_span: Span, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let arg_span = arg.span;
+        let arg_ty = self.lookup(&arg.item.ty);
+        let Some((key_ty, val_ty)) = arg_ty.as_dict_kv() else {
+            return Err(Spanned::from(TypeError {
+                msg: format!("{}'s argument must be a Dict, got {}", if wants_keys { "keys" } else { "values" }, arg_ty)
+            }, arg_span));
+        };
+        let result_elem = if wants_keys { key_ty.clone() } else { val_ty.clone() };
+        let result_ty = Type::list(result_elem);
+        let name = if wants_keys { "keys" } else { "values" };
+        let callable = Spanned::from(TypedExpr {
+            id: 0,
+            ty: Type::Function { params: vec![arg_ty.clone()], result: Box::new(result_ty.clone()) },
+            kind: TypedExprKind::Var(name.to_string()),
+        }, callee_span);
+        Ok(Spanned::from(TypedExpr {
+            id: 0,
+            ty: result_ty,
             kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] },
         }, span))
     }
@@ -8324,16 +8677,15 @@ impl TypeChecker {
     /// teaching codegen a new node. `xs`/`i` are passed in unlowered (as
     /// `Expression`, not `TypedExpr`) since they're spliced into the
     /// desugared block and lowered there, exactly once.
+    /// `get(xs, i)` — lowers `xs_arg` up front (rather than splicing it
+    /// raw into a `let` block the way this used to) so the desugaring
+    /// below it can already see whether it's a `List` or `Dict` receiver.
+    /// That makes this a thin wrapper around `finish_get_ufcs`, which
+    /// already has to solve exactly this "receiver pre-lowered, evaluated
+    /// once" problem for `xs.get(i)`.
     fn finish_get(&mut self, xs_arg: Spanned<Expression>, i_arg: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
-        let xs_span = xs_arg.span;
-        let ident = |n: &str| Expression::literal(Token::Identifier(n.to_string()));
-        let let_stmt = |name: &str, value: Spanned<Expression>, sp: Span| Spanned::from(
-            Expression::assign(Spanned::from(ident(name), sp), None, value, Some(Mutability::Immutable)),
-            sp,
-        );
-        let mut stmts = vec![let_stmt("__get_xs", xs_arg, xs_span)];
-        stmts.extend(Self::get_rest_stmts(i_arg, span));
-        self.check_and_lower(Spanned::from(Expression::Block(stmts), span))
+        let xs_lowered = self.check_and_lower(xs_arg)?;
+        self.finish_get_ufcs(xs_lowered, i_arg, span)
     }
 
     /// The `xs.get(i)` UFCS form (`lower_ufcs_call`'s `field == "get"`
@@ -8353,7 +8705,15 @@ impl TypeChecker {
             TypedExpr { id: 0, ty: xs_ty.clone(), kind: TypedExprKind::Assign { name: "__get_xs".to_string(), value: Box::new(xs_lowered) } },
             span,
         );
-        let rest_block = Spanned::from(Expression::Block(Self::get_rest_stmts(i_arg, span)), span);
+        // `Dict` gets its own desugaring (membership check + `KeyError`,
+        // no negative-index wraparound) — everything else (`List`, or an
+        // unresolved `TypeVar`, matching prior behavior) keeps `List`'s.
+        let rest_stmts = if self.lookup(&xs_ty).as_dict_kv().is_some() {
+            Self::get_rest_stmts_dict(i_arg, span)
+        } else {
+            Self::get_rest_stmts(i_arg, span)
+        };
+        let rest_block = Spanned::from(Expression::Block(rest_stmts), span);
         let rest = self.with_context_mut(
             std::iter::once(("__get_xs".to_string(), xs_ty, false)),
             |t| t.check_and_lower(rest_block),
@@ -8423,6 +8783,44 @@ impl TypeChecker {
             span,
         );
         stmts.push(Spanned::from(Expression::conditional(in_bounds, index_expr, Some(index_error)), span));
+        stmts
+    }
+
+    /// `get`'s `Dict` desugaring — `get_rest_stmts`'s counterpart, from
+    /// `__get_k` onward: `if k in xs then xs[k] else KeyError(key=repr(k))`.
+    /// No negative-index wraparound (that's a `List` concept); membership
+    /// is checked via `in`, which is `frog_dict_find(...) >= 0` — an O(1)
+    /// hash lookup, not a scan — so this doesn't even cost the second
+    /// lookup `xs[k]` itself performs a naive reading might expect.
+    fn get_rest_stmts_dict(k_arg: Spanned<Expression>, span: Span) -> Vec<Spanned<Expression>> {
+        let ident = |n: &str| Expression::literal(Token::Identifier(n.to_string()));
+        let let_stmt = |name: &str, value: Spanned<Expression>, sp: Span| Spanned::from(
+            Expression::assign(Spanned::from(ident(name), sp), None, value, Some(Mutability::Immutable)),
+            sp,
+        );
+
+        let k_span = k_arg.span;
+        let mut stmts = Vec::with_capacity(2);
+        stmts.push(let_stmt("__get_k", k_arg, k_span));
+
+        let has_key = Spanned::from(Expression::binary(
+            Token::In, Spanned::from(ident("__get_k"), span), Spanned::from(ident("__get_xs"), span),
+        ), span);
+        let index_expr = Spanned::from(
+            Expression::index(Spanned::from(ident("__get_xs"), span), Spanned::from(ident("__get_k"), span)),
+            span,
+        );
+        let key_repr = Spanned::from(
+            Expression::call(Spanned::from(ident("repr"), span), vec![Spanned::from(ident("__get_k"), span)]),
+            span,
+        );
+        let key_error = Spanned::from(
+            Expression::call(Spanned::from(ident("KeyError"), span), vec![
+                Spanned::from(Expression::assign(Spanned::from(ident("key"), span), None, key_repr, None), span),
+            ]),
+            span,
+        );
+        stmts.push(Spanned::from(Expression::conditional(has_key, index_expr, Some(key_error)), span));
         stmts
     }
 
@@ -9024,6 +9422,26 @@ impl TypeChecker {
             return self.finish_get_ufcs(target, i_arg, span);
         }
 
+        // `keys`/`values`/`remove` — same reasoning as `len`/`push`/`get`.
+        if member_hit.is_none() && (field == "keys" || field == "values") {
+            if !rest_args.is_empty() {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 0, got {}", rest_args.len())
+                }, callee_span));
+            }
+            return self.finish_keys_values(target, field == "keys", callee_span, span);
+        }
+        if member_hit.is_none() && field == "remove" {
+            if rest_args.len() != 1 {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Wrong number of arguments, expected 1, got {}", rest_args.len())
+                }, callee_span));
+            }
+            let (place, leaf_ty) = self.lower_place(raw_target, target_span)?;
+            let k_arg = rest_args.into_iter().next().expect("arity checked just above");
+            return self.finish_remove(place, leaf_ty, target_span, k_arg, span);
+        }
+
         let Some(func_ty) = self.ctx.get(&callee).cloned() else {
             return Err(Spanned::from(TypeError {
                 msg: format!("{} has no field '{}', and there's no function '{}' to call as a method", resolved, field, field)
@@ -9140,6 +9558,64 @@ impl TypeChecker {
         Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
     }
 
+    /// `["k": v, ...]` / `[:]` — see `Trait::Hash`'s doc comment for why
+    /// the key type is restricted to `Int`/`Float`/`Bool`/`Str` for now.
+    fn lower_dict_lit(&mut self, pairs: Vec<(Spanned<Expression>, Spanned<Expression>)>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let (kind, ty) = if pairs.is_empty() {
+            (TypedExprKind::Dict(Vec::new()), Type::dict(self.fresh_var(), self.fresh_var()))
+        } else {
+            let mut items: Vec<(Spanned<TypedExpr>, Spanned<TypedExpr>)> = Vec::with_capacity(pairs.len());
+            let mut first_k: Option<Type> = None;
+            let mut first_v: Option<Type> = None;
+            for (k, v) in pairs {
+                let (k_span, v_span) = (k.span, v.span);
+                let k_lowered = self.check_and_lower(k)?;
+                let v_lowered = self.check_and_lower(v)?;
+                match &first_k {
+                    None => first_k = Some(k_lowered.item.ty.clone()),
+                    Some(first) => {
+                        let first = first.clone();
+                        if !self.unify(&first, &k_lowered.item.ty) {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!(
+                                    "Dict keys must have the same type, got {} and {}",
+                                    self.lookup(&first), self.lookup(&k_lowered.item.ty)
+                                )
+                            }, k_span));
+                        }
+                    },
+                }
+                match &first_v {
+                    None => first_v = Some(v_lowered.item.ty.clone()),
+                    Some(first) => {
+                        let first = first.clone();
+                        if !self.unify(&first, &v_lowered.item.ty) {
+                            return Err(Spanned::from(TypeError {
+                                msg: format!(
+                                    "Dict values must have the same type, got {} and {}",
+                                    self.lookup(&first), self.lookup(&v_lowered.item.ty)
+                                )
+                            }, v_span));
+                        }
+                    },
+                }
+                items.push((k_lowered, v_lowered));
+            }
+            let key_ty = self.lookup(&first_k.expect("pairs is non-empty"));
+            let val_ty = self.lookup(&first_v.expect("pairs is non-empty"));
+            if !self.type_implements(&key_ty, &Trait::Hash) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!(
+                        "{} does not provide Hash, so it can't be a Dict key — only Int, Float, Bool, and Str can, for now",
+                        key_ty
+                    )
+                }, span));
+            }
+            (TypedExprKind::Dict(items), Type::dict(key_ty, val_ty))
+        };
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind }, span))
+    }
+
     // A block is its own lexical scope: bindings made by a `let`
     // inside it (directly, or via a nested block/conditional branch)
     // must not leak to whatever follows the block. Without this,
@@ -9194,6 +9670,40 @@ impl TypeChecker {
         let target = self.check_and_lower(*idx.target)?;
         let target_ty = target.item.ty.clone();
         let resolved_target = self.lookup(&target_ty);
+
+        // `d[k]` — same node (`TypedExprKind::Index`) as `xs[i]`; codegen
+        // tells the two apart by `target`'s type, exactly the way it
+        // already reads `elem_ty`/`ptr_mask` off the static type rather
+        // than the node kind. Both panic out of range/absent; `.get` is
+        // the non-panicking form for both (`finish_get`).
+        if let Some((key_ty, val_ty)) = resolved_target.as_dict_kv() {
+            let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
+            let index_span = idx.index.span;
+            let index = self.check_and_lower(*idx.index)?;
+            if !self.unify(&index.item.ty, &key_ty) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("Dict key must be {}, got {}", self.lookup(&key_ty), self.lookup(&index.item.ty))
+                }, index_span));
+            }
+            // For a dict literal this is redundant with `lower_dict_lit`'s
+            // own Hash check, but an empty dict (`[:]`) defers its key type
+            // to a fresh TypeVar that's never checked against Hash until
+            // something indexes into it — without this, `d[[1, 2]]` would
+            // unify the key TypeVar to a non-Hash type here and only fail
+            // later as a codegen `unreachable!()` instead of a type error.
+            let resolved_key_ty = self.lookup(&key_ty);
+            if !self.type_implements(&resolved_key_ty, &Trait::Hash) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!(
+                        "{} does not provide Hash, so it can't be a Dict key — only Int, Float, Bool, and Str can, for now",
+                        resolved_key_ty
+                    )
+                }, index_span));
+            }
+            let ty = self.lookup(&val_ty);
+            return Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Index { target: Box::new(target), index: Box::new(index) } }, span));
+        }
+
         let elem_ty = match resolved_target.as_list_elem() {
             Some(inner) => inner.clone(),
             None if matches!(&resolved_target, Type::TypeVar { .. }) => {
@@ -9206,7 +9716,7 @@ impl TypeChecker {
                 elem
             },
             _ => return Err(Spanned::from(TypeError {
-                msg: format!("Can't index into {}, expected a List", resolved_target)
+                msg: format!("Can't index into {}, expected a List or Dict", resolved_target)
             }, target_span)),
         };
 
@@ -9475,6 +9985,31 @@ impl TypeChecker {
         let iterable = self.check_and_lower(*fl.iterable)?;
         let iter_ty = iterable.item.ty.clone();
         let resolved_iter = self.lookup(&iter_ty);
+        // `for k in d` iterates `d`'s keys, in insertion order — desugar
+        // to `for k in d.keys()` right here so the rest of this function
+        // (and `Comprehension`'s `List(Item)` collection) never has to
+        // know `Dict` is iterable at all. See `finish_keys_values`.
+        if let Some((key_ty, _)) = resolved_iter.as_dict_kv() {
+            let key_ty = key_ty.clone();
+            let iterable = self.finish_keys_values(iterable, true, iterable_span, iterable_span)?;
+            let (cond, body) = self.with_context(
+                std::iter::once((fl.var.clone(), key_ty)),
+                |t| -> Result<_, Spanned<TypeError>> {
+                    let cond = match fl.cond {
+                        Some(c) => {
+                            let cond_span = c.span;
+                            let lowered = t.check_and_lower(*c)?;
+                            t.check_condition(&lowered.item.ty.clone(), cond_span)?;
+                            Some(Box::new(t.coerce_truthy(lowered, cond_span)))
+                        },
+                        None => None,
+                    };
+                    let body = t.check_and_lower(*fl.body)?;
+                    Ok((cond, body))
+                },
+            )?;
+            return Ok((fl.var, Box::new(iterable), cond, Box::new(body), None));
+        }
         let (elem_ty, iter_via) = if let Some(inner) = resolved_iter.as_list_elem() {
             (inner.clone(), None)
         } else if let Some(inner) = resolved_iter.as_range_elem() {
@@ -10237,6 +10772,12 @@ impl TypeChecker {
             TypedExprKind::List(elems) => {
                 for e in elems { self.desugar_notation(e)?; }
             }
+            TypedExprKind::Dict(pairs) => {
+                for (k, v) in pairs {
+                    self.desugar_notation(k)?;
+                    self.desugar_notation(v)?;
+                }
+            }
             TypedExprKind::Block(stmts) => {
                 for s in stmts { self.desugar_notation(s)?; }
             }
@@ -10416,6 +10957,10 @@ impl TypeChecker {
         if let Some(elem_ty) = ty.as_list_elem().cloned() {
             return self.build_repr_list(&elem_ty, v, span);
         }
+        if let Some((key_ty, val_ty)) = ty.as_dict_kv() {
+            let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
+            return self.build_repr_dict(&key_ty, &val_ty, v, span);
+        }
         match ty {
             Type::Union(members) => {
                 let members = members.clone();
@@ -10497,6 +11042,61 @@ impl TypeChecker {
         let joined = Self::build_str_join(comprehension, Self::str_lit(", ", span), span);
         let cat = Self::str_cat(vec![Self::str_lit("[", span), joined, Self::str_lit("]", span)], span);
         Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![list_assign, cat]) }, span))
+    }
+
+    /// `["k0": repr(v0), ...]` — `Dict<K, V>` notation, `build_repr_list`'s
+    /// twin: binds `v` to a temporary (`__repr_d{n}`), iterates its keys
+    /// (`.keys()` — insertion order, `FrogDict`'s doc comment) via the
+    /// same comprehension-plus-join shape, each pair rendered
+    /// `repr(k) + ": " + repr(d[k])`. The empty case is a runtime branch,
+    /// not just the static-`TypeVar` shortcut `build_repr_list` gets away
+    /// with: `[:]` is the *only* reading a dict can ever be empty at
+    /// (unlike `[]`, which is also every other collection's empty form),
+    /// so it must print that way even for a concretely-typed dict that
+    /// just happens to be empty right now, e.g. after every entry has
+    /// been `.remove`d.
+    fn build_repr_dict(&mut self, key_ty: &Type, val_ty: &Type, v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        if matches!(key_ty, Type::TypeVar { .. }) {
+            return Ok(Self::str_lit("[:]", span));
+        }
+        let dict_name = format!("__repr_d{}", self.next_id); self.next_id += 1;
+        let key_name = format!("__repr_k{}", self.next_id); self.next_id += 1;
+        let dict_ty = Type::dict(key_ty.clone(), val_ty.clone());
+
+        let dict_var = |name: &str| Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Var(name.to_string()) }, span);
+        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(v) } }, span);
+
+        let keys_call = self.finish_keys_values(dict_var(&dict_name), true, span, span)?;
+        let key_var = Spanned::from(TypedExpr { id: 0, ty: key_ty.clone(), kind: TypedExprKind::Var(key_name.clone()) }, span);
+        let key_repr = self.build_repr(key_ty, key_var, span)?;
+        let index_expr = Spanned::from(TypedExpr {
+            id: 0, ty: val_ty.clone(),
+            kind: TypedExprKind::Index {
+                target: Box::new(dict_var(&dict_name)),
+                index: Box::new(Spanned::from(TypedExpr { id: 0, ty: key_ty.clone(), kind: TypedExprKind::Var(key_name.clone()) }, span)),
+            },
+        }, span);
+        let val_repr = self.build_repr(val_ty, index_expr, span)?;
+        let pair = Self::str_cat(vec![key_repr, Self::str_lit(": ", span), val_repr], span);
+
+        let comprehension = Spanned::from(TypedExpr {
+            id: 0, ty: Type::list(Type::Str),
+            kind: TypedExprKind::Comprehension { var: key_name, iterable: Box::new(keys_call), cond: None, body: Box::new(pair), iter_via: None },
+        }, span);
+        let joined = Self::build_str_join(comprehension, Self::str_lit(", ", span), span);
+        let nonempty = Self::str_cat(vec![Self::str_lit("[", span), joined, Self::str_lit("]", span)], span);
+
+        let len_call = self.finish_len(dict_var(&dict_name), span, span)?;
+        let is_empty = Spanned::from(TypedExpr {
+            id: 0, ty: Type::Bool,
+            kind: TypedExprKind::Binary { op: Token::EqEq, left: Box::new(len_call), right: Box::new(Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::IntLit(0) }, span)) },
+        }, span);
+        let cond = Spanned::from(TypedExpr {
+            id: 0, ty: Type::Str,
+            kind: TypedExprKind::Conditional { cond: Box::new(is_empty), true_branch: Box::new(Self::str_lit("[:]", span)), false_branch: Some(Box::new(nonempty)) },
+        }, span);
+
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![dict_assign, cond]) }, span))
     }
 
     /// Union notation, nominal or anonymous. Binds `v` to a temporary
@@ -10659,6 +11259,15 @@ impl TypeChecker {
         if let Some(elem_ty) = ty.as_list_elem().cloned() {
             return self.build_json_list(&elem_ty, v, span);
         }
+        if let Some((key_ty, val_ty)) = ty.as_dict_kv() {
+            let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
+            if key_ty != Type::Str && !matches!(key_ty, Type::TypeVar { .. }) {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("json.to_str's Dict keys must be Str (JSON object keys are strings), got {}", key_ty)
+                }, span));
+            }
+            return self.build_json_dict(&val_ty, v, span);
+        }
         match ty {
             Type::Union(members) => {
                 let members = members.clone();
@@ -10747,6 +11356,49 @@ impl TypeChecker {
         let joined = Self::build_str_join(comprehension, Self::str_lit(",", span), span);
         let cat = Self::str_cat(vec![Self::str_lit("[", span), joined, Self::str_lit("]", span)], span);
         Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![list_assign, cat]) }, span))
+    }
+
+    /// `{"k0":v0,...}` — `Dict<Str, V>` JSON notation. Caller (`build_json`)
+    /// has already rejected a non-`Str` key, so this only ever builds a
+    /// genuine JSON object. No empty-object special case is needed the way
+    /// `build_repr_dict` needs one for `[:]`: `{}` is unambiguous, JSON has
+    /// no separate empty-array-vs-empty-object collision to disambiguate.
+    fn build_json_dict(&mut self, val_ty: &Type, v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // Only reachable for a provably empty dict (`json.to_str([:])`) —
+        // same reasoning as `build_json_list`'s identical guard.
+        if matches!(val_ty, Type::TypeVar { .. }) {
+            return Ok(Self::str_lit("{}", span));
+        }
+        let dict_name = format!("__json_d{}", self.next_id); self.next_id += 1;
+        let key_name = format!("__json_k{}", self.next_id); self.next_id += 1;
+        let dict_ty = Type::dict(Type::Str, val_ty.clone());
+
+        let dict_var = |name: &str| Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Var(name.to_string()) }, span);
+        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(v) } }, span);
+
+        let keys_call = self.finish_keys_values(dict_var(&dict_name), true, span, span)?;
+        let key_var = Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Var(key_name.clone()) }, span);
+        // The key is JSON-escaped at *runtime* here, unlike a struct
+        // field's compile-time-known name (`build_json_fields`) — a
+        // `Dict` key is an ordinary runtime `Str` value.
+        let key_json = Self::repr_leaf_call("__json_str", Type::Str, key_var, span);
+        let index_expr = Spanned::from(TypedExpr {
+            id: 0, ty: val_ty.clone(),
+            kind: TypedExprKind::Index {
+                target: Box::new(dict_var(&dict_name)),
+                index: Box::new(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Var(key_name.clone()) }, span)),
+            },
+        }, span);
+        let val_json = self.build_json(val_ty, index_expr, span)?;
+        let pair = Self::str_cat(vec![key_json, Self::str_lit(":", span), val_json], span);
+
+        let comprehension = Spanned::from(TypedExpr {
+            id: 0, ty: Type::list(Type::Str),
+            kind: TypedExprKind::Comprehension { var: key_name, iterable: Box::new(keys_call), cond: None, body: Box::new(pair), iter_via: None },
+        }, span);
+        let joined = Self::build_str_join(comprehension, Self::str_lit(",", span), span);
+        let cat = Self::str_cat(vec![Self::str_lit("{", span), joined, Self::str_lit("}", span)], span);
+        Ok(Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Block(vec![dict_assign, cat]) }, span))
     }
 
     /// `build_repr_union`'s twin — same temp-binding, same nominal /
@@ -10894,6 +11546,15 @@ impl TypeChecker {
         if let Some(elem_ty) = ty.as_list_elem().cloned() {
             return self.build_read_json_list(&elem_ty, node, span);
         }
+        if let Some((key_ty, val_ty)) = ty.as_dict_kv() {
+            let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
+            if key_ty != Type::Str {
+                return Err(Spanned::from(TypeError {
+                    msg: format!("json.parse's Dict keys must be Str (JSON object keys are strings), got {}", key_ty)
+                }, span));
+            }
+            return self.build_read_json_dict(&val_ty, node, span);
+        }
         match ty {
             Type::Union(members) => {
                 let members = members.clone();
@@ -10990,6 +11651,57 @@ impl TypeChecker {
             kind: TypedExprKind::Comprehension { var: idx_name, iterable: Box::new(range), cond: None, body: Box::new(elem_val), iter_via: None },
         }, span);
         Ok(Spanned::from(TypedExpr { id: 0, ty: Type::list(elem_ty.clone()), kind: TypedExprKind::Block(vec![node_assign, comprehension]) }, span))
+    }
+
+    /// `Dict<Str, V>` JSON parsing — `build_json_dict`'s inverse,
+    /// `build_read_dict`'s twin with `frog_json_*` accessors in place of
+    /// `frog_read_*` ones. Builds the `Dict` with the same unrolled-loop
+    /// shape `build_read_dict` uses, for the same reason (a runtime pair
+    /// count, no comprehension-shaped `Dict` builder to reuse).
+    fn build_read_json_dict(&mut self, val_ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let node_name = format!("__json_dn{}", self.next_id); self.next_id += 1;
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+
+        let len_call = Self::read_leaf_call("frog_json_obj_len", Type::Int, Type::Int, Self::node_var(&node_name, span), span);
+        let len_name = format!("__json_dl{}", self.next_id); self.next_id += 1;
+        let len_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: len_name.clone(), value: Box::new(len_call) } }, span);
+
+        let range = Spanned::from(TypedExpr {
+            id: 0, ty: Type::range(Type::Int),
+            kind: TypedExprKind::Range { start: Box::new(Self::int_lit(0, span)), end: Box::new(Self::node_var(&len_name, span)) },
+        }, span);
+        let idx_name = format!("__json_di{}", self.next_id); self.next_id += 1;
+
+        let dict_name = format!("__json_dd{}", self.next_id); self.next_id += 1;
+        let dict_ty = Type::dict(Type::Str, val_ty.clone());
+        let alloc_dict = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Dict(Vec::new()) }, span);
+        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(alloc_dict) } }, span);
+
+        // `frog_json_key_at` returns a fresh `Str` directly (no further
+        // `build_read_json` dispatch needed — it's already the right leaf
+        // type), unlike `frog_json_val_at`, which returns an opaque node
+        // handle `build_read_json(val_ty, ...)` still has to interpret.
+        let key_val = Self::read_call2("frog_json_key_at", Type::Int, Type::Int, Type::Str, Self::node_var(&node_name, span), Self::node_var(&idx_name, span), span);
+        let val_node = Self::read_call2("frog_json_val_at", Type::Int, Type::Int, Type::Int, Self::node_var(&node_name, span), Self::node_var(&idx_name, span), span);
+        let val_val = self.build_read_json(val_ty, val_node, span)?;
+
+        let place = Place { root: dict_name.clone(), path: vec![PlaceSeg::Index {
+            index: Box::new(key_val),
+            elem_ty: val_ty.clone(),
+            is_dict: true,
+        }] };
+        let insert = Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::PlaceAssign { place, value: Box::new(val_val) } }, span);
+
+        let loop_body = Spanned::from(TypedExpr {
+            id: 0, ty: Type::None,
+            kind: TypedExprKind::ForLoop { var: idx_name, iterable: Box::new(range), cond: None, body: Box::new(insert), iter_via: None },
+        }, span);
+
+        let dict_var = Spanned::from(TypedExpr { id: 0, ty: dict_ty, kind: TypedExprKind::Var(dict_name) }, span);
+        Ok(Spanned::from(TypedExpr {
+            id: 0, ty: dict_var.item.ty.clone(),
+            kind: TypedExprKind::Block(vec![node_assign, len_assign, dict_assign, loop_body, dict_var]),
+        }, span))
     }
 
     /// `build_read_union_as`'s twin, and it exists for the same reason —
@@ -11371,6 +12083,10 @@ impl TypeChecker {
         if let Some(elem_ty) = ty.as_list_elem().cloned() {
             return self.build_read_list(&elem_ty, node, span);
         }
+        if let Some((key_ty, val_ty)) = ty.as_dict_kv() {
+            let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
+            return self.build_read_dict(&key_ty, &val_ty, node, span);
+        }
         match ty {
             Type::Union(members) => {
                 let members = members.clone();
@@ -11438,6 +12154,67 @@ impl TypeChecker {
             kind: TypedExprKind::Comprehension { var: idx_name, iterable: Box::new(range), cond: None, body: Box::new(elem_val), iter_via: None },
         }, span);
         Ok(Spanned::from(TypedExpr { id: 0, ty: Type::list(elem_ty.clone()), kind: TypedExprKind::Block(vec![node_assign, comprehension]) }, span))
+    }
+
+    /// `["k": read(key_at(node,i)) -- read(val_at(node,i))]`, folded into
+    /// a `Dict` literal one pair at a time — `build_read_list`'s twin.
+    /// There is no comprehension-shaped Dict-builder to reuse the way
+    /// lists have (`[for i in .. do ...]` collects a `List`, never a
+    /// `Dict`), so this builds a `TypedExprKind::Dict` node directly
+    /// instead: `frog_read_dict_len`/`_key_at`/`_val_at` are all pure
+    /// reads of the already-parsed node (no allocation, no failure that
+    /// isn't reported through `mark_failed_at`), so unrolling the pairs
+    /// by count here — rather than looping — is exactly as valid as
+    /// `build_read_struct` unrolling its fields, and needs no runtime
+    /// loop construct that doesn't otherwise exist for building a `Dict`.
+    fn build_read_dict(&mut self, key_ty: &Type, val_ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        let node_name = format!("__read_d{}", self.next_id); self.next_id += 1;
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+
+        let len_call = Self::read_leaf_call("frog_read_dict_len", Type::Int, Type::Int, Self::node_var(&node_name, span), span);
+        let len_name = format!("__read_dn{}", self.next_id); self.next_id += 1;
+        let len_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: len_name.clone(), value: Box::new(len_call) } }, span);
+
+        // `Trait::Hash` keys are scalar and can't fail to hash, so nothing
+        // here needs the loop `build_read_list` uses to stay within a
+        // bounded tree size — but a *runtime*-known pair count still
+        // means a real loop, not unrolling: unlike `build_read_struct`'s
+        // fields (a fixed, compile-time count), `frog_read_dict_len`'s
+        // result is only known once the notation text is parsed. So this
+        // reuses the same comprehension-over-a-Range shape
+        // `build_read_list` does, just building `Dict` pairs as the body
+        // instead of collecting a `List`.
+        let range = Spanned::from(TypedExpr {
+            id: 0, ty: Type::range(Type::Int),
+            kind: TypedExprKind::Range { start: Box::new(Self::int_lit(0, span)), end: Box::new(Self::node_var(&len_name, span)) },
+        }, span);
+        let idx_name = format!("__read_di{}", self.next_id); self.next_id += 1;
+        let key_node = Self::read_call2("frog_read_dict_key_at", Type::Int, Type::Int, Type::Int, Self::node_var(&node_name, span), Self::node_var(&idx_name, span), span);
+        let val_node = Self::read_call2("frog_read_dict_val_at", Type::Int, Type::Int, Type::Int, Self::node_var(&node_name, span), Self::node_var(&idx_name, span), span);
+        let key_val = self.build_read(key_ty, key_node, span)?;
+        let val_val = self.build_read(val_ty, val_node, span)?;
+        let dict_name = format!("__read_dd{}", self.next_id); self.next_id += 1;
+        let dict_ty = Type::dict(key_ty.clone(), val_ty.clone());
+        let alloc_dict = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Dict(Vec::new()) }, span);
+        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(alloc_dict) } }, span);
+
+        let place = Place { root: dict_name.clone(), path: vec![PlaceSeg::Index {
+            index: Box::new(key_val),
+            elem_ty: val_ty.clone(),
+            is_dict: true,
+        }] };
+        let insert = Spanned::from(TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::PlaceAssign { place, value: Box::new(val_val) } }, span);
+
+        let loop_body = Spanned::from(TypedExpr {
+            id: 0, ty: Type::None,
+            kind: TypedExprKind::ForLoop { var: idx_name, iterable: Box::new(range), cond: None, body: Box::new(insert), iter_via: None },
+        }, span);
+
+        let dict_var = Spanned::from(TypedExpr { id: 0, ty: dict_ty, kind: TypedExprKind::Var(dict_name) }, span);
+        Ok(Spanned::from(TypedExpr {
+            id: 0, ty: dict_var.item.ty.clone(),
+            kind: TypedExprKind::Block(vec![node_assign, len_assign, dict_assign, loop_body, dict_var]),
+        }, span))
     }
 
     /// Union notation's inverse. `node` is bound to a temporary first
@@ -11627,6 +12404,7 @@ impl TypeChecker {
                 Type::Str   => "frog_read_is_str",
                 Type::None  => "frog_read_is_none",
                 t if t.as_list_elem().is_some()  => "frog_read_is_list",
+                t if t.as_dict_kv().is_some()    => "frog_read_is_dict",
                 t if t.as_range_elem().is_some() => "frog_read_is_range",
                 _ => "frog_read_is_struct",
             };
@@ -11717,6 +12495,8 @@ impl TypeChecker {
                     if arg_types.len() != binder_names.len() {
                         let msg = if name == LIST_NAME {
                             format!("List takes exactly 1 type argument, got {}", arg_types.len())
+                        } else if name == DICT_NAME {
+                            format!("Dict takes exactly 2 type arguments (key, value), got {}", arg_types.len())
                         } else {
                             format!(
                                 "{} takes exactly {} type argument(s), got {}",
@@ -11727,6 +12507,12 @@ impl TypeChecker {
                     }
                     if name == LIST_NAME {
                         return Ok(Type::list(arg_types.into_iter().next().expect("arity checked above")));
+                    }
+                    if name == DICT_NAME {
+                        let mut it = arg_types.into_iter();
+                        let k = it.next().expect("arity checked above");
+                        let v = it.next().expect("arity checked above");
+                        return Ok(Type::dict(k, v));
                     }
                     return Ok(Type::Named { name: name.clone(), args: arg_types });
                 }

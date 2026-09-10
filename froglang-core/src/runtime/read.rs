@@ -185,7 +185,7 @@ pub extern "C" fn frog_read_msg() -> i64 {
 // ── navigation ───────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum Kind { Int, Float, Bool, Str, None, List, Range, Call, Other }
+enum Kind { Int, Float, Bool, Str, None, List, Dict, Range, Call, Other }
 
 fn expression_kind(e: &Expression) -> Kind {
     use crate::frontend::expression::LiteralExpr;
@@ -198,6 +198,7 @@ fn expression_kind(e: &Expression) -> Kind {
         Expression::Literal(LiteralExpr { token: Token::None }) => Kind::None,
         Expression::Unary(u) if u.op == Token::Minus => expression_kind(&u.expr.item),
         Expression::Tuple(_) => Kind::List,
+        Expression::DictLit(_) => Kind::Dict,
         Expression::Range(_) => Kind::Range,
         Expression::Call(_) | Expression::FieldAccess(_) => Kind::Call,
         _ => Kind::Other,
@@ -225,6 +226,7 @@ read_is_kind!(frog_read_is_bool, Kind::Bool);
 read_is_kind!(frog_read_is_str, Kind::Str);
 read_is_kind!(frog_read_is_none, Kind::None);
 read_is_kind!(frog_read_is_list, Kind::List);
+read_is_kind!(frog_read_is_dict, Kind::Dict);
 read_is_kind!(frog_read_is_range, Kind::Range);
 read_is_kind!(frog_read_is_struct, Kind::Call);
 
@@ -363,6 +365,44 @@ pub extern "C" fn frog_read_list_at(node: i64, i: i64) -> i64 {
         match elems.get(i as usize) {
             Some(e) => node_handle(e),
             None => { mark_failed_at("list index out of range", n.span.start); node }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn frog_read_dict_len(node: i64) -> i64 {
+    with_node(node, |n| match &n.item {
+        Expression::DictLit(pairs) => pairs.len() as i64,
+        _ => { mark_failed_at("expected a Dict literal", n.span.start); 0 }
+    })
+}
+
+/// `node`'s `i`th pair's key, or `node` itself on any mismatch.
+#[no_mangle]
+pub extern "C" fn frog_read_dict_key_at(node: i64, i: i64) -> i64 {
+    with_node(node, |n| {
+        let Expression::DictLit(pairs) = &n.item else {
+            mark_failed_at("expected a Dict literal", n.span.start);
+            return node;
+        };
+        match pairs.get(i as usize) {
+            Some((k, _)) => node_handle(k),
+            None => { mark_failed_at("dict index out of range", n.span.start); node }
+        }
+    })
+}
+
+/// `node`'s `i`th pair's value, or `node` itself on any mismatch.
+#[no_mangle]
+pub extern "C" fn frog_read_dict_val_at(node: i64, i: i64) -> i64 {
+    with_node(node, |n| {
+        let Expression::DictLit(pairs) = &n.item else {
+            mark_failed_at("expected a Dict literal", n.span.start);
+            return node;
+        };
+        match pairs.get(i as usize) {
+            Some((_, v)) => node_handle(v),
+            None => { mark_failed_at("dict index out of range", n.span.start); node }
         }
     })
 }

@@ -22,6 +22,12 @@ pub enum FrogValue {
     Bool(bool),
     Str(String),
     List(Vec<FrogValue>),
+    /// In insertion order (`runtime::gc::FrogDict`'s doc comment). Like
+    /// `List` above, a struct-typed value decodes wrong (only leaf 0 of
+    /// its flattened layout) — the same pre-existing `FrogValue`
+    /// limitation `List`'s identical `frog_list_get(.., 0)` already has,
+    /// not something new here.
+    Dict(Vec<(FrogValue, FrogValue)>),
     None,
 }
 
@@ -36,6 +42,17 @@ impl FrogValue {
                 })
                 .collect();
             return FrogValue::List(elems);
+        }
+        if let Some((key_ty, val_ty)) = ty.as_dict_kv() {
+            let len = runtime::dict::frog_dict_len(bits) as usize;
+            let pairs = (0..len)
+                .map(|i| {
+                    let k = runtime::dict::frog_dict_slot(bits, i as i64, 0);
+                    let v = runtime::dict::frog_dict_slot(bits, i as i64, 1);
+                    (FrogValue::from_bits(k, key_ty, _heap), FrogValue::from_bits(v, val_ty, _heap))
+                })
+                .collect();
+            return FrogValue::Dict(pairs);
         }
         match ty {
             Type::Int  => FrogValue::Int(bits),
@@ -83,6 +100,14 @@ impl FrogValue {
                 "[{}]",
                 v.iter().map(|e| e.display_str()).collect::<Vec<_>>().join(", ")
             ),
+            FrogValue::Dict(pairs) => if pairs.is_empty() {
+                "[:]".to_string()
+            } else {
+                format!(
+                    "[{}]",
+                    pairs.iter().map(|(k, v)| format!("{}: {}", k.display_str(), v.display_str())).collect::<Vec<_>>().join(", ")
+                )
+            },
             FrogValue::None      => String::new(),
         }
     }
@@ -207,7 +232,11 @@ impl FrogState {
     /// Start building a `FrogState` with host (Rust) functions registered —
     /// see `plans/EMBEDDING.md` and `crate::host`.
     pub fn builder() -> FrogStateBuilder {
-        FrogStateBuilder { hosts: Vec::new(), prelude: Vec::new() }
+        FrogStateBuilder {
+            hosts: Vec::new(),
+            prelude: Vec::new(),
+            dict_backend: std::sync::Arc::new(crate::runtime::dict::HashbrownBackend),
+        }
     }
 
     /// `FrogState::builder()` with the stdlib (`crate::stdlib`) installed —
@@ -478,7 +507,7 @@ impl FrogState {
 /// of these would silently never be called, since the special case wins
 /// before the generic `func_ids` lookup ever runs. Rejected at `build()`
 /// with a clear error instead.
-const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "panic", "panic!builtin", "gc_dump", "repr", "read", "json"];
+const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "keys", "values", "remove", "panic", "panic!builtin", "gc_dump", "repr", "read", "json"];
 
 /// Builds a `FrogState` with host (Rust) functions registered before the
 /// JIT module exists — required because `JITBuilder::symbol` only accepts
@@ -486,6 +515,7 @@ const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "panic", "panic
 pub struct FrogStateBuilder {
     hosts:   Vec<crate::host::HostFn>,
     prelude: Vec<String>,
+    dict_backend: std::sync::Arc<dyn crate::runtime::dict::DictBackend>,
 }
 
 impl FrogStateBuilder {
@@ -503,6 +533,17 @@ impl FrogStateBuilder {
     /// rather than a separate Rust-side type-definition API.
     pub fn prelude(mut self, src: impl Into<String>) -> Self {
         self.prelude.push(src.into());
+        self
+    }
+
+    /// Swap the index every `Dict` this `FrogState` allocates uses —
+    /// `runtime::dict::HashbrownBackend` (the default) unless overridden
+    /// here. The seam is deliberately narrow: a `DictBackend` only ever
+    /// sees a hash and candidate entry indices, never a froglang value,
+    /// the GC, or the word encoding — see `runtime::dict`'s module doc
+    /// comment.
+    pub fn dict_backend(mut self, backend: std::sync::Arc<dyn crate::runtime::dict::DictBackend>) -> Self {
+        self.dict_backend = backend;
         self
     }
 
@@ -532,8 +573,10 @@ impl FrogStateBuilder {
         // primitive's `func_ids` key.
         let codegen = Codegen::new_with_hosts(&self.hosts).map_err(FrogError::Type)?;
 
+        let mut heap = GcHeap::new();
+        heap.dict_backend = self.dict_backend.clone();
         let mut state = FrogState {
-            heap:         GcHeap::new(),
+            heap,
             tc:           TypeChecker::new(),
             codegen,
             env:          HashMap::new(),

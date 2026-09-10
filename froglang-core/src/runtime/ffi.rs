@@ -335,7 +335,7 @@ fn frog_index_out_of_bounds(idx: i64, len: i64) -> ! {
 /// message and then die that way, and `1 / 0` died that way with no output
 /// at all. `trap` stays correct for genuinely unreachable IR (a `Never`-typed
 /// tail), which is what it's for.
-fn frog_abort(msg: std::fmt::Arguments) -> ! {
+pub(super) fn frog_abort(msg: std::fmt::Arguments) -> ! {
     let _ = std::io::stdout().flush();
     eprintln!("frog: {}", msg);
     std::process::exit(1);
@@ -484,22 +484,43 @@ pub extern "C" fn frog_clone(w: i64) -> i64 {
     })
 }
 
+/// Doubles a raw (non-GC-managed) buffer of 8-byte-aligned words from
+/// `old_size` to `new_size` bytes: `std::alloc::alloc` when there's
+/// nothing to carry forward (`old_size == 0` — `Dict`'s entries/hashes
+/// buffers before their first insert), `realloc` otherwise (`List`'s data
+/// buffer, which `GcHeap::alloc_list` guarantees always starts non-empty,
+/// so `old_size` is never 0 there). Aborts the process on allocation
+/// failure — there's no error path out of JIT code.
+///
+/// Caller does the capacity-doubling arithmetic and the `u32::MAX`
+/// overflow check first (`frog_list_push`'s and `dict::grow_if_full`'s
+/// units differ — words vs. entries — so that check can't live here), and
+/// updates `heap.bytes_allocated` by `new_size - old_size` afterward.
+///
+/// # Safety
+/// `old_ptr` must be a pointer previously returned by this function (or
+/// null iff `old_size == 0`) allocated with `old_size` bytes at 8-byte
+/// alignment.
+pub(crate) unsafe fn grow_raw_buffer(old_ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
+    let new_layout = Layout::from_size_align(new_size, 8).expect("buffer layout");
+    let new_data = if old_size == 0 {
+        std::alloc::alloc(new_layout)
+    } else {
+        let old_layout = Layout::from_size_align(old_size, 8).expect("buffer layout");
+        std::alloc::realloc(old_ptr, old_layout, new_size)
+    };
+    if new_data.is_null() {
+        std::alloc::handle_alloc_error(new_layout);
+    }
+    new_data
+}
+
 #[no_mangle]
 pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
     with_heap(|heap| {
         let list_ptr = list as *mut FrogList;
         unsafe {
             if (*list_ptr).len == (*list_ptr).cap {
-                // `realloc` must be handed the layout the buffer was
-                // allocated with. `GcHeap::alloc_list` allocates `cap`
-                // whole `i64` slots, 8-byte aligned, whether that block
-                // came fresh from the system allocator or off a free list
-                // (`GcHeap::alloc_bytes` rounds every size class to whole
-                // 8-byte words, so a recycled block's original layout is
-                // byte-for-byte this one) — so `Layout::array::<i64>(cap)`
-                // is exactly right in both cases. The grown buffer is a
-                // plain global-allocator block of `new_cap` slots, which is
-                // what `free_obj` later recycles at that same size.
                 let old_cap = (*list_ptr).cap as usize;
                 // `cap` is a `u32`; doubling past that would silently
                 // truncate and leave the list claiming capacity it doesn't
@@ -508,20 +529,12 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
                 if new_cap > u32::MAX as usize {
                     frog_abort(format_args!("list grew past the maximum length of {} elements", u32::MAX));
                 }
-                let old_layout = Layout::array::<i64>(old_cap).expect("list realloc layout");
+                let old_size = old_cap * std::mem::size_of::<i64>();
                 let new_size = new_cap * std::mem::size_of::<i64>();
-                let new_data = std::alloc::realloc(
-                    (*list_ptr).data as *mut u8,
-                    old_layout,
-                    new_size,
-                ) as *mut i64;
-                if new_data.is_null() {
-                    std::alloc::handle_alloc_error(
-                        Layout::array::<i64>(new_cap).expect("list realloc layout"));
-                }
+                let new_data = grow_raw_buffer((*list_ptr).data as *mut u8, old_size, new_size) as *mut i64;
                 (*list_ptr).data = new_data;
                 (*list_ptr).cap = new_cap as u32;
-                heap.bytes_allocated += (new_cap - old_cap) * std::mem::size_of::<i64>();
+                heap.bytes_allocated += new_size - old_size;
             }
             let idx = (*list_ptr).len as usize;
             *(*list_ptr).data.add(idx) = val;

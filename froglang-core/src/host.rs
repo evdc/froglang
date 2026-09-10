@@ -9,6 +9,8 @@
 //! descriptor from an ordinary-looking Rust function; this module is what it
 //! expands into.
 
+use std::collections::HashMap;
+
 use crate::frontend::typeck::Type;
 use crate::runtime::host::FrogCtx;
 
@@ -161,6 +163,55 @@ impl<T: ToFrog> ToFrog for Vec<T> {
         // most one column and its scannability is `T`'s own.
         let ptr_mask: u64 = if crate::codegen::is_heap_ty(&T::frog_type()) { 1 } else { 0 };
         out[0] = ctx.alloc_list(&flat, stride, ptr_mask);
+    }
+}
+
+/// `HashMap<K, V>` ↔ `Dict<K, V>` — `Vec<T>`'s twin. **`K` must be one of
+/// `i64`/`f64`/`bool`/`String` (`Trait::Hash`'s four members) and single-
+/// slot** — unlike `Vec<T>`'s `T`, this can't be checked at compile time
+/// (there is no marker trait yet distinguishing a `Hash`-able frog key
+/// type from any other `ToFrog`/`FromFrog` impl), so passing e.g. a
+/// `HashMap<MyStruct, V>` compiles but produces a `Dict` codegen and the
+/// runtime can't actually index — same class of unchecked precondition
+/// `Result<T, E>`'s impl documents below.
+impl<K: FromFrog + std::hash::Hash + Eq, V: FromFrog> FromFrog for HashMap<K, V> {
+    fn frog_type() -> Type { Type::dict(K::frog_type(), V::frog_type()) }
+    fn from_frog(ctx: &FrogCtx, slots: &[i64]) -> Self {
+        let w = slots[0];
+        let kstride = K::SLOTS.max(1);
+        let vstride = V::SLOTS;
+        let len = ctx.dict_len(w);
+        (0..len)
+            .map(|i| {
+                let k_slots: Vec<i64> = (0..kstride).map(|s| ctx.dict_entry_slot(w, i, kstride, vstride, s)).collect();
+                let v_slots: Vec<i64> = (0..vstride).map(|s| ctx.dict_entry_slot(w, i, kstride, vstride, kstride + s)).collect();
+                (K::from_frog(ctx, &k_slots), V::from_frog(ctx, &v_slots))
+            })
+            .collect()
+    }
+}
+impl<K: ToFrog + std::hash::Hash + Eq, V: ToFrog> ToFrog for HashMap<K, V> {
+    const IS_PTR: bool = true;
+    fn frog_type() -> Type { Type::dict(K::frog_type(), V::frog_type()) }
+    fn to_frog(self, ctx: &mut FrogCtx, out: &mut [i64]) {
+        let kstride = K::SLOTS.max(1);
+        let vstride = V::SLOTS;
+        let mut flat: Vec<i64> = Vec::with_capacity(self.len() * (kstride + vstride));
+        for (k, v) in self {
+            let mut kbuf = vec![0i64; K::SLOTS];
+            k.to_frog(ctx, &mut kbuf);
+            flat.extend_from_slice(&kbuf);
+            let mut vbuf = vec![0i64; V::SLOTS];
+            v.to_frog(ctx, &mut vbuf);
+            flat.extend_from_slice(&vbuf);
+        }
+        // One bit each for the key and value columns — sound only because
+        // every `ToFrog` impl today is single-slot, exactly the
+        // assumption `Vec<T>`'s identical `ptr_mask` computation above
+        // already depends on.
+        let ptr_mask: u64 = (K::IS_PTR as u64) | ((V::IS_PTR as u64) << kstride);
+        let key_kind = crate::codegen::key_kind_of(&K::frog_type()) as u32;
+        out[0] = ctx.alloc_dict(&flat, kstride, vstride, ptr_mask, key_kind);
     }
 }
 

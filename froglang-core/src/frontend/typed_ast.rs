@@ -64,16 +64,25 @@ pub struct IterVia {
 pub enum PlaceSeg {
     Field(String),
     Index {
-        /// Already type-checked (unified against `Int`) and lowered —
-        /// evaluated once, at the point this step is reached.
+        /// Already type-checked (unified against the container's key/
+        /// index type) and lowered — evaluated once, at the point this
+        /// step is reached. `index.item.ty` is a `Dict`'s key type or
+        /// `Int` for a `List` — codegen reads it directly rather than
+        /// carrying a redundant copy here.
         index: TypedExprRef,
-        /// The indexed list's element type, resolved once by
-        /// `TypeChecker::lower_place_assign` — codegen needs it to lay
-        /// out the write (`struct_fields(elem_ty)`) but has no other way
-        /// to recover it, since a path's later segments (if this isn't
-        /// the last one) only know the element's *fields*, never its
-        /// whole type.
+        /// The indexed collection's element (List) or value (Dict) type,
+        /// resolved once by `TypeChecker::lower_place`/`lower_place_
+        /// assign` — codegen needs it to lay out the write
+        /// (`struct_fields(elem_ty)`) but has no other way to recover
+        /// it, since a path's later segments (if this isn't the last
+        /// one) only know the element's *fields*, never its whole type.
         elem_ty: Type,
+        /// Is the container a `Dict` rather than a `List`? Codegen has
+        /// no other way to tell at this step — `elem_ty` is the
+        /// *result* type either way, not the container's — so this
+        /// picks `frog_dict_insert`/`frog_dict_slot` vs
+        /// `frog_list_get`/`frog_list_set` at `emit_place_ref`.
+        is_dict: bool,
     },
 }
 
@@ -227,6 +236,12 @@ pub enum TypedExprKind {
 
     /// Homogeneous list (parsed as `[a, b, c]`, inferred as `List<T>`).
     List(Vec<Spanned<TypedExpr>>),
+
+    /// Dict literal (parsed as `["k": v, ...]`/`[:]`, inferred as
+    /// `Dict<K, V>`), in source (insertion) order — `plans/DATA.md`
+    /// requires deterministic print order, and this is also the order
+    /// entries are inserted into `runtime::gc::FrogDict` at construction.
+    Dict(Vec<(Spanned<TypedExpr>, Spanned<TypedExpr>)>),
 
     Block(Vec<Spanned<TypedExpr>>),
 

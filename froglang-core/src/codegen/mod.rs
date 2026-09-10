@@ -11,7 +11,7 @@ use crate::frontend::liveness;
 use crate::frontend::tokens::{Span, Spanned, Token};
 use crate::frontend::typed_ast::{Arg, IterVia, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
-use crate::runtime::{ffi, gc};
+use crate::runtime::{ffi, gc, dict};
 use crate::runtime::gc::{FrogList, FrogVariant};
 
 /// One entry per top-level `func`/lambda declared by `compile_entry`'s Pass
@@ -126,7 +126,7 @@ struct Ctx<'a> {
 /// scalar columns are labelled `Type::Int` and are deliberately excluded —
 /// a raw `Int` carries no tag bits and must never be scanned).
 pub fn is_heap_ty(ty: &Type) -> bool {
-    matches!(ty, Type::Str | Type::Union(_)) || ty.is_list()
+    matches!(ty, Type::Str | Type::Union(_)) || ty.is_list() || ty.is_dict()
 }
 
 /// The largest number of members a union can have and still be laid out
@@ -207,7 +207,7 @@ fn union_is_recursive(members: &[Type], structs: &StructDefs) -> bool {
 /// a boxed union's word may be an immediate (`(t << 3) | 7`). Overlaying a
 /// second tag on either corrupts it — RUNTIME.md's second open question.
 fn overlay_safe(leaf_ty: &Type) -> bool {
-    matches!(leaf_ty, Type::Str) || leaf_ty.is_list()
+    matches!(leaf_ty, Type::Str) || leaf_ty.is_list() || leaf_ty.is_dict()
 }
 
 /// Slot layout of an inline union (`union_is_inline`).
@@ -844,9 +844,9 @@ fn shared_flag_offset() -> i32 {
 /// branch.
 ///
 /// `val` must be a plain (untagged, non-null) heap pointer. Every caller
-/// holds a value of exactly `Type::List`, which is never tagged (only a
-/// union's word carries tag bits) and never null (`alloc_list` always
-/// returns an object, even for `[]`).
+/// holds a `List` or `Dict` value, neither ever tagged (only a union's
+/// word carries tag bits) nor ever null (`alloc_list`/`alloc_dict` always
+/// return an object, even for `[]`/`[:]`).
 fn emit_mark_shared(bcx: &mut FunctionBuilder, val: Value) {
     let one = bcx.ins().iconst(types::I8, 1);
     bcx.ins().store(heap_mem(), one, val, shared_flag_offset());
@@ -870,7 +870,7 @@ fn emit_mark_shared(bcx: &mut FunctionBuilder, val: Value) {
 /// a byte store, which is the whole reason this is affordable now.
 fn mark_shared_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: &[Value], structs: &StructDefs) {
     for (v, (_, lty)) in vals.iter().zip(struct_fields(ty, structs).iter()) {
-        if lty.is_list() {
+        if lty.is_list() || lty.is_dict() {
             emit_mark_shared(bcx, *v);
         }
     }
@@ -1453,6 +1453,108 @@ fn print_list(elem_ty: &Type, list_val: Value, bcx: &mut FunctionBuilder, ctx: &
     print_fragment("]", bcx, ctx);
 }
 
+/// Print a dict as `["k": v, ...]`, in insertion order — see `FrogDict`'s
+/// doc comment for why that's just entries `0..len` with no tombstone
+/// skipping. Mirrors `print_list` exactly, just with a `kstride`/`vstride`
+/// split and a `": "` between each pair's key and value.
+fn print_dict(key_ty: &Type, val_ty: &Type, dict_val: Value, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
+    print_fragment("[", bcx, ctx);
+
+    let key_leafs = struct_fields(key_ty, ctx.structs);
+    let val_leafs = struct_fields(val_ty, ctx.structs);
+    let kstride = key_leafs.len().max(1) as i64;
+
+    let len_callee = ctx.module.declare_func_in_func(ctx.func_ids["frog_dict_len"], bcx.func);
+    let len_call = bcx.ins().call(len_callee, &[dict_val]);
+    let len_val = bcx.inst_results(len_call)[0];
+
+    // `[:]` for the empty dict specifically — disambiguates it from an
+    // empty list/tuple at the notation level, matching the literal
+    // syntax (`plans/DATA.md`'s "print order must be deterministic").
+    let is_empty = bcx.ins().icmp_imm_s(IntCC::Equal, len_val, 0);
+    let empty_bb = bcx.create_block();
+    let nonempty_bb = bcx.create_block();
+    let exit_bb = bcx.create_block();
+    bcx.ins().brif(is_empty, empty_bb, &[], nonempty_bb, &[]);
+
+    bcx.switch_to_block(empty_bb);
+    bcx.seal_block(empty_bb);
+    print_fragment(":", bcx, ctx);
+    bcx.ins().jump(exit_bb, &[]);
+
+    bcx.switch_to_block(nonempty_bb);
+    bcx.seal_block(nonempty_bb);
+
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    let loop_exit_bb = bcx.create_block();
+    bcx.append_block_param(header_bb, types::I64);
+
+    let zero = bcx.ins().iconst(types::I64, 0);
+    bcx.ins().jump(header_bb, &[BlockArg::from(zero)]);
+
+    bcx.switch_to_block(header_bb);
+    let i = bcx.block_params(header_bb)[0];
+    let in_range = bcx.ins().icmp(IntCC::SignedLessThan, i, len_val);
+    bcx.ins().brif(in_range, body_bb, &[], loop_exit_bb, &[]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+
+    let sep_bb  = bcx.create_block();
+    let elem_bb = bcx.create_block();
+    let is_first = bcx.ins().icmp_imm_s(IntCC::Equal, i, 0);
+    bcx.ins().brif(is_first, elem_bb, &[], sep_bb, &[]);
+    bcx.switch_to_block(sep_bb);
+    bcx.seal_block(sep_bb);
+    print_fragment(", ", bcx, ctx);
+    bcx.ins().jump(elem_bb, &[]);
+    bcx.switch_to_block(elem_bb);
+    bcx.seal_block(elem_bb);
+
+    let slot_id = ctx.func_ids["frog_dict_slot"];
+    let mut key_vals = Vec::with_capacity(key_leafs.len());
+    for leaf_idx in 0..key_leafs.len() {
+        let callee = ctx.module.declare_func_in_func(slot_id, bcx.func);
+        let slot_val = bcx.ins().iconst(types::I64, leaf_idx as i64);
+        let call = bcx.ins().call(callee, &[dict_val, i, slot_val]);
+        let raw = bcx.inst_results(call)[0];
+        key_vals.push(from_i64_repr(bcx, &key_leafs[leaf_idx].1, raw));
+    }
+    let mut val_vals = Vec::with_capacity(val_leafs.len());
+    for leaf_idx in 0..val_leafs.len() {
+        let callee = ctx.module.declare_func_in_func(slot_id, bcx.func);
+        let slot_val = bcx.ins().iconst(types::I64, kstride + leaf_idx as i64);
+        let call = bcx.ins().call(callee, &[dict_val, i, slot_val]);
+        let raw = bcx.inst_results(call)[0];
+        val_vals.push(from_i64_repr(bcx, &val_leafs[leaf_idx].1, raw));
+    }
+    // Rooting reasoning identical to `print_list`'s: nothing `print_value`
+    // emits allocates today, but the invariant is whole-program regardless.
+    let key_leaf_tys: Vec<Type> = key_leafs.iter().map(|(_, t)| t.clone()).collect();
+    let val_leaf_tys: Vec<Type> = val_leafs.iter().map(|(_, t)| t.clone()).collect();
+    declare_gc_leaves(bcx, &key_vals, &key_leaf_tys);
+    declare_gc_leaves(bcx, &val_vals, &val_leaf_tys);
+
+    let mut kcursor = 0;
+    print_value(key_ty, &key_vals, &mut kcursor, bcx, ctx);
+    print_fragment(": ", bcx, ctx);
+    let mut vcursor = 0;
+    print_value(val_ty, &val_vals, &mut vcursor, bcx, ctx);
+
+    let i_next = bcx.ins().iadd_imm_s(i, 1);
+    bcx.ins().jump(header_bb, &[BlockArg::from(i_next)]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(loop_exit_bb);
+    bcx.seal_block(loop_exit_bb);
+    bcx.ins().jump(exit_bb, &[]);
+
+    bcx.switch_to_block(exit_bb);
+    bcx.seal_block(exit_bb);
+    print_fragment("]", bcx, ctx);
+}
+
 /// Print one value without a trailing newline. Structs are represented as a
 /// sequence of flattened leaf values, so this recursively consumes that
 /// sequence according to the declared field layout.
@@ -1491,6 +1593,13 @@ fn print_value(ty: &Type, values: &[Value], cursor: &mut usize, bcx: &mut Functi
         let list_val = values[*cursor];
         *cursor += 1;
         print_list(&inner, list_val, bcx, ctx);
+        return;
+    }
+    if let Some((k, v)) = ty.as_dict_kv() {
+        let (k, v) = (k.clone(), v.clone());
+        let dict_val = values[*cursor];
+        *cursor += 1;
+        print_dict(&k, &v, dict_val, bcx, ctx);
         return;
     }
     match ty {
@@ -1787,6 +1896,103 @@ fn eq_list(elem_ty: &Type, lv: Value, rv: Value, bcx: &mut FunctionBuilder, ctx:
     bcx.block_params(merge_bb)[0]
 }
 
+/// `a == b` for `Dict<key_ty, val_ty>` — order-independent by construction:
+/// walks `a`'s entries (`0..len`, source/insertion order, but the order
+/// doesn't matter to the result) and for each, looks its key up in `b`
+/// directly (`frog_dict_find`) rather than comparing position-for-position
+/// the way `eq_list` does. Same length first, same reasoning as `eq_list`.
+fn eq_dict(key_ty: &Type, val_ty: &Type, lv: Value, rv: Value, bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
+    let key_leafs = struct_fields(key_ty, ctx.structs);
+    let val_leafs = struct_fields(val_ty, ctx.structs);
+    let kstride = key_leafs.len().max(1) as i64;
+    let len_id = ctx.func_ids["frog_dict_len"];
+
+    let len_callee = ctx.module.declare_func_in_func(len_id, bcx.func);
+    let l_len_call = bcx.ins().call(len_callee, &[lv]);
+    let l_len = bcx.inst_results(l_len_call)[0];
+    let r_len_call = bcx.ins().call(len_callee, &[rv]);
+    let r_len = bcx.inst_results(r_len_call)[0];
+
+    let merge_bb = bcx.create_block();
+    bcx.append_block_param(merge_bb, types::I8);
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    bcx.append_block_param(header_bb, types::I64);
+
+    let same_len = bcx.ins().icmp(IntCC::Equal, l_len, r_len);
+    let no = bcx.ins().iconst(types::I8, 0);
+    let zero = bcx.ins().iconst(types::I64, 0);
+    bcx.ins().brif(same_len, header_bb, &[BlockArg::from(zero)], merge_bb, &[BlockArg::from(no)]);
+
+    bcx.switch_to_block(header_bb);
+    let i = bcx.block_params(header_bb)[0];
+    let in_range = bcx.ins().icmp(IntCC::SignedLessThan, i, l_len);
+    let yes = bcx.ins().iconst(types::I8, 1);
+    bcx.ins().brif(in_range, body_bb, &[], merge_bb, &[BlockArg::from(yes)]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+
+    let slot_id = ctx.func_ids["frog_dict_slot"];
+    let mut key_vals = Vec::with_capacity(key_leafs.len());
+    let mut key_wires = Vec::with_capacity(key_leafs.len());
+    for leaf_idx in 0..key_leafs.len() {
+        let callee = ctx.module.declare_func_in_func(slot_id, bcx.func);
+        let slot_val = bcx.ins().iconst(types::I64, leaf_idx as i64);
+        let call = bcx.ins().call(callee, &[lv, i, slot_val]);
+        let raw = bcx.inst_results(call)[0];
+        key_wires.push(raw);
+        key_vals.push(from_i64_repr(bcx, &key_leafs[leaf_idx].1, raw));
+    }
+    let key_leaf_tys: Vec<Type> = key_leafs.iter().map(|(_, t)| t.clone()).collect();
+    declare_gc_leaves(bcx, &key_vals, &key_leaf_tys);
+
+    // Only v1's single-leaf scalar/`Str` keys are supported (`Trait::Hash`),
+    // so `key_wires[0]` is always the whole key — no `to_i64_repr` needed,
+    // `frog_dict_slot`/`from_i64_repr`/`to_i64_repr` round-trip the wire
+    // format exactly.
+    let find_id = ctx.func_ids["frog_dict_find"];
+    let find_callee = ctx.module.declare_func_in_func(find_id, bcx.func);
+    let find_call = bcx.ins().call(find_callee, &[rv, key_wires[0]]);
+    let r_entry = bcx.inst_results(find_call)[0];
+
+    let neg_one = bcx.ins().iconst(types::I64, -1);
+    let found = bcx.ins().icmp(IntCC::NotEqual, r_entry, neg_one);
+    let has_val_bb = bcx.create_block();
+    let no2 = bcx.ins().iconst(types::I8, 0);
+    bcx.ins().brif(found, has_val_bb, &[], merge_bb, &[BlockArg::from(no2)]);
+
+    bcx.switch_to_block(has_val_bb);
+    bcx.seal_block(has_val_bb);
+    let mut l_vals = Vec::with_capacity(val_leafs.len());
+    let mut r_vals = Vec::with_capacity(val_leafs.len());
+    for leaf_idx in 0..val_leafs.len() {
+        let l_callee = ctx.module.declare_func_in_func(slot_id, bcx.func);
+        let l_slot = bcx.ins().iconst(types::I64, kstride + leaf_idx as i64);
+        let l_call = bcx.ins().call(l_callee, &[lv, i, l_slot]);
+        l_vals.push(from_i64_repr(bcx, &val_leafs[leaf_idx].1, bcx.inst_results(l_call)[0]));
+
+        let r_callee = ctx.module.declare_func_in_func(slot_id, bcx.func);
+        let r_slot = bcx.ins().iconst(types::I64, kstride + leaf_idx as i64);
+        let r_call = bcx.ins().call(r_callee, &[rv, r_entry, r_slot]);
+        r_vals.push(from_i64_repr(bcx, &val_leafs[leaf_idx].1, bcx.inst_results(r_call)[0]));
+    }
+    let val_leaf_tys: Vec<Type> = val_leafs.iter().map(|(_, t)| t.clone()).collect();
+    declare_gc_leaves(bcx, &l_vals, &val_leaf_tys);
+    declare_gc_leaves(bcx, &r_vals, &val_leaf_tys);
+    let mut cursor = 0;
+    let eq = eq_value(val_ty, &l_vals, &r_vals, &mut cursor, bcx, ctx);
+
+    let i_next = bcx.ins().iadd_imm_s(i, 1);
+    let no3 = bcx.ins().iconst(types::I8, 0);
+    bcx.ins().brif(eq, header_bb, &[BlockArg::from(i_next)], merge_bb, &[BlockArg::from(no3)]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(merge_bb);
+    bcx.seal_block(merge_bb);
+    bcx.block_params(merge_bb)[0]
+}
+
 /// `x in xs` — scans `haystack` (a `List<elem_ty>`) for an element equal to
 /// `needle` (`needle`'s already-flattened leaves), short-circuiting on the
 /// first match. Mirrors `eq_list`'s loop skeleton, but compares one fixed
@@ -1958,6 +2164,12 @@ fn eq_value(ty: &Type, l: &[Value], r: &[Value], cursor: &mut usize, bcx: &mut F
         *cursor += 1;
         return eq_list(&inner, lv, rv, bcx, ctx);
     }
+    if let Some((k, v)) = ty.as_dict_kv() {
+        let (k, v) = (k.clone(), v.clone());
+        let (lv, rv) = (l[*cursor], r[*cursor]);
+        *cursor += 1;
+        return eq_dict(&k, &v, lv, rv, bcx, ctx);
+    }
     let (lv, rv) = (l.get(*cursor).copied(), r.get(*cursor).copied());
     match ty {
         Type::Str => {
@@ -2063,8 +2275,12 @@ enum PlaceRef {
     /// heap at all. A struct is a flat set of named bindings, so a pure
     /// field path is a rebind, not a store.
     Vars(String),
-    /// Slots `offset..` of element `index` of the heap-allocated `list`.
-    Slot { list: Value, index: Value, offset: usize },
+    /// Slots `offset..` of element/entry `index` of the heap-allocated
+    /// `list` — a `List` element index or a `Dict` entry index
+    /// (`is_dict`), the latter already resolved from a raw key by
+    /// `emit_place_ref` (`frog_dict_insert` for the final leaf,
+    /// `emit_dict_find_or_abort` for every step above it).
+    Slot { list: Value, index: Value, offset: usize, is_dict: bool },
 }
 
 /// Walk a place, unsharing every list *above* its leaf — `MUTABILITY.md`
@@ -2097,7 +2313,7 @@ fn emit_place_ref(
     let Some(last) = path.iter().rposition(|s| matches!(s, PlaceSeg::Index { .. })) else {
         return PlaceRef::Vars(var_key(root, &dotted_fields(path)));
     };
-    let PlaceSeg::Index { index, elem_ty } = &path[last] else {
+    let PlaceSeg::Index { index, elem_ty, is_dict } = &path[last] else {
         unreachable!("`last` was found by matching `Index`")
     };
 
@@ -2106,8 +2322,9 @@ fn emit_place_ref(
 
     // Fields before the first `[index]` — the whole run, when there is no
     // index — name one flattened leaf `Variable` holding the outermost
-    // list. It was declared when `root` was bound: a `List`-typed leaf
-    // never recurses further in `struct_fields`, so this names exactly one.
+    // list. It was declared when `root` was bound: a `List`/`Dict`-typed
+    // leaf never recurses further in `struct_fields`, so this names
+    // exactly one.
     let list_key = var_key(root, &dotted_fields(&segs[..first.unwrap_or(segs.len())]));
     let list_var = *vars.get(&list_key)
         .unwrap_or_else(|| panic!("place root '{}' is unbound in codegen", list_key));
@@ -2115,25 +2332,95 @@ fn emit_place_ref(
     cur = emit_unshare(bcx, ctx, cur);
     bcx.def_var(list_var, cur);
 
-    // Every further `[index]` step reads a nested list out of its parent,
-    // unshares it, and writes it back. A field run after an index names a
-    // slot within that element's own flattened layout (`grid[y].cells[x]`),
-    // so it contributes an offset, exactly as the trailing run does below.
+    // Every further `[index]` step reads a nested list/dict out of its
+    // parent, unshares it, and writes it back. A field run after an index
+    // names a slot within that element's own flattened layout
+    // (`grid[y].cells[x]`), so it contributes an offset, exactly as the
+    // trailing run does below. A `Dict` step reads an *existing* entry
+    // (`emit_dict_find_or_abort` — the same abort a missing `List` index
+    // gets, `frog_list_get`'s own bounds check), never creates one: only
+    // the trailing leaf's own `d[k] = v` does that.
     let mut rest = first.map_or(&[][..], |i| &segs[i..]);
-    while let Some((PlaceSeg::Index { index, elem_ty }, tail)) = rest.split_first() {
+    while let Some((PlaceSeg::Index { index, elem_ty, is_dict }, tail)) = rest.split_first() {
         let next_index = tail.iter().position(|s| matches!(s, PlaceSeg::Index { .. })).unwrap_or(tail.len());
-        let offset = field_run_offset(elem_ty, &tail[..next_index], ctx);
+        // For a `Dict` step, `field_run_offset` gives an offset into the
+        // *value* type's own leaves (0-based) — the entry's value leaves
+        // start only after its `kstride` key leaves (`FrogDict`'s doc
+        // comment), so that has to be added on top. A `List` step has no
+        // such split (`kstride` is 0), matching today's behavior exactly.
+        let offset = field_run_offset(elem_ty, &tail[..next_index], ctx)
+            + if *is_dict { dict_kstride(&index.item.ty, ctx) } else { 0 };
         let idx_val = compile_expr(index, bcx, vars, ctx);
-        let inner = emit_slot_load(bcx, ctx, cur, idx_val, offset);
+        let idx_val = if *is_dict {
+            let key_wire = to_i64_repr(bcx, &index.item.ty, idx_val);
+            emit_dict_find_or_abort(bcx, ctx, cur, key_wire)
+        } else {
+            idx_val
+        };
+        let inner = emit_slot_load(bcx, ctx, cur, idx_val, offset, *is_dict);
         let inner = emit_unshare_nested(bcx, ctx, inner, 2);
-        emit_slot_store(bcx, ctx, cur, idx_val, offset, inner);
+        emit_slot_store(bcx, ctx, cur, idx_val, offset, inner, *is_dict);
         cur = inner;
         rest = &tail[next_index..];
     }
 
-    let index = compile_expr(index, bcx, vars, ctx);
-    let offset = field_run_offset(elem_ty, &path[last + 1..], ctx);
-    PlaceRef::Slot { list: cur, index, offset }
+    let idx_val = compile_expr(index, bcx, vars, ctx);
+    let idx_val = if *is_dict {
+        // The trailing leaf: `d[k] = v` inserts if `k` is absent —
+        // `frog_dict_insert`, not `emit_dict_find_or_abort`. A *read*
+        // through this same place (`place_load`, e.g. `d[k] += 1`) still
+        // goes through the now-inserted (zero-valued) entry, matching
+        // how `xs[i] += 1` already requires `i` in bounds first.
+        let key_wire = to_i64_repr(bcx, &index.item.ty, idx_val);
+        let insert_id = ctx.func_ids["frog_dict_insert"];
+        let callee = ctx.module.declare_func_in_func(insert_id, bcx.func);
+        let call = bcx.ins().call(callee, &[cur, key_wire]);
+        bcx.inst_results(call)[0]
+    } else {
+        idx_val
+    };
+    let offset = field_run_offset(elem_ty, &path[last + 1..], ctx)
+        + if *is_dict { dict_kstride(&index.item.ty, ctx) } else { 0 };
+    PlaceRef::Slot { list: cur, index: idx_val, offset, is_dict: *is_dict }
+}
+
+/// A `Dict` key type's leaf width — v1 keys are exactly the four
+/// `Trait::Hash` scalars, always one leaf, but this stays a real
+/// computation (not a bare `1`) so the deferred structural-key widening
+/// (`Trait::Hash`'s doc comment) needs no change here.
+fn dict_kstride(key_ty: &Type, ctx: &Ctx) -> usize {
+    struct_fields(key_ty, ctx.structs).len().max(1)
+}
+
+/// `frog_dict_find(dict, key_wire)`, aborting (`frog_dict_key_missing`) if
+/// absent. The read half of a `Dict` place step — a non-final `[key]` in a
+/// path reads an existing entry, it never creates one (that's only ever
+/// the path's own trailing leaf, via `frog_dict_insert` — see
+/// `emit_place_ref`). Also the codegen `Index` *expression* (`d[k]`,
+/// non-place) uses this same shape.
+fn emit_dict_find_or_abort(bcx: &mut FunctionBuilder, ctx: &mut Ctx, dict: Value, key_wire: Value) -> Value {
+    let find_id = ctx.func_ids["frog_dict_find"];
+    let find_callee = ctx.module.declare_func_in_func(find_id, bcx.func);
+    let find_call = bcx.ins().call(find_callee, &[dict, key_wire]);
+    let entry = bcx.inst_results(find_call)[0];
+
+    let neg_one = bcx.ins().iconst(types::I64, -1);
+    let missing = bcx.ins().icmp(IntCC::Equal, entry, neg_one);
+    let missing_block = bcx.create_block();
+    let found_block = bcx.create_block();
+    bcx.append_block_param(found_block, types::I64);
+    bcx.ins().brif(missing, missing_block, &[], found_block, &[BlockArg::from(entry)]);
+
+    bcx.switch_to_block(missing_block);
+    bcx.seal_block(missing_block);
+    let key_missing_id = ctx.func_ids["frog_dict_key_missing"];
+    let key_missing_callee = ctx.module.declare_func_in_func(key_missing_id, bcx.func);
+    bcx.ins().call(key_missing_callee, &[dict, key_wire]);
+    bcx.ins().trap(TrapCode::user(4).expect("nonzero trap code"));
+
+    bcx.switch_to_block(found_block);
+    bcx.seal_block(found_block);
+    bcx.block_params(found_block)[0]
 }
 
 /// The flattened-leaf offset a run of `.field` steps names within `ty`.
@@ -2142,9 +2429,14 @@ fn field_run_offset(ty: &Type, segs: &[PlaceSeg], ctx: &Ctx) -> usize {
     if fields.is_empty() { 0 } else { dotted_leaf_range(ty, &fields, ctx.structs).0 }
 }
 
-fn emit_slot_load(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, index: Value, offset: usize) -> Value {
+/// `index` is a `List` element index or a `Dict` entry index (`is_dict`)
+/// — the caller resolves a `Dict` key to an entry index before calling
+/// this (`emit_place_ref`/`emit_dict_find_or_abort`/`frog_dict_insert`),
+/// since that resolution can insert or abort, which this uniform
+/// (container, position, offset) shape has no room for.
+fn emit_slot_load(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, index: Value, offset: usize, is_dict: bool) -> Value {
     let off_val = bcx.ins().iconst(types::I64, offset as i64);
-    let get_id = ctx.func_ids["frog_list_get"];
+    let get_id = ctx.func_ids[if is_dict { "frog_dict_slot" } else { "frog_list_get" }];
     let callee = ctx.module.declare_func_in_func(get_id, bcx.func);
     let call = bcx.ins().call(callee, &[list, index, off_val]);
     let raw = bcx.inst_results(call)[0];
@@ -2152,9 +2444,9 @@ fn emit_slot_load(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, index: 
     raw
 }
 
-fn emit_slot_store(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, index: Value, offset: usize, val: Value) {
+fn emit_slot_store(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, index: Value, offset: usize, val: Value, is_dict: bool) {
     let off_val = bcx.ins().iconst(types::I64, offset as i64);
-    let set_id = ctx.func_ids["frog_list_set"];
+    let set_id = ctx.func_ids[if is_dict { "frog_dict_set_slot" } else { "frog_list_set" }];
     let callee = ctx.module.declare_func_in_func(set_id, bcx.func);
     bcx.ins().call(callee, &[list, index, off_val, val]);
 }
@@ -2175,9 +2467,9 @@ fn place_load(
                 bcx.use_var(var)
             })
             .collect(),
-        PlaceRef::Slot { list, index, offset } => leafs.iter().enumerate()
+        PlaceRef::Slot { list, index, offset, is_dict } => leafs.iter().enumerate()
             .map(|(i, (_, lty))| {
-                let raw = emit_slot_load(bcx, ctx, *list, *index, offset + i);
+                let raw = emit_slot_load(bcx, ctx, *list, *index, offset + i, *is_dict);
                 from_i64_repr(bcx, lty, raw)
             })
             .collect(),
@@ -2201,20 +2493,28 @@ fn place_store(
                 bcx.def_var(var, *v);
             }
         },
-        PlaceRef::Slot { list, index, offset } => {
+        PlaceRef::Slot { list, index, offset, is_dict } => {
             for (i, (v, (_, lty))) in vals.iter().zip(leafs.iter()).enumerate() {
                 let raw = to_i64_repr(bcx, lty, *v);
-                emit_slot_store(bcx, ctx, *list, *index, offset + i, raw);
+                emit_slot_store(bcx, ctx, *list, *index, offset + i, raw, *is_dict);
             }
         },
     }
 }
 
-/// Resolve a place to the `List` at its leaf, unshared and ready to be
-/// mutated in place — `push`'s receiver. The unshared pointer is written
+/// Resolve a place to the mutable-builtin-container value at its leaf
+/// (`List` or `Dict`), unshared and ready to be mutated in place — `push`'s
+/// and `remove`'s receiver respectively. The unshared pointer is written
 /// back to the place, so the mutation is reachable from the root.
-fn emit_mutable_list(
+///
+/// `placeholder_ty` only stands in for `struct_fields`'s benefit: a `List`
+/// or `Dict` leaf is always exactly one flattened leaf regardless of its
+/// real element/key/value types, so callers pass `Type::list(Type::Int)`
+/// or `Type::dict(Type::Int, Type::Int)` — any `List`/`Dict` instantiation
+/// resolves to the same one-leaf shape here.
+fn emit_mutable_container(
     place: &Place,
+    placeholder_ty: &Type,
     bcx: &mut FunctionBuilder,
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
@@ -2241,10 +2541,10 @@ fn emit_mutable_list(
         PlaceRef::Vars(_) if from_mut_param => 2,
         PlaceRef::Vars(_) => 1,
     };
-    let list = place_load(&pref, &Type::list(Type::Int), bcx, vars, ctx)[0];
-    let list = emit_unshare_nested(bcx, ctx, list, allowed);
-    place_store(&pref, &Type::list(Type::Int), &[list], bcx, vars, ctx);
-    list
+    let container = place_load(&pref, placeholder_ty, bcx, vars, ctx)[0];
+    let container = emit_unshare_nested(bcx, ctx, container, allowed);
+    place_store(&pref, placeholder_ty, &[container], bcx, vars, ctx);
+    container
 }
 
 /// Codegen for `TypedExprKind::PlaceAssign` — resolve the place, store the
@@ -2343,6 +2643,34 @@ fn compile_expr_multi(
 
         TypedExprKind::Call { callable, args } => compile_call(callable, args, bcx, vars, ctx),
 
+        TypedExprKind::Index { target, index } if target.item.ty.is_dict() => {
+            let dict_val = compile_expr_transient(target, bcx, vars, ctx);
+            let key_ty = target.item.ty.as_dict_kv().expect("checked is_dict above").0.clone();
+            let idx_val = compile_expr(index, bcx, vars, ctx);
+            let key_wire = to_i64_repr(bcx, &key_ty, idx_val);
+
+            // `d[k]` panics on a missing key, mirroring `xs[i]` — see
+            // `frog_dict_key_missing`'s doc comment. `.get` (`finish_get`)
+            // is the non-panicking form.
+            let entry = emit_dict_find_or_abort(bcx, ctx, dict_val, key_wire);
+
+            let leafs = struct_fields(&expr.item.ty, ctx.structs);
+            let kstride = target.item.ty.as_dict_kv().map(|(k, _)| struct_fields(k, ctx.structs).len().max(1)).unwrap_or(1);
+            let slot_id = ctx.func_ids["frog_dict_slot"];
+            let mut results = Vec::with_capacity(leafs.len());
+            for (i, (_, lty)) in leafs.iter().enumerate() {
+                let callee = ctx.module.declare_func_in_func(slot_id, bcx.func);
+                let slot_val = bcx.ins().iconst(types::I64, (kstride + i) as i64);
+                let call = bcx.ins().call(callee, &[dict_val, entry, slot_val]);
+                let raw = bcx.inst_results(call)[0];
+                results.push(from_i64_repr(bcx, lty, raw));
+            }
+            let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
+            declare_gc_leaves(bcx, &results, &leaf_tys);
+            mark_shared_extracted(bcx, &expr.item.ty, &results, ctx.structs);
+            results
+        },
+
         TypedExprKind::Index { target, index } => {
             let list_val = compile_expr_transient(target, bcx, vars, ctx);
             let idx_val  = compile_expr(index, bcx, vars, ctx);
@@ -2430,6 +2758,8 @@ fn compile_expr_multi(
         },
 
         TypedExprKind::List(elems) => compile_list_lit(&expr.item.ty, elems, bcx, vars, ctx),
+
+        TypedExprKind::Dict(pairs) => compile_dict_lit(&expr.item.ty, pairs, bcx, vars, ctx),
 
         TypedExprKind::ForLoop { var, iterable, cond, body, iter_via } => {
             compile_for_loop(var, iterable, iter_via, cond, body, LoopOutput::Discard, bcx, vars, ctx);
@@ -2594,6 +2924,25 @@ fn negate_if_ne(op: &Token, eq: Value, bcx: &mut FunctionBuilder) -> Value {
 }
 
 fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    // ── Dict membership (`k in d`) — must short-circuit before the `Str`
+    // dispatch just below: `left` (the key) may itself be a `Str`, which
+    // that guard would otherwise catch first and misread as
+    // `frog_str_contains(key, d)`. No `eq_value`/loop needed here, the
+    // whole point of the hash index — `left` is a v1 `Trait::Hash`
+    // scalar, always exactly one leaf.
+    if *op == Token::In && right.item.ty.is_dict() {
+        let key_ty = right.item.ty.as_dict_kv().expect("is_dict implies key/value types").0.clone();
+        let lv = compile_expr(left, bcx, vars, ctx);
+        let key_wire = to_i64_repr(bcx, &key_ty, lv);
+        let rv = compile_expr_transient(right, bcx, vars, ctx);
+        let find_id = ctx.func_ids["frog_dict_find"];
+        let callee = ctx.module.declare_func_in_func(find_id, bcx.func);
+        let call = bcx.ins().call(callee, &[rv, key_wire]);
+        let entry = bcx.inst_results(call)[0];
+        let neg_one = bcx.ins().iconst(types::I64, -1);
+        return vec![bcx.ins().icmp(IntCC::NotEqual, entry, neg_one)];
+    }
+
     // ── String operations (must short-circuit before numeric path) ──
     if left.item.ty == Type::Str {
         let lv = compile_expr(left,  bcx, vars, ctx);
@@ -2676,6 +3025,9 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
         return vec![list_contains(&elem, &lv, rv, bcx, ctx)];
     }
 
+    // Dict membership (`k in d`) is handled at the very top of this
+    // function, before the `Str` dispatch above — see that block's comment.
+
     // ── List equality (structural — see `eq_list`) ──────────────────
     //
     // Reached both from a source-level `[1, 2] == [1, 2]` and from a
@@ -2691,6 +3043,16 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
         let lv = compile_expr_transient(left,  bcx, vars, ctx);
         let rv = compile_expr_transient(right, bcx, vars, ctx);
         let eq = eq_list(&elem, lv, rv, bcx, ctx);
+        return vec![negate_if_ne(op, eq, bcx)];
+    }
+
+    // ── Dict equality (structural, order-independent — see `eq_dict`) ──
+    if left.item.ty.is_dict() && matches!(op, Token::EqEq | Token::NotEq) {
+        let (key_ty, val_ty) = left.item.ty.as_dict_kv().expect("is_dict implies key/value types");
+        let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
+        let lv = compile_expr_transient(left,  bcx, vars, ctx);
+        let rv = compile_expr_transient(right, bcx, vars, ctx);
+        let eq = eq_dict(&key_ty, &val_ty, lv, rv, bcx, ctx);
         return vec![negate_if_ne(op, eq, bcx)];
     }
 
@@ -2991,11 +3353,28 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
         let (Arg::Mut(place), Some(v_arg)) = (&args[0], args[1].value()) else {
             unreachable!("typeck's `finish_push` builds push's receiver as `Arg::Mut`")
         };
-        let list_val = emit_mutable_list(place, bcx, vars, ctx);
+        let list_val = emit_mutable_container(place, &Type::list(Type::Int), bcx, vars, ctx);
         let leafs = struct_fields(&v_arg.item.ty, ctx.structs);
         let vvals = compile_expr_multi(v_arg, bcx, vars, ctx);
         // See `compile_list_lit`'s identical push via `push_element`.
         push_element(bcx, ctx, list_val, &vvals, &leafs);
+        return vec![bcx.ins().iconst(types::I64, 0)];
+    }
+
+    // `__dict_remove_entry(mut d, k)` — the mutating half of `.remove`
+    // (`typeck::finish_remove`, never spelled in source); the value it
+    // returns has already been read out by the caller's synthesized
+    // desugaring before this runs.
+    if func_name == "__dict_remove_entry" {
+        let (Arg::Mut(place), Some(k_arg)) = (&args[0], args[1].value()) else {
+            unreachable!("typeck's `finish_remove` builds this call's receiver as `Arg::Mut`")
+        };
+        let dict_val = emit_mutable_container(place, &Type::dict(Type::Int, Type::Int), bcx, vars, ctx);
+        let key_val = compile_expr(k_arg, bcx, vars, ctx);
+        let key_wire = to_i64_repr(bcx, &k_arg.item.ty, key_val);
+        let remove_id = ctx.func_ids["frog_dict_remove"];
+        let callee = ctx.module.declare_func_in_func(remove_id, bcx.func);
+        bcx.ins().call(callee, &[dict_val, key_wire]);
         return vec![bcx.ins().iconst(types::I64, 0)];
     }
 
@@ -3051,6 +3430,13 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
             print_fragment("\n", bcx, ctx);
             return vec![bcx.ins().iconst(types::I64, 0)];
         }
+        if let Some((k, v)) = arg.item.ty.as_dict_kv() {
+            let (k, v) = (k.clone(), v.clone());
+            let dict_val = compile_expr_transient(arg, bcx, vars, ctx);
+            print_dict(&k, &v, dict_val, bcx, ctx);
+            print_fragment("\n", bcx, ctx);
+            return vec![bcx.ins().iconst(types::I64, 0)];
+        }
         let arg_val = compile_expr(arg, bcx, vars, ctx);
         let rt_name = match &arg.item.ty {
             Type::Str => "print",
@@ -3080,6 +3466,8 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
         let arg_val = compile_expr_transient(arg, bcx, vars, ctx);
         let rt_name = if arg.item.ty.is_list() {
             "frog_list_len"
+        } else if arg.item.ty.is_dict() {
+            "frog_dict_len"
         } else {
             match &arg.item.ty {
                 Type::Str => "frog_str_len",
@@ -3106,6 +3494,17 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
         let call   = bcx.ins().call(callee, &[start_val, end_val]);
         let result = bcx.inst_results(call)[0];
         declare_gc_ptr(bcx, result);
+        return vec![result];
+    }
+
+    // `keys(d)`/`d.keys()`, `values(d)`/`d.values()` — see typeck's
+    // `finish_keys_values`. `func_name` is `"keys"` or `"values"` itself,
+    // so no separate flag needs threading through.
+    if func_name == "keys" || func_name == "values" {
+        let arg = arg_exprs[0];
+        let (key_ty, val_ty) = arg.item.ty.as_dict_kv().map(|(k, v)| (k.clone(), v.clone())).expect("finish_keys_values checked this is a Dict");
+        let dict_val = compile_expr_transient(arg, bcx, vars, ctx);
+        let result = compile_dict_keys_or_values(&key_ty, &val_ty, func_name == "keys", dict_val, bcx, ctx);
         return vec![result];
     }
 
@@ -3345,6 +3744,155 @@ fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut Func
     vec![list_ptr]
 }
 
+/// The `runtime::dict::KeyKind` discriminant for a `Dict` key type —
+/// `Trait::Hash`'s four members. Reuses `KeyKind`'s own `#[repr(u32)]`
+/// values rather than re-hardcoding them, so the two enumerations can't
+/// silently drift apart.
+pub(crate) fn key_kind_of(ty: &Type) -> i64 {
+    match ty {
+        Type::Int   => dict::KeyKind::Int as i64,
+        Type::Float => dict::KeyKind::Float as i64,
+        Type::Bool  => dict::KeyKind::Bool as i64,
+        Type::Str   => dict::KeyKind::Str as i64,
+        // `[:]`'s key type is a fresh, never-constrained `TypeVar` —
+        // nothing is ever inserted (there's no mutation yet — Dict
+        // literals are the only construction path), so which `KeyKind`
+        // this dict is tagged with is unobservable. `Int`'s arbitrary but
+        // harmless.
+        Type::TypeVar { .. } => dict::KeyKind::Int as i64,
+        other => unreachable!("Dict key type {:?} is not Hash — typeck should have rejected it", other),
+    }
+}
+
+fn compile_dict_lit(
+    dict_ty: &Type,
+    pairs: &[(Spanned<TypedExpr>, Spanned<TypedExpr>)],
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> Vec<Value> {
+    let (key_ty, val_ty) = dict_ty.as_dict_kv()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .unwrap_or((Type::Int, Type::Int));
+    let key_leafs = struct_fields(&key_ty, ctx.structs);
+    let val_leafs = struct_fields(&val_ty, ctx.structs);
+    // v1 keys are exactly the four `Trait::Hash` scalars, always one leaf.
+    let kstride = key_leafs.len().max(1) as i64;
+    let vstride = val_leafs.len() as i64;
+    let mut all_leaf_tys: Vec<Type> = key_leafs.iter().map(|(_, t)| t.clone()).collect();
+    all_leaf_tys.extend(val_leafs.iter().map(|(_, t)| t.clone()));
+    let ptr_mask = gc_mask(all_leaf_tys.iter());
+
+    let n = pairs.len() as i64;
+    let cap_val      = bcx.ins().iconst(types::I64, n);
+    let kstride_val  = bcx.ins().iconst(types::I64, kstride);
+    let vstride_val  = bcx.ins().iconst(types::I64, vstride);
+    let mask_val     = bcx.ins().iconst(types::I64, ptr_mask);
+    let key_kind_val = bcx.ins().iconst(types::I64, key_kind_of(&key_ty));
+
+    let alloc_id = ctx.func_ids["frog_alloc_dict"];
+    let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+    let alloc_call = bcx.ins().call(alloc_ref, &[cap_val, kstride_val, vstride_val, mask_val, key_kind_val]);
+    let dict_ptr = bcx.inst_results(alloc_call)[0];
+    // Root the dict itself *before* compiling any key/value: either can
+    // allocate (a `Str` key or value) and trigger a collection, and the
+    // dict must already be reachable by then — same reasoning as
+    // `compile_list_lit`.
+    declare_gc_ptr(bcx, dict_ptr);
+
+    let insert_id = ctx.func_ids["frog_dict_insert"];
+    let insert_ref = ctx.module.declare_func_in_func(insert_id, bcx.func);
+    let set_slot_id = ctx.func_ids["frog_dict_set_slot"];
+    let set_slot_ref = ctx.module.declare_func_in_func(set_slot_id, bcx.func);
+
+    for (k, v) in pairs {
+        let kv = compile_expr(k, bcx, vars, ctx);
+        let kv_wire = to_i64_repr(bcx, &key_ty, kv);
+        let insert_call = bcx.ins().call(insert_ref, &[dict_ptr, kv_wire]);
+        let entry = bcx.inst_results(insert_call)[0];
+
+        let vvs = compile_expr_multi(v, bcx, vars, ctx);
+        for (i, (vv, (_, lty))) in vvs.iter().zip(val_leafs.iter()).enumerate() {
+            let wire = to_i64_repr(bcx, lty, *vv);
+            let slot_val = bcx.ins().iconst(types::I64, kstride + i as i64);
+            bcx.ins().call(set_slot_ref, &[dict_ptr, entry, slot_val, wire]);
+        }
+    }
+
+    vec![dict_ptr]
+}
+
+/// `d.keys()` / `d.values()` — allocate a `List` of exactly `frog_dict_len
+/// (d)` elements and fill it by reading each entry's key (or value)
+/// leaves straight out of `d`, in insertion order (`FrogDict`'s doc
+/// comment: no tombstones, so `0..len` already *is* that order — the
+/// same fact `print_dict`/`eq_dict` lean on). Mirrors `compile_list_lit`'s
+/// allocation and `print_dict`'s loop skeleton.
+fn compile_dict_keys_or_values(
+    key_ty: &Type,
+    val_ty: &Type,
+    wants_keys: bool,
+    dict_val: Value,
+    bcx: &mut FunctionBuilder,
+    ctx: &mut Ctx,
+) -> Value {
+    let key_leafs = struct_fields(key_ty, ctx.structs);
+    let val_leafs = struct_fields(val_ty, ctx.structs);
+    let kstride = key_leafs.len().max(1) as i64;
+    let (leafs, base_offset) = if wants_keys { (&key_leafs, 0) } else { (&val_leafs, kstride) };
+    let out_stride = (leafs.len().max(1)) as i64;
+    let out_ptr_mask = gc_mask(leafs.iter().map(|(_, t)| t));
+
+    let len_callee = ctx.module.declare_func_in_func(ctx.func_ids["frog_dict_len"], bcx.func);
+    let len_call = bcx.ins().call(len_callee, &[dict_val]);
+    let len_val = bcx.inst_results(len_call)[0];
+
+    let stride_val = bcx.ins().iconst(types::I64, out_stride);
+    let mask_val = bcx.ins().iconst(types::I64, out_ptr_mask);
+    let alloc_id = ctx.func_ids["frog_alloc_list"];
+    let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
+    let alloc_call = bcx.ins().call(alloc_ref, &[len_val, stride_val, mask_val]);
+    let list_ptr = bcx.inst_results(alloc_call)[0];
+    declare_gc_ptr(bcx, list_ptr);
+
+    let header_bb = bcx.create_block();
+    let body_bb   = bcx.create_block();
+    let exit_bb   = bcx.create_block();
+    bcx.append_block_param(header_bb, types::I64);
+    let zero = bcx.ins().iconst(types::I64, 0);
+    bcx.ins().jump(header_bb, &[BlockArg::from(zero)]);
+
+    bcx.switch_to_block(header_bb);
+    let i = bcx.block_params(header_bb)[0];
+    let in_range = bcx.ins().icmp(IntCC::SignedLessThan, i, len_val);
+    bcx.ins().brif(in_range, body_bb, &[], exit_bb, &[]);
+
+    bcx.switch_to_block(body_bb);
+    bcx.seal_block(body_bb);
+
+    let slot_id = ctx.func_ids["frog_dict_slot"];
+    let mut vals = Vec::with_capacity(leafs.len());
+    for (leaf_idx, (_, lty)) in leafs.iter().enumerate() {
+        let callee = ctx.module.declare_func_in_func(slot_id, bcx.func);
+        let slot_val = bcx.ins().iconst(types::I64, base_offset + leaf_idx as i64);
+        let call = bcx.ins().call(callee, &[dict_val, i, slot_val]);
+        let raw = bcx.inst_results(call)[0];
+        vals.push(from_i64_repr(bcx, lty, raw));
+    }
+    let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
+    declare_gc_leaves(bcx, &vals, &leaf_tys);
+    push_element(bcx, ctx, list_ptr, &vals, leafs);
+
+    let i_next = bcx.ins().iadd_imm_s(i, 1);
+    bcx.ins().jump(header_bb, &[BlockArg::from(i_next)]);
+    bcx.seal_block(header_bb);
+
+    bcx.switch_to_block(exit_bb);
+    bcx.seal_block(exit_bb);
+
+    list_ptr
+}
+
 fn compile_variant_init(
     union_ty: &Type,
     enum_name: &str,
@@ -3503,9 +4051,9 @@ fn compile_narrow(target_ty: &Type, value: &Spanned<TypedExpr>, bcx: &mut Functi
 
 fn compile_truthy(value: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     let v = compile_expr(value, bcx, vars, ctx);
-    if value.item.ty.is_list() {
-        let id     = ctx.func_ids["frog_list_len"];
-        let callee = ctx.module.declare_func_in_func(id, bcx.func);
+    if value.item.ty.is_list() || value.item.ty.is_dict() {
+        let id     = if value.item.ty.is_list() { "frog_list_len" } else { "frog_dict_len" };
+        let callee = ctx.module.declare_func_in_func(ctx.func_ids[id], bcx.func);
         let call   = bcx.ins().call(callee, &[v]);
         let len    = bcx.inst_results(call)[0];
         let zero   = bcx.ins().iconst(types::I64, 0);
@@ -4171,6 +4719,14 @@ impl Codegen {
         builder.symbol("frog_list_push",   ffi::frog_list_push   as *const u8);
         builder.symbol("frog_list_slice",  ffi::frog_list_slice  as *const u8);
         builder.symbol("frog_range",       ffi::frog_range       as *const u8);
+        builder.symbol("frog_alloc_dict",     dict::frog_alloc_dict     as *const u8);
+        builder.symbol("frog_dict_len",       dict::frog_dict_len       as *const u8);
+        builder.symbol("frog_dict_find",      dict::frog_dict_find      as *const u8);
+        builder.symbol("frog_dict_insert",    dict::frog_dict_insert    as *const u8);
+        builder.symbol("frog_dict_slot",      dict::frog_dict_slot      as *const u8);
+        builder.symbol("frog_dict_set_slot",  dict::frog_dict_set_slot  as *const u8);
+        builder.symbol("frog_dict_remove",    dict::frog_dict_remove    as *const u8);
+        builder.symbol("frog_dict_key_missing", dict::frog_dict_key_missing as *const u8);
         builder.symbol("frog_gc_dump",     ffi::frog_gc_dump     as *const u8);
         builder.symbol("frog_alloc_variant", ffi::frog_alloc_variant as *const u8);
         builder.symbol("frog_variant_tag", ffi::frog_variant_tag as *const u8);
@@ -4197,6 +4753,7 @@ impl Codegen {
         builder.symbol("frog_read_is_str",    crate::runtime::read::frog_read_is_str    as *const u8);
         builder.symbol("frog_read_is_none",   crate::runtime::read::frog_read_is_none   as *const u8);
         builder.symbol("frog_read_is_list",   crate::runtime::read::frog_read_is_list   as *const u8);
+        builder.symbol("frog_read_is_dict",   crate::runtime::read::frog_read_is_dict   as *const u8);
         builder.symbol("frog_read_is_range",  crate::runtime::read::frog_read_is_range  as *const u8);
         builder.symbol("frog_read_is_struct", crate::runtime::read::frog_read_is_struct as *const u8);
         builder.symbol("frog_read_expect",    crate::runtime::read::frog_read_expect    as *const u8);
@@ -4209,6 +4766,9 @@ impl Codegen {
         builder.symbol("frog_read_is_call",   crate::runtime::read::frog_read_is_call   as *const u8);
         builder.symbol("frog_read_list_len",  crate::runtime::read::frog_read_list_len  as *const u8);
         builder.symbol("frog_read_list_at",   crate::runtime::read::frog_read_list_at   as *const u8);
+        builder.symbol("frog_read_dict_len",  crate::runtime::read::frog_read_dict_len  as *const u8);
+        builder.symbol("frog_read_dict_key_at", crate::runtime::read::frog_read_dict_key_at as *const u8);
+        builder.symbol("frog_read_dict_val_at", crate::runtime::read::frog_read_dict_val_at as *const u8);
         builder.symbol("frog_read_range_lo",  crate::runtime::read::frog_read_range_lo  as *const u8);
         builder.symbol("frog_read_range_hi",  crate::runtime::read::frog_read_range_hi  as *const u8);
         // `json` (plans/DATA.md stage 8) — `TypeChecker::build_json` (serialize)
@@ -4238,6 +4798,9 @@ impl Codegen {
         builder.symbol("frog_json_get",        crate::runtime::json::frog_json_get        as *const u8);
         builder.symbol("frog_json_at",         crate::runtime::json::frog_json_at         as *const u8);
         builder.symbol("frog_json_len",        crate::runtime::json::frog_json_len        as *const u8);
+        builder.symbol("frog_json_obj_len",    crate::runtime::json::frog_json_obj_len    as *const u8);
+        builder.symbol("frog_json_key_at",     crate::runtime::json::frog_json_key_at     as *const u8);
+        builder.symbol("frog_json_val_at",     crate::runtime::json::frog_json_val_at     as *const u8);
 
         // Host functions (`FrogStateBuilder::func`, `plans/EMBEDDING.md`).
         // Registered before any frog type is resolved — each shim's JIT
@@ -4297,6 +4860,14 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_list_push",  "frog_list_push",  &[I64, I64],      Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_list_slice", "frog_list_slice", &[I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_range",      "frog_range",      &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_alloc_dict",       "frog_alloc_dict",       &[I64, I64, I64, I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_dict_len",         "frog_dict_len",         &[I64],                     Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_dict_find",        "frog_dict_find",        &[I64, I64],                Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_dict_insert",      "frog_dict_insert",      &[I64, I64],                Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_dict_slot",        "frog_dict_slot",        &[I64, I64, I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_dict_set_slot",    "frog_dict_set_slot",    &[I64, I64, I64, I64],      None);
+        declare_rt(&mut module, &mut func_ids, "frog_dict_remove",      "frog_dict_remove",      &[I64, I64],                Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_dict_key_missing", "frog_dict_key_missing", &[I64, I64],                None);
         declare_rt(&mut module, &mut func_ids, "frog_gc_dump",    "gc_dump",         &[],               None);
         declare_rt(&mut module, &mut func_ids, "frog_alloc_variant", "frog_alloc_variant", &[I64, I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_variant_tag", "frog_variant_tag", &[I64], Some(I64));
@@ -4333,6 +4904,7 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_read_is_str",    "frog_read_is_str",    &[I64], Some(types::I8));
         declare_rt(&mut module, &mut func_ids, "frog_read_is_none",   "frog_read_is_none",   &[I64], Some(types::I8));
         declare_rt(&mut module, &mut func_ids, "frog_read_is_list",   "frog_read_is_list",   &[I64], Some(types::I8));
+        declare_rt(&mut module, &mut func_ids, "frog_read_is_dict",   "frog_read_is_dict",   &[I64], Some(types::I8));
         declare_rt(&mut module, &mut func_ids, "frog_read_is_range",  "frog_read_is_range",  &[I64], Some(types::I8));
         declare_rt(&mut module, &mut func_ids, "frog_read_is_struct", "frog_read_is_struct", &[I64], Some(types::I8));
         declare_rt(&mut module, &mut func_ids, "frog_read_expect",    "frog_read_expect",    &[I64, I64], Some(I64));
@@ -4345,6 +4917,9 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_read_is_call",  "frog_read_is_call",  &[I64, I64],      Some(types::I8));
         declare_rt(&mut module, &mut func_ids, "frog_read_list_len", "frog_read_list_len", &[I64],           Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_read_list_at",  "frog_read_list_at",  &[I64, I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_dict_len", "frog_read_dict_len", &[I64],           Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_dict_key_at", "frog_read_dict_key_at", &[I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_read_dict_val_at", "frog_read_dict_val_at", &[I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_read_range_lo", "frog_read_range_lo", &[I64],           Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_read_range_hi", "frog_read_range_hi", &[I64],           Some(I64));
         // `json` (plans/DATA.md stage 8) — `build_json`'s two Tier-2 write
@@ -4375,6 +4950,9 @@ impl Codegen {
         declare_rt(&mut module, &mut func_ids, "frog_json_get",        "frog_json_get",       &[I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_json_at",         "frog_json_at",        &[I64, I64], Some(I64));
         declare_rt(&mut module, &mut func_ids, "frog_json_len",        "frog_json_len",       &[I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_obj_len",    "frog_json_obj_len",   &[I64],      Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_key_at",     "frog_json_key_at",    &[I64, I64], Some(I64));
+        declare_rt(&mut module, &mut func_ids, "frog_json_val_at",     "frog_json_val_at",    &[I64, I64], Some(I64));
 
         // Every host function shares this one import signature — see
         // `Ctx`'s `host_fns` field and `compile_call`'s host-call arm.

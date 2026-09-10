@@ -136,12 +136,35 @@ removed rather than struck through — check `plans/*.md` git history if you wan
   is `frog check`'s own two `println!`s in `main.rs`, which is a small, specific fix rather
   than a project-level priority.
 
+### Newly done, 2026-09-09
+
+- ~~**`Dict`/`Map`.**~~ **Done** — `["key": value]` literal syntax, `[:]` for empty
+  (the bikesheded "Other Ideas" runner-up, one character instead of `Dict{...}`).
+  `Dict<K, V>` is a builtin-boxed type (`FrogDict` in `runtime/gc.rs`, following `List`'s
+  model, not `Range`'s), backed by a swappable `runtime::dict::DictBackend` — the default
+  is `hashbrown::HashTable` — installed per-`FrogState` via `FrogStateBuilder::dict_backend`.
+  A new structural `Trait::Hash`, deliberately narrow for now: `Int`/`Float`/`Bool`/`Str`
+  keys only, not recursed into `List`/struct/union members, since there is no runtime
+  polymorphic hashing or equality (`codegen::eq_value` is emitted per statically-known
+  type) to hash a compound key with — widening this is real future work (synthesized
+  per-`K` `__hash_K`/`__keyeq_K` functions), not a rule change. Full surface: `d[k]`
+  (panics on a missing key, mirroring `xs[i]`), `.get(k)` → `V | KeyError`, `k in d`
+  (O(1), not a value scan), `==` (structural, order-independent), `len`, truthiness,
+  `d[k] = v` (insert-or-overwrite, COW-safe, nested paths work), `.keys()`/`.values()`
+  (insertion order — no tombstones, so `0..len` already *is* that order), `for k in d`
+  (desugars to `.keys()`), `.remove(k)` → `V | KeyError` (compacts, preserves order).
+  `repr`, `read`, and `json.to_str`/`json.parse` (JSON object, `Str` keys only) all round-
+  trip; `tests/test_dict.rs` (41 tests) plus extensions to `test_host_fns.rs`,
+  `test_repr.rs`, `test_read.rs`. Along the way, fixed a real pre-existing gap in
+  `TypeChecker::lower_expected`: it only tried `unify`ing an unresolved `TypeVar` when the
+  *value's* type was the var, never when the *expected slot* was — invisible until `Dict`
+  gave the checker its first "grow into an unconstrained slot via index-assignment" case
+  (`mut d = [:]; d[k] = v`), since `List` has no analogous path (`xs[i] = v` requires `i`
+  already in bounds). Not done: structural (non-scalar) keys, `Set`, and `Dict` in the
+  "impls for generic types" gap below (`provides` on a generic builtin still errors).
+
 ### Near-term (usability + gaps most likely to bite real code)
 
-- **`Dict`/`Map`** — no type exists yet (`{"a": 1}` doesn't parse); purely a stdlib task now
-  that generics are done, though it also wants a structural `Hash` trait (the way `Eq` already
-  is) and the map-literal syntax is still an open bikeshed (see "Other Ideas" below). With
-  first-class functions done, this is the largest remaining hole for ordinary programs.
 - **`frog check`'s own diagnostics** — it prints `Spanned<TypeError>`'s `Debug` form where
   `run` renders a caret. One call site, `main.rs`.
 - **A real line-joining rule** — the one parse gap deliberately left open by the sweep above.
@@ -161,7 +184,7 @@ removed rather than struck through — check `plans/*.md` git history if you wan
 
 - ~~User-definable generics~~ — **done**.
 - ~~Modules~~ — **done**.
-- `Dict`/`Map` — still missing, no longer generics-blocked (see above).
+- ~~`Dict`/`Map`~~ — **done** (see "Newly done, 2026-09-09" above).
 - An AOT compile path — swap the Cranelift JIT for `cranelift-object`, link against the runtime.
   Nothing built; `host.rs` has one doc-comment line describing the idea, no dependency, no `build`
   CLI subcommand (only `run`/`check`).

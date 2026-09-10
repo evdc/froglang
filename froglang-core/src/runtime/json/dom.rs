@@ -47,6 +47,7 @@ pub type ParseError = (String, usize);
 #[cfg(not(feature = "json_simd"))]
 mod backend {
     use super::{Json, Kind, ParseError};
+    use std::cell::RefCell;
 
     pub fn parse(src: &str) -> Result<Json, ParseError> {
         serde_json::from_str(src).map_err(|e| {
@@ -91,6 +92,94 @@ mod backend {
     pub fn get<'a>(v: &'a Json, key: &str) -> Option<&'a Json> { v.get(key) }
     pub fn at(v: &Json, i: usize) -> Option<&Json> { v.as_array().and_then(|a| a.get(i)) }
     pub fn len(v: &Json) -> Option<usize> { v.as_array().map(|a| a.len()) }
+    pub fn obj_len(v: &Json) -> Option<usize> { v.as_object().map(|o| o.len()) }
+    // `serde_json::Map` is a `BTreeMap` (no `preserve_order` feature), so
+    // this yields keys in sorted order, not the original document's —
+    // acceptable since `Dict` equality is order-independent (`eq_dict`)
+    // and nothing here promises a byte-for-byte round trip, only a value
+    // one.
+    //
+    // A bare `.iter().nth(i)` would be `O(i)` per call (a `BTreeMap` has no
+    // O(1) nth-key) — fine for one query, but `json.parse`'s Dict-from-
+    // object conversion queries every index 0..n once (actually twice: a
+    // key_at then a val_at call per index, from `runtime::json::mod`),
+    // which would make the whole conversion `O(n^2)`. `ENTRY_CURSOR` caches
+    // a forward-only iterator across calls so that access pattern — same
+    // index twice, then the next index — costs `O(1)` amortized per call
+    // instead. Any other pattern (a different object, or a non-sequential
+    // index) just falls back to a fresh scan, same cost as before.
+    thread_local! {
+        static ENTRY_CURSOR: RefCell<Option<EntryCursor>> = const { RefCell::new(None) };
+    }
+
+    struct EntryCursor {
+        obj: usize, // identity of the `serde_json::Map` last walked, as an address
+        iter: serde_json::map::Iter<'static>,
+        idx: usize,
+        // `*const str`'s a fat pointer with no null value, so the key half
+        // is kept as raw parts instead — reassembled with `slice::from_raw_parts`.
+        entry: Option<(*const u8, usize, *const Json)>,
+    }
+
+    pub fn entry_at(v: &Json, i: usize) -> Option<(&str, &Json)> {
+        let obj = v.as_object()?;
+        let obj_id = obj as *const _ as usize;
+
+        unsafe fn reassemble<'a>(e: (*const u8, usize, *const Json)) -> (&'a str, &'a Json) {
+            let bytes = std::slice::from_raw_parts(e.0, e.1);
+            (std::str::from_utf8_unchecked(bytes), &*e.2)
+        }
+
+        ENTRY_CURSOR.with(|cell| {
+            let mut slot = cell.borrow_mut();
+
+            // Same object, same index as last time — the key_at/val_at
+            // pair querying one index twice — served straight from cache.
+            if let Some(cur) = slot.as_ref() {
+                if cur.obj == obj_id && cur.idx == i {
+                    return cur.entry.map(|e| unsafe { reassemble(e) });
+                }
+            }
+
+            // Same object, next index — advance the cached iterator by
+            // one instead of restarting the walk from the front.
+            if let Some(cur) = slot.as_mut() {
+                if cur.obj == obj_id && i == cur.idx + 1 {
+                    return match cur.iter.next() {
+                        Some((k, val)) => {
+                            cur.idx = i;
+                            let e = (k.as_ptr(), k.len(), val as *const Json);
+                            cur.entry = Some(e);
+                            Some(unsafe { reassemble(e) })
+                        }
+                        None => { cur.entry = None; None }
+                    };
+                }
+            }
+
+            // Anything else (a different object, index 0, or an
+            // out-of-order query): (re)build a fresh cursor and walk it up
+            // to `i`. SAFETY: `obj`'s entries live as long as the parsed
+            // document (`JsonState::root` in `runtime::json::mod`), well
+            // past this thread-local cache's use of them — laundering the
+            // lifetime to `'static` here is the same trick every node
+            // handle in this module already relies on.
+            let iter: serde_json::map::Iter<'static> = unsafe { std::mem::transmute(obj.iter()) };
+            let mut cur = EntryCursor { obj: obj_id, iter, idx: 0, entry: None };
+            for n in 0..=i {
+                match cur.iter.next() {
+                    Some((k, val)) => {
+                        cur.idx = n;
+                        cur.entry = Some((k.as_ptr(), k.len(), val as *const Json));
+                    }
+                    None => { cur.entry = None; break; }
+                }
+            }
+            let result = if cur.idx == i { cur.entry.map(|e| unsafe { reassemble(e) }) } else { None };
+            *slot = Some(cur);
+            result
+        })
+    }
 }
 
 // ── simd-json ────────────────────────────────────────────────────────────────
@@ -147,9 +236,17 @@ mod backend {
     pub fn get<'a>(v: &'a Json, key: &str) -> Option<&'a Json> { ValueObjectAccess::get(v, key) }
     pub fn at(v: &Json, i: usize) -> Option<&Json> { v.as_array().and_then(|a| a.get(i)) }
     pub fn len(v: &Json) -> Option<usize> { v.as_array().map(|a| a.len()) }
+    pub fn obj_len(v: &Json) -> Option<usize> { ValueAsObject::as_object(v).map(|o| o.len()) }
+    // `simd-json`'s `Object` (`halfbrown`) is hash-ordered, not insertion —
+    // same "not the original order, but the round-trip law only needs
+    // order-independent equality" reasoning as the `serde_json` backend's
+    // `entry_at` above.
+    pub fn entry_at(v: &Json, i: usize) -> Option<(&str, &Json)> {
+        ValueAsObject::as_object(v).and_then(|o| o.iter().nth(i)).map(|(k, v)| (k.as_str(), v))
+    }
 }
 
-pub use backend::{as_bool, as_f64, as_i64, as_str, at, get, kind, len, parse};
+pub use backend::{as_bool, as_f64, as_i64, as_str, at, entry_at, get, kind, len, obj_len, parse};
 
 // ── writing ──────────────────────────────────────────────────────────────────
 

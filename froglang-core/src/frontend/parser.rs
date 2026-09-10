@@ -99,6 +99,13 @@ pub struct Parser<'a> {
     lexer: Lexer<'a>,
     pub current_token: Spanned<Token>,
     errors: Vec<Spanned<ParseError>>,
+    /// While true, `continue_expression` treats `:` as having no infix rule
+    /// (rather than firing `Grammar::type_annotation`) — set around the
+    /// element list of a `[...]` literal so `["a": 1]` isn't swallowed as
+    /// type ascription (`Grammar::tuple`), and reset to `false` around any
+    /// nested `(...)`/`{...}` group (`Grammar::grouping`/`call`/
+    /// `block_expr`) so ascription keeps working there, e.g. `[(x: Int)]`.
+    colon_suppressed: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -122,6 +129,7 @@ impl<'a> Parser<'a> {
             lexer,
             current_token,
             errors,
+            colon_suppressed: false,
         }
     }
 
@@ -282,6 +290,40 @@ impl<'a> Parser<'a> {
         exprs
     }
 
+    /// Continues an `expression_list`-style parse when the first element
+    /// was already parsed by the caller — `Grammar::tuple` must parse one
+    /// element before it can tell a list literal from a dict literal, so it
+    /// can't call `expression_list` itself. Mirrors that function's loop
+    /// (from just after the first element) so a bad later element records
+    /// an error and lets parsing continue, instead of aborting the whole
+    /// literal via `?`.
+    pub(crate) fn continue_expression_list(&mut self, first: Spanned<Expression>, separator: &Token, terminator: &Token) -> Vec<Spanned<Expression>> {
+        let mut exprs = vec![first];
+        loop {
+            self.skip_newlines();
+
+            if self.check(terminator) {
+                break;
+            } else if !self.check(separator) {
+                let err = self.current_token.clone().map(|t|
+                    ParseError::ExpectedButFound(separator.clone(), t)
+                );
+                self.errors.push(err);
+                return exprs;
+            }
+
+            let _ = self.advance(); // consume the separator
+            self.skip_newlines();
+            if self.check(terminator) { break; } // trailing separator
+
+            match self.expression(Precedence::Assign) {
+                Ok(expr) => exprs.push(expr),
+                Err(err) => self.errors.push(err),
+            }
+        }
+        exprs
+    }
+
     pub fn expression(&mut self, precedence: Precedence) -> ParseResult {
         let token = self.advance()?;
 
@@ -298,12 +340,30 @@ impl<'a> Parser<'a> {
     /// without swallowing the `,` or `)` that ends the argument.
     pub fn continue_expression(&mut self, mut left: Spanned<Expression>, precedence: Precedence) -> ParseResult {
         loop {
+            if self.colon_suppressed && matches!(self.current_token.item, Token::Colon) {
+                break;
+            }
             let rule = Grammar::get_parse_rule(&self.current_token);
             if precedence > rule.precedence { break; }
             let token = self.advance()?;
             left = (rule.infix)(self, token, left, rule.precedence)?;
         }
         Ok(left)
+    }
+
+    /// Run `f` with `colon_suppressed` set to `val` for its duration,
+    /// restoring the previous value afterward regardless of how `f`
+    /// returns (including via `?`) — see `colon_suppressed`'s doc comment.
+    pub fn with_colon_suppressed<T>(
+        &mut self,
+        val: bool,
+        f: impl FnOnce(&mut Parser<'a>) -> Result<T, Spanned<ParseError>>,
+    ) -> Result<T, Spanned<ParseError>> {
+        let prev = self.colon_suppressed;
+        self.colon_suppressed = val;
+        let result = f(self);
+        self.colon_suppressed = prev;
+        result
     }
 
     fn synchronize(&mut self) {

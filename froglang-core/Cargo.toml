@@ -33,6 +33,7 @@ cranelift-native   = "0.135"
 # build. `simd-json` is the opt-in fast path — see the `json_simd` feature.
 serde_json = "1"
 simd-json = { version = "0.14", optional = true }
+hashbrown = "0.17.1"
 
 [[bin]]
 name = "froglang-core"

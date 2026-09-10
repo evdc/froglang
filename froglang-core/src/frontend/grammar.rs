@@ -194,33 +194,39 @@ impl Grammar {
     /// positions, though — a newline in the middle of an expression
     /// (`(1 +\n2)`) still ends it, the same as everywhere else.
     pub fn grouping(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
-        parser.skip_newlines();
-        // `()` is not an expression at all — the only thing it can be is a
-        // zero-parameter lambda's parameter list, so `paren_params` demands
-        // the `->` that makes it one.
-        if parser.check(&Token::RightParen) {
-            let closing = parser.advance()?;
-            return Self::paren_params(parser, t, Vec::new(), closing);
-        }
-
-        let first = parser.expression(Precedence::Assign)?;
-        parser.skip_newlines();
-        if !parser.check(&Token::Comma) {
-            parser.consume(Token::RightParen)?;
-            return Ok(first);
-        }
-
-        let mut items = vec![first];
-        while parser.check(&Token::Comma) {
-            parser.advance()?;
+        // Reset around a nested `(...)` group — see `Parser::colon_suppressed`'s
+        // doc comment — so `["a": (x: Int)]` still parses `(x: Int)` as
+        // type ascription rather than inheriting a `[...]` literal's
+        // suppression.
+        parser.with_colon_suppressed(false, move |parser| {
             parser.skip_newlines();
-            // A trailing comma, as `expression_list` allows for `[...]`.
-            if parser.check(&Token::RightParen) { break; }
-            items.push(parser.expression(Precedence::Assign)?);
+            // `()` is not an expression at all — the only thing it can be is a
+            // zero-parameter lambda's parameter list, so `paren_params` demands
+            // the `->` that makes it one.
+            if parser.check(&Token::RightParen) {
+                let closing = parser.advance()?;
+                return Self::paren_params(parser, t, Vec::new(), closing);
+            }
+
+            let first = parser.expression(Precedence::Assign)?;
             parser.skip_newlines();
-        }
-        let closing = parser.consume(Token::RightParen)?;
-        Self::paren_params(parser, t, items, closing)
+            if !parser.check(&Token::Comma) {
+                parser.consume(Token::RightParen)?;
+                return Ok(first);
+            }
+
+            let mut items = vec![first];
+            while parser.check(&Token::Comma) {
+                parser.advance()?;
+                parser.skip_newlines();
+                // A trailing comma, as `expression_list` allows for `[...]`.
+                if parser.check(&Token::RightParen) { break; }
+                items.push(parser.expression(Precedence::Assign)?);
+                parser.skip_newlines();
+            }
+            let closing = parser.consume(Token::RightParen)?;
+            Self::paren_params(parser, t, items, closing)
+        })
     }
 
     /// The `(a, b, ...)` on the left of a `->`: a lambda's parameter list,
@@ -252,6 +258,9 @@ impl Grammar {
     }
 
     pub fn block_expr(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
+        // Reset around a nested `{...}` block — see `Grammar::grouping`'s
+        // comment on the same thing.
+        parser.with_colon_suppressed(false, move |parser| {
         let mut stmts = vec![];
         // skip leading blank lines / semicolons
         while parser.check(&Token::Newline) || parser.check(&Token::Semicolon) {
@@ -296,6 +305,7 @@ impl Grammar {
         } else {
             Ok(Spanned { span: t.span.merge(closing.span), item: Expression::Block(stmts) })
         }
+        })
     }
 
     pub fn conditional(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
@@ -805,10 +815,15 @@ impl Grammar {
     }
 
     pub fn call(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
-        let args = parser.expression_list(&Token::Comma, &Token::RightParen);
-        let closing = parser.consume(Token::RightParen)?;
-        // Need to extend span by to include the closing paren
-        Ok(Spanned { span: left.span.merge(closing.span), item: Expression::call(left, args) })
+        // Reset around call args — see `Grammar::grouping`'s comment on
+        // the same thing, e.g. an ascribed argument inside a `[...]`
+        // literal: `[f(x: Int)]`.
+        parser.with_colon_suppressed(false, move |parser| {
+            let args = parser.expression_list(&Token::Comma, &Token::RightParen);
+            let closing = parser.consume(Token::RightParen)?;
+            // Need to extend span by to include the closing paren
+            Ok(Spanned { span: left.span.merge(closing.span), item: Expression::call(left, args) })
+        })
     }
 
     pub fn index(parser: &mut Parser, _t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {
@@ -856,35 +871,105 @@ impl Grammar {
         })
     }
 
+    /// `[...]` in prefix position: a list literal (`[1, 2, 3]`), a dict
+    /// literal (`["a": 1, "b": 2]`, `[:]` empty), or a comprehension
+    /// (`[for x in xs do ...]`).
+    ///
+    /// List vs dict is decided by whether a `:` follows the first
+    /// element — both share this one entry point rather than a lookahead
+    /// grammar split, since only after parsing the first element as an
+    /// ordinary expression do we know which it is. `Parser::
+    /// colon_suppressed` is what makes that parse stop cleanly at the
+    /// `:` instead of `Grammar::type_annotation` swallowing it (see that
+    /// field's doc comment) — active for this whole literal's element
+    /// list, reset to `false` around any nested `(...)`/`{...}` group so
+    /// `["a": (x: Int)]`-shaped ascription still works.
     pub fn tuple(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
-        // `[for x in xs ...]` is a list comprehension, not a list literal —
-        // hand off to `for_expr` and wrap the result instead of falling
-        // into the ordinary comma-separated element list below. Newlines
-        // right after `[` are insignificant here (same as everywhere else
-        // inside brackets, see `expression_list`), so skip them before the
-        // `for` lookahead — otherwise `[\n for x in xs do ...]` silently
-        // falls through to list-literal parsing instead of erroring or
-        // being recognized as a comprehension.
-        parser.skip_newlines();
-        if parser.check(&Token::For) {
-            let for_tok = parser.advance()?; // consume `for`
-            let for_loop = Grammar::for_expr(parser, for_tok)?;
+        parser.with_colon_suppressed(true, move |parser| {
+            // `[for x in xs ...]` is a list comprehension, not a list literal —
+            // hand off to `for_expr` and wrap the result instead of falling
+            // into the ordinary comma-separated element list below. Newlines
+            // right after `[` are insignificant here (same as everywhere else
+            // inside brackets, see `expression_list`), so skip them before the
+            // `for` lookahead — otherwise `[\n for x in xs do ...]` silently
+            // falls through to list-literal parsing instead of erroring or
+            // being recognized as a comprehension.
             parser.skip_newlines();
-            let closing = parser.consume(Token::RightBracket)?;
-            return Ok(Spanned {
-                span: t.span.merge(closing.span),
-                item: Expression::comprehension(for_loop)
-            });
-        }
+            if parser.check(&Token::For) {
+                let for_tok = parser.advance()?; // consume `for`
+                let for_loop = Grammar::for_expr(parser, for_tok)?;
+                parser.skip_newlines();
+                let closing = parser.consume(Token::RightBracket)?;
+                return Ok(Spanned {
+                    span: t.span.merge(closing.span),
+                    item: Expression::comprehension(for_loop)
+                });
+            }
 
-        // n.b. a record expression [a=1, b=2, c=3] parses as a tuple of Assign expressions
-        // but we can rewrite it into a record initializer in the compiler, if any of the exprs is an Assign
-        // and, I suppose, error if we have a mix
-        let exprs = parser.expression_list(&Token::Comma, &Token::RightBracket);
-        let closing = parser.consume(Token::RightBracket)?;
-        Ok(Spanned {
-            span: t.span.merge(closing.span),
-            item: Expression::Tuple(exprs)
+            // `[:]` — the empty dict. Checked before the empty-list case
+            // below since `[]` (no colon at all) means the empty list/tuple.
+            if parser.check(&Token::Colon) {
+                parser.advance()?; // consume `:`
+                parser.skip_newlines();
+                let closing = parser.consume(Token::RightBracket)?;
+                return Ok(Spanned {
+                    span: t.span.merge(closing.span),
+                    item: Expression::dict_lit(Vec::new())
+                });
+            }
+
+            if parser.check(&Token::RightBracket) {
+                let closing = parser.advance()?;
+                return Ok(Spanned { span: t.span.merge(closing.span), item: Expression::Tuple(Vec::new()) });
+            }
+
+            let first = parser.expression(Precedence::Assign)?;
+            parser.skip_newlines();
+
+            if parser.check(&Token::Colon) {
+                parser.advance()?; // consume `:`
+                parser.skip_newlines();
+                let first_val = parser.expression(Precedence::Assign)?;
+                let mut pairs = vec![(first, first_val)];
+                parser.skip_newlines();
+                while parser.check(&Token::Comma) {
+                    parser.advance()?;
+                    parser.skip_newlines();
+                    if parser.check(&Token::RightBracket) { break; } // trailing comma
+                    let k = parser.expression(Precedence::Assign)?;
+                    parser.skip_newlines();
+                    parser.consume(Token::Colon).map_err(|_| Spanned::new(
+                        ParseError::Other(
+                            "a Dict literal can't mix 'key: value' pairs with bare elements".to_string()
+                        ),
+                        k.span.start, k.span.end,
+                    ))?;
+                    parser.skip_newlines();
+                    let v = parser.expression(Precedence::Assign)?;
+                    pairs.push((k, v));
+                    parser.skip_newlines();
+                }
+                let closing = parser.consume(Token::RightBracket)?;
+                return Ok(Spanned {
+                    span: t.span.merge(closing.span),
+                    item: Expression::dict_lit(pairs)
+                });
+            }
+
+            // Not a dict — an ordinary list/tuple literal, continuing from
+            // `first`. `expression_list` can't be called directly since
+            // `first` is already parsed; `continue_expression_list` picks up
+            // its loop from there, preserving its per-element error recovery.
+            //
+            // n.b. a record expression [a=1, b=2, c=3] parses as a tuple of Assign expressions
+            // but we can rewrite it into a record initializer in the compiler, if any of the exprs is an Assign
+            // and, I suppose, error if we have a mix
+            let exprs = parser.continue_expression_list(first, &Token::Comma, &Token::RightBracket);
+            let closing = parser.consume(Token::RightBracket)?;
+            Ok(Spanned {
+                span: t.span.merge(closing.span),
+                item: Expression::Tuple(exprs)
+            })
         })
     }
 

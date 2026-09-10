@@ -52,6 +52,10 @@ pub fn install(builder: FrogStateBuilder) -> FrogStateBuilder {
     // `Error`-providing type declared before it's usable — same reasoning
     // as `ErrMsg` above.
     let builder = builder.prelude("error IndexError(index: Int, len: Int)");
+    // `Dict.get`'s error member — same reasoning as `IndexError` above.
+    // `key` is `repr(k)`, not `k` itself, so this works for any `Trait::
+    // Hash` key type rather than assuming `Str`.
+    let builder = builder.prelude("error KeyError(key: Str)");
     let builder = str::install(builder);
     fs::install(builder)
 }

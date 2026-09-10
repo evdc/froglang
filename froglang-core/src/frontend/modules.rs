@@ -136,6 +136,10 @@ fn check_no_nested_imports(stmts: &[Spanned<Expression>], path: &Path) -> Result
                 for e in es { walk(&e.item, path)?; }
                 Ok(())
             }
+            Expression::DictLit(pairs) => {
+                for (k, v) in pairs { walk(&k.item, path)?; walk(&v.item, path)?; }
+                Ok(())
+            }
             // `a.ty` is a `TypeExpr` — the type grammar has no `import` form.
             Expression::Annotated(a) => walk(&a.expr.item, path),
             Expression::Index(i) => { walk(&i.target.item, path)?; walk(&i.index.item, path) }
@@ -676,6 +680,13 @@ fn rewrite(
         Expression::Tuple(es) | Expression::Block(es) | Expression::Interp(es) => {
             for e in es {
                 rewrite(&mut e.item, subst, qualified, shadow, track_let_shadow);
+            }
+        }
+
+        Expression::DictLit(pairs) => {
+            for (k, v) in pairs {
+                rewrite(&mut k.item, subst, qualified, shadow, track_let_shadow);
+                rewrite(&mut v.item, subst, qualified, shadow, track_let_shadow);
             }
         }
 

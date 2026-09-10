@@ -152,6 +152,62 @@ impl FrogCtx {
         let list_ptr = w as *const crate::runtime::gc::FrogList;
         unsafe { *(*list_ptr).data.add(idx * stride.max(1) + slot) }
     }
+
+    /// Allocate a `Dict<K, V>` from `entries` — a flat, already-wire-
+    /// formatted buffer of `kstride + vstride`-wide `(key, value)` blocks,
+    /// in the insertion order the resulting `Dict` should report — and
+    /// root the result. `key_kind` is a `runtime::dict::KeyKind`
+    /// discriminant. Builds the hash index in one pass (`rebuild`, the
+    /// same one `GcHeap::clone_obj`'s `Dict` arm uses) rather than
+    /// inserting one entry at a time.
+    ///
+    /// A duplicate key in `entries` is **not** deduplicated here — the
+    /// caller (a `ToFrog` impl driven by a Rust collection that is itself
+    /// already key-unique, e.g. `HashMap`) never produces one; passing
+    /// one anyway leaves both entries in `entries` but only the *last*
+    /// reachable through the index, the same "last write wins" a repeated
+    /// key in a source-level Dict literal gets.
+    pub fn alloc_dict(&mut self, entries: &[i64], kstride: usize, vstride: usize, ptr_mask: u64, key_kind: u32) -> i64 {
+        use crate::runtime::dict::{hash_key, dict_index_mut, KeyKind};
+        let stride = (kstride + vstride).max(1);
+        let elem_count = if stride == 0 { 0 } else { entries.len() / stride };
+        let ptr = {
+            let heap = self.heap();
+            heap.maybe_collect();
+            let dict = heap.alloc_dict(elem_count, kstride, vstride, ptr_mask, key_kind);
+            unsafe {
+                (*dict).len = elem_count as u32;
+                if !entries.is_empty() {
+                    std::ptr::copy_nonoverlapping(entries.as_ptr(), (*dict).entries, entries.len());
+                }
+                let kind = KeyKind::from_u32(key_kind);
+                let dict_entries = (*dict).entries;
+                let mut pairs = (0..elem_count).map(|i| {
+                    let key = *dict_entries.add(i * stride);
+                    (hash_key(kind, key), i as u32)
+                });
+                dict_index_mut(dict).rebuild(&mut pairs);
+            }
+            dict as i64
+        };
+        self.heap().push_root(ptr, true);
+        ptr
+    }
+
+    /// Read a `Dict`'s entry count and one entry's flattened slots
+    /// (`kstride + vstride`-wide, `alloc_dict`'s convention), in whatever
+    /// order the entries buffer holds them — insertion order (`FrogDict`'s
+    /// doc comment). Thin wrapper mirroring `list_len`/`list_elem`.
+    pub fn dict_len(&self, w: i64) -> usize {
+        let dict_ptr = w as *const crate::runtime::gc::FrogDict;
+        unsafe { (*dict_ptr).len as usize }
+    }
+
+    pub fn dict_entry_slot(&self, w: i64, idx: usize, kstride: usize, vstride: usize, slot: usize) -> i64 {
+        let stride = (kstride + vstride).max(1);
+        let dict_ptr = w as *const crate::runtime::gc::FrogDict;
+        unsafe { *(*dict_ptr).entries.add(idx * stride + slot) }
+    }
 }
 
 /// Releases every root `FrogCtx` pushed since the scope opened. See

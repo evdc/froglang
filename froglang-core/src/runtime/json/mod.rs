@@ -313,6 +313,45 @@ pub extern "C" fn frog_json_len(node: i64) -> i64 {
     })
 }
 
+/// `Dict<Str, V>` parsing's entry points — `frog_json_at`/`frog_json_len`'s
+/// object counterparts. `dom::entry_at`'s doc comment covers why the order
+/// isn't the original document's.
+#[no_mangle]
+pub extern "C" fn frog_json_obj_len(node: i64) -> i64 {
+    with_node(node, |n| match dom::obj_len(n) {
+        Some(l) => l as i64,
+        None => { mark_failed("expected an object"); 0 }
+    })
+}
+
+/// `node`'s `i`th member's key, as a fresh `Str`. `frog_json_str`'s twin —
+/// see its doc comment for why `jit_frame_guard!` is load-bearing here too.
+#[no_mangle]
+pub extern "C" fn frog_json_key_at(node: i64, i: i64) -> i64 {
+    let _jit_frame = crate::jit_frame_guard!();
+    let k: Option<String> = with_node(node, |n| dom::entry_at(n, i as usize).map(|(k, _)| k.to_string()));
+    let k = k.unwrap_or_else(|| { mark_failed(format!("missing object member {}", i)); String::new() });
+    with_heap(|heap: &mut GcHeap| {
+        heap.maybe_collect();
+        heap.alloc_str(k.as_bytes()) as i64
+    })
+}
+
+/// `node`'s `i`th member's value, or `node` itself on any mismatch.
+#[no_mangle]
+pub extern "C" fn frog_json_val_at(node: i64, i: i64) -> i64 {
+    with_node(node, |n| {
+        if dom::kind(n) != Kind::Object {
+            mark_failed("expected an object");
+            return node;
+        }
+        match dom::entry_at(n, i as usize) {
+            Some((_, v)) => node_handle(v),
+            None => { mark_failed(format!("missing object member {}", i)); node }
+        }
+    })
+}
+
 /// Unconditionally marks failure with `what` and returns `node` unchanged
 /// — the union arms' "no alternative matched" fallback, reached only after
 /// every kind/tag test has already failed. `frog_read_expect`'s twin.

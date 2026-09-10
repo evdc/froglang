@@ -71,6 +71,46 @@ fn list_arg_and_return_round_trip() {
     }
 }
 
+#[frog_fn]
+fn double_values(d: std::collections::HashMap<String, i64>) -> std::collections::HashMap<String, i64> {
+    d.into_iter().map(|(k, v)| (k, v * 2)).collect()
+}
+
+#[test]
+fn dict_arg_and_return_round_trip() {
+    let mut s = FrogState::builder().func(double_values_host()).build().unwrap();
+    let (v, _) = s.eval(r#"double_values(["a": 1, "b": 2])"#).unwrap();
+    match v {
+        FrogValue::Dict(pairs) => {
+            let mut got: Vec<(String, i64)> = pairs.iter().map(|(k, v)| (string(k), int(v))).collect();
+            got.sort();
+            assert_eq!(got, vec![("a".to_string(), 2), ("b".to_string(), 4)]);
+        }
+        other => panic!("expected Dict, got {:?}", other),
+    }
+}
+
+#[test]
+fn dict_returned_from_a_host_fn_survives_a_collection() {
+    let mut s = FrogState::builder().func(double_values_host()).build().unwrap();
+    let (v, _) = s.eval(r#"let r = double_values(["a": 1])
+r"#).unwrap();
+    match &v {
+        FrogValue::Dict(pairs) => assert_eq!(pairs.len(), 1),
+        other => panic!("expected Dict, got {:?}", other),
+    }
+    s.heap.force_collect();
+    let (v2, _) = s.eval("r").unwrap();
+    match v2 {
+        FrogValue::Dict(pairs) => {
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(string(&pairs[0].0), "a");
+            assert_eq!(int(&pairs[0].1), 2);
+        }
+        other => panic!("expected Dict, got {:?}", other),
+    }
+}
+
 /// Registering a name the frontend already matches specially must fail at
 /// `build()`, not silently shadow it or panic deep inside codegen.
 #[test]

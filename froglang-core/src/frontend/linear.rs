@@ -248,6 +248,15 @@ fn walk(
 
         TypedExprKind::List(elems) => fold(elems, liveness, ctx, suppress),
 
+        TypedExprKind::Dict(pairs) => {
+            let mut moved = HashSet::new();
+            for (k, v) in pairs {
+                moved = union(moved, walk(k, liveness, ctx, suppress)?);
+                moved = union(moved, walk(v, liveness, ctx, suppress)?);
+            }
+            Ok(moved)
+        }
+
         TypedExprKind::Block(stmts) => fold(stmts, liveness, ctx, suppress),
 
         TypedExprKind::StructInit { fields, .. } | TypedExprKind::VariantInit { fields, .. } => {

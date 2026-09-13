@@ -54,7 +54,23 @@ plumbing.
 
 ## Gaps that must close (blocking)
 
-### G1 — String/byte literals bake a host pointer into code
+### G1 — String/byte literals bake a host pointer into code — **DONE (2026-09-13)**
+Implemented as below. A new `StrLiterals` interning table (`HashMap<Vec<u8>, DataId>` + a
+module-global name counter) lives on `Codegen`; `emit_str_literal(bytes, bcx, ctx)` interns the
+bytes as a module-local read-only data object (`declare_data`/`DataDescription::define`/
+`define_data`) on first sight and, at each use site, materializes the pointer with
+`bcx.ins().symbol_value(I64, module.declare_data_in_func(id, func))` plus an `iconst` length. Both
+`TypedExprKind::StrLit` and `print_fragment` now call it — no `bytes.as_ptr() as i64` immediate
+survives in `codegen/mod.rs`. The transient `string_arena` (`Codegen`/`FrogState`/`compile_entry`/
+`build_*` threading, and both call sites in `state.rs`/`compile_and_run`) is **deleted**, not
+branched: the data object is owned by the module for its whole lifetime, so nothing external need
+keep literal bytes alive. Confirmed the CLIF now emits `symbol_value.i64 gvN` (a colocated symbol
+reference — a relocation under `cranelift-object`, an absolute address under the JIT) rather than an
+`iconst` pointer. String interpolation lowers through `StrLit`, so it was covered with no third
+site. Verified: full suite 1175/1175, **and 1175/1175 again under `FROG_GC_STRESS=1`** (collect on
+every allocation — the hardest stress on the string-alloc path this touched).
+
+<details><summary>Original gap description</summary>
 `TypedExprKind::StrLit` (`codegen/mod.rs:2654`) and `print_fragment` (`:1432`) both do
 `bytes.as_ptr() as i64` → `iconst`, and keep the bytes alive in a transient `string_arena: Vec<Vec<u8>>`
 only for the duration of the JIT call. In an AOT object this pointer is meaningless — it points
@@ -72,6 +88,8 @@ touches the hot expression path.
 
 Note: string interpolation (`INTERPOLATION.md`) lowers to `StrLit` + concat/`print_fragment`, so it
 is covered by this one fix — verify no third `as_ptr()` site hides in the interpolation desugar.
+
+</details>
 
 ### G2 — `Codegen` is hard-wired to `JITModule` — **DONE (2026-09-12)**
 Implemented as below. `Codegen<M: Module>` is generic; `Ctx.module`, `declare_rt`, `build_func_body`,
@@ -203,8 +221,8 @@ Cross-compilation is out of scope for v1 (host target only).
 ## Suggested order of work
 
 1. ~~**G2** (abstract `Codegen` over `Module`)~~ **DONE** — no behavior change; JIT suite green.
-2. **G1** (literals as data objects) — flip both backends, delete `string_arena`, dedup. Verified
-   entirely by the existing JIT test suite (behavior must be identical).
+2. ~~**G1** (literals as data objects)~~ **DONE** — both backends emit `symbol_value`, `string_arena`
+   deleted, literals deduped. JIT suite identical, including under `FROG_GC_STRESS=1`.
 3. **G7** (runtime staticlib) + **G8** skeleton (`frog build` that emits `.o` and links a trivial
    `main` that just calls a hand-written `__frog_main`) — prove the link line and symbol resolution
    on a program with no strings and no GC first.

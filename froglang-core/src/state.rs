@@ -200,7 +200,6 @@ pub struct FrogState {
     /// existed; more than one for a struct-typed binding.
     pub env:          HashMap<String, Vec<i64>>,
     pub env_types:    HashMap<String, Type>,
-    pub string_arena: Vec<Vec<u8>>,
     pub entry_count:  usize,
     /// One entry per successful `eval`/`eval_file` call, in `entry_id`
     /// order — see `EntrySource`. A failed entry (type error, codegen panic)
@@ -405,7 +404,6 @@ impl FrogState {
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.codegen.compile_entry(
                 typed,
-                &mut self.string_arena,
                 entry_count,
                 &self.env,
                 &self.env_types,
@@ -621,7 +619,6 @@ impl FrogStateBuilder {
             codegen,
             env:          HashMap::new(),
             env_types:    HashMap::new(),
-            string_arena: Vec::new(),
             entry_count:  0,
             entry_sources: Vec::new(),
         };

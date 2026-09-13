@@ -5,7 +5,7 @@ use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, BlockA
 use cranelift_codegen::{settings, settings::Configurable, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use crate::frontend::liveness;
 use crate::frontend::tokens::{Span, Spanned, Token};
@@ -29,8 +29,61 @@ pub struct FnSourceInfo {
     pub entry_id: usize,
 }
 
+/// Interned string/byte literals, each emitted once as a module-local,
+/// read-only data object and referenced by relocation (`symbol_value`) at
+/// its use sites — never as a baked `bytes.as_ptr()` immediate, which points
+/// into the compiler's own heap and is meaningless in an AOT object (and
+/// which forced the now-deleted `string_arena` to keep those bytes alive for
+/// the JIT call). See `plans/AOT.md`, G1.
+///
+/// The counter is module-global so a literal in a later REPL entry never
+/// collides with an earlier entry's data symbol; the map dedups identical
+/// bytes to one object (immutable, so sharing is always safe).
+#[derive(Default)]
+struct StrLiterals {
+    map:  HashMap<Vec<u8>, DataId>,
+    next: usize,
+}
+
+impl StrLiterals {
+    /// The `DataId` of a read-only data object holding `bytes`, declaring and
+    /// defining it on first sight and reusing it thereafter.
+    fn intern(&mut self, module: &mut dyn Module, bytes: &[u8]) -> DataId {
+        if let Some(&id) = self.map.get(bytes) {
+            return id;
+        }
+        let name = format!("__frog_str_{}", self.next);
+        self.next += 1;
+        let id = module
+            .declare_data(&name, Linkage::Local, /*writable=*/ false, /*tls=*/ false)
+            .unwrap_or_else(|e| panic!("declare_data '{}' failed: {}", name, e));
+        let mut desc = DataDescription::new();
+        desc.define(bytes.to_vec().into_boxed_slice());
+        module
+            .define_data(id, &desc)
+            .unwrap_or_else(|e| panic!("define_data '{}' failed: {}", name, e));
+        self.map.insert(bytes.to_vec(), id);
+        id
+    }
+}
+
+/// Emit `(data_ptr, len)` SSA values for `bytes`, materializing a pointer to
+/// its interned data object via a `symbol_value` relocation (AOT-clean;
+/// resolves to an absolute address under the JIT, a relocation under
+/// `cranelift-object`). Both the `StrLit` allocation path and the
+/// `print_fragment` formatting path go through here.
+fn emit_str_literal(bytes: &[u8], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> (Value, Value) {
+    let id = ctx.str_literals.intern(ctx.module, bytes);
+    let gv = ctx.module.declare_data_in_func(id, bcx.func);
+    let ptr = bcx.ins().symbol_value(types::I64, gv);
+    let len = bcx.ins().iconst(types::I64, bytes.len() as i64);
+    (ptr, len)
+}
+
 pub struct Codegen<M: Module> {
     pub module: M,
+    /// Interned string/byte literal data objects — see `StrLiterals`.
+    str_literals: StrLiterals,
     func_ids: HashMap<String, FuncId>,
     builder_ctx: FunctionBuilderContext,
     /// Names registered via `new_with_hosts` — every one of them also has a
@@ -66,7 +119,7 @@ pub type JitCodegen = Codegen<JITModule>;
 struct Ctx<'a> {
     func_ids:      &'a HashMap<String, FuncId>,
     module:        &'a mut dyn Module,
-    string_arena:  &'a mut Vec<Vec<u8>>,
+    str_literals:  &'a mut StrLiterals,
     /// Field layout for every registered struct, from `TypeChecker::struct_defs`.
     /// Structs are represented unboxed: a struct-typed value is never one
     /// SSA `Value`, it's flattened into as many `Value`s as it has leaf
@@ -1437,12 +1490,7 @@ impl From<bool> for DivFaultKind { fn from(b: bool) -> Self { DivFaultKind::Know
 
 /// Emit a non-GC string fragment used while formatting composite values.
 fn print_fragment(text: &str, bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
-    let bytes = text.as_bytes().to_vec();
-    let ptr = bytes.as_ptr() as i64;
-    let len = bytes.len() as i64;
-    ctx.string_arena.push(bytes);
-    let data = bcx.ins().iconst(types::I64, ptr);
-    let len = bcx.ins().iconst(types::I64, len);
+    let (data, len) = emit_str_literal(text.as_bytes(), bcx, ctx);
     let id = ctx.func_ids["frog_bytes_print"];
     let callee = ctx.module.declare_func_in_func(id, bcx.func);
     bcx.ins().call(callee, &[data, len]);
@@ -2330,9 +2378,10 @@ fn compile_expr(
 /// wrapped in a one-element `Vec`, so nothing about existing (pre-struct)
 /// codegen changes in substance.
 ///
-/// `ctx.string_arena` keeps source `Vec<u8>` buffers alive until the JIT
-/// executes; `frog_alloc_str` copies bytes immediately, so the arena only
-/// needs to outlive the call to the compiled function.
+/// A string literal is emitted as a module-local read-only data object
+/// (`emit_str_literal`/`StrLiterals`) and referenced by relocation, not as a
+/// baked host pointer; `frog_alloc_str` copies its bytes into the GC heap
+/// immediately.
 ///
 /// Every SSA value whose static type is GC-scannable is declared to
 /// Cranelift (`declare_gc_value`/`declare_gc_var`) at or near the point it
@@ -2659,13 +2708,7 @@ fn compile_expr_multi(
         TypedExprKind::FloatLit(f) => vec![bcx.ins().f64const(*f)],
 
         TypedExprKind::StrLit(s) => {
-            let bytes = s.as_bytes().to_vec();
-            let ptr = bytes.as_ptr() as i64;
-            let len = bytes.len() as i64;
-            ctx.string_arena.push(bytes);  // keep alive until after JIT call
-
-            let data_val = bcx.ins().iconst(types::I64, ptr);
-            let len_val  = bcx.ins().iconst(types::I64, len);
+            let (data_val, len_val) = emit_str_literal(s.as_bytes(), bcx, ctx);
 
             let func_id = ctx.func_ids["frog_alloc_str"];
             let callee  = ctx.module.declare_func_in_func(func_id, bcx.func);
@@ -5054,6 +5097,7 @@ impl Codegen<JITModule> {
 
         Ok(Codegen {
             module,
+            str_literals: StrLiterals::default(),
             func_ids,
             builder_ctx: FunctionBuilderContext::new(),
             host_fns,
@@ -5105,7 +5149,7 @@ impl<M: Module> Codegen<M> {
         params: &[(String, Type, bool)],
         return_type: &Type,
         body: &Spanned<TypedExpr>,
-        string_arena: &mut Vec<Vec<u8>>,
+        str_literals: &mut StrLiterals,
         structs: &StructDefs,
         unions: &UnionDefs,
         host_fns: &std::collections::HashSet<String>,
@@ -5147,7 +5191,7 @@ impl<M: Module> Codegen<M> {
         }
 
         let mut ctx = Ctx {
-            func_ids, module, string_arena, structs, unions,
+            func_ids, module, str_literals, structs, unions,
             printing_unions: Vec::new(), comparing_unions: Vec::new(), mut_params, liveness: body_liveness,
             host_fns,
             cow_verify: cow_verify_enabled(),
@@ -5220,7 +5264,7 @@ impl<M: Module> Codegen<M> {
         module: &mut dyn Module,
         func_ids: &HashMap<String, FuncId>,
         stmts: &[Spanned<TypedExpr>],
-        string_arena: &mut Vec<Vec<u8>>,
+        str_literals: &mut StrLiterals,
         pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
@@ -5278,7 +5322,7 @@ impl<M: Module> Codegen<M> {
         }
 
         let mut ctx = Ctx {
-            func_ids, module, string_arena, structs, unions,
+            func_ids, module, str_literals, structs, unions,
             printing_unions: Vec::new(), comparing_unions: Vec::new(), mut_params: Vec::new(), liveness: entry_liveness,
             host_fns,
             cow_verify: cow_verify_enabled(),
@@ -5379,7 +5423,6 @@ impl<M: Module> Codegen<M> {
     pub fn emit_entry(
         &mut self,
         typed: Spanned<TypedExpr>,
-        string_arena: &mut Vec<Vec<u8>>,
         entry_id: usize,
         pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
@@ -5455,7 +5498,7 @@ impl<M: Module> Codegen<M> {
                 params,
                 return_type,
                 body,
-                string_arena,
+                &mut self.str_literals,
                 structs,
                 unions,
                 &self.host_fns,
@@ -5488,7 +5531,7 @@ impl<M: Module> Codegen<M> {
             &mut self.module,
             &self.func_ids,
             &stmts,
-            string_arena,
+            &mut self.str_literals,
             pre_env,
             env_types,
             structs,
@@ -5518,7 +5561,6 @@ impl Codegen<JITModule> {
     pub fn compile_entry(
         &mut self,
         typed: Spanned<TypedExpr>,
-        string_arena: &mut Vec<Vec<u8>>,
         entry_id: usize,
         pre_env: &HashMap<String, Vec<i64>>,
         env_types: &HashMap<String, Type>,
@@ -5526,7 +5568,7 @@ impl Codegen<JITModule> {
         unions: &UnionDefs,
     ) -> (FuncId, Vec<(String, Type)>) {
         let (main_id, bindings, pending_maps, pending_names) = self.emit_entry(
-            typed, string_arena, entry_id, pre_env, env_types, structs, unions,
+            typed, entry_id, pre_env, env_types, structs, unions,
         );
 
         self.module.finalize_definitions().expect("finalize_definitions failed");
@@ -5641,9 +5683,8 @@ pub fn compile_and_run(src: &str) -> i64 {
     crate::frontend::liveness::number_nodes(&mut typed);
 
     let mut codegen = JitCodegen::new();
-    let mut string_arena: Vec<Vec<u8>> = Vec::new();
     let (main_id, bindings) = codegen.compile_entry(
-        typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),
+        typed, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),
     );
 
     let ptr = codegen.module.get_finalized_function(main_id);
@@ -5664,5 +5705,5 @@ pub fn compile_and_run(src: &str) -> i64 {
     let result = f(out_ptr as i64);
     gc::GC_HEAP.with(|h| h.borrow_mut().pop_scanned_span());
     result
-    // string_arena and out_buf dropped here, after f() returns
+    // out_buf dropped here, after f() returns
 }

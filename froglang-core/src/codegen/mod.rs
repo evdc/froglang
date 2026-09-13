@@ -29,8 +29,8 @@ pub struct FnSourceInfo {
     pub entry_id: usize,
 }
 
-pub struct Codegen {
-    pub module: JITModule,
+pub struct Codegen<M: Module> {
+    pub module: M,
     func_ids: HashMap<String, FuncId>,
     builder_ctx: FunctionBuilderContext,
     /// Names registered via `new_with_hosts` — every one of them also has a
@@ -46,6 +46,13 @@ pub struct Codegen {
     source_map: Vec<FnSourceInfo>,
 }
 
+/// The JIT-backed `Codegen` — what `run`/REPL (`state.rs`) drive. The
+/// generic `Codegen<M>` exists so the shared emission passes can also be
+/// driven by a `cranelift-object` `ObjectModule` for AOT (`plans/AOT.md`,
+/// G2); everything JIT-specific (constructing the module, `finalize_definitions`,
+/// `get_finalized_function`) lives in `impl Codegen<JITModule>`.
+pub type JitCodegen = Codegen<JITModule>;
+
 /// Per-function-compilation context threaded through `compile_expr`.
 ///
 /// GC roots are Cranelift's business now, not this module's: every value
@@ -58,7 +65,7 @@ pub struct Codegen {
 /// use-after-frees that lockstep requirement produced. See RUNTIME.md Part 2.
 struct Ctx<'a> {
     func_ids:      &'a HashMap<String, FuncId>,
-    module:        &'a mut JITModule,
+    module:        &'a mut dyn Module,
     string_arena:  &'a mut Vec<Vec<u8>>,
     /// Field layout for every registered struct, from `TypeChecker::struct_defs`.
     /// Structs are represented unboxed: a struct-typed value is never one
@@ -1318,7 +1325,7 @@ fn from_i64_repr(bcx: &mut FunctionBuilder, ty: &Type, val: Value) -> Value {
 
 /// Declare a runtime import function in the module and insert its FuncId.
 fn declare_rt(
-    module: &mut JITModule,
+    module: &mut dyn Module,
     func_ids: &mut HashMap<String, FuncId>,
     sym_name: &str,   // name in the JIT symbol table / linker
     key: &str,        // key in func_ids (may differ to create aliases like "print")
@@ -4675,13 +4682,13 @@ fn compile_iterable_for_loop(
     result_list
 }
 
-impl Default for Codegen {
+impl Default for Codegen<JITModule> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Codegen {
+impl<M: Module> Codegen<M> {
     /// Snapshot `func_ids` before a `compile_entry` call that might panic
     /// partway through (e.g. after Pass 1 has declared this entry's
     /// functions but before Pass 2 finishes defining them). Pair with
@@ -4726,7 +4733,9 @@ impl Codegen {
     pub fn reset_builder_ctx(&mut self) {
         self.builder_ctx = FunctionBuilderContext::new();
     }
+}
 
+impl Codegen<JITModule> {
     pub fn new() -> Self {
         // `hosts` is empty, so no name can collide with a runtime primitive.
         Self::new_with_hosts(&[]).expect("empty host list can't collide")
@@ -5052,6 +5061,9 @@ impl Codegen {
         })
     }
 
+}
+
+impl<M: Module> Codegen<M> {
     /// A struct-typed param or return value expands to one `AbiParam` per
     /// flattened leaf field (`struct_fields`), in declared-field order —
     /// Cranelift signatures natively support multiple params/returns, so
@@ -5088,7 +5100,7 @@ impl Codegen {
         name: &str,
         builder_ctx: &mut FunctionBuilderContext,
         cl_ctx: &mut Context,
-        module: &mut JITModule,
+        module: &mut dyn Module,
         func_ids: &HashMap<String, FuncId>,
         params: &[(String, Type, bool)],
         return_type: &Type,
@@ -5205,7 +5217,7 @@ impl Codegen {
     fn build_main_body(
         builder_ctx: &mut FunctionBuilderContext,
         cl_ctx: &mut Context,
-        module: &mut JITModule,
+        module: &mut dyn Module,
         func_ids: &HashMap<String, FuncId>,
         stmts: &[Spanned<TypedExpr>],
         string_arena: &mut Vec<Vec<u8>>,
@@ -5354,9 +5366,17 @@ impl Codegen {
     /// Compile a single top-level program or REPL entry into a uniquely-named
     /// `__frog_main_N` function, pre-seeding the variable environment from
     /// prior entries (empty for a one-shot compile, e.g. `compile_and_run`).
-    /// Returns its `FuncId` and the ordered list of top-level bindings it
-    /// writes to its `out_ptr` parameter.
-    pub fn compile_entry(
+    ///
+    /// Backend-agnostic: it declares and *defines* every function into
+    /// `self.module` (a `JITModule` or an `ObjectModule`) but does not
+    /// finalize. Returns `__frog_main`'s `FuncId`, the ordered top-level
+    /// bindings it writes to `out_ptr`, and the per-function stack maps and
+    /// debug names — which the caller files once addresses are known: the
+    /// JIT does this immediately (`Codegen<JITModule>::compile_entry`), the
+    /// AOT backend serializes them for load-time registration
+    /// (`plans/AOT.md`, G4).
+    #[allow(clippy::type_complexity)]
+    pub fn emit_entry(
         &mut self,
         typed: Spanned<TypedExpr>,
         string_arena: &mut Vec<Vec<u8>>,
@@ -5365,7 +5385,7 @@ impl Codegen {
         env_types: &HashMap<String, Type>,
         structs: &StructDefs,
         unions: &UnionDefs,
-    ) -> (FuncId, Vec<(String, Type)>) {
+    ) -> (FuncId, Vec<(String, Type)>, Vec<(FuncId, gc::JitFunctionMaps)>, Vec<(FuncId, String)>) {
         let stmts: Vec<Spanned<TypedExpr>> = match typed.item.kind {
             TypedExprKind::Block(s) => s,
             _ => vec![typed],
@@ -5484,6 +5504,31 @@ impl Codegen {
         pending_names.push((main_id, entry_name.clone()));
         self.module.clear_context(&mut ctx);
 
+        (main_id, bindings, pending_maps, pending_names)
+    }
+}
+
+impl Codegen<JITModule> {
+    /// The JIT driver over `emit_entry`: define every function, finalize so
+    /// they have addresses, then file each one's stack maps into the
+    /// process-wide `gc::JIT_CODE` keyed by its finalized return address (see
+    /// `gc::JitCode`). Returns `__frog_main`'s `FuncId` and the ordered
+    /// top-level bindings — the signature `FrogState::eval` and
+    /// `compile_and_run` depend on.
+    pub fn compile_entry(
+        &mut self,
+        typed: Spanned<TypedExpr>,
+        string_arena: &mut Vec<Vec<u8>>,
+        entry_id: usize,
+        pre_env: &HashMap<String, Vec<i64>>,
+        env_types: &HashMap<String, Type>,
+        structs: &StructDefs,
+        unions: &UnionDefs,
+    ) -> (FuncId, Vec<(String, Type)>) {
+        let (main_id, bindings, pending_maps, pending_names) = self.emit_entry(
+            typed, string_arena, entry_id, pre_env, env_types, structs, unions,
+        );
+
         self.module.finalize_definitions().expect("finalize_definitions failed");
 
         // Only now do these functions have addresses, so only now can their
@@ -5517,7 +5562,7 @@ fn dump_clif(name: &str, ctx: &cranelift_codegen::Context) {
     eprintln!("=== {} ===\n{}", name, ctx.func.display());
 }
 
-impl Codegen {
+impl Codegen<JITModule> {
     /// Append `start length name` for each just-finalized function to the
     /// file named by `FROG_JIT_SYMBOLS`, and do nothing at all when that
     /// variable is unset.
@@ -5595,7 +5640,7 @@ pub fn compile_and_run(src: &str) -> i64 {
     tc.desugar_notation(&mut typed).expect("repr type error");
     crate::frontend::liveness::number_nodes(&mut typed);
 
-    let mut codegen = Codegen::new();
+    let mut codegen = JitCodegen::new();
     let mut string_arena: Vec<Vec<u8>> = Vec::new();
     let (main_id, bindings) = codegen.compile_entry(
         typed, &mut string_arena, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),

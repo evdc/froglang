@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::codegen::Codegen;
+use crate::codegen::JitCodegen;
 use crate::frontend::parser::ParseError;
 use crate::frontend::modules;
 use crate::frontend::typeck::{Type, TypeChecker};
@@ -193,7 +193,7 @@ pub struct EntrySource {
 pub struct FrogState {
     pub heap:         GcHeap,
     pub tc:           TypeChecker,
-    pub codegen:      Codegen,
+    pub codegen:      JitCodegen,
     /// One `i64` per flattened leaf field of the binding's type (see
     /// `struct_fields` in `codegen/mod.rs`) — a single element for every
     /// non-struct type, matching how it always worked before structs
@@ -611,7 +611,7 @@ impl FrogStateBuilder {
         // declared before any frog type exists — see `Codegen::new_with_hosts`,
         // which also rejects a host name that collides with a runtime
         // primitive's `func_ids` key.
-        let codegen = Codegen::new_with_hosts(&self.hosts).map_err(FrogError::Type)?;
+        let codegen = JitCodegen::new_with_hosts(&self.hosts).map_err(FrogError::Type)?;
 
         let mut heap = GcHeap::new();
         heap.dict_backend = self.dict_backend.clone();

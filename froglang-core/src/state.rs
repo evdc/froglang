@@ -535,6 +535,14 @@ impl FrogStateBuilder {
         self
     }
 
+    /// The host functions registered so far. `frog build` needs them apart
+    /// from the `FrogState` it builds: the object backend declares the same
+    /// host imports the JIT does (`ObjectCodegen::new_object`), but `build()`
+    /// consumes the builder.
+    pub fn hosts(&self) -> &[crate::host::HostFn] {
+        &self.hosts
+    }
+
     /// Evaluate `src` before any user code — the mechanism for declaring
     /// host `data` types (`error IoError(msg: Str)`) a host function's
     /// signature refers to, since it reuses the ordinary parser/typeck path

@@ -185,9 +185,14 @@ removed rather than struck through — check `plans/*.md` git history if you wan
 - ~~User-definable generics~~ — **done**.
 - ~~Modules~~ — **done**.
 - ~~`Dict`/`Map`~~ — **done** (see "Newly done, 2026-09-09" above).
-- An AOT compile path — swap the Cranelift JIT for `cranelift-object`, link against the runtime.
-  Nothing built; `host.rs` has one doc-comment line describing the idea, no dependency, no `build`
-  CLI subcommand (only `run`/`check`).
+- ~~An AOT compile path — swap the Cranelift JIT for `cranelift-object`, link against the runtime.~~
+  **done** (`plans/AOT.md`). `frog build prog.frog -o prog` emits a relocatable object from a
+  `Codegen<ObjectModule>` (the same `Codegen` the JIT drives, now generic over `Module`) and links
+  it against `libfroglang_core.a` with `cc`. String literals are relocated data objects (not baked
+  pointers), GC stack maps are serialized and registered at load time (`FROG_GC_STRESS`-verified),
+  and a generated `main` runs the program for side effects via `frog_rt_main`, discarding the final
+  value. Host functions link and run against an AOT `FrogCtx`. Whole-corpus JIT/AOT differential is
+  green; the JIT path is behaviorally unchanged.
 - Struct/union marshalling, `mut` parameters, and generic host functions in the embedding API —
   all still open (`plans/EMBEDDING.md`'s own deferred list, still accurate).
 

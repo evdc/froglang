@@ -110,7 +110,14 @@ fn _frog_fn(f: ItemFn) -> syn::Result<TokenStream> {
         // validity (see `HostFn`), and marking it `unsafe` would only move
         // the obligation somewhere no human writes.
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        #[no_mangle]
+        // Exported under the descriptor's `symbol` name (`__frog_host_<fn>`),
+        // not the Rust identifier `__frog_shim_<fn>`. The JIT bridges the two
+        // via `JITBuilder::symbol(host.symbol, host.shim_addr)`, but an AOT
+        // object imports the shim by that `symbol` name and the linker must
+        // find it under exactly that name in the runtime staticlib
+        // (`plans/AOT.md`, G7). `#[export_name]` gives the function that
+        // symbol directly, replacing the plain `#[no_mangle]`.
+        #[export_name = #symbol_lit]
         pub extern "C" fn #shim_ident(
             __frog_ctx: *mut ::froglang_core::runtime::host::FrogCtx,
             __frog_args_ptr: *const i64,

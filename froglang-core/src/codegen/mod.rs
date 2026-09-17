@@ -5,6 +5,7 @@ use cranelift_codegen::ir::{condcodes::{FloatCC, IntCC}, types, AbiParam, BlockA
 use cranelift_codegen::{settings, settings::Configurable, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_object::{ObjectBuilder, ObjectModule};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 
 use crate::frontend::liveness;
@@ -4942,158 +4943,8 @@ impl Codegen<JITModule> {
             builder.symbol(host.symbol, host.shim);
         }
 
-        let mut module   = JITModule::new(builder);
-        let mut func_ids = HashMap::<String, FuncId>::new();
-        let mut host_fns = std::collections::HashSet::new();
-
-        use types::I64;
-        // Declare Cranelift import signatures for each runtime function.
-        declare_rt(&mut module, &mut func_ids, "frog_alloc_str",  "frog_alloc_str",  &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_str_len",    "frog_str_len",    &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_str_concat", "frog_str_concat", &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_str_eq",     "frog_str_eq",     &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_str_cmp",    "frog_str_cmp",    &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_str_contains", "frog_str_contains", &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_str_print",  "frog_str_print",  &[I64],           None);
-        declare_rt(&mut module, &mut func_ids, "frog_str_repr_print", "frog_str_repr_print", &[I64], None);
-        declare_rt(&mut module, &mut func_ids, "frog_bytes_print", "frog_bytes_print", &[I64, I64], None);
-        // "print" in froglang calls frog_str_println (with newline).
-        declare_rt(&mut module, &mut func_ids, "frog_str_println","print",           &[I64],           None);
-        // `panic` prints its message and exits the process from the runtime
-        // side (`ffi::frog_panic`); it never returns. It used to be an alias
-        // for `frog_str_println`, relying on the generic `Call` codegen's
-        // `Type::Never` handling to emit a `trap` once the call came back —
-        // but a `trap` is SIGILL, so `panic("boom")` printed its message and
-        // then died with exit 132 instead of a clean 1. The `Never` trap
-        // after the call is now dead code, which is exactly what it's for.
-        declare_rt(&mut module, &mut func_ids, "frog_panic",     "panic",           &[I64],           None);
-        // `!`'s desugaring (`TypeChecker::build_unwrap_arms`) resolves to
-        // this reserved alias, not `"panic"`, so it can't be redirected by
-        // a user-defined `func panic(...)` (which would overwrite the
-        // `"panic"` key above via the ordinary user-function registration
-        // path) — see `UNWRAP_PANIC_NAME` in typeck.rs.
-        declare_rt(&mut module, &mut func_ids, "frog_panic",     "panic!builtin",   &[I64],           None);
-        // Integer-division fault reporting — see `emit_int_div_guard`.
-        declare_rt(&mut module, &mut func_ids, "frog_div_error", "frog_div_error",  &[I64],           None);
-        declare_rt(&mut module, &mut func_ids, "frog_int_println", "frog_int_println", &[I64],           None);
-        declare_rt(&mut module, &mut func_ids, "frog_float_println", "frog_float_println", &[types::F64], None);
-        declare_rt(&mut module, &mut func_ids, "frog_bool_println", "frog_bool_println", &[types::I8],  None);
-        declare_rt(&mut module, &mut func_ids, "frog_int_print", "frog_int_print", &[I64], None);
-        declare_rt(&mut module, &mut func_ids, "frog_float_print", "frog_float_print", &[types::F64], None);
-        declare_rt(&mut module, &mut func_ids, "frog_bool_print", "frog_bool_print", &[types::I8], None);
-        declare_rt(&mut module, &mut func_ids, "frog_alloc_list", "frog_alloc_list", &[I64, I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_list_len",   "frog_list_len",   &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_list_get",   "frog_list_get",   &[I64, I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_list_set",   "frog_list_set",   &[I64, I64, I64, I64], None);
-        declare_rt(&mut module, &mut func_ids, "frog_list_push",  "frog_list_push",  &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_list_slice", "frog_list_slice", &[I64, I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_range",      "frog_range",      &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_alloc_dict",       "frog_alloc_dict",       &[I64, I64, I64, I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_dict_len",         "frog_dict_len",         &[I64],                     Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_dict_find",        "frog_dict_find",        &[I64, I64],                Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_dict_insert",      "frog_dict_insert",      &[I64, I64],                Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_dict_slot",        "frog_dict_slot",        &[I64, I64, I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_dict_set_slot",    "frog_dict_set_slot",    &[I64, I64, I64, I64],      None);
-        declare_rt(&mut module, &mut func_ids, "frog_dict_remove",      "frog_dict_remove",      &[I64, I64],                Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_dict_key_missing", "frog_dict_key_missing", &[I64, I64],                None);
-        declare_rt(&mut module, &mut func_ids, "frog_gc_dump",    "gc_dump",         &[],               None);
-        declare_rt(&mut module, &mut func_ids, "frog_alloc_variant", "frog_alloc_variant", &[I64, I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_variant_tag", "frog_variant_tag", &[I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_variant_get", "frog_variant_get", &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_variant_set", "frog_variant_set", &[I64, I64, I64], None);
-        // Deep-clone-on-Copy for a GC-pointer-bearing `Var` read — see
-        // `compile_expr_multi`'s `TypedExprKind::Var` arm and `Ctx::liveness`.
-        declare_rt(&mut module, &mut func_ids, "frog_cow_verify", "frog_cow_verify", &[I64, I64], None);
-        declare_rt(&mut module, &mut func_ids, "frog_clone",      "frog_clone",      &[I64],           Some(I64));
-        // Fetches the `FrogCtx*` a host call passes as its own argument 0
-        // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,
-        // "Getting the ctx pointer without baking an address").
-        declare_rt(&mut module, &mut func_ids, "frog_ctx_current", "frog_ctx_current", &[], Some(I64));
-        // `repr` leaves (plans/DATA.md stage 5). `__repr_int`/`__repr_float`/
-        // `__repr_bool`/`__repr_str`/`__str_join` are the `func_ids` keys
-        // `desugar_notation` synthesizes `Var(...)` callables under — never
-        // spellable in source, so they need no `compile_call` special case:
-        // they go through the ordinary named-call path at the bottom of
-        // `compile_call`, keyed by these aliases exactly like `"print"` is
-        // an alias for `frog_str_println` above.
-        declare_rt(&mut module, &mut func_ids, "frog_int_repr",   "__repr_int",     &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_float_repr", "__repr_float",   &[types::F64],    Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_bool_repr",  "__repr_bool",    &[types::I8],     Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_str_repr",   "__repr_str",     &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_str_join",   "__str_join",     &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_open",     "frog_read_open",     &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_close",    "frog_read_close",    &[],              None);
-        declare_rt(&mut module, &mut func_ids, "frog_read_failed",   "frog_read_failed",   &[],              Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_offset",   "frog_read_offset",   &[],              Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_msg",      "frog_read_msg",      &[],              Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_int",    "frog_read_is_int",    &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_float",  "frog_read_is_float",  &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_bool",   "frog_read_is_bool",   &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_str",    "frog_read_is_str",    &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_none",   "frog_read_is_none",   &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_list",   "frog_read_is_list",   &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_dict",   "frog_read_is_dict",   &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_range",  "frog_read_is_range",  &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_struct", "frog_read_is_struct", &[I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_expect",    "frog_read_expect",    &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_int",      "frog_read_int",      &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_float",    "frog_read_float",    &[I64],           Some(types::F64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_bool",     "frog_read_bool",     &[I64],           Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_str",      "frog_read_str",      &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_field",    "frog_read_field",    &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_arg",      "frog_read_arg",      &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_is_call",  "frog_read_is_call",  &[I64, I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_read_list_len", "frog_read_list_len", &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_list_at",  "frog_read_list_at",  &[I64, I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_dict_len", "frog_read_dict_len", &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_dict_key_at", "frog_read_dict_key_at", &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_dict_val_at", "frog_read_dict_val_at", &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_range_lo", "frog_read_range_lo", &[I64],           Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_read_range_hi", "frog_read_range_hi", &[I64],           Some(I64));
-        // `json` (plans/DATA.md stage 8) — `build_json`'s two Tier-2 write
-        // leaves, then `build_read_json`'s accessors, which mirror `read`'s
-        // above one for one. `__repr_int`/`__repr_bool` cover the other
-        // scalars: their output is already JSON-legal.
-        declare_rt(&mut module, &mut func_ids, "frog_json_escape",     "__json_str",          &[I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_float_repr", "__json_float",        &[types::F64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_open",       "frog_json_open",      &[I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_close",      "frog_json_close",     &[],         None);
-        declare_rt(&mut module, &mut func_ids, "frog_json_failed",     "frog_json_failed",    &[],         Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_offset",     "frog_json_offset",    &[],         Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_msg",        "frog_json_msg",       &[],         Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_is_int",     "frog_json_is_int",    &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_is_float",   "frog_json_is_float",  &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_is_bool",    "frog_json_is_bool",   &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_is_str",     "frog_json_is_str",    &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_is_null",    "frog_json_is_null",   &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_is_array",   "frog_json_is_array",  &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_is_object",  "frog_json_is_object", &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_is_number",  "frog_json_is_number", &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_has",        "frog_json_has",       &[I64, I64], Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_expect",     "frog_json_expect",    &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_int",        "frog_json_int",       &[I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_float",      "frog_json_float",     &[I64],      Some(types::F64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_bool",       "frog_json_bool",      &[I64],      Some(types::I8));
-        declare_rt(&mut module, &mut func_ids, "frog_json_str",        "frog_json_str",       &[I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_get",        "frog_json_get",       &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_at",         "frog_json_at",        &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_len",        "frog_json_len",       &[I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_obj_len",    "frog_json_obj_len",   &[I64],      Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_key_at",     "frog_json_key_at",    &[I64, I64], Some(I64));
-        declare_rt(&mut module, &mut func_ids, "frog_json_val_at",     "frog_json_val_at",    &[I64, I64], Some(I64));
-
-        // Every host function shares this one import signature — see
-        // `Ctx`'s `host_fns` field and `compile_call`'s host-call arm.
-        for host in hosts {
-            if func_ids.contains_key(host.name) {
-                return Err(format!(
-                    "host function '{}' collides with a runtime primitive of the same name",
-                    host.name
-                ));
-            }
-            declare_rt(&mut module, &mut func_ids, host.symbol, host.name, &[I64, I64, I64], None);
-            host_fns.insert(host.name.to_string());
-        }
+        let mut module = JITModule::new(builder);
+        let (func_ids, host_fns) = declare_runtime_imports(&mut module, hosts)?;
 
         Ok(Codegen {
             module,
@@ -5104,7 +4955,366 @@ impl Codegen<JITModule> {
             source_map: Vec::new(),
         })
     }
+}
 
+/// Declare the `Linkage::Import` signature of every runtime `frog_*` entry
+/// point and every host shim into `module`, returning the `func_ids` name map
+/// and the set of host-fn names. Shared by the JIT (`new_with_hosts`) and the
+/// AOT object backend (`new_object`): both need identical import declarations,
+/// and only *how* each symbol is resolved differs (the JIT bakes an address
+/// via `JITBuilder::symbol`; the linker resolves it for an object). Errors if
+/// a host name collides with a runtime primitive's `func_ids` key.
+fn declare_runtime_imports(
+    module: &mut dyn Module,
+    hosts: &[crate::host::HostFn],
+) -> Result<(HashMap<String, FuncId>, std::collections::HashSet<String>), String> {
+    let mut func_ids = HashMap::<String, FuncId>::new();
+    let mut host_fns = std::collections::HashSet::new();
+
+    use types::I64;
+    // Declare Cranelift import signatures for each runtime function.
+    declare_rt(module, &mut func_ids, "frog_alloc_str",  "frog_alloc_str",  &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_str_len",    "frog_str_len",    &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_str_concat", "frog_str_concat", &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_str_eq",     "frog_str_eq",     &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_str_cmp",    "frog_str_cmp",    &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_str_contains", "frog_str_contains", &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_str_print",  "frog_str_print",  &[I64],           None);
+    declare_rt(module, &mut func_ids, "frog_str_repr_print", "frog_str_repr_print", &[I64], None);
+    declare_rt(module, &mut func_ids, "frog_bytes_print", "frog_bytes_print", &[I64, I64], None);
+    // "print" in froglang calls frog_str_println (with newline).
+    declare_rt(module, &mut func_ids, "frog_str_println","print",           &[I64],           None);
+    // `panic` prints its message and exits the process from the runtime
+    // side (`ffi::frog_panic`); it never returns. It used to be an alias
+    // for `frog_str_println`, relying on the generic `Call` codegen's
+    // `Type::Never` handling to emit a `trap` once the call came back —
+    // but a `trap` is SIGILL, so `panic("boom")` printed its message and
+    // then died with exit 132 instead of a clean 1. The `Never` trap
+    // after the call is now dead code, which is exactly what it's for.
+    declare_rt(module, &mut func_ids, "frog_panic",     "panic",           &[I64],           None);
+    // `!`'s desugaring (`TypeChecker::build_unwrap_arms`) resolves to
+    // this reserved alias, not `"panic"`, so it can't be redirected by
+    // a user-defined `func panic(...)` (which would overwrite the
+    // `"panic"` key above via the ordinary user-function registration
+    // path) — see `UNWRAP_PANIC_NAME` in typeck.rs.
+    declare_rt(module, &mut func_ids, "frog_panic",     "panic!builtin",   &[I64],           None);
+    // Integer-division fault reporting — see `emit_int_div_guard`.
+    declare_rt(module, &mut func_ids, "frog_div_error", "frog_div_error",  &[I64],           None);
+    declare_rt(module, &mut func_ids, "frog_int_println", "frog_int_println", &[I64],           None);
+    declare_rt(module, &mut func_ids, "frog_float_println", "frog_float_println", &[types::F64], None);
+    declare_rt(module, &mut func_ids, "frog_bool_println", "frog_bool_println", &[types::I8],  None);
+    declare_rt(module, &mut func_ids, "frog_int_print", "frog_int_print", &[I64], None);
+    declare_rt(module, &mut func_ids, "frog_float_print", "frog_float_print", &[types::F64], None);
+    declare_rt(module, &mut func_ids, "frog_bool_print", "frog_bool_print", &[types::I8], None);
+    declare_rt(module, &mut func_ids, "frog_alloc_list", "frog_alloc_list", &[I64, I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_list_len",   "frog_list_len",   &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_list_get",   "frog_list_get",   &[I64, I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_list_set",   "frog_list_set",   &[I64, I64, I64, I64], None);
+    declare_rt(module, &mut func_ids, "frog_list_push",  "frog_list_push",  &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_list_slice", "frog_list_slice", &[I64, I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_range",      "frog_range",      &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_alloc_dict",       "frog_alloc_dict",       &[I64, I64, I64, I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_dict_len",         "frog_dict_len",         &[I64],                     Some(I64));
+    declare_rt(module, &mut func_ids, "frog_dict_find",        "frog_dict_find",        &[I64, I64],                Some(I64));
+    declare_rt(module, &mut func_ids, "frog_dict_insert",      "frog_dict_insert",      &[I64, I64],                Some(I64));
+    declare_rt(module, &mut func_ids, "frog_dict_slot",        "frog_dict_slot",        &[I64, I64, I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_dict_set_slot",    "frog_dict_set_slot",    &[I64, I64, I64, I64],      None);
+    declare_rt(module, &mut func_ids, "frog_dict_remove",      "frog_dict_remove",      &[I64, I64],                Some(I64));
+    declare_rt(module, &mut func_ids, "frog_dict_key_missing", "frog_dict_key_missing", &[I64, I64],                None);
+    declare_rt(module, &mut func_ids, "frog_gc_dump",    "gc_dump",         &[],               None);
+    declare_rt(module, &mut func_ids, "frog_alloc_variant", "frog_alloc_variant", &[I64, I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_variant_tag", "frog_variant_tag", &[I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_variant_get", "frog_variant_get", &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_variant_set", "frog_variant_set", &[I64, I64, I64], None);
+    // Deep-clone-on-Copy for a GC-pointer-bearing `Var` read — see
+    // `compile_expr_multi`'s `TypedExprKind::Var` arm and `Ctx::liveness`.
+    declare_rt(module, &mut func_ids, "frog_cow_verify", "frog_cow_verify", &[I64, I64], None);
+    declare_rt(module, &mut func_ids, "frog_clone",      "frog_clone",      &[I64],           Some(I64));
+    // Fetches the `FrogCtx*` a host call passes as its own argument 0
+    // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,
+    // "Getting the ctx pointer without baking an address").
+    declare_rt(module, &mut func_ids, "frog_ctx_current", "frog_ctx_current", &[], Some(I64));
+    // `repr` leaves (plans/DATA.md stage 5). `__repr_int`/`__repr_float`/
+    // `__repr_bool`/`__repr_str`/`__str_join` are the `func_ids` keys
+    // `desugar_notation` synthesizes `Var(...)` callables under — never
+    // spellable in source, so they need no `compile_call` special case:
+    // they go through the ordinary named-call path at the bottom of
+    // `compile_call`, keyed by these aliases exactly like `"print"` is
+    // an alias for `frog_str_println` above.
+    declare_rt(module, &mut func_ids, "frog_int_repr",   "__repr_int",     &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_float_repr", "__repr_float",   &[types::F64],    Some(I64));
+    declare_rt(module, &mut func_ids, "frog_bool_repr",  "__repr_bool",    &[types::I8],     Some(I64));
+    declare_rt(module, &mut func_ids, "frog_str_repr",   "__repr_str",     &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_str_join",   "__str_join",     &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_open",     "frog_read_open",     &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_close",    "frog_read_close",    &[],              None);
+    declare_rt(module, &mut func_ids, "frog_read_failed",   "frog_read_failed",   &[],              Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_offset",   "frog_read_offset",   &[],              Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_msg",      "frog_read_msg",      &[],              Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_is_int",    "frog_read_is_int",    &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_is_float",  "frog_read_is_float",  &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_is_bool",   "frog_read_is_bool",   &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_is_str",    "frog_read_is_str",    &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_is_none",   "frog_read_is_none",   &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_is_list",   "frog_read_is_list",   &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_is_dict",   "frog_read_is_dict",   &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_is_range",  "frog_read_is_range",  &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_is_struct", "frog_read_is_struct", &[I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_expect",    "frog_read_expect",    &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_int",      "frog_read_int",      &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_float",    "frog_read_float",    &[I64],           Some(types::F64));
+    declare_rt(module, &mut func_ids, "frog_read_bool",     "frog_read_bool",     &[I64],           Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_str",      "frog_read_str",      &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_field",    "frog_read_field",    &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_arg",      "frog_read_arg",      &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_is_call",  "frog_read_is_call",  &[I64, I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_read_list_len", "frog_read_list_len", &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_list_at",  "frog_read_list_at",  &[I64, I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_dict_len", "frog_read_dict_len", &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_dict_key_at", "frog_read_dict_key_at", &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_dict_val_at", "frog_read_dict_val_at", &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_range_lo", "frog_read_range_lo", &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_read_range_hi", "frog_read_range_hi", &[I64],           Some(I64));
+    // `json` (plans/DATA.md stage 8) — `build_json`'s two Tier-2 write
+    // leaves, then `build_read_json`'s accessors, which mirror `read`'s
+    // above one for one. `__repr_int`/`__repr_bool` cover the other
+    // scalars: their output is already JSON-legal.
+    declare_rt(module, &mut func_ids, "frog_json_escape",     "__json_str",          &[I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_float_repr", "__json_float",        &[types::F64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_open",       "frog_json_open",      &[I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_close",      "frog_json_close",     &[],         None);
+    declare_rt(module, &mut func_ids, "frog_json_failed",     "frog_json_failed",    &[],         Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_offset",     "frog_json_offset",    &[],         Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_msg",        "frog_json_msg",       &[],         Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_is_int",     "frog_json_is_int",    &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_is_float",   "frog_json_is_float",  &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_is_bool",    "frog_json_is_bool",   &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_is_str",     "frog_json_is_str",    &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_is_null",    "frog_json_is_null",   &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_is_array",   "frog_json_is_array",  &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_is_object",  "frog_json_is_object", &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_is_number",  "frog_json_is_number", &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_has",        "frog_json_has",       &[I64, I64], Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_expect",     "frog_json_expect",    &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_int",        "frog_json_int",       &[I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_float",      "frog_json_float",     &[I64],      Some(types::F64));
+    declare_rt(module, &mut func_ids, "frog_json_bool",       "frog_json_bool",      &[I64],      Some(types::I8));
+    declare_rt(module, &mut func_ids, "frog_json_str",        "frog_json_str",       &[I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_get",        "frog_json_get",       &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_at",         "frog_json_at",        &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_len",        "frog_json_len",       &[I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_obj_len",    "frog_json_obj_len",   &[I64],      Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_key_at",     "frog_json_key_at",    &[I64, I64], Some(I64));
+    declare_rt(module, &mut func_ids, "frog_json_val_at",     "frog_json_val_at",    &[I64, I64], Some(I64));
+
+    // Every host function shares this one import signature — see
+    // `Ctx`'s `host_fns` field and `compile_call`'s host-call arm.
+    for host in hosts {
+        if func_ids.contains_key(host.name) {
+            return Err(format!(
+                "host function '{}' collides with a runtime primitive of the same name",
+                host.name
+            ));
+        }
+        declare_rt(module, &mut func_ids, host.symbol, host.name, &[I64, I64, I64], None);
+        host_fns.insert(host.name.to_string());
+    }
+
+    Ok((func_ids, host_fns))
+}
+
+/// The AOT-backed `Codegen` — emits a relocatable object linked against the
+/// runtime staticlib, rather than running code in-process (`plans/AOT.md`).
+pub type ObjectCodegen = Codegen<ObjectModule>;
+
+impl Codegen<ObjectModule> {
+    /// Build an AOT `Codegen`. Same runtime import declarations as the JIT
+    /// (`declare_runtime_imports` — the linker resolves the `frog_*` symbols
+    /// against `libfroglang_core.a`), but the ISA is position-independent
+    /// (`is_pic`) because the object is linked into a PIE, and keeps
+    /// `preserve_frame_pointers` for the GC stack walk exactly as the JIT does.
+    pub fn new_object(hosts: &[crate::host::HostFn]) -> Result<Self, String> {
+        let mut flag_builder = settings::builder();
+        flag_builder.set("is_pic", "true").expect("is_pic setting");
+        flag_builder.set("preserve_frame_pointers", "true").expect("preserve_frame_pointers setting");
+        // Unlike the JIT (`new_with_hosts`, kept at `none` because its compile
+        // time is on every run's critical path), AOT pays compilation once at
+        // build time, so the GVN/LICM the optimizer buys is free at run time —
+        // `plans/AOT.md`, G3.
+        flag_builder.set("opt_level", "speed").expect("opt_level setting");
+        let flags = settings::Flags::new(flag_builder);
+        let isa = cranelift_native::builder()
+            .expect("host machine not supported by Cranelift")
+            .finish(flags)
+            .expect("ISA builder failed");
+        let builder = ObjectBuilder::new(isa, "frog_program", cranelift_module::default_libcall_names())
+            .map_err(|e| format!("ObjectBuilder failed: {}", e))?;
+        let mut module = ObjectModule::new(builder);
+        let (mut func_ids, host_fns) = declare_runtime_imports(&mut module, hosts)?;
+        // AOT-only: the emitted `main` calls this once at startup to file every
+        // function's stack maps into `JIT_CODE` (`plans/AOT.md`, G4). Declared
+        // only here, never for the JIT (which registers maps at finalize time).
+        declare_rt(&mut module, &mut func_ids, "frog_register_stackmaps", "frog_register_stackmaps", &[types::I64], None);
+        // AOT-only: the run harness the emitted `main` calls — sets up the heap
+        // and `FrogCtx`, runs `__frog_main` for side effects, discards the
+        // result (`plans/AOT.md`, G5). `(entry_addr, out_ptr) -> exit_code`.
+        declare_rt(&mut module, &mut func_ids, "frog_rt_main", "frog_rt_main", &[types::I64, types::I64], Some(types::I32));
+        Ok(Codegen {
+            module,
+            str_literals: StrLiterals::default(),
+            func_ids,
+            builder_ctx: FunctionBuilderContext::new(),
+            host_fns,
+            source_map: Vec::new(),
+        })
+    }
+
+    /// Compile one whole program and emit a relocatable object as bytes.
+    ///
+    /// G8 skeleton: also emits a C `main` that calls the entry with a
+    /// stack out-buffer and returns the program's integer result as the
+    /// process exit code — the observable signal for a program with no
+    /// side effects. G5 will replace this with a runtime `frog_rt_main`
+    /// that initializes the heap and runs the program for its side effects,
+    /// discarding the final value (`plans/AOT.md`, decision (a)).
+    pub fn build_object(
+        mut self,
+        typed: Spanned<TypedExpr>,
+        structs: &StructDefs,
+        unions: &UnionDefs,
+    ) -> Vec<u8> {
+        let (main_id, bindings, maps, _names) = self.emit_entry(
+            typed, 0, &HashMap::new(), &HashMap::new(), structs, unions,
+        );
+        let out_slots: usize = bindings.iter()
+            .map(|(_, ty)| struct_fields(ty, structs).len())
+            .sum::<usize>()
+            .max(1);
+        let registry = self.emit_stackmap_registry(maps);
+        self.emit_c_main(main_id, out_slots, registry);
+        let product = self.module.finish();
+        product.emit().expect("object emit failed")
+    }
+
+    /// Serialize every function's stack maps into a read-only data table the
+    /// emitted `main` hands to `frog_register_stackmaps` at startup
+    /// (`plans/AOT.md`, G4). Returns the registry `DataId`, or `None` if no
+    /// function has any GC-live safepoint (then no registration is needed).
+    ///
+    /// Layout mirrors `frog_register_stackmaps`' reader exactly:
+    ///   registry: `[ count:u64, { fn_addr:u64, meta_addr:u64 } * count ]`
+    ///   meta[i]:  `[ len:u64, num_safepoints:u32, (ret_off:u32, num_slots:u32, slots:[u32])* ]`
+    /// `fn_addr`/`meta_addr` are zero in the emitted bytes and filled by
+    /// `write_function_addr`/`write_data_addr` relocations at link/load time —
+    /// which is what makes a function's load-time base available without the
+    /// JIT's `get_finalized_function`.
+    fn emit_stackmap_registry(&mut self, maps: Vec<(FuncId, gc::JitFunctionMaps)>) -> Option<DataId> {
+        let funcs: Vec<(FuncId, gc::JitFunctionMaps)> =
+            maps.into_iter().filter(|(_, m)| !m.maps.is_empty()).collect();
+        if funcs.is_empty() {
+            return None;
+        }
+
+        // One pure-bytes meta blob per function (no relocations).
+        let mut meta_ids: Vec<DataId> = Vec::with_capacity(funcs.len());
+        for (i, (_fid, m)) in funcs.iter().enumerate() {
+            let mut bytes: Vec<u8> = Vec::new();
+            bytes.extend_from_slice(&(m.len as u64).to_ne_bytes());
+            bytes.extend_from_slice(&(m.maps.len() as u32).to_ne_bytes());
+            for (ret_off, slots) in &m.maps {
+                bytes.extend_from_slice(&ret_off.to_ne_bytes());
+                bytes.extend_from_slice(&(slots.len() as u32).to_ne_bytes());
+                for off in slots {
+                    bytes.extend_from_slice(&off.to_ne_bytes());
+                }
+            }
+            let name = format!("__frog_stackmap_meta_{}", i);
+            let id = self.module
+                .declare_data(&name, Linkage::Local, /*writable=*/ false, /*tls=*/ false)
+                .unwrap_or_else(|e| panic!("declare_data '{}' failed: {}", name, e));
+            let mut desc = DataDescription::new();
+            desc.set_align(8);
+            desc.define(bytes.into_boxed_slice());
+            self.module.define_data(id, &desc).expect("define stackmap meta");
+            meta_ids.push(id);
+        }
+
+        // Registry: count header, then one 16-byte {fn_addr, meta_addr} record
+        // per function. The two address fields are relocated.
+        const RECORD: usize = 16;
+        let total = 8 + funcs.len() * RECORD;
+        let mut contents = vec![0u8; total];
+        contents[0..8].copy_from_slice(&(funcs.len() as u64).to_ne_bytes());
+
+        let mut desc = DataDescription::new();
+        desc.set_align(8);
+        desc.define(contents.into_boxed_slice());
+        for (i, (fid, _)) in funcs.iter().enumerate() {
+            let base = 8 + i * RECORD;
+            let fref = self.module.declare_func_in_data(*fid, &mut desc);
+            desc.write_function_addr(base as u32, fref);
+            let gv = self.module.declare_data_in_data(meta_ids[i], &mut desc);
+            desc.write_data_addr((base + 8) as u32, gv, 0);
+        }
+        let reg = self.module
+            .declare_data("__frog_stackmap_registry", Linkage::Local, false, false)
+            .expect("declare stackmap registry");
+        self.module.define_data(reg, &desc).expect("define stackmap registry");
+        Some(reg)
+    }
+
+    /// Emit `int main(void)` (exported): register stack maps, then hand
+    /// `__frog_main`'s address and a stack out-buffer of `out_slots` i64s to
+    /// the runtime harness `frog_rt_main`, which sets up the heap and
+    /// `FrogCtx`, runs the program for side effects, and returns the process
+    /// exit code (`plans/AOT.md`, G5). The entry stays `Linkage::Local` — its
+    /// address is taken with `func_addr`, an intra-object reference.
+    fn emit_c_main(&mut self, entry_func: FuncId, out_slots: usize, registry: Option<DataId>) {
+        let target_config = self.module.target_config();
+        let mut sig = self.module.make_signature();
+        sig.returns.push(AbiParam::new(types::I32));
+        let main_id = self.module
+            .declare_function("main", Linkage::Export, &sig)
+            .expect("declare main failed");
+        let register_id = self.func_ids["frog_register_stackmaps"];
+        let rt_main_id = self.func_ids["frog_rt_main"];
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        {
+            let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut self.builder_ctx);
+            let blk = bcx.create_block();
+            bcx.switch_to_block(blk);
+            bcx.seal_block(blk);
+
+            // Register stack maps before any froglang code runs, so the first
+            // collection has a populated `JIT_CODE` to resolve AOT frames against.
+            if let Some(reg) = registry {
+                let gv = self.module.declare_data_in_func(reg, bcx.func);
+                let reg_ptr = bcx.ins().symbol_value(types::I64, gv);
+                let callee = self.module.declare_func_in_func(register_id, bcx.func);
+                bcx.ins().call(callee, &[reg_ptr]);
+            }
+
+            let ss = bcx.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot, (out_slots * 8) as u32, 3,
+            ));
+            let out_addr = bcx.ins().stack_addr(types::I64, ss, 0);
+
+            // `frog_rt_main(entry_addr, out_ptr) -> exit_code`.
+            let entry_ref = self.module.declare_func_in_func(entry_func, bcx.func);
+            let entry_addr = bcx.ins().func_addr(types::I64, entry_ref);
+            let callee = self.module.declare_func_in_func(rt_main_id, bcx.func);
+            let call = bcx.ins().call(callee, &[entry_addr, out_addr]);
+            let code = bcx.inst_results(call)[0];
+            bcx.ins().return_(&[code]);
+
+            bcx.seal_all_blocks();
+            bcx.finalize(target_config);
+        }
+        self.module.define_function(main_id, &mut ctx).expect("define main failed");
+        self.module.clear_context(&mut ctx);
+    }
 }
 
 impl<M: Module> Codegen<M> {

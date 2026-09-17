@@ -437,6 +437,64 @@ impl JitCode {
     }
 }
 
+/// AOT startup: register every function's stack maps into this thread's
+/// `JIT_CODE`, given the serialized registry the `cranelift-object` backend
+/// emitted (`plans/AOT.md`, G4). In the JIT this filing happens at
+/// `finalize_definitions` time from known addresses; an AOT binary has no such
+/// moment, so the emitted `main` calls this once before running the program.
+///
+/// `registry` layout (native-endian, produced by `Codegen::emit_stackmap_registry`):
+///   `[ count: u64, { fn_addr: u64, meta_addr: u64 } * count ]`
+/// where `fn_addr`/`meta_addr` are absolute pointers the linker/loader filled
+/// via relocations. Each `meta_addr` points at:
+///   `[ len: u64, num_safepoints: u32, (ret_off: u32, num_slots: u32, slots: [u32; num_slots])* ]`
+/// which mirrors `JitFunctionMaps` minus its (now load-time) `start`.
+///
+/// # Safety
+/// `registry` must be a valid pointer to a table of exactly this shape, with
+/// every `fn_addr`/`meta_addr` relocated — which is precisely what the emitted
+/// object guarantees. Intended to be called only from AOT-emitted `main`.
+#[no_mangle]
+pub unsafe extern "C" fn frog_register_stackmaps(registry: *const u8) {
+    if registry.is_null() {
+        return;
+    }
+    #[inline]
+    unsafe fn rd_u64(p: *const u8) -> u64 {
+        std::ptr::read_unaligned(p as *const u64)
+    }
+    #[inline]
+    unsafe fn rd_u32(p: *const u8) -> u32 {
+        std::ptr::read_unaligned(p as *const u32)
+    }
+
+    let count = rd_u64(registry) as usize;
+    let mut rec = registry.add(8);
+    for _ in 0..count {
+        let fn_addr = rd_u64(rec) as usize;
+        let meta = rd_u64(rec.add(8)) as *const u8;
+        rec = rec.add(16);
+
+        let len = rd_u64(meta) as usize;
+        let n_safepoints = rd_u32(meta.add(8)) as usize;
+        let mut mp = meta.add(12);
+        let mut maps: Vec<(u32, Vec<u32>)> = Vec::with_capacity(n_safepoints);
+        for _ in 0..n_safepoints {
+            let ret_off = rd_u32(mp);
+            let n_slots = rd_u32(mp.add(4)) as usize;
+            mp = mp.add(8);
+            let mut slots = Vec::with_capacity(n_slots);
+            for j in 0..n_slots {
+                slots.push(rd_u32(mp.add(j * 4)));
+            }
+            mp = mp.add(n_slots * 4);
+            maps.push((ret_off, slots));
+        }
+
+        JIT_CODE.with(|c| c.borrow_mut().register(JitFunctionMaps { start: fn_addr, len, maps }));
+    }
+}
+
 // ── GcHeap ───────────────────────────────────────────────────────────────────
 
 pub struct GcHeap {

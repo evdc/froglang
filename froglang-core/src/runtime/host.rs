@@ -16,7 +16,7 @@
 use std::cell::Cell;
 
 use crate::frontend::typeck::{StructDefs, UnionDefs};
-use crate::runtime::gc::GcHeap;
+use crate::runtime::gc::{GcHeap, ACTIVE_HEAP, GC_HEAP};
 
 thread_local! {
     /// The `FrogCtx` for the `FrogState` currently executing on this
@@ -46,6 +46,58 @@ pub fn with_active_ctx<R>(ctx: &mut FrogCtx, f: impl FnOnce() -> R) -> R {
 #[no_mangle]
 pub extern "C" fn frog_ctx_current() -> i64 {
     ACTIVE_CTX.with(|c| c.get() as i64)
+}
+
+/// AOT entry harness (`plans/AOT.md`, G5). The standalone-binary analogue of
+/// `FrogState::call_jit`: publish this thread's `GC_HEAP` as the active heap
+/// (so every runtime `frog_*` call and host shim allocates into it through a
+/// raw pointer, exactly as the JIT does with `FrogState::heap`), publish a
+/// `FrogCtx` so host-function shims can fetch it via `frog_ctx_current`, then
+/// run the program's `__frog_main` for its side effects and **discard** the
+/// result — decision (a): a compiled program is a script, not a REPL entry, so
+/// its final expression value is evaluated for effect and thrown away.
+///
+/// `entry` is `__frog_main`'s address (a C-ABI `(i64) -> i64` that writes its
+/// top-level bindings into `out_ptr`). `out_ptr` is a caller-owned buffer wide
+/// enough for those bindings; it needs no GC scan span, because every value
+/// written into it is simultaneously live in `__frog_main`'s own frame — hence
+/// already covered by that frame's stack map for the call's duration — and
+/// nothing reads the buffer back after the call returns.
+///
+/// The `FrogCtx` carries *empty* struct/union tables (G6): no shipped
+/// `ToFrog`/`FromFrog` impl consults them — they compute layout compositionally
+/// from `leaves()` (`plans/EMBEDDING.md`, "AOT considerations") — so an AOT
+/// binary needs no serialized type tables to marshal host arguments.
+///
+/// # Safety
+/// `entry` must be a valid `__frog_main` address emitted by the object
+/// backend. Intended to be called only from AOT-emitted `main`.
+#[no_mangle]
+pub unsafe extern "C" fn frog_rt_main(entry: usize, out_ptr: i64) -> i32 {
+    let entry: extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
+
+    // A raw pointer to this thread's `GcHeap` without holding a `RefCell`
+    // borrow open — so the short `GC_HEAP.borrow_mut()` fallbacks inside
+    // `with_heap` never conflict. Publishing it as `ACTIVE_HEAP` routes all
+    // heap access through this pointer instead, mirroring `call_jit`.
+    let heap_ptr = GC_HEAP.with(|h| h.as_ptr());
+    ACTIVE_HEAP.with(|p| p.set(heap_ptr));
+
+    let empty_structs = StructDefs::default();
+    let empty_unions = UnionDefs::default();
+    let mut ctx = FrogCtx::new(heap_ptr, &empty_structs, &empty_unions);
+    with_active_ctx(&mut ctx, || {
+        entry(out_ptr);
+    });
+
+    ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
+    // The binary's `main` is the emitted C one, not Rust's `lang_start`, so
+    // Rust's at-exit stdout flush never runs: anything a program wrote
+    // after its last newline (`write_stdout("x")`) would sit in the
+    // `LineWriter` and be lost when `main` returns. `frog_abort` flushes
+    // for the same reason on the error path.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    0
 }
 
 /// What a host shim uses to read its arguments, build heap values, and

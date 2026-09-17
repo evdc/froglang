@@ -17,6 +17,7 @@ use crate::runtime::host::FrogCtx;
 /// A registered host function, as `FrogStateBuilder::func` wants it.
 /// Built by `#[frog_fn]`; can be built by hand for the rare escape-hatch
 /// case of a signature `#[frog_fn]` can't express.
+#[derive(Clone)]
 pub struct HostFn {
     /// The name frog source calls this by.
     pub name: &'static str,

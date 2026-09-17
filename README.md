@@ -335,6 +335,30 @@ Supported in codegen:
   for the inline case, boxed as a `FrogVariant` for a union that is self-referential or has
   more than `MAX_INLINE_UNION_MEMBERS` members
 
+## Ahead-of-time compilation
+
+`frog build program.frog -o program` produces a standalone native executable — no compiler,
+no Cranelift, no per-run codegen. It reuses the exact same `Codegen` as the JIT (`Codegen<M>`
+is generic over Cranelift's `Module`; the JIT drives a `JITModule`, `build` drives a
+`cranelift-object` `ObjectModule`), emits a relocatable object, and links it against the
+runtime as a static library (`libfroglang_core.a`) with the system `cc`.
+
+Two things make this work despite the runtime's GC and host-function machinery:
+
+- **Stack maps are registered at load time.** The JIT files each function's GC stack maps by
+  its finalized address; an AOT binary doesn't know those addresses until it loads, so the
+  object carries a serialized stack-map table (each function's base filled by a relocation),
+  and a generated `main` calls `frog_register_stackmaps` once at startup before running any
+  froglang code. Verified against `FROG_GC_STRESS=1` — collecting on every allocation — so a
+  live value held across an allocation is never lost.
+- **The program runs for its side effects.** Like every other AOT-compiled language, a built
+  binary's output comes from explicit `print(...)`; the program's final expression value is
+  evaluated and then **discarded**, not printed. (`frog run` still prints it, REPL-style —
+  that is the one deliberate behavioral difference between `run` and `build`.)
+
+The AOT backend compiles at `opt_level=speed` (the JIT stays at `none`, where its one-time-
+per-run compile cost dominates); `build` pays codegen once, so the optimizer is free.
+
 ## Runtime / GC
 
 Heap-allocated values (`Str`, `List`) are managed by a **mark-sweep garbage collector**.
@@ -571,6 +595,10 @@ cargo run -- run program.frog
 
 # Type-check only
 cargo run -- check program.frog
+
+# Ahead-of-time compile to a standalone native executable
+cargo run -- build program.frog -o program
+./program
 
 # Run all tests
 cargo test

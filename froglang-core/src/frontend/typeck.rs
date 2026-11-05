@@ -6020,7 +6020,7 @@ impl TypeChecker {
     /// inventory. `Function` bodies and `IterVia::next_call` are included:
     /// a walk that skipped them would miss exactly the nested cases this
     /// pass exists to find.
-    fn children(expr: &Spanned<TypedExpr>) -> Vec<&Spanned<TypedExpr>> {
+    pub(crate) fn children(expr: &Spanned<TypedExpr>) -> Vec<&Spanned<TypedExpr>> {
         let mut out: Vec<&Spanned<TypedExpr>> = Vec::new();
         match &expr.item.kind {
             TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)

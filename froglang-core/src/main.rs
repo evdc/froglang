@@ -277,5 +277,8 @@ fn main() {
         // no args → REPL
         _ => repl(),
     }
+    if std::env::var_os("FROG_COPY_STATS").is_some() {
+        eprint!("{}", froglang_core::runtime::ffi::copy_stats_report());
+    }
 }
 

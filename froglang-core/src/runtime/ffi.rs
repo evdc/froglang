@@ -452,6 +452,69 @@ pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
     })
 }
 
+// ── Copy statistics (plans/NOGC.md §6 step 0) ─────────────────────────────────
+// Measurement only. With `FROG_COPY_STATS` set at compile time, codegen calls
+// `frog_copy_stat` at every `Copy`-classified read of a `Str`/`List`/`Dict`
+// leaf. That deep-copies the value (what unique ownership would copy there)
+// and discards the copy. Output is unchanged, but the extra garbage changes GC
+// pressure, so stats runs are for counts and bytes, never for timing.
+// Counters are indexed `site * 3 + kind`; sites follow `liveness::CopySite`.
+pub const COPY_KIND_NAMES: [&str; 3] = ["Str", "List", "Dict"];
+pub const COPY_SITE_NAMES: [&str; 6] = ["call-arg", "let", "store", "literal", "return", "other"];
+static COPY_EVENTS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static COPY_BYTES: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+
+#[no_mangle]
+pub extern "C" fn frog_copy_stat(w: i64, kind: i64, site: i64) {
+    if !super::gc::is_heap_ptr(w) {
+        return;
+    }
+    let _jit_frame = crate::jit_frame_guard!();
+    let _roots = RuntimeRoots::hold(&[w]);
+    let copied = with_heap(|heap| {
+        heap.maybe_collect();
+        let before = heap.bytes_allocated;
+        let obj = super::gc::heap_ptr(w);
+        unsafe {
+            if kind == 0 {
+                // `clone_obj` returns an immutable `Str` as-is (a pointer copy
+                // is already free), so measure a fresh allocation of its bytes.
+                let len = (*(obj as *const FrogStr)).len as usize;
+                let data = std::slice::from_raw_parts(
+                    (obj as *const u8).add(std::mem::size_of::<FrogStr>()), len);
+                heap.alloc_str(data);
+            } else {
+                heap.clone_obj(obj);
+            }
+        }
+        heap.bytes_allocated - before
+    });
+    let idx = site as usize * 3 + kind as usize;
+    COPY_EVENTS[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    COPY_BYTES[idx].fetch_add(copied as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Human-readable totals for the copies counted by `frog_copy_stat`: one line
+/// per (site, kind) with any events, then a total.
+pub fn copy_stats_report() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out = String::from("copy stats: Copy-classified heap reads that unique ownership would deep-copy\n");
+    let (mut total_events, mut total_bytes) = (0u64, 0u64);
+    for (s, site) in COPY_SITE_NAMES.iter().enumerate() {
+        for (k, kind) in COPY_KIND_NAMES.iter().enumerate() {
+            let idx = s * 3 + k;
+            let (e, b) = (COPY_EVENTS[idx].load(Relaxed), COPY_BYTES[idx].load(Relaxed));
+            total_events += e;
+            total_bytes += b;
+            if e > 0 {
+                out += &format!("  {:<9} {:<5} events={:<12} bytes={}\n", site, kind, e, b);
+            }
+        }
+    }
+    out += &format!("  total events={} bytes={}\n", total_events, total_bytes);
+    out
+}
+
 /// Deep-clone the heap value `w` — the runtime primitive codegen's
 /// `Ownership::Copy`-gated clone-on-read (see `codegen::compile_expr_multi`'s
 /// `Var` arm) calls whenever a binding's value is duplicated and might still

@@ -888,8 +888,32 @@ fn mark_shared_if_aliased(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut
     let TypedExprKind::Var(_) = &expr.item.kind else { return vals };
     if ctx.liveness.ownership(expr.item.id) != liveness::Ownership::Copy { return vals; }
 
+    if std::env::var_os("FROG_COPY_STATS").is_some() {
+        let site = ctx.liveness.copy_site(expr.item.id) as i64;
+        count_copy_extracted(bcx, &expr.item.ty, &vals, ctx, site);
+    }
     mark_shared_extracted(bcx, &expr.item.ty, &vals, ctx.structs);
     vals
+}
+
+/// `FROG_COPY_STATS` (plans/NOGC.md §6 step 0): for each `Str`/`List`/`Dict`
+/// leaf of a `Copy`-classified read, call `frog_copy_stat` so the runtime can
+/// measure the deep copy unique ownership would make there. Same leaf walk as
+/// `mark_shared_extracted`, but it also counts `Str`, which COW never marks.
+fn count_copy_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: &[Value], ctx: &mut Ctx, site: i64) {
+    for (v, (_, lty)) in vals.iter().zip(struct_fields(ty, ctx.structs).iter()) {
+        let kind: i64 = match lty {
+            Type::Str => 0,
+            t if t.is_list() => 1,
+            t if t.is_dict() => 2,
+            _ => continue,
+        };
+        let callee_id = ctx.func_ids["frog_copy_stat"];
+        let callee = ctx.module.declare_func_in_func(callee_id, bcx.func);
+        let kind_val = bcx.ins().iconst(types::I64, kind);
+        let site_val = bcx.ins().iconst(types::I64, site);
+        bcx.ins().call(callee, &[*v, kind_val, site_val]);
+    }
 }
 
 /// Compile `expr` for a *transient* consumer: one that reads a pointer only
@@ -4863,6 +4887,7 @@ impl Codegen<JITModule> {
         builder.symbol("frog_variant_set", ffi::frog_variant_set as *const u8);
         builder.symbol("frog_cow_verify", ffi::frog_cow_verify as *const u8);
         builder.symbol("frog_clone",       ffi::frog_clone       as *const u8);
+        builder.symbol("frog_copy_stat",   ffi::frog_copy_stat   as *const u8);
         builder.symbol("frog_ctx_current", crate::runtime::host::frog_ctx_current as *const u8);
         // `repr` leaves (plans/DATA.md stage 5) — see `desugar_notation` in typeck.rs.
         builder.symbol("frog_int_repr",    ffi::frog_int_repr    as *const u8);
@@ -5030,6 +5055,7 @@ fn declare_runtime_imports(
     // `compile_expr_multi`'s `TypedExprKind::Var` arm and `Ctx::liveness`.
     declare_rt(module, &mut func_ids, "frog_cow_verify", "frog_cow_verify", &[I64, I64], None);
     declare_rt(module, &mut func_ids, "frog_clone",      "frog_clone",      &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_copy_stat",  "frog_copy_stat",  &[I64, I64, I64], None);
     // Fetches the `FrogCtx*` a host call passes as its own argument 0
     // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,
     // "Getting the ctx pointer without baking an address").

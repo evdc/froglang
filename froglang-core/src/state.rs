@@ -510,7 +510,36 @@ impl FrogState {
         self.heap.maybe_collect();
 
         let value = FrogValue::from_bits(bits, &result_ty, &self.heap);
+        // Ownership: the entry handed its result over, and `value` is a deep copy,
+        // so the result's own objects are released here.
+        if self.heap.is_owned() {
+            for v in crate::codegen::heap_roots_in_leaves(&[bits], result_leaf0.get(..1).unwrap_or_default()) {
+                self.heap.drop_word(v);
+            }
+        }
         Ok((value, result_ty))
+    }
+}
+
+/// `FROG_OWNERSHIP` teardown: release the bindings this state still holds, and
+/// with `FROG_LEAK_CHECK`, report any object that is still live. A leak prints a
+/// `leak:` line to stderr, so a run that leaks is visible without changing its result.
+impl Drop for FrogState {
+    fn drop(&mut self) {
+        if !self.heap.is_owned() {
+            return;
+        }
+        for (name, ty) in &self.env_types {
+            if let Some(vals) = self.env.get(name) {
+                let leafs = crate::codegen::struct_fields(ty, self.tc.struct_defs());
+                for v in crate::codegen::heap_roots_in_leaves(vals, &leafs) {
+                    self.heap.drop_word(v);
+                }
+            }
+        }
+        if self.heap.leak_check_enabled() && self.heap.live_objects() != 0 {
+            eprintln!("leak: {} GC object(s) still live after teardown", self.heap.live_objects());
+        }
     }
 }
 

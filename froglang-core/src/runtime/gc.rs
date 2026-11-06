@@ -546,6 +546,16 @@ pub struct GcHeap {
     /// expensive as a full sweep, which is only acceptable for a test run
     /// explicitly opting in.
     stress:          bool,
+    /// `FROG_OWNERSHIP` (NOGC §6 step 2): objects are owned by exactly one
+    /// codegen-visible owner and freed by `frog_drop`, never by the collector.
+    /// So they are not linked into `head`, and `maybe_collect` does nothing.
+    owned:           bool,
+    /// `FROG_LEAK_CHECK`: track freed addresses so a second free of one panics
+    /// instead of corrupting a free list.
+    leak_check:      bool,
+    /// Heap objects currently allocated and not yet freed.
+    live_objects:    usize,
+    freed:           std::collections::HashSet<usize>,
     /// Reusable mark-phase worklist. Kept on the heap rather than allocated
     /// per `mark` call: `mark` is invoked once per root, so a fresh `Vec`
     /// each time is a `malloc`/`free` pair per root per collection.
@@ -599,6 +609,111 @@ impl Default for GcHeap {
 }
 
 impl GcHeap {
+    /// The `next` link a new object starts with: the old head, unless the
+    /// heap is owned, where objects are not on the collector's list at all.
+    #[inline]
+    fn link_next(&self) -> *mut GcHeader {
+        if self.owned { std::ptr::null_mut() } else { self.head }
+    }
+
+    /// Record a newly allocated object (see `link_next`).
+    #[inline]
+    fn link_head(&mut self, obj: *mut GcHeader) {
+        self.live_objects += 1;
+        if self.leak_check {
+            self.freed.remove(&(obj as usize));
+        }
+        if !self.owned {
+            self.head = obj;
+        }
+    }
+
+    /// Whether this heap runs under `FROG_OWNERSHIP` (see `owned`).
+    pub fn is_owned(&self) -> bool {
+        self.owned
+    }
+
+    /// Whether `FROG_LEAK_CHECK` is on for this heap.
+    pub fn leak_check_enabled(&self) -> bool {
+        self.leak_check
+    }
+
+    /// Free the object `w` holds, and everything it owns, if it holds one
+    /// (`FROG_OWNERSHIP` only). Scalars and immediates are left alone.
+    pub fn drop_word(&mut self, w: i64) {
+        if is_heap_ptr(w) {
+            unsafe { self.drop_tree(heap_ptr(w)) };
+        }
+    }
+
+    /// Objects allocated and not yet freed. Under `FROG_OWNERSHIP` a program
+    /// that frees everything it allocated ends at zero.
+    pub fn live_objects(&self) -> usize {
+        self.live_objects
+    }
+
+    /// Free `obj` and every object it owns: recursively, through the same
+    /// pointer masks the collector traces. Only valid under `FROG_OWNERSHIP`,
+    /// where each object has exactly one owner.
+    pub unsafe fn drop_tree(&mut self, obj: *mut GcHeader) {
+        match (*obj).kind {
+            ObjKind::Str => {}
+            ObjKind::List => {
+                let list = obj as *mut FrogList;
+                let stride = ((*list).stride as usize).max(1);
+                let len = (*list).len as usize;
+                let mask = (*list).ptr_mask;
+                if mask != 0 {
+                    for i in 0..len / stride {
+                        for bit in 0..stride {
+                            if mask & (1u64 << bit) == 0 { continue; }
+                            let w = *(*list).data.add(i * stride + bit);
+                            if is_heap_ptr(w) { self.drop_tree(heap_ptr(w)); }
+                        }
+                    }
+                }
+            }
+            ObjKind::Dict => {
+                let dict = obj as *mut FrogDict;
+                let len = (*dict).len as usize;
+                let stride = ((*dict).kstride + (*dict).vstride).max(1) as usize;
+                let mask = (*dict).ptr_mask;
+                if mask != 0 {
+                    for i in 0..len {
+                        for bit in 0..stride {
+                            if mask & (1u64 << bit) == 0 { continue; }
+                            let w = *(*dict).entries.add(i * stride + bit);
+                            if is_heap_ptr(w) { self.drop_tree(heap_ptr(w)); }
+                        }
+                    }
+                }
+            }
+            ObjKind::Variant => {
+                let variant = obj as *mut FrogVariant;
+                let mask = (*variant).ptr_mask;
+                if mask != 0 {
+                    let data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
+                    for i in 0..(*variant).nslots as usize {
+                        if mask & (1u64 << i) == 0 { continue; }
+                        let w = *data.add(i);
+                        if is_heap_ptr(w) { self.drop_tree(heap_ptr(w)); }
+                    }
+                }
+            }
+        }
+        self.free_shallow(obj);
+    }
+
+    /// Free `obj` alone, leaving whatever it points at alone. The caller has
+    /// moved those children elsewhere (or does not own them).
+    pub unsafe fn free_shallow(&mut self, obj: *mut GcHeader) {
+        if self.leak_check && !self.freed.insert(obj as usize) {
+            panic!("double free of GC object {:p}", obj);
+        }
+        let freed = self.free_obj(obj);
+        self.bytes_allocated -= freed;
+    }
+
     /// Allocate `size` bytes (rounded up to a word), reusing a recycled
     /// block of that exact size class if one is available. All GC object
     /// allocation goes through here.
@@ -647,6 +762,10 @@ impl GcHeap {
             jit_frame:       0,
             free_lists:      vec![std::ptr::null_mut(); MAX_FREE_WORDS + 1],
             stress:          std::env::var_os("FROG_GC_STRESS").is_some(),
+            owned:           std::env::var_os("FROG_OWNERSHIP").is_some(),
+            leak_check:      std::env::var_os("FROG_LEAK_CHECK").is_some(),
+            live_objects:    0,
+            freed:           std::collections::HashSet::new(),
             mark_worklist:   Vec::new(),
             dict_backend:    std::sync::Arc::new(crate::runtime::dict::HashbrownBackend),
         }
@@ -727,6 +846,7 @@ impl GcHeap {
     }
 
     pub fn maybe_collect(&mut self) {
+        if self.owned { return; }
         if self.stress || self.bytes_allocated > self.gc_threshold {
             self.collect();
         }
@@ -1095,6 +1215,7 @@ impl GcHeap {
     /// same rounded sizes the matching `alloc_*` added to
     /// `bytes_allocated`, so the running total stays exact.
     unsafe fn free_obj(&mut self, obj: *mut GcHeader) -> usize {
+        self.live_objects -= 1;
         match (*obj).kind {
             ObjKind::Str => {
                 let str_ptr = obj as *mut FrogStr;
@@ -1168,7 +1289,7 @@ impl GcHeap {
         let ptr = self.alloc_bytes(total) as *mut FrogStr;
         unsafe {
             (*ptr).header = GcHeader {
-                next:   self.head,
+                next:   self.link_next(),
                 marked: false,
                 kind:   ObjKind::Str,
                 shared: false,
@@ -1179,7 +1300,7 @@ impl GcHeap {
             *dst.add(len) = 0;  // NUL terminator
         }
 
-        self.head = ptr as *mut GcHeader;
+        self.link_head(ptr as *mut GcHeader);
         self.bytes_allocated += total;
         gc_trace!("alloc Str  {} bytes -> {:p}  (total: {} bytes)",
             total, ptr, self.bytes_allocated);
@@ -1209,7 +1330,7 @@ impl GcHeap {
 
         unsafe {
             (*ptr).header = GcHeader {
-                next:   self.head,
+                next:   self.link_next(),
                 marked: false,
                 kind:   ObjKind::List,
                 shared: false,
@@ -1221,7 +1342,7 @@ impl GcHeap {
             (*ptr).data       = data;
         }
 
-        self.head = ptr as *mut GcHeader;
+        self.link_head(ptr as *mut GcHeader);
         self.bytes_allocated += list_size + data_size;
         gc_trace!("alloc List {} bytes -> {:p}  (total: {} bytes)",
             list_size + data_size, ptr, self.bytes_allocated);
@@ -1240,7 +1361,7 @@ impl GcHeap {
         let ptr = self.alloc_bytes(total) as *mut FrogVariant;
         unsafe {
             (*ptr).header = GcHeader {
-                next:   self.head,
+                next:   self.link_next(),
                 marked: false,
                 kind:   ObjKind::Variant,
                 shared: false,
@@ -1265,7 +1386,7 @@ impl GcHeap {
             }
         }
 
-        self.head = ptr as *mut GcHeader;
+        self.link_head(ptr as *mut GcHeader);
         self.bytes_allocated += total;
         gc_trace!("alloc Variant tag={} {} bytes -> {:p}  (total: {} bytes)",
             tag, total, ptr, self.bytes_allocated);
@@ -1294,7 +1415,7 @@ impl GcHeap {
 
         unsafe {
             (*ptr).header = GcHeader {
-                next:   self.head,
+                next:   self.link_next(),
                 marked: false,
                 kind:   ObjKind::Dict,
                 shared: false,
@@ -1310,7 +1431,7 @@ impl GcHeap {
             (*ptr).index     = Box::into_raw(boxed) as *mut ();
         }
 
-        self.head = ptr as *mut GcHeader;
+        self.link_head(ptr as *mut GcHeader);
         self.bytes_allocated += dict_size + entries_size + hashes_size;
         gc_trace!("alloc Dict {} bytes -> {:p}  (total: {} bytes)",
             dict_size + entries_size + hashes_size, ptr, self.bytes_allocated);
@@ -1627,8 +1748,10 @@ mod tests {
 
     #[test]
     fn test_gc_sweep_clears_unreferenced() {
-        // Reset GC state for this test via a fresh GcHeap inline.
+        // Reset GC state for this test via a fresh GcHeap inline. It tests the
+        // collector, so the heap is not owned even under `FROG_OWNERSHIP`.
         let mut heap = GcHeap::new();
+        heap.owned = false;
         let s = b"ephemeral";
         heap.alloc_str(s);
         let before = heap.bytes_allocated;
@@ -1642,6 +1765,7 @@ mod tests {
     #[test]
     fn test_gc_sweep_keeps_rooted() {
         let mut heap = GcHeap::new();
+        heap.owned = false;
         let s = b"kept";
         let ptr = heap.alloc_str(s) as i64;
         heap.push_root(ptr, true);

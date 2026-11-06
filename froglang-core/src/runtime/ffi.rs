@@ -553,6 +553,27 @@ pub extern "C" fn frog_clone(w: i64) -> i64 {
     })
 }
 
+/// Free the object `w` and everything it owns (NOGC §6 step 2, `FROG_OWNERSHIP`).
+/// A no-op for immediates, scalars and null, so codegen may drop a slot that
+/// was never filled or was already moved out of (both hold 0).
+#[no_mangle]
+pub extern "C" fn frog_drop(w: i64) {
+    if !super::gc::is_heap_ptr(w) {
+        return;
+    }
+    with_heap(|heap| unsafe { heap.drop_tree(super::gc::heap_ptr(w)) });
+}
+
+/// Free only the object `w` itself, not what it points at. Used for the
+/// intermediate list that `keys`/`values`/`slice` build before deep-copying it.
+#[no_mangle]
+pub extern "C" fn frog_drop_shallow(w: i64) {
+    if !super::gc::is_heap_ptr(w) {
+        return;
+    }
+    with_heap(|heap| unsafe { heap.free_shallow(super::gc::heap_ptr(w)) });
+}
+
 /// `frog_clone` for ownership mode (NOGC §6 step 2): also copies every `Str`
 /// reached, so the result shares no object with its source.
 #[no_mangle]

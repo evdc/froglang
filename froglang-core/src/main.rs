@@ -72,7 +72,8 @@ fn stdlib_checker() -> (froglang_core::frontend::typeck::TypeChecker, Vec<frogla
     let builder = froglang_core::stdlib::install(FrogState::builder());
     let hosts = builder.hosts().to_vec();
     match builder.build() {
-        Ok(state) => (state.tc, hosts),
+        // `FrogState` releases its environment on drop, so the checker is swapped out, not moved.
+        Ok(mut state) => (std::mem::replace(&mut state.tc, froglang_core::frontend::typeck::TypeChecker::new()), hosts),
         Err(e) => { println!("{}", e); process::exit(1); }
     }
 }

@@ -64,14 +64,23 @@ pub struct Conventions {
     pub functions: Vec<FnSummary>,
     /// Names defined more than once. They are not analysed, and every call to one consumes.
     pub ambiguous: Vec<String>,
-    /// `Var` nodes passed as a call argument to a borrowing position.
+    /// Call arguments (any expression) passed to a borrowing position. The
+    /// caller keeps ownership of these values and drops them itself.
     pub borrowed_args: HashSet<NodeId>,
+    /// Per analysed function, keyed by its body's node id: whether each
+    /// parameter is borrowed. A `mut` parameter is never borrowed.
+    pub borrowed_params: HashMap<NodeId, Vec<bool>>,
 }
 
 impl Conventions {
     /// The convention of parameter `index` of the function `name`, if known.
     pub fn convention(&self, name: &str, index: usize) -> Option<Convention> {
         self.functions.iter().find(|f| f.name == name)?.params.get(index).map(|p| p.conv)
+    }
+
+    /// Whether parameter `index` of the function whose body is `body` is borrowed.
+    pub fn is_borrowed_param(&self, body: NodeId, index: usize) -> bool {
+        self.borrowed_params.get(&body).and_then(|v| v.get(index)).copied().unwrap_or(false)
     }
 
     /// Human-readable dump for `FROG_DUMP_CONVENTIONS`.
@@ -95,18 +104,26 @@ impl Conventions {
 
 thread_local! {
     /// The borrowed call-argument nodes of the program being compiled on this thread.
-    /// Set by `publish`, read by codegen's copy statistics.
+    /// Set by `publish`, read by codegen.
     static BORROWED_ARGS: RefCell<HashSet<NodeId>> = RefCell::new(HashSet::new());
+    static BORROWED_PARAMS: RefCell<HashMap<NodeId, Vec<bool>>> = RefCell::new(HashMap::new());
 }
 
-/// Make `conv`'s borrowed call arguments visible to codegen on this thread.
+/// Make `conv`'s borrowed call arguments and parameters visible to codegen on this thread.
 pub fn publish(conv: &Conventions) {
     BORROWED_ARGS.with(|s| *s.borrow_mut() = conv.borrowed_args.clone());
+    BORROWED_PARAMS.with(|s| *s.borrow_mut() = conv.borrowed_params.clone());
 }
 
-/// Whether the `Var` node `id` is a call argument that a borrowing callee would not need copied.
+/// Whether the expression `id` is a call argument that its callee only borrows.
 pub fn is_borrowed_arg(id: NodeId) -> bool {
     BORROWED_ARGS.with(|s| s.borrow().contains(&id))
+}
+
+/// Whether parameter `index` of the function whose body node is `body` is borrowed
+/// (see `Conventions::is_borrowed_param`). Unknown functions own their parameters.
+pub fn is_borrowed_param(body: NodeId, index: usize) -> bool {
+    BORROWED_PARAMS.with(|s| s.borrow().get(&body).and_then(|v| v.get(index)).copied().unwrap_or(false))
 }
 
 /// Builtins that only read their arguments, so a call to one borrows them.
@@ -174,6 +191,12 @@ pub fn infer(program: &Spanned<TypedExpr>, external_borrowers: &HashSet<String>)
     let mut scan = Scan { table: &table, targets: HashSet::new(), reasons: HashMap::new(), borrowed_args: Vec::new() };
     scan.scan(program, None);
     let borrowed_args: HashSet<NodeId> = scan.borrowed_args.into_iter().collect();
+    let borrowed_params: HashMap<NodeId, Vec<bool>> = defs.iter()
+        .filter(|d| !table.ambiguous.contains(&d.name))
+        .map(|d| (d.body.item.id, d.params.iter().enumerate()
+            .map(|(i, (_, is_mut))| !is_mut && table.fns[&d.name][i].1 == Convention::Borrow)
+            .collect()))
+        .collect();
 
     let mut functions: Vec<FnSummary> = defs.iter()
         .filter(|d| !table.ambiguous.contains(&d.name))
@@ -191,7 +214,7 @@ pub fn infer(program: &Spanned<TypedExpr>, external_borrowers: &HashSet<String>)
     let mut ambiguous: Vec<String> = ambiguous_names.into_iter().collect();
     ambiguous.sort();
 
-    Conventions { functions, ambiguous, borrowed_args }
+    Conventions { functions, ambiguous, borrowed_args, borrowed_params }
 }
 
 /// A named `func` found in the program.
@@ -304,10 +327,7 @@ impl Scan<'_> {
                     Arg::Value(e) => match arg_flow(self.table, callable, i) {
                         ArgFlow::Escapes(reason) => self.scan(e, Some(reason)),
                         ArgFlow::Borrows => {
-                            if matches!(e.item.kind, TypedExprKind::Var(_) | TypedExprKind::Index { .. }
-                                | TypedExprKind::Slice { .. } | TypedExprKind::FieldAccess { .. }) {
-                                self.borrowed_args.push(e.item.id);
-                            }
+                            self.borrowed_args.push(e.item.id);
                             self.scan(e, None);
                         }
                     },

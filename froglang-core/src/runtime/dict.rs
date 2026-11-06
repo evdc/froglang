@@ -219,6 +219,12 @@ pub extern "C" fn frog_dict_insert(d: i64, key: i64) -> i64 {
             index.find(hash, &mut eq)
         };
         if let Some(e) = found {
+            // Ownership: the caller gave its `Str` key to the dict, which keeps
+            // it only when the key is new. An existing entry keeps its own key,
+            // so this copy is released here.
+            if heap.is_owned() && kind == KeyKind::Str {
+                heap.drop_word(key);
+            }
             return e as i64;
         }
 
@@ -304,6 +310,8 @@ pub extern "C" fn frog_dict_remove(d: i64, key: i64) -> i64 {
         index.find(hash, &mut eq)
     };
     let Some(e) = found else { return 0; };
+    // Ownership: the removed entry's key and value objects leave the dict.
+    release_entry(dict, e as usize, stride);
     unsafe {
         let entries = (*dict).entries;
         let hashes = (*dict).hashes;
@@ -338,4 +346,26 @@ pub extern "C" fn frog_dict_remove(d: i64, key: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn frog_dict_key_missing(_d: i64, _key: i64) -> ! {
     frog_abort(format_args!("key not found in Dict"));
+}
+
+/// `FROG_OWNERSHIP`: free the heap leaves of entry `e`, which is leaving the dict.
+/// A no-op unless the heap is owned, and it reads only the leaves the dict's
+/// pointer mask marks as objects.
+fn release_entry(dict: *mut FrogDict, e: usize, stride: usize) {
+    let mask = unsafe { (*dict).ptr_mask };
+    if mask == 0 {
+        return;
+    }
+    let entries = unsafe { (*dict).entries };
+    with_heap(|heap| {
+        if !heap.is_owned() {
+            return;
+        }
+        for bit in 0..stride {
+            if mask & (1u64 << bit) == 0 {
+                continue;
+            }
+            heap.drop_word(unsafe { *entries.add(e * stride + bit) });
+        }
+    });
 }

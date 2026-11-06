@@ -1062,6 +1062,33 @@ fn push_frame(ctx: &mut Ctx, block: bool) {
     ctx.frames.push(Frame { block, slots: Vec::new() });
 }
 
+/// Ownership mode: a deep copy of the heap word `v` (`frog_clone_owned`), or `v`
+/// itself when it holds no heap object. The test is `gc::is_heap_ptr`, done
+/// inline, since most union words are immediates and a call for them is wasted.
+fn emit_clone_word(bcx: &mut FunctionBuilder, ctx: &mut Ctx, v: Value) -> Value {
+    let tag = bcx.ins().band_imm_s(v, gc::TAG_MASK);
+    let not_immediate = bcx.ins().icmp_imm_s(IntCC::NotEqual, tag, gc::TAG_IMMEDIATE);
+    let addr = bcx.ins().band_imm_s(v, !gc::TAG_MASK);
+    let has_object = bcx.ins().icmp_imm_s(IntCC::NotEqual, addr, 0);
+    let go = bcx.ins().band(not_immediate, has_object);
+    let call_bb = bcx.create_block();
+    let done_bb = bcx.create_block();
+    bcx.append_block_param(done_bb, types::I64);
+    bcx.ins().brif(go, call_bb, &[], done_bb, &[BlockArg::from(v)]);
+    bcx.switch_to_block(call_bb);
+    bcx.seal_block(call_bb);
+    let id = ctx.func_ids["frog_clone_owned"];
+    let callee = ctx.module.declare_func_in_func(id, bcx.func);
+    let call = bcx.ins().call(callee, &[v]);
+    let cloned = bcx.inst_results(call)[0];
+    bcx.ins().jump(done_bb, &[BlockArg::from(cloned)]);
+    bcx.switch_to_block(done_bb);
+    bcx.seal_block(done_bb);
+    let out = bcx.block_params(done_bb)[0];
+    declare_gc_ptr(bcx, out);
+    out
+}
+
 /// Call `frog_drop` on the word `v`, but only when it holds a heap object, which
 /// is the test `gc::is_heap_ptr` makes: an immediate (tag 7) or a null word has
 /// nothing to free, and most union words are immediates. The check is inline so
@@ -1206,12 +1233,7 @@ fn mut_param_copyout_taken(bcx: &mut FunctionBuilder, vars: &HashMap<String, Var
 /// Ownership mode: a fresh deep copy of one heap word `v`, owned by the caller.
 fn clone_owned_word(bcx: &mut FunctionBuilder, ctx: &mut Ctx, v: Value) -> Value {
     if bcx.is_unreachable() { return v; }
-    let clone_id = ctx.func_ids["frog_clone_owned"];
-    let clone_ref = ctx.module.declare_func_in_func(clone_id, bcx.func);
-    let call = bcx.ins().call(clone_ref, &[v]);
-    let copy = bcx.inst_results(call)[0];
-    declare_gc_ptr(bcx, copy);
-    copy
+    emit_clone_word(bcx, ctx, v)
 }
 
 /// Ownership mode: `list` is a fresh shell whose elements some other owner still
@@ -1250,15 +1272,10 @@ fn share_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: Vec<Value>, borro
         return vals;
     }
     let leafs = struct_fields(ty, ctx.structs);
-    let clone_id = ctx.func_ids["frog_clone_owned"];
     let mut out = Vec::with_capacity(vals.len());
     for (v, (_, lty)) in vals.into_iter().zip(leafs.iter()) {
         if is_heap_ty(lty) {
-            let callee = ctx.module.declare_func_in_func(clone_id, bcx.func);
-            let call = bcx.ins().call(callee, &[v]);
-            let cloned = bcx.inst_results(call)[0];
-            declare_gc_ptr(bcx, cloned);
-            out.push(cloned);
+            out.push(emit_clone_word(bcx, ctx, v));
         } else {
             out.push(v);
         }

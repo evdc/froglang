@@ -140,7 +140,11 @@ fn test_rebinding_same_name_does_not_leak_old_value() {
     // *real* garbage before the next one fires — force one final sweep for
     // a deterministic check, rather than assert on however far the
     // self-growing threshold happened to get in 500 iterations.
-    s.heap.force_collect();
+    // Under `FROG_OWNERSHIP` each rebinding frees the value it replaces, so
+    // there is nothing to sweep: the bound below holds without a collection.
+    if !s.heap.is_owned() {
+        s.heap.force_collect();
+    }
     // Only the *latest* `s` (~4000 bytes plus its GC header) should still be
     // live. Under the old accumulate-forever roots, this would be on the
     // order of 500 * 4000 = 2,000,000 bytes instead.
@@ -268,7 +272,9 @@ checksum
     // spine — the free lists recycle blocks rather than returning them to
     // the system allocator, but `bytes_allocated` still counts live bytes
     // only, so this is the same bound it always was.
-    s.heap.force_collect();
+    if !s.heap.is_owned() {
+        s.heap.force_collect();
+    }
     assert!(
         s.heap.bytes_allocated < 200_000,
         "expected the churn to be collected, but {} bytes are still live",

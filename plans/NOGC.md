@@ -589,6 +589,32 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    copy their result, and `words` costs about 8% more for it.
    The COW verifier does not catch a missing copy in `let b = a`, because both bindings share one
    SSA value. The value-semantics tests do catch it: skipping the copy fails 18 of them.
+
+   **Status: second half done, uncommitted.** Drops and frees are in place under `FROG_OWNERSHIP`.
+   - Every owned heap value lives in a slot. A block frame holds bindings, and a statement frame
+     holds the temporaries it produced. A consumer that keeps a value takes it out of its frame,
+     which clears the slot. Popping a frame frees whatever its slots still hold. An early `return`
+     drops every open frame. A `Move` read clears the binding it leaves. Dropping a slot that holds 0
+     is a no-op, so this needs no static drop flags.
+   - Runtime: `frog_drop` frees an object and everything it owns (`GcHeap::drop_tree`, using the
+     same pointer masks as the collector). `frog_drop_shallow` frees a list shell. The collector is
+     off under ownership. `FROG_LEAK_CHECK` makes a second free panic, and reports at teardown any
+     object still live. `FrogState` frees its environment on drop.
+   - Results: 1192 suite tests plus 9 new ones in `tests/test_ownership.rs` pass in both modes, with
+     zero leak reports and zero double frees. A sabotage check (drops disabled) makes the leak
+     report appear, so the oracle is live. Both modes also pass the AOT build tests.
+   - Deviations from the plan: drops happen at scope and statement end, not at each value's last
+     use, so memory is held a little longer than the plan's model. Static drop placement from
+     `dead_after` is not implemented. Calls take ownership by the callee's convention, and that
+     convention is keyed by the body node. A callee from an earlier REPL entry is not known to the
+     caller. The caller treats it as consuming, so the callee frees nothing it borrowed, which leaks
+     rather than crashes.
+   - Performance (release, best of 3): `life` matches default (15 ms). `words` is 177 ms against 159
+     ms. `orders` is 80 ms against 49 ms, and the remaining cost is union temporaries and their
+     drops in the `?`/`catch` path, which is the next thing to tune.
+   - Known, not fixed: default mode (GC) still has the `values(d)` alias that ownership mode fixes.
+     Collector unit tests and the GC-stress churn test now run only on a collected heap (`owned`
+     is set false, or the sweep check is skipped).
 3. **Delete the GC:** stack maps, roots, COW, `RuntimeRoots`, and the AOT stack-map table.
    `SELFHOST.md` G6 disappears.
 4. **Allocator layer:** segment headers, task heap and bump arena; then `with Arena` with

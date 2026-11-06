@@ -553,6 +553,22 @@ pub extern "C" fn frog_clone(w: i64) -> i64 {
     })
 }
 
+/// `frog_clone` for ownership mode (NOGC §6 step 2): also copies every `Str`
+/// reached, so the result shares no object with its source.
+#[no_mangle]
+pub extern "C" fn frog_clone_owned(w: i64) -> i64 {
+    if !super::gc::is_heap_ptr(w) {
+        return w;
+    }
+    let _jit_frame = crate::jit_frame_guard!();
+    let _roots = RuntimeRoots::hold(&[w]);
+    with_heap(|heap| {
+        heap.maybe_collect();
+        let cloned = unsafe { heap.clone_obj_with(super::gc::heap_ptr(w), true) };
+        (cloned as i64) | (w & super::gc::TAG_MASK)
+    })
+}
+
 /// Doubles a raw (non-GC-managed) buffer of 8-byte-aligned words from
 /// `old_size` to `new_size` bytes: `std::alloc::alloc` when there's
 /// nothing to carry forward (`old_size == 0` — `Dict`'s entries/hashes

@@ -1045,10 +1045,10 @@ fn share_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: Vec<Value>, borro
         return vals;
     }
     let leafs = struct_fields(ty, ctx.structs);
-    let clone_id = ctx.func_ids["frog_clone"];
+    let clone_id = ctx.func_ids["frog_clone_owned"];
     let mut out = Vec::with_capacity(vals.len());
     for (v, (_, lty)) in vals.into_iter().zip(leafs.iter()) {
-        if lty.is_list() || lty.is_dict() {
+        if lty.is_list() || lty.is_dict() || *lty == Type::Str {
             let callee = ctx.module.declare_func_in_func(clone_id, bcx.func);
             let call = bcx.ins().call(callee, &[v]);
             let cloned = bcx.inst_results(call)[0];
@@ -3729,12 +3729,14 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
         let (key_ty, val_ty) = arg.item.ty.as_dict_kv().map(|(k, v)| (k.clone(), v.clone())).expect("finish_keys_values checked this is a Dict");
         let dict_val = compile_expr_transient(arg, bcx, vars, ctx);
         let mut result = compile_dict_keys_or_values(&key_ty, &val_ty, func_name == "keys", dict_val, bcx, ctx);
-        // `values(d)` puts the dict's own element objects into a new list, so
-        // under ownership the result must not share them with `d`. A deep
-        // copy of the whole result list gives it private elements. Keys are
-        // scalars or `Str`, which never need this.
-        if ctx.ownership && func_name == "values" && struct_fields(&val_ty, ctx.structs).iter().any(|(_, t)| t.is_list() || t.is_dict()) {
-            let clone_id = ctx.func_ids["frog_clone"];
+        // `keys(d)`/`values(d)` put the dict's own key or value objects into a
+        // new list, so under ownership the result must not share them with `d`.
+        // A deep copy of the whole result list gives it private elements. Only
+        // the heap leaves of the element type matter: a scalar key or value is
+        // copied by value already.
+        let elem_ty = if func_name == "keys" { &key_ty } else { &val_ty };
+        if ctx.ownership && struct_fields(elem_ty, ctx.structs).iter().any(|(_, t)| t.is_list() || t.is_dict() || *t == Type::Str) {
+            let clone_id = ctx.func_ids["frog_clone_owned"];
             let callee = ctx.module.declare_func_in_func(clone_id, bcx.func);
             let call = bcx.ins().call(callee, &[result]);
             result = bcx.inst_results(call)[0];
@@ -4971,6 +4973,7 @@ impl Codegen<JITModule> {
         builder.symbol("frog_variant_set", ffi::frog_variant_set as *const u8);
         builder.symbol("frog_cow_verify", ffi::frog_cow_verify as *const u8);
         builder.symbol("frog_clone",       ffi::frog_clone       as *const u8);
+        builder.symbol("frog_clone_owned", ffi::frog_clone_owned as *const u8);
         builder.symbol("frog_copy_stat",   ffi::frog_copy_stat   as *const u8);
         builder.symbol("frog_ctx_current", crate::runtime::host::frog_ctx_current as *const u8);
         // `repr` leaves (plans/DATA.md stage 5) — see `desugar_notation` in typeck.rs.
@@ -5139,6 +5142,7 @@ fn declare_runtime_imports(
     // `compile_expr_multi`'s `TypedExprKind::Var` arm and `Ctx::liveness`.
     declare_rt(module, &mut func_ids, "frog_cow_verify", "frog_cow_verify", &[I64, I64], None);
     declare_rt(module, &mut func_ids, "frog_clone",      "frog_clone",      &[I64],           Some(I64));
+    declare_rt(module, &mut func_ids, "frog_clone_owned", "frog_clone_owned", &[I64],           Some(I64));
     declare_rt(module, &mut func_ids, "frog_copy_stat",  "frog_copy_stat",  &[I64, I64, I64], None);
     // Fetches the `FrogCtx*` a host call passes as its own argument 0
     // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,

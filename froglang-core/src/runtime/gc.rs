@@ -1363,7 +1363,19 @@ impl GcHeap {
     /// popped only after every child has been written into it) rather than
     /// relying on `RuntimeRoots` from within `GcHeap` itself.
     pub unsafe fn clone_obj(&mut self, obj: *mut GcHeader) -> *mut GcHeader {
+        self.clone_obj_with(obj, false)
+    }
+
+    /// `clone_obj`, where `copy_str` also copies each `Str` it reaches. The GC
+    /// model shares immutable `Str`s by pointer (`clone_obj`); ownership mode
+    /// (NOGC §6 step 2) gives every owner its own object, so it asks for copies.
+    pub unsafe fn clone_obj_with(&mut self, obj: *mut GcHeader, copy_str: bool) -> *mut GcHeader {
         match (*obj).kind {
+            ObjKind::Str if copy_str => {
+                let len = (*(obj as *const FrogStr)).len as usize;
+                let data = std::slice::from_raw_parts((obj as *const u8).add(std::mem::size_of::<FrogStr>()), len);
+                self.alloc_str(data) as *mut GcHeader
+            }
             ObjKind::Str => obj,
             ObjKind::List => {
                 let src = obj as *mut FrogList;
@@ -1385,7 +1397,7 @@ impl GcHeap {
                             if mask & (1u64 << bit) == 0 { continue; }
                             let w = *(*new_list).data.add(base + bit);
                             if is_heap_ptr(w) {
-                                let cloned = self.clone_obj(heap_ptr(w));
+                                let cloned = self.clone_obj_with(heap_ptr(w), copy_str);
                                 *(*new_list).data.add(base + bit) = (cloned as i64) | (w & TAG_MASK);
                             }
                         }
@@ -1424,7 +1436,7 @@ impl GcHeap {
                             if mask & (1u64 << bit) == 0 { continue; }
                             let w = *(*new_dict).entries.add(base + bit);
                             if is_heap_ptr(w) {
-                                let cloned = self.clone_obj(heap_ptr(w));
+                                let cloned = self.clone_obj_with(heap_ptr(w), copy_str);
                                 *(*new_dict).entries.add(base + bit) = (cloned as i64) | (w & TAG_MASK);
                             }
                         }
@@ -1458,7 +1470,7 @@ impl GcHeap {
                         if mask & (1u64 << i) == 0 { continue; }
                         let w = *dst_data.add(i);
                         if is_heap_ptr(w) {
-                            let cloned = self.clone_obj(heap_ptr(w));
+                            let cloned = self.clone_obj_with(heap_ptr(w), copy_str);
                             *dst_data.add(i) = (cloned as i64) | (w & TAG_MASK);
                         }
                     }

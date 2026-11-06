@@ -585,6 +585,8 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    mode. `values(d)` deep-copies its result. The GC still runs and frees nothing explicitly, so
    drops and the leak checker are not done yet. Both modes pass the suite (1192 tests). Under
    `FROG_OWNERSHIP` the `life` benchmark matches default mode, and so do `orders` and `words`.
+   `Str` is deep-copied too, as the plan's Q1 default (`frog_clone_owned`). `keys(d)` and `values(d)`
+   copy their result, and `words` costs about 8% more for it.
    The COW verifier does not catch a missing copy in `let b = a`, because both bindings share one
    SSA value. The value-semantics tests do catch it: skipping the copy fails 18 of them.
 3. **Delete the GC:** stack maps, roots, COW, `RuntimeRoots`, and the AOT stack-map table.

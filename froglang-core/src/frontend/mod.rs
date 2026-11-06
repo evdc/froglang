@@ -8,4 +8,5 @@ pub mod type_expr;
 pub mod typed_ast;
 pub mod modules;
 pub mod liveness;
+pub mod conventions;
 pub mod linear;

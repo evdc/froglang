@@ -368,6 +368,16 @@ impl FrogState {
         // get real ids too.
         crate::frontend::liveness::number_nodes(&mut typed);
 
+        // NOGC step 1 (plans/NOGC.md §6): parameter conventions. Analysis only;
+        // codegen is unchanged. Gated so ordinary runs pay nothing.
+        if std::env::var_os("FROG_COPY_STATS").is_some() || std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
+            let conv = crate::frontend::conventions::infer(&typed);
+            if std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
+                eprint!("{}", conv.dump());
+            }
+            crate::frontend::conventions::publish(&conv);
+        }
+
         // `TRAITS.md` Part 7: `Linear` violations are type errors, and must
         // be caught here — before codegen, which has no way to report a
         // clean `Spanned<TypeError>` (it only ever panics on a bad tree).

@@ -889,7 +889,11 @@ fn mark_shared_if_aliased(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut
     if ctx.liveness.ownership(expr.item.id) != liveness::Ownership::Copy { return vals; }
 
     if std::env::var_os("FROG_COPY_STATS").is_some() {
-        let site = ctx.liveness.copy_site(expr.item.id) as i64;
+        let site = if crate::frontend::conventions::is_borrowed_arg(expr.item.id) {
+            crate::frontend::conventions::BORROWED_SITE
+        } else {
+            ctx.liveness.copy_site(expr.item.id) as i64
+        };
         count_copy_extracted(bcx, &expr.item.ty, &vals, ctx, site);
     }
     mark_shared_extracted(bcx, &expr.item.ty, &vals, ctx.structs);
@@ -914,6 +918,20 @@ fn count_copy_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: &[Value], ct
         let site_val = bcx.ins().iconst(types::I64, site);
         bcx.ins().call(callee, &[*v, kind_val, site_val]);
     }
+}
+
+/// `FROG_COPY_STATS`: an extraction (`xs[i]`) copies its heap leaves under NOGC
+/// §1.3. Its site is the flow the extracted value goes into, as for a `Var`
+/// read, offset by `EXTRACT_SITE_BASE` so the report keeps extractions apart
+/// from `Var` reads. Extractions in a transient position (an index target, an
+/// operand) classify as `other`, which is a borrow under the design.
+fn count_extraction(bcx: &mut FunctionBuilder, expr: &Spanned<TypedExpr>, vals: &[Value], ctx: &mut Ctx) {
+    let base = if crate::frontend::conventions::is_borrowed_arg(expr.item.id) {
+        crate::frontend::conventions::BORROWED_SITE
+    } else {
+        ctx.liveness.copy_site(expr.item.id) as i64
+    };
+    count_copy_extracted(bcx, &expr.item.ty, vals, ctx, crate::frontend::conventions::EXTRACT_SITE_BASE + base);
 }
 
 /// Compile `expr` for a *transient* consumer: one that reads a pointer only
@@ -2818,6 +2836,7 @@ fn compile_expr_multi(
             }
             let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
             declare_gc_leaves(bcx, &results, &leaf_tys);
+            if std::env::var_os("FROG_COPY_STATS").is_some() { count_extraction(bcx, expr, &results, ctx); }
             mark_shared_extracted(bcx, &expr.item.ty, &results, ctx.structs);
             results
         },
@@ -2842,6 +2861,7 @@ fn compile_expr_multi(
             // (`is_heap_ty`), so `root_flat_leaves` needs nothing else.
             let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
             declare_gc_leaves(bcx, &results, &leaf_tys);
+            if std::env::var_os("FROG_COPY_STATS").is_some() { count_extraction(bcx, expr, &results, ctx); }
             mark_shared_extracted(bcx, &expr.item.ty, &results, ctx.structs);
             results
         },

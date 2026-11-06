@@ -254,7 +254,10 @@ pub fn analyze_body(body: &Spanned<TypedExpr>, exit_live: &NameSet) -> Liveness 
 /// conditional's branches pass that context through, since their value is the
 /// whole expression's value. Anything not listed here is `Other`.
 fn classify_copy_sites(expr: &Spanned<TypedExpr>, site: CopySite, out: &mut HashMap<NodeId, CopySite>) {
-    if let TypedExprKind::Var(_) = expr.item.kind {
+    // Extractions (`xs[i]`, `xs[a..b]`, `p.f`) are recorded too: under NOGC §1.3
+    // each one copies its heap leaves, so it needs the same flow context.
+    if matches!(expr.item.kind, TypedExprKind::Var(_) | TypedExprKind::Index { .. }
+        | TypedExprKind::Slice { .. } | TypedExprKind::FieldAccess { .. }) {
         out.insert(expr.item.id, site);
     }
     let children = TypeChecker::children(expr);

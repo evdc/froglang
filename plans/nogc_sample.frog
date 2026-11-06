@@ -1,0 +1,401 @@
+// nogc_sample.frog — a design sketch for plans/NOGC.md. It does NOT run.
+//
+// A small site crawler and report generator:
+//   1. read a list of seed URLs from a file              (file handles, `with`, Drop)
+//   2. fetch them concurrently, with limits and deadlines (structured concurrency, async I/O)
+//   3. parse each page into a big temporary DOM          (arenas)
+//   4. build the cross-link graph, which has cycles      (Pool<T> / Id<T>)
+//   5. score pages in parallel over the frozen graph     (`freezes`, borrowed sharing)
+//   6. write the report atomically                       (Linear: commit-or-abort)
+//
+// Each comment tag says what machinery a construct relies on:
+//   [have]  exists in froglang today
+//   [plan]  designed in an earlier plan (CONCURRENCY.md, DATA.md ...), not built
+//   [nogc]  new in NOGC.md (the section number follows)
+//
+// The thing to notice: nowhere in this file is there a GC root, a refcount, a COW
+// barrier, a destructor table or an unwinder. Memory is freed (a) at each value's last
+// use, (b) in one step when an arena, task or host call ends, or (c) never, for Ids,
+// which are plain integers.
+
+import "std/net.frog"  { http, Response, NetError }          // [have] modules; [plan] std/net
+import "std/fs.frog"   { open, open_append, AtomicFile, FsError }
+import "std/html.frog" { parse_html, Dom, NodeKind }
+import "std/time.frog" { Deadline, seconds }
+import "std/task.frog" { Scope, Parallel, Limit, collect, all, Outcome }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Data
+// ─────────────────────────────────────────────────────────────────────────────
+
+// [have] Nominal structs, flattened and unboxed. `Str` and `List` fields are owned
+// heap leaves. [nogc §1.3] Their drop glue is generated from the same stride/ptr_mask
+// metadata the GC tracer walks today.
+data Summary(url: Str, title: Str, links: List<Str>, words: Int)
+
+// [have] `error X(...)` is sugar for `data X(...) provides Error`.
+error CrawlError(url: Str, reason: Str)
+
+// [nogc §2.3] A graph node. `out` and `inbound` hold Ids, which are (index, generation)
+// pairs and not pointers, so a cycle a → b → a is just integers in two lists. The
+// owned-memory graph is still a tree: the Pool owns every Page, and each Page owns its
+// lists. No GC is needed to collect the cycle.
+data Page(summary: Summary, out: List<Id<Page>>, inbound: List<Id<Page>>, score: Float)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. Read seeds from a file
+// ─────────────────────────────────────────────────────────────────────────────
+
+// `can Fs` [plan CONCURRENCY.md Rule A]: the capability is written here because this
+// is an API boundary. It is inferred for private helpers.
+func read_seeds(path: Str): List<Str> | FsError can Fs = {
+    mut seeds: List<Str> = []                                  // [have] `mut`, typed let
+
+    // [plan + nogc §3.3] `with open(path) as f`:
+    //   - `open` returns a Context. `enter` opens the fd. `exit` closes it on EVERY path:
+    //     normal exit, `?` early return, panic, or cancellation.
+    //   - `f` is a SECOND-CLASS handle [nogc §3.3 item 3]. It can be passed down
+    //     (`f.lines()`, `count_lines(f)`) but it cannot be stored in a value, returned,
+    //     or captured by an escaping closure. This one local, syntactic rule is all that
+    //     replaced CONCURRENCY.md's Rule B (region-bound types and their contagion).
+    //   - On panic or cancel there is no unwinder. `enter` pushed a record on this task's
+    //     cleanup stack. The runtime runs `exit(Panicked)` from that record, then frees
+    //     the task heap in one step [nogc §3.5].
+    with open(path)? as f {                                   // [have] `?` propagates FsError
+        for line in f.lines() do {                             // streaming reads; the scheduler may suspend here
+            // `line` is an owned Str. The runtime allocated it in this task's heap.
+            let t = line.trim()                                // [have] UFCS to a host fn.
+                                                               // [nogc §1.2] `line` is borrowed
+                                                               // by `trim`, so no copy is made.
+            if t != "" and not t.starts_with("#") then
+                push(mut seeds, t)                             // [have] stage-8 `mut` place.
+                                                               // [nogc §1.2] `t` is consumed here:
+                                                               // last use, so it is MOVED into the list.
+            // [nogc §1.3] `line` was last used at `trim`, so it was freed there.
+            // No GC ever sees it.
+        }
+        // stash = f                // ERROR [nogc §3.3]: `f` is second-class; it cannot be bound
+        //                          // to a binding declared outside its `with`
+    }
+    seeds                                                      // [nogc §1.2] moved out to the caller, no copy
+}
+
+// The affine (Drop) counterpart. A plain `let` of a resource with `provides Drop`
+// [nogc §3.6] needs no `with`: it closes at SCOPE END, and not at last use, because
+// closing a file is observable and should happen at a predictable point. Use `with`
+// when you want a second-class handle or exit logic; use `let` when you just own the
+// resource.
+func log_line(path: Str, msg: Str): None | FsError can Fs = {
+    let log = open_append(path)?                               // log: LogFile, provides Drop
+    log.write("${now()} ${msg}\n")?                           // [have] string interpolation
+    // `log` is dropped (fd closed) at this `}`. On panic, the Drop value's registration
+    // on the cleanup stack closes it [nogc §3.5].
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2 + 3. Fetch a page and summarize it inside an arena
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One task's work: fetch, parse, summarize. It runs as a SPAWNED TASK (section 2),
+// so it has its own task heap [nogc §2.3]. Everything it allocates (the response body,
+// the DOM, intermediate strings) lives there, and the task's end frees all of it,
+// whether it finishes, errors, or is cancelled. Only the returned Summary leaves, and
+// the parent copies it out at join.
+func fetch_summary(url: Str): Summary | CrawlError can Net = {
+    // [plan CONCURRENCY.md "I/O"] `http.get` is colorless. It looks like a blocking call,
+    // but under the fiber Io implementation it parks this task on a socket and lets the
+    // scheduler run other tasks. The Io implementation is a dynamic context entry, so
+    // tests swap in `TestIo` (see `test_crawl` at the bottom).
+    let resp: Response = http.get(url) catch [e] ->            // [have] `catch` with a handler
+        return CrawlError(url = url, reason = e.msg)           // [have] `return` from inside catch
+                                                               // [nogc §1.2] `url` is borrowed by
+                                                               // `http.get` and copied into the error,
+                                                               // because it is used again below
+
+    if resp.status != 200 then
+        return CrawlError(url = url, reason = "HTTP ${resp.status}")
+
+    // [nogc §2.3] `with Arena { e }`:
+    //   - Inside the block, the CURRENT ALLOCATOR is a bump arena (a dynamic context
+    //     entry [nogc §2.2]). `parse_html` was compiled once and allocates through
+    //     whatever allocator is current; nothing is specialized per allocator.
+    //   - The DOM is tens of thousands of small boxed nodes. Under the GC each was a
+    //     header plus a mark/sweep; under plain ownership each would be its own free().
+    //     Here they are all bump-allocated, every free() inside is a no-op (one branch on
+    //     the segment header), and the whole arena goes in one step at `}`.
+    //   - The body FREEZES outer state: places rooted outside the block are read-only in
+    //     it. That is what makes the arena sound with no runtime write barrier: nothing
+    //     allocated in the arena can be stored into something that outlives it.
+    //   - The block's VALUE is the only way out. Allocations that flow into the result are
+    //     made in the outer allocator via the hidden "result allocator" (Goose-style
+    //     in-place construction / MLKit region polymorphism). Anything else that reaches
+    //     the result, such as `title` extracted from a DOM text node, is deep-copied out
+    //     (evacuated) at exit. Getting this wrong costs a copy, never a dangling pointer:
+    //     no reference type exists to dangle.
+    let summary = with Arena {
+        let dom: Dom = parse_html(resp.body)                   // `resp.body` borrowed; the DOM is in the arena
+
+        // [have] comprehensions. [nogc §2.3] The intermediate lists here are arena
+        // garbage, freed in bulk at exit.
+        let anchors = [for n in dom.walk() if n.kind == NodeKind.Element and n.tag == "a" do n]
+        let links   = [for a in anchors if a.attr("href") is Str do absolutize(url, a.attr("href")!)]
+
+        // resp.headers.seen = true    // ERROR [nogc §2.3, Q3 decided: strict]: `resp` is rooted
+        //                             // outside the Arena block, so it is frozen (read-only) here.
+        // mark_seen(mut resp)         // ERROR too: freezing is transitive through calls [nogc §3.9]
+
+        Summary(
+            url   = url,                                       // borrowed outer value, copied into the result
+            title = match dom.find("title") {                  // [have] match + narrowing on `Node?`
+                is None then "(untitled)"
+                is n then n.text()                             // a Str inside the arena, evacuated (copied) out at exit
+            },
+            links = links,                                     // allocated via the result allocator: already outside
+            words = dom.text().split(" ").len(),               // the giant joined string never leaves the arena
+        )
+    }
+    // Here the DOM, `anchors` and every temp string are already gone. One pointer reset.
+    // `resp` dies at its last use (inside the block, `resp.body`), and its body buffer
+    // was freed then [nogc §1.3]. That happened before this line ran.
+    summary
+}
+
+func absolutize(base: Str, href: Str): Str =
+    if href.starts_with("http") then href else base.trim_end("/") + "/" + href.trim_start("/")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Concurrency: fetch everything under one structured scope
+// ─────────────────────────────────────────────────────────────────────────────
+
+// [plan] Supervisors are ordinary folds (CONCURRENCY.md "Scope"). `collect` never cancels
+// siblings: it gathers successes and errors separately. The value of the whole
+// `with Scope(collect)` expression is this accumulator, not the body's value.
+data Collected(oks: List<Summary>, errs: List<CrawlError>)
+
+// `can Net, Spawn`: `Spawn` is deliberately NOT ambient [plan CONCURRENCY.md Rule A].
+// Any function that starts concurrent work says so in its signature, so callers know.
+// This one also contains its own scope, so the requirement is discharged inside and
+// callers would not need `Spawn`. It is written here to show the shape.
+func fetch_all(urls: List<Str>): Collected can Net = {
+    // Three contexts stacked in one header. These are three nested nodes of the one tree
+    // [nogc §3.4], outermost first, and the order is meaningful:
+    //   Deadline(30s)    cancels everything below it after 30s. Cancellation is an
+    //                    unwind [plan], implemented as "run the cleanup stack, then free
+    //                    the heap" [nogc §3.5], so a cancelled fetch's socket closes (its
+    //                    `with`) and its DOM arena and task heap are freed in one step.
+    //   Limit(8)         a semaphore: at most 8 children in flight. It provides no handle.
+    //   Scope(collect)   provides `Spawn`; its exit joins every child and returns the fold.
+    with Deadline(seconds(30)), Limit(8), Scope(collect) {
+        for u in urls do
+            // [plan] `spawn` is a syntactic form: arguments are evaluated NOW, and the body
+            // runs later as a task with its OWN HEAP [nogc §2.3].
+            // [nogc Q4] `u` is moved into the child if this is its last use and copied
+            // otherwise; here it is the loop variable's last use, so it is moved. The
+            // child never borrows parent memory, because the Scope does not freeze, so
+            // the parent may keep mutating its own state while children run.
+            spawn fetch_summary(u)
+    }
+    // At this `}` every child has settled; structured concurrency guarantees it. Each
+    // child's Summary was copied into this task's heap (by the parent, at join, so a
+    // free never crosses heaps), and each child heap was then destroyed whole.
+}
+
+// Heterogeneous results. There is NO Task<T> type [nogc §3.4, Q7 decided]. `robots` and
+// `sitemap` are DEFERRED-INIT `let`s [nogc §3.9]: they have an annotated type, no
+// initializer, and must be assigned exactly once before any read. `spawn` writes into
+// them, and definite-initialization analysis treats them as initialized only after the
+// `with` block joins. `spawn` itself produces no value, so a running task cannot escape
+// its scope by construction. That is why Rule B is gone.
+func fetch_meta(host: Str): Str can Net = {
+    let robots: Str | CrawlError                               // [nogc §3.9] deferred-init let
+    let sitemap: Str | CrawlError
+    with Scope(all) {
+        robots  = spawn fetch_text(host + "/robots.txt")
+        sitemap = spawn fetch_text(host + "/sitemap.xml")
+        // print(robots)          // ERROR: `robots` is not initialized until the scope joins
+    }
+    "${robots catch "none"} / ${sitemap catch "none"}"
+}
+
+func fetch_text(url: Str): Str | CrawlError can Net = {
+    let r = http.get(url) catch [e] -> return CrawlError(url = url, reason = e.msg)
+    r.body                                                     // partial move out of `r`; the rest of `r` is dropped
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. The link graph: cyclic data as a value
+// ─────────────────────────────────────────────────────────────────────────────
+
+func build_graph(summaries: List<Summary>): Pool<Page> = {
+    // [nogc §2.3] Pool<Page> is a VALUE: copy it and you copy the whole graph, and every
+    // Id stays valid in the copy (Ids are pool-relative, as in Goose). It also round-trips
+    // through repr/read/JSON [have DATA.md], because Ids are just data.
+    mut g = Pool<Page>()
+    mut by_url: Dict<Str, Id<Page>> = {}                       // [have] Dict; Id<T> provides Hash
+
+    // `summaries` is a CONSUME parameter [nogc §1.2]: the callee moves its elements into
+    // the pool, so the inference marks it `consume` and the caller moves it in on its
+    // last use, with no copy.
+    for s in summaries do {
+        let key = s.url                                        // a residual copy (`s` is moved below), so the
+                                                               // `implicit-copy` LINT reports it [nogc §1.4, Q2].
+                                                               // `copy(s.url)` would silence it.
+        let id = g.add(Page(summary = s, out = [], inbound = [], score = 0.0))
+        by_url[key] = id                                       // [have] Dict index assignment
+    }
+
+    // Second pass: wire edges. Cycles are fine.
+    for id in g.ids() do {
+        for link in g[id].summary.links do                    // `g[id]` is a PLACE [have stage 8 + nogc Q5]
+            if by_url.get(link) is Id<Page> then {             // [have] narrowing via `is`
+                let target = by_url[link]
+                push(mut g[id].out, target)                    // mutate in place through the pool: no copy of the Page
+                push(mut g[target].inbound, id)                // `target` may equal `id` (a self-link); fine, ints
+            }
+    }
+    g                                                          // moved out
+}
+
+// Removing a node makes old Ids STALE, and the stale use is detected, never unsafe.
+func prune_orphans(mut g: Pool<Page>) = {
+    let orphans = [for id in g.ids() if g[id].inbound.len() == 0 do id]
+    for id in orphans do g.remove(id)                          // O(1); bumps the slot's generation
+    // Other pages may still list a removed Id in `out`. Reading through it:
+    //   g[stale]      panics ("stale Id<Page>")
+    //   g.get(stale)  returns `Page?`, so `none` [have unions/narrowing]
+    // Goose would return "some other valid Page" here, cheaper but silent; rejected in NOGC §2.4.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Parallel scoring over a frozen graph
+// ─────────────────────────────────────────────────────────────────────────────
+
+func score_all(mut g: Pool<Page>) = {
+    let ids = g.ids()
+
+    // [nogc §3.4] `with Parallel(all)`: like Scope, but children MAY run on other OS
+    // threads, and the context FREEZES outer state for the block's duration. So:
+    //   - Children BORROW `g` (read-only), with no copy, no refcount and no atomics,
+    //     even across threads. This is Vale's "seamless concurrency": safe because
+    //     nothing can write `g` until the block exits, and the block cannot exit until
+    //     every child has joined.
+    //   - The parent body cannot mutate `g` inside the block either; it is frozen too.
+    //   - Each child still allocates in its own task heap, so threads never contend on
+    //     an allocator and there is no GC to stop the world. That is why M:N is no longer
+    //     a semantic question [nogc §3.7].
+    //   - The block's value is the `all` fold: a List<Float>, in spawn order.
+    let scores = with Parallel(all) {
+        for id in ids do spawn page_rank_step(g, id)          // `g` borrowed (frozen); `id` is an Int pair, copied
+        // g[ids[0]].score = 1.0  // ERROR: `g` is frozen inside a `freezes` context
+    }
+
+    // Unfrozen again: write the results back in place.
+    for i in 0..ids.len() do g[ids[i]].score = scores[i]
+}
+
+func page_rank_step(g: Pool<Page>, id: Id<Page>): Float =    // `g`: inferred BORROW, never copied
+    0.15 + 0.85 * sum([for src in g[id].inbound do 1.0 / max(1, g[src].out.len()).to_float()])
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Write the report atomically: a Linear resource
+// ─────────────────────────────────────────────────────────────────────────────
+
+// AtomicFile provides Linear, Abort [have TRAITS.md Part 7 checker; nogc §3.6, §3.8].
+// It writes to `path.tmp`, and on every SUCCESS path it must be consumed exactly once:
+//     commit(f): None | FsError    renames tmp → path
+//     abort(f)                     deletes tmp (this is the `Abort` trait's member)
+// Forgetting both on a success path is a compile error, not a leak and not a silently
+// half-written report. `Linear` REQUIRES `Abort` [nogc §3.8]: a linear type with no
+// failure path is rejected.
+// On failure paths, consumption is automatic:
+//   - `?` that fires calls abort(out) for every live Abort value, in reverse acquisition
+//     order, then returns the error. This is a typeck desugar into `?`'s error arm.
+//   - panic or cancel: `out` wraps a host fd, which is in this task's RESOURCE TABLE, so
+//     the runtime calls the host-level abort before destroying the heap [nogc §3.8].
+func write_report(path: Str, g: Pool<Page>, failures: List<CrawlError>): None | FsError can Fs = {
+    let out = AtomicFile.create(path)?
+
+    // Building the report text in an arena: lots of temporary interpolated strings, freed
+    // in one step. `out` is a Linear value from OUTSIDE the block, so it is frozen here;
+    // we produce the text and write it after.
+    let text = with Arena {
+        let ranked = g.ids().sort_by(id -> -g[id].score)       // [have] lambdas, lowered; no closure object
+        let lines  = [for id in ranked do "${g[id].score}\t${g[id].summary.url}\t${g[id].summary.title}"]
+        let errs   = [for e in failures do "FAILED\t${e.url}\t${e.reason}"]
+        (lines + errs).join("\n")                              // only this Str survives
+    }
+
+    // `write` takes `mut out`, so it does not consume it. If it fails, `?` fires:
+    // abort(out) runs (the tmp file is deleted), then FsError is returned.
+    // Without §3.8 this line had to be `catch [e] -> { abort(out); return e }`.
+    out.write(text)?
+    out.write("\n# generated ${now()}\n")?                    // same again: every `?` is an abort point
+
+    commit(out)                                                // success path: consumed EXPLICITLY.
+                                                               // Returns None | FsError; as the tail
+                                                               // expression it is the function's result.
+
+    // Counter-example, for the rule's edges:
+    //   if text == "" then return FsError(msg = "empty")      // ERROR: a plain `return` is not an
+    //                                                         // error edge, so `out` is unconsumed.
+    //                                                         // Write `abort(out)` first, or use `?`.
+}
+
+// Abort on a NON-linear type: "keep on success, undo on failure" [nogc §3.8].
+// `Scratch` provides Drop + Abort. On success paths it is dropped at scope end (its
+// directory is kept, as the cache). On a `?` edge it is aborted instead (the directory is
+// removed, so a failed run leaves no half-populated cache behind).
+func warm_cache(dir: Str, urls: List<Str>): None | CrawlError | FsError can Fs, Net = {
+    let scratch = Scratch.create(dir)?                         // Scratch provides Drop, Abort
+    for u in urls do {
+        let body = fetch_text(u)?                              // fires → abort(scratch): dir removed
+        scratch.put(u.hash().to_str(), body)?                  // fires → abort(scratch) too
+    }
+    // normal exit: drop(scratch) closes its handles; the directory stays
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────────────────────
+
+// [plan CONCURRENCY.md] `main` is GRANTED `Fs, Net` by the host (an embedding Rust app
+// could grant only `Fs`). `main`'s body runs inside an implicit root Scope, and the root
+// TASK HEAP is where everything below lives unless an arena or child task takes over.
+func main() can Fs, Net = {
+    let seeds = read_seeds("seeds.txt")!                       // [have] `!` panics on the error member
+
+    let got = fetch_all(seeds)                                 // seeds MOVED in (last use)
+    for e in got.errs do log_line("crawl.log", "error: ${e.url}: ${e.reason}")!
+
+    mut g = build_graph(got.oks)                               // partial move: `got.oks` moved out;
+                                                               // `got.errs` is still live (used below)
+    prune_orphans(mut g)
+    score_all(mut g)
+
+    // [plan] Attenuating authority: the plugin formats extra report sections and
+    // provably cannot touch the network. Note that `without` is just another node in the
+    // same tree as Arena, Scope and Deadline.
+    let extra = without Net { run_formatter_plugin(g) }       // `g` borrowed
+
+    write_report("report.tsv", g, got.errs)!
+    print("crawled ${g.len()} pages, ${got.errs.len()} failures\n${extra}")
+
+    // Process exit: the root heap is destroyed whole. No final GC, no finalizers.
+}
+
+func run_formatter_plugin(g: Pool<Page>): Str = "top page: ${g.max_by(p -> p.score).summary.url}"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deterministic test: the same code, under an injected Io
+// ─────────────────────────────────────────────────────────────────────────────
+
+// [plan CONCURRENCY.md "Deterministic testing"] TestIo is a context, so it is another node
+// in the tree. It provides Net (backed by canned responses) and a virtual clock, and it
+// fixes the scheduling order, so Deadline(30s) fires deterministically in virtual time.
+// Nothing in fetch_all changes.
+func test_crawl() = {
+    let canned = {"http://a/": "<title>A</title><a href='/b'>", "http://a/b": "<title>B</title><a href='/'>"}
+    let got = with TestIo(responses = canned, seed = 42) { fetch_all(["http://a/", "http://a/b"]) }
+    mut g = build_graph(got.oks)
+    assert(g.len() == 2)                                       // a ↔ b: a cycle, held in a value
+}

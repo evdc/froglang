@@ -460,9 +460,10 @@ pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
 // pressure, so stats runs are for counts and bytes, never for timing.
 // Counters are indexed `site * 3 + kind`; sites follow `liveness::CopySite`.
 pub const COPY_KIND_NAMES: [&str; 3] = ["Str", "List", "Dict"];
-pub const COPY_SITE_NAMES: [&str; 6] = ["call-arg", "let", "store", "literal", "return", "other"];
-static COPY_EVENTS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
-static COPY_BYTES: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+pub const COPY_SITE_NAMES: [&str; 7] = ["call-arg", "let", "store", "literal", "return", "other", "call-arg-borrow"];
+// Sites `0..7` are `Var` reads, `7..14` their extraction twins (`EXTRACT_SITE_BASE`).
+static COPY_EVENTS: [std::sync::atomic::AtomicU64; 42] = [const { std::sync::atomic::AtomicU64::new(0) }; 42];
+static COPY_BYTES: [std::sync::atomic::AtomicU64; 42] = [const { std::sync::atomic::AtomicU64::new(0) }; 42];
 
 #[no_mangle]
 pub extern "C" fn frog_copy_stat(w: i64, kind: i64, site: i64) {
@@ -500,14 +501,19 @@ pub fn copy_stats_report() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let mut out = String::from("copy stats: Copy-classified heap reads that unique ownership would deep-copy\n");
     let (mut total_events, mut total_bytes) = (0u64, 0u64);
-    for (s, site) in COPY_SITE_NAMES.iter().enumerate() {
+    for s in 0..2 * COPY_SITE_NAMES.len() {
+        let (origin, site) = if s < COPY_SITE_NAMES.len() {
+            ("var", COPY_SITE_NAMES[s])
+        } else {
+            ("extract", COPY_SITE_NAMES[s - COPY_SITE_NAMES.len()])
+        };
         for (k, kind) in COPY_KIND_NAMES.iter().enumerate() {
             let idx = s * 3 + k;
             let (e, b) = (COPY_EVENTS[idx].load(Relaxed), COPY_BYTES[idx].load(Relaxed));
             total_events += e;
             total_bytes += b;
             if e > 0 {
-                out += &format!("  {:<9} {:<5} events={:<12} bytes={}\n", site, kind, e, b);
+                out += &format!("  {:<7} {:<18} {:<5} events={:<12} bytes={}\n", origin, site, kind, e, b);
             }
         }
     }

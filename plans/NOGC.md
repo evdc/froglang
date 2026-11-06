@@ -579,6 +579,14 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
 2. **Ownership codegen behind a flag:** drops at last use, drop glue from masks, deep copy at
    residual copies, no `shared` bit. Run the whole suite in both modes, with a leak checker
    (allocation count at exit is zero) as the oracle that replaces `FROG_GC_STRESS`.
+   **Status: first slice done, uncommitted** (`FROG_OWNERSHIP`). Every site that marked a list or
+   dict leaf `shared` (`Var` reads, extractions, for-loop elements) now deep-copies it, unless the
+   read is a borrowed call argument or a transient target. The `shared` bit is never set in this
+   mode. `values(d)` deep-copies its result. The GC still runs and frees nothing explicitly, so
+   drops and the leak checker are not done yet. Both modes pass the suite (1192 tests). Under
+   `FROG_OWNERSHIP` the `life` benchmark matches default mode, and so do `orders` and `words`.
+   The COW verifier does not catch a missing copy in `let b = a`, because both bindings share one
+   SSA value. The value-semantics tests do catch it: skipping the copy fails 18 of them.
 3. **Delete the GC:** stack maps, roots, COW, `RuntimeRoots`, and the AOT stack-map table.
    `SELFHOST.md` G6 disappears.
 4. **Allocator layer:** segment headers, task heap and bump arena; then `with Arena` with

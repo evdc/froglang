@@ -176,6 +176,17 @@ struct Ctx<'a> {
     /// ordinary build emits no call at all rather than one that returns
     /// early.
     cow_verify:    bool,
+    /// `FROG_OWNERSHIP` (NOGC §6 step 2): values are owned, not shared. A
+    /// `Copy`-classified read or extraction of a `List`/`Dict` leaf deep-copies
+    /// it (unless the read is a borrowed call argument) instead of setting the
+    /// `shared` bit, so the bit is never set in this mode.
+    ownership:     bool,
+    /// Set by `compile_expr_multi_transient` just before it compiles an
+    /// `Index`/`FieldAccess` target, and consumed (`mem::take`) on entry to
+    /// `compile_expr_multi`, so it applies to that one node only. Such a target
+    /// is read only to address through it, so under `ownership` its extraction
+    /// is not copied.
+    transient_extract: bool,
 }
 
 /// True iff a slot of this type is a GC-scannable column — a word the
@@ -896,8 +907,8 @@ fn mark_shared_if_aliased(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut
         };
         count_copy_extracted(bcx, &expr.item.ty, &vals, ctx, site);
     }
-    mark_shared_extracted(bcx, &expr.item.ty, &vals, ctx.structs);
-    vals
+    let borrowed = crate::frontend::conventions::is_borrowed_arg(expr.item.id);
+    share_extracted(bcx, &expr.item.ty, vals, borrowed, ctx)
 }
 
 /// `FROG_COPY_STATS` (plans/NOGC.md §6 step 0): for each `Str`/`List`/`Dict`
@@ -954,6 +965,10 @@ fn count_extraction(bcx: &mut FunctionBuilder, expr: &Spanned<TypedExpr>, vals: 
 fn compile_expr_multi_transient(expr: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     match &expr.item.kind {
         TypedExprKind::Var(name) => read_var_raw(name, &expr.item.ty, bcx, vars, ctx.structs),
+        TypedExprKind::Index { .. } | TypedExprKind::FieldAccess { .. } => {
+            ctx.transient_extract = true;
+            compile_expr_multi(expr, bcx, vars, ctx)
+        },
         _ => compile_expr_multi(expr, bcx, vars, ctx),
     }
 }
@@ -1007,6 +1022,43 @@ fn list_stride(bcx: &mut FunctionBuilder, list: Value) -> Value {
 /// `Codegen`, not per barrier.
 fn cow_verify_enabled() -> bool {
     std::env::var_os("FROG_COW_VERIFY").is_some()
+}
+
+/// Whether `FROG_OWNERSHIP` selects the ownership model (NOGC §6 step 2). Read
+/// per function, like `cow_verify_enabled`.
+fn ownership_enabled() -> bool {
+    std::env::var_os("FROG_OWNERSHIP").is_some()
+}
+
+/// The sharing decision for a value just read or extracted from somewhere
+/// else. Under the GC model it marks the list and dict leaves `shared`
+/// (`mark_shared_extracted`). Under `FROG_OWNERSHIP` it gives the consumer its
+/// own copy of each list and dict leaf, unless `borrowed` (the value is a call
+/// argument the callee only reads, see `conventions`), in which case it is
+/// passed as is.
+fn share_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: Vec<Value>, borrowed: bool, ctx: &mut Ctx) -> Vec<Value> {
+    if !ctx.ownership {
+        mark_shared_extracted(bcx, ty, &vals, ctx.structs);
+        return vals;
+    }
+    if borrowed {
+        return vals;
+    }
+    let leafs = struct_fields(ty, ctx.structs);
+    let clone_id = ctx.func_ids["frog_clone"];
+    let mut out = Vec::with_capacity(vals.len());
+    for (v, (_, lty)) in vals.into_iter().zip(leafs.iter()) {
+        if lty.is_list() || lty.is_dict() {
+            let callee = ctx.module.declare_func_in_func(clone_id, bcx.func);
+            let call = bcx.ins().call(callee, &[v]);
+            let cloned = bcx.inst_results(call)[0];
+            declare_gc_ptr(bcx, cloned);
+            out.push(cloned);
+        } else {
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// Byte offset of the copy-on-write `shared` flag within any GC object.
@@ -2743,6 +2795,7 @@ fn compile_expr_multi(
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
 ) -> Vec<Value> {
+    let transient = std::mem::take(&mut ctx.transient_extract);
     match &expr.item.kind {
         TypedExprKind::IntLit(n) => vec![bcx.ins().iconst(types::I64, *n)],
 
@@ -2837,7 +2890,7 @@ fn compile_expr_multi(
             let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
             declare_gc_leaves(bcx, &results, &leaf_tys);
             if std::env::var_os("FROG_COPY_STATS").is_some() { count_extraction(bcx, expr, &results, ctx); }
-            mark_shared_extracted(bcx, &expr.item.ty, &results, ctx.structs);
+            let results = share_extracted(bcx, &expr.item.ty, results, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
             results
         },
 
@@ -2862,7 +2915,7 @@ fn compile_expr_multi(
             let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
             declare_gc_leaves(bcx, &results, &leaf_tys);
             if std::env::var_os("FROG_COPY_STATS").is_some() { count_extraction(bcx, expr, &results, ctx); }
-            mark_shared_extracted(bcx, &expr.item.ty, &results, ctx.structs);
+            let results = share_extracted(bcx, &expr.item.ty, results, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
             results
         },
 
@@ -2976,7 +3029,7 @@ fn compile_expr_multi(
                             let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
                             let leaves = unpack_union_member(&members, &members[0], &slots, bcx, ctx.structs);
                             let out = leaves[offset..offset + leaf_types.len()].to_vec();
-                            mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+                            let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
                             return out;
                         }
                     }
@@ -2987,14 +3040,14 @@ fn compile_expr_multi(
                     // `for_each_heap_producer`'s matching arm).
                     let ptr = compile_expr_transient(target, bcx, vars, ctx);
                     let out = read_variant_slots(ptr, offset, &leaf_types, bcx, ctx);
-                    mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+                    let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
                     out
                 },
                 None => {
                     let target_vals = compile_expr_multi_transient(target, bcx, vars, ctx);
                     let (start, len) = field_slice_range(&target.item.ty, field, ctx.structs);
                     let out = target_vals[start..start + len].to_vec();
-                    mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+                    let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
                     out
                 },
             }
@@ -3031,13 +3084,13 @@ fn compile_expr_multi(
                     let member_ty = Type::strukt(format!("{}.{}", enum_name, variant));
                     let leaves = unpack_union_member(&members, &member_ty, &slots, bcx, ctx.structs);
                     let out = leaves[offset..offset + leaf_types.len()].to_vec();
-                    mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+                    let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
                     return out;
                 }
             }
             let ptr = compile_expr_transient(target, bcx, vars, ctx);
             let out = read_variant_slots(ptr, offset, &leaf_types, bcx, ctx);
-            mark_shared_extracted(bcx, &expr.item.ty, &out, ctx.structs);
+            let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
             out
         },
 
@@ -3675,7 +3728,18 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
         let arg = arg_exprs[0];
         let (key_ty, val_ty) = arg.item.ty.as_dict_kv().map(|(k, v)| (k.clone(), v.clone())).expect("finish_keys_values checked this is a Dict");
         let dict_val = compile_expr_transient(arg, bcx, vars, ctx);
-        let result = compile_dict_keys_or_values(&key_ty, &val_ty, func_name == "keys", dict_val, bcx, ctx);
+        let mut result = compile_dict_keys_or_values(&key_ty, &val_ty, func_name == "keys", dict_val, bcx, ctx);
+        // `values(d)` puts the dict's own element objects into a new list, so
+        // under ownership the result must not share them with `d`. A deep
+        // copy of the whole result list gives it private elements. Keys are
+        // scalars or `Str`, which never need this.
+        if ctx.ownership && func_name == "values" && struct_fields(&val_ty, ctx.structs).iter().any(|(_, t)| t.is_list() || t.is_dict()) {
+            let clone_id = ctx.func_ids["frog_clone"];
+            let callee = ctx.module.declare_func_in_func(clone_id, bcx.func);
+            let call = bcx.ins().call(callee, &[result]);
+            result = bcx.inst_results(call)[0];
+            declare_gc_ptr(bcx, result);
+        }
         return vec![result];
     }
 
@@ -4487,7 +4551,7 @@ fn compile_for_loop(
     declare_gc_leaves(bcx, &elem_vals, &elem_leaf_tys);
     // The list keeps its own path to every element, so a `List`-typed element
     // is aliased the moment it is bound — see `mark_shared_extracted`.
-    mark_shared_extracted(bcx, &elem_ty, &elem_vals, ctx.structs);
+    let elem_vals = share_extracted(bcx, &elem_ty, elem_vals, false, ctx);
     for ((leaf_path, lty), elem_val) in elem_leafs.iter().zip(elem_vals) {
         let key = var_key(var, leaf_path);
         let var_id = get_or_declare_var(bcx, vars, &key, lty);
@@ -5451,6 +5515,8 @@ impl<M: Module> Codegen<M> {
             printing_unions: Vec::new(), comparing_unions: Vec::new(), mut_params, liveness: body_liveness,
             host_fns,
             cow_verify: cow_verify_enabled(),
+            ownership: ownership_enabled(),
+            transient_extract: false,
         };
         let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
 
@@ -5582,6 +5648,8 @@ impl<M: Module> Codegen<M> {
             printing_unions: Vec::new(), comparing_unions: Vec::new(), mut_params: Vec::new(), liveness: entry_liveness,
             host_fns,
             cow_verify: cow_verify_enabled(),
+            ownership: ownership_enabled(),
+            transient_extract: false,
         };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();

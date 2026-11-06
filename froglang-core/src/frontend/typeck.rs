@@ -1753,6 +1753,12 @@ impl TypeChecker {
     /// Threaded into `Codegen::compile_entry` so codegen can flatten
     /// struct-typed values into their leaf fields — see `struct_fields`
     /// in `codegen/mod.rs`.
+    /// Names registered as host functions (`add_ctx`). Their arguments are
+    /// marshalled, so they borrow.
+    pub fn host_names(&self) -> &std::collections::HashSet<String> {
+        &self.host_names
+    }
+
     pub fn struct_defs(&self) -> &StructDefs {
         &self.struct_defs
     }

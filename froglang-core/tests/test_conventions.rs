@@ -1,7 +1,7 @@
 // Parameter conventions (plans/NOGC.md §1.2, §6 step 1): which parameters a
 // callee only reads (Borrow) and which let their value escape (Consume).
 
-use froglang_core::frontend::conventions::{infer, Conventions, Convention};
+use froglang_core::frontend::conventions::{builtin_borrowers, infer, Conventions, Convention};
 use froglang_core::frontend::liveness::number_nodes;
 use froglang_core::frontend::parser::Parser;
 use froglang_core::frontend::typeck::TypeChecker;
@@ -13,7 +13,7 @@ fn conventions_of(src: &str) -> Conventions {
     tc.lower_function_values(&mut typed).expect("function value error");
     tc.desugar_notation(&mut typed).expect("notation error");
     number_nodes(&mut typed);
-    infer(&typed)
+    infer(&typed, &builtin_borrowers())
 }
 
 #[test]
@@ -84,4 +84,18 @@ fn ambiguous_name_is_not_analysed() {
     let c = conventions_of(src);
     assert!(c.functions.is_empty());
     assert_eq!(c.ambiguous, vec!["f".to_string()]);
+}
+
+#[test]
+fn external_callee_not_in_borrowers_consumes() {
+    // `len` is defined outside the program. With no borrower set it may be an
+    // earlier REPL entry whose body is unknown, so `f` must consume its argument.
+    let ast = Parser::parse("func f(s: Str): Int = len(s)\n").expect("parse error");
+    let mut tc = TypeChecker::new();
+    let mut typed = tc.check_and_lower(ast).expect("type error");
+    tc.lower_function_values(&mut typed).expect("function value error");
+    tc.desugar_notation(&mut typed).expect("notation error");
+    number_nodes(&mut typed);
+    let c = infer(&typed, &std::collections::HashSet::new());
+    assert_eq!(c.convention("f", 0), Some(Convention::Consume));
 }

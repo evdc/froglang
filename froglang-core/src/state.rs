@@ -368,10 +368,16 @@ impl FrogState {
         // get real ids too.
         crate::frontend::liveness::number_nodes(&mut typed);
 
-        // NOGC step 1 (plans/NOGC.md §6): parameter conventions. Analysis only;
-        // codegen is unchanged. Gated so ordinary runs pay nothing.
-        if std::env::var_os("FROG_COPY_STATS").is_some() || std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
-            let conv = crate::frontend::conventions::infer(&typed);
+        // NOGC step 1 (plans/NOGC.md §6): parameter conventions. Codegen reads
+        // them only under `FROG_OWNERSHIP` (step 2) and for the copy statistics.
+        // Gated so ordinary runs pay nothing.
+        if std::env::var_os("FROG_COPY_STATS").is_some()
+            || std::env::var_os("FROG_DUMP_CONVENTIONS").is_some()
+            || std::env::var_os("FROG_OWNERSHIP").is_some()
+        {
+            let mut borrowers = crate::frontend::conventions::builtin_borrowers();
+            borrowers.extend(self.tc.host_names().iter().cloned());
+            let conv = crate::frontend::conventions::infer(&typed, &borrowers);
             if std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
                 eprint!("{}", conv.dump());
             }

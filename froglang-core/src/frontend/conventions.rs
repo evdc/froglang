@@ -109,9 +109,21 @@ pub fn is_borrowed_arg(id: NodeId) -> bool {
     BORROWED_ARGS.with(|s| s.borrow().contains(&id))
 }
 
+/// Builtins that only read their arguments, so a call to one borrows them.
+/// Host functions are added by the caller (`TypeChecker::is_host_name`).
+pub fn builtin_borrowers() -> HashSet<String> {
+    ["print", "len", "gc_dump", "panic", "keys", "values", "to_list"]
+        .into_iter().map(String::from).collect()
+}
+
 /// Analyse a whole typed program (after `number_nodes`) and infer every
 /// function's parameter conventions.
-pub fn infer(program: &Spanned<TypedExpr>) -> Conventions {
+///
+/// `external_borrowers` names the callees that are not defined in `program`
+/// but are known to only read their arguments (host functions and builtins).
+/// Any other name that is not defined in `program` must have been defined in
+/// an earlier REPL entry, and is treated as consuming, since its body is unknown.
+pub fn infer(program: &Spanned<TypedExpr>, external_borrowers: &HashSet<String>) -> Conventions {
     let mut defs = Vec::new();
     collect_defs(program, &mut defs);
 
@@ -120,7 +132,11 @@ pub fn infer(program: &Spanned<TypedExpr>) -> Conventions {
     for d in &defs {
         if !seen.insert(d.name.clone()) { ambiguous_names.insert(d.name.clone()); }
     }
-    let mut table = Table { fns: HashMap::new(), ambiguous: ambiguous_names.clone() };
+    let mut table = Table {
+        fns: HashMap::new(),
+        ambiguous: ambiguous_names.clone(),
+        external_borrowers: external_borrowers.clone(),
+    };
     for d in &defs {
         if table.ambiguous.contains(&d.name) { continue; }
         table.fns.insert(d.name.clone(), d.params.iter().map(|(_, m)| (*m, Convention::Borrow)).collect());
@@ -206,6 +222,8 @@ struct Table {
     /// Each uniquely-named function: per parameter, whether it is `mut` and its convention.
     fns: HashMap<String, Vec<(bool, Convention)>>,
     ambiguous: HashSet<String>,
+    /// Callees defined outside the program that only read their arguments.
+    external_borrowers: HashSet<String>,
 }
 
 enum ArgFlow {
@@ -230,13 +248,17 @@ fn arg_flow(table: &Table, callable: &Spanned<TypedExpr>, index: usize) -> ArgFl
             _ => ArgFlow::Borrows,
         };
     }
-    // Not defined in this program: a host function or a stdlib builtin.
-    // Host arguments are marshalled, which copies them, so they borrow. `push`
-    // is the one builtin that keeps its value argument.
+    // `push` is the one builtin that keeps its value argument.
     if name == "push" && index == 1 {
         return ArgFlow::Escapes("push");
     }
-    ArgFlow::Borrows
+    // Not defined in this program. A known host function or builtin borrows:
+    // host arguments are marshalled, which copies them. Anything else was
+    // defined in an earlier entry, so its body is unknown and it must consume.
+    if table.external_borrowers.contains(name) {
+        return ArgFlow::Borrows;
+    }
+    ArgFlow::Escapes("call-arg")
 }
 
 /// The flow a child of `expr` takes, given `expr`'s own flow. `None` means only read.

@@ -181,14 +181,10 @@ struct Ctx<'a> {
     /// it (unless the read is a borrowed call argument) instead of setting the
     /// `shared` bit, so the bit is never set in this mode.
     ownership:     bool,
-    /// Set by `compile_expr_multi_transient` just before it compiles an
-    /// `Index`/`FieldAccess` target, and consumed (`mem::take`) on entry to
-    /// `compile_expr_multi`, so it applies to that one node only. Such a target
-    /// is read only to address through it, so under `ownership` its extraction
-    /// is not copied.
-    view_next: bool,
-    /// Set just before compiling an `Assign` whose value nobody reads (a
-    /// non-tail statement of a block). Consumed on entry to the `Assign` arm.
+    /// Set just before compiling an expression whose value nobody uses (a
+    /// non-tail statement, a discarding loop's body), and consumed on entry to
+    /// `compile_expr_multi`, so it applies to that one node. A discarded block or
+    /// conditional does not own its result out of its frames (see `own_vals`).
     discard_next: bool,
     /// `FROG_OWNERSHIP` (NOGC §6 step 2): the slots that own heap values,
     /// innermost last. A `Block` frame holds bindings, which live until the
@@ -198,7 +194,11 @@ struct Ctx<'a> {
     frames: Vec<Frame>,
     /// Owned temporaries by their SSA value, so a consumer that keeps a value can
     /// take it back out of its frame (`take_vals`).
-    temp_of: HashMap<Value, Variable>,
+    temp_of: HashMap<Value, (Variable, u32)>,
+    /// How many conditionals and loops enclose the code being compiled. A
+    /// temporary taken at the depth it was registered at is taken on every path
+    /// to the end of its frame, so its drop is not emitted (see `take_vals`).
+    depth: u32,
     /// Names bound to values this function owns. A read of any other name is a
     /// borrowed view, and in an owning position it is copied.
     owned_names: std::collections::HashSet<String>,
@@ -934,8 +934,7 @@ fn mark_shared_if_aliased(expr: &Spanned<TypedExpr>, vals: Vec<Value>, bcx: &mut
         };
         count_copy_extracted(bcx, &expr.item.ty, &vals, ctx, site);
     }
-    let borrowed = crate::frontend::conventions::is_borrowed_arg(expr.item.id);
-    share_extracted(bcx, &expr.item.ty, vals, borrowed, ctx)
+    share_extracted(bcx, &expr.item.ty, vals, ctx)
 }
 
 /// `FROG_COPY_STATS` (plans/NOGC.md §6 step 0): for each `Str`/`List`/`Dict`
@@ -992,10 +991,6 @@ fn count_extraction(bcx: &mut FunctionBuilder, expr: &Spanned<TypedExpr>, vals: 
 fn compile_expr_multi_transient(expr: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     match &expr.item.kind {
         TypedExprKind::Var(name) => read_var_raw(name, &expr.item.ty, bcx, vars, ctx.structs),
-        TypedExprKind::Index { .. } | TypedExprKind::FieldAccess { .. } => {
-            ctx.view_next = true;
-            compile_expr_multi(expr, bcx, vars, ctx)
-        },
         _ => compile_expr_multi(expr, bcx, vars, ctx),
     }
 }
@@ -1131,6 +1126,10 @@ fn pop_frame(bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
             ctx.known.remove(pos);
         }
     }
+    // The frame's temporaries end with it, so none of them can be taken any more.
+    if !frame.slots.is_empty() {
+        ctx.temp_of.retain(|_, (var, _)| !frame.slots.contains(var));
+    }
     for var in frame.slots.into_iter().rev() {
         drop_var(bcx, ctx, var);
     }
@@ -1144,17 +1143,17 @@ fn drop_top_frame_slots(bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
     }
 }
 
-/// One iteration's body value. A `collect` loop hands it to the result list. A
-/// discarding loop frees it now, so earlier iterations do not pile up until the loop ends.
-fn consume_loop_body(bcx: &mut FunctionBuilder, ctx: &mut Ctx, result_list: Option<Value>, body_vals: &[Value], body: &Spanned<TypedExpr>) {
-    take_vals(bcx, ctx, body_vals);
-    match result_list {
-        Some(list_ptr) => {
-            let body_leafs = struct_fields(&body.item.ty, ctx.structs);
-            push_element(bcx, ctx, list_ptr, body_vals, &body_leafs);
-        }
-        None if ctx.ownership => drop_vals(bcx, ctx, &body.item.ty, body_vals),
-        None => {}
+/// Compile one iteration's body. A `collect` loop keeps the value in its result
+/// list. A discarding loop compiles the body as discarded (`Ctx::discard_next`):
+/// its temporaries end with the iteration's frame, and nothing is copied out.
+fn compile_loop_body(bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx, result_list: Option<Value>, body: &Spanned<TypedExpr>) {
+    ctx.discard_next = result_list.is_none();
+    let body_vals = compile_expr_multi(body, bcx, vars, ctx);
+    if let Some(list_ptr) = result_list {
+        let body_vals = own_vals(bcx, ctx, &body.item.ty, body_vals);
+        let body_leafs = struct_fields(&body.item.ty, ctx.structs);
+        push_element(bcx, ctx, list_ptr, &body_vals, &body_leafs);
+        take_vals(bcx, ctx, &body_vals);
     }
 }
 
@@ -1186,18 +1185,32 @@ fn reg_heap(bcx: &mut FunctionBuilder, ctx: &mut Ctx, ty: &Type, vals: &[Value])
         let var = bcx.declare_var(types::I64);
         bcx.def_var(var, *v);
         ctx.frames.last_mut().expect("checked non-empty").slots.push(var);
-        ctx.temp_of.insert(*v, var);
+        ctx.temp_of.insert(*v, (var, ctx.depth));
     }
 }
 
 /// A consumer keeps `vals`: remove them from their frame so they are not dropped
 /// there. A value that was never registered (a scalar, or a view) is left alone.
+///
+/// When the take happens at the same depth as the registration, every path from
+/// the registration to the frame's end runs through it: the depth counts only
+/// enclosing conditionals and loops, so no branch can leave the value owned.
+/// Then the slot is removed and its drop is never emitted. The take still clears
+/// the variable, so a drop emitted earlier (an early return) stays harmless.
 fn take_vals(bcx: &mut FunctionBuilder, ctx: &mut Ctx, vals: &[Value]) {
     if !ctx.ownership { return; }
     for v in vals {
-        if let Some(var) = ctx.temp_of.remove(v) {
+        if let Some((var, depth)) = ctx.temp_of.remove(v) {
             let zero = bcx.ins().iconst(types::I64, 0);
             bcx.def_var(var, zero);
+            if depth == ctx.depth {
+                for f in ctx.frames.iter_mut().rev() {
+                    if let Some(pos) = f.slots.iter().position(|slot| *slot == var) {
+                        f.slots.remove(pos);
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -1230,10 +1243,33 @@ fn mut_param_copyout_taken(bcx: &mut FunctionBuilder, vars: &HashMap<String, Var
     out
 }
 
-/// Ownership mode: a fresh deep copy of one heap word `v`, owned by the caller.
-fn clone_owned_word(bcx: &mut FunctionBuilder, ctx: &mut Ctx, v: Value) -> Value {
-    if bcx.is_unreachable() { return v; }
-    emit_clone_word(bcx, ctx, v)
+/// Ownership mode: make every heap leaf of `vals` owned by the current statement.
+/// A temporary already is. A view (a read of storage some other owner holds) is
+/// copied here, and the copy registered as a temporary. A consumer that keeps a
+/// value calls this where it reads the value, so the copy is taken at the same
+/// point in evaluation order as the read, and calls `take_vals` once it has stored
+/// the value. A consumer that only reads a value calls neither, and copies nothing.
+fn own_vals(bcx: &mut FunctionBuilder, ctx: &mut Ctx, ty: &Type, vals: Vec<Value>) -> Vec<Value> {
+    if !ctx.ownership || bcx.is_unreachable() { return vals; }
+    let leafs = struct_fields(ty, ctx.structs);
+    let mut out = Vec::with_capacity(vals.len());
+    for (v, (_, lty)) in vals.into_iter().zip(leafs.iter()) {
+        if is_heap_ty(lty) && !ctx.temp_of.contains_key(&v) {
+            let copy = emit_clone_word(bcx, ctx, v);
+            reg_heap(bcx, ctx, lty, &[copy]);
+            out.push(copy);
+        } else {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// `own_vals` then `take_vals`: for a consumer that stores the value right away.
+fn keep_vals(bcx: &mut FunctionBuilder, ctx: &mut Ctx, ty: &Type, vals: Vec<Value>) -> Vec<Value> {
+    let vals = own_vals(bcx, ctx, ty, vals);
+    take_vals(bcx, ctx, &vals);
+    vals
 }
 
 /// Ownership mode: `list` is a fresh shell whose elements some other owner still
@@ -1252,35 +1288,15 @@ fn own_shared_list(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value) -> Val
     owned
 }
 
-/// Copy the heap leaves of `vals` so the consumer owns them.
-fn copy_owned(bcx: &mut FunctionBuilder, ctx: &mut Ctx, ty: &Type, vals: Vec<Value>) -> Vec<Value> {
-    share_extracted(bcx, ty, vals, false, ctx)
-}
-
-/// The sharing decision for a value just read or extracted from somewhere
-/// else. Under the GC model it marks the list and dict leaves `shared`
-/// (`mark_shared_extracted`). Under `FROG_OWNERSHIP` it gives the consumer its
-/// own copy of each list and dict leaf, unless `borrowed` (the value is a call
-/// argument the callee only reads, see `conventions`), in which case it is
-/// passed as is.
-fn share_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: Vec<Value>, borrowed: bool, ctx: &mut Ctx) -> Vec<Value> {
+/// A value just extracted from a container. Under the GC model it may now have
+/// two owners, so its list and dict leaves are marked `shared`
+/// (`mark_shared_extracted`). Under `FROG_OWNERSHIP` it is a view and costs
+/// nothing: whoever keeps it copies it (`own_vals`).
+fn share_extracted(bcx: &mut FunctionBuilder, ty: &Type, vals: Vec<Value>, ctx: &mut Ctx) -> Vec<Value> {
     if !ctx.ownership {
         mark_shared_extracted(bcx, ty, &vals, ctx.structs);
-        return vals;
     }
-    if borrowed || bcx.is_unreachable() {
-        return vals;
-    }
-    let leafs = struct_fields(ty, ctx.structs);
-    let mut out = Vec::with_capacity(vals.len());
-    for (v, (_, lty)) in vals.into_iter().zip(leafs.iter()) {
-        if is_heap_ty(lty) {
-            out.push(emit_clone_word(bcx, ctx, v));
-        } else {
-            out.push(v);
-        }
-    }
-    out
+    vals
 }
 
 /// Byte offset of the copy-on-write `shared` flag within any GC object.
@@ -2820,9 +2836,9 @@ fn emit_place_ref(
         // through this same place (`place_load`, e.g. `d[k] += 1`) still
         // goes through the now-inserted (zero-valued) entry, matching
         // how `xs[i] += 1` already requires `i` in bounds first.
-        let key_wire = to_i64_repr(bcx, &index.item.ty, idx_val);
         // The dict keeps the key when it is new, so the key is handed over.
-        take_vals(bcx, ctx, &[idx_val]);
+        let idx_val = keep_vals(bcx, ctx, &index.item.ty, vec![idx_val])[0];
+        let key_wire = to_i64_repr(bcx, &index.item.ty, idx_val);
         let insert_id = ctx.func_ids["frog_dict_insert"];
         let callee = ctx.module.declare_func_in_func(insert_id, bcx.func);
         let call = bcx.ins().call(callee, &[cur, key_wire]);
@@ -3010,45 +3026,56 @@ fn compile_place_assign(
 ) {
     let pref = emit_place_ref(place, bcx, vars, ctx);
     let vals = compile_expr_multi(value, bcx, vars, ctx);
+    let vals = keep_vals(bcx, ctx, &value.item.ty, vals);
     if ctx.ownership {
-        take_vals(bcx, ctx, &vals);
         let old = place_load(&pref, &value.item.ty, bcx, vars, ctx);
         drop_vals(bcx, ctx, &value.item.ty, &old);
     }
     place_store(&pref, &value.item.ty, &vals, bcx, vars, ctx);
 }
 
-/// Compile `expr`. Under `FROG_OWNERSHIP` a value it produces is registered with
-/// the current statement (see `reg_heap`), unless it is a view: a read of storage
-/// some other owner still holds. Views are a `Var`, an extraction or a `Narrow`
-/// compiled in a view position (`ctx.view_next`).
+/// Compile `expr`. Under `FROG_OWNERSHIP` its heap leaves are either owned
+/// temporaries, registered with the current statement (`reg_heap`) and dropped
+/// at its end unless a consumer takes them, or views: reads of storage some other
+/// owner holds (a binding, a container's element or field, a union's payload).
+/// Reading either costs nothing. A consumer that keeps a value copies a view
+/// (`own_vals`), so a copy is made only where a value gets a second owner.
+///
+/// A view lives as long as what it reads, so where a value flows out of a frame
+/// (a block's tail, a conditional's branch, a function's result) it is owned
+/// first, unless nobody wants the value (`Ctx::discard_next`).
 fn compile_expr_multi(
     expr: &Spanned<TypedExpr>,
     bcx: &mut FunctionBuilder,
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
 ) -> Vec<Value> {
-    let view = std::mem::take(&mut ctx.view_next);
-    let vals = compile_expr_multi_inner(expr, bcx, vars, ctx, view);
-    let is_view = view && matches!(expr.item.kind,
-        TypedExprKind::Var(_) | TypedExprKind::Index { .. } | TypedExprKind::FieldAccess { .. }
-        | TypedExprKind::VariantField { .. } | TypedExprKind::Narrow { .. });
-    if !is_view && !matches!(expr.item.kind, TypedExprKind::Function { .. }) {
+    use TypedExprKind as K;
+    let discard = std::mem::take(&mut ctx.discard_next) && ctx.ownership;
+    let vals = compile_expr_multi_inner(expr, bcx, vars, ctx, discard);
+    // A view registers nothing (the `Var` arm registers a moved value itself),
+    // nor does a struct literal, whose leaves are its fields' own, nor a
+    // discarded block or conditional, whose temporaries already ended inside it.
+    let registers = match &expr.item.kind {
+        K::Var(_) | K::Index { .. } | K::FieldAccess { .. } | K::VariantField { .. }
+        | K::Narrow { .. } | K::Assign { .. } | K::Function { .. } | K::StructInit { .. } => false,
+        K::Block(_) | K::Conditional { .. } => !discard,
+        _ => true,
+    };
+    if registers {
         reg_heap(bcx, ctx, &expr.item.ty, &vals);
     }
     vals
 }
 
-/// The body of `compile_expr_multi`. `view` says the value is only read in place
-/// (see `compile_expr_multi`).
+/// The body of `compile_expr_multi`. `discard` says nobody uses the value.
 fn compile_expr_multi_inner(
     expr: &Spanned<TypedExpr>,
     bcx: &mut FunctionBuilder,
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
-    view: bool,
+    discard: bool,
 ) -> Vec<Value> {
-    let transient = view;
     match &expr.item.kind {
         TypedExprKind::IntLit(n) => vec![bcx.ins().iconst(types::I64, *n)],
 
@@ -3092,15 +3119,11 @@ fn compile_expr_multi_inner(
             if !ctx.ownership {
                 return mark_shared_if_aliased(expr, raw, bcx, ctx);
             }
-            // Ownership: a view reads the binding in place. Any other read gives
-            // the consumer an owned value. A `Move` (the name's last use) hands
-            // over the binding's own object and clears the binding. A `Copy`
-            // (the name stays live) gives a copy. A name that is not owned (a
-            // borrowed parameter) can only be copied, so it never gives its own
-            // object away.
-            if transient {
-                return raw;
-            }
+            // Ownership: a read is a view of the binding. On the name's last use
+            // (`Move`) the binding's own object moves into the statement instead,
+            // and the binding is cleared, so a consumer that keeps it takes it
+            // without a copy. A name that is not owned (a borrowed parameter)
+            // never gives its object away.
             let last_use = ctx.liveness.ownership(expr.item.id) == liveness::Ownership::Move;
             if last_use && ctx.owned_names.contains(name) {
                 for (path, lty) in struct_fields(&expr.item.ty, ctx.structs) {
@@ -3110,10 +3133,9 @@ fn compile_expr_multi_inner(
                         bcx.def_var(var, zero);
                     }
                 }
-                raw
-            } else {
-                copy_owned(bcx, ctx, &expr.item.ty, raw)
+                reg_heap(bcx, ctx, &expr.item.ty, &raw);
             }
+            raw
         },
 
         TypedExprKind::Unary { op, expr: inner } => {
@@ -3138,7 +3160,7 @@ fn compile_expr_multi_inner(
         TypedExprKind::Binary { op, left, right } => compile_binary(op, left, right, bcx, vars, ctx),
 
         TypedExprKind::Conditional { cond, true_branch, false_branch } =>
-            compile_conditional(expr, cond, true_branch, false_branch, bcx, vars, ctx),
+            compile_conditional(expr, cond, true_branch, false_branch, discard, bcx, vars, ctx),
 
         TypedExprKind::Call { callable, args } => compile_call(callable, args, bcx, vars, ctx),
 
@@ -3167,7 +3189,7 @@ fn compile_expr_multi_inner(
             let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
             declare_gc_leaves(bcx, &results, &leaf_tys);
             if std::env::var_os("FROG_COPY_STATS").is_some() { count_extraction(bcx, expr, &results, ctx); }
-            let results = share_extracted(bcx, &expr.item.ty, results, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
+            let results = share_extracted(bcx, &expr.item.ty, results, ctx);
             results
         },
 
@@ -3192,7 +3214,7 @@ fn compile_expr_multi_inner(
             let leaf_tys: Vec<Type> = leafs.iter().map(|(_, t)| t.clone()).collect();
             declare_gc_leaves(bcx, &results, &leaf_tys);
             if std::env::var_os("FROG_COPY_STATS").is_some() { count_extraction(bcx, expr, &results, ctx); }
-            let results = share_extracted(bcx, &expr.item.ty, results, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
+            let results = share_extracted(bcx, &expr.item.ty, results, ctx);
             results
         },
 
@@ -3238,13 +3260,12 @@ fn compile_expr_multi_inner(
         },
 
         TypedExprKind::Assign { name, value } => {
-            let discard = std::mem::take(&mut ctx.discard_next);
             if matches!(value.item.kind, TypedExprKind::Function { .. }) {
                 vec![bcx.ins().iconst(types::I64, 0)]
             } else {
                 let vals = compile_expr_multi(value, bcx, vars, ctx);
-                // The binding now owns the value, so the statement must not drop it.
-                take_vals(bcx, ctx, &vals);
+                // The binding keeps the value.
+                let vals = keep_vals(bcx, ctx, &value.item.ty, vals);
                 let leafs = struct_fields(&value.item.ty, ctx.structs);
                 for (v, (path, lty)) in vals.iter().zip(leafs.iter()) {
                     let key = var_key(name, path);
@@ -3260,13 +3281,8 @@ fn compile_expr_multi_inner(
                 }
                 if ctx.ownership {
                     ctx.owned_names.insert(name.clone());
-                    // The binding owns `vals`. An assignment whose value is used hands
-                    // out a copy, which the consumer owns. A discarded one hands out nothing.
-                    if discard {
-                        return Vec::new();
-                    }
-                    return copy_owned(bcx, ctx, &value.item.ty, vals);
                 }
+                // The assignment's value is a view of the binding.
                 vals
             }
         },
@@ -3278,11 +3294,14 @@ fn compile_expr_multi_inner(
             for (i, stmt) in stmts.iter().enumerate() {
                 push_frame(ctx, false);
                 let is_tail = i + 1 == n;
-                ctx.discard_next = !is_tail && matches!(stmt.item.kind, TypedExprKind::Assign { .. });
-                let vals = compile_expr_multi(stmt, bcx, vars, ctx);
-                if ctx.ownership && is_tail {
-                    // The tail is the block's result, so it leaves this statement.
-                    take_vals(bcx, ctx, &vals);
+                // Only the tail's value is used, and only if the block's is.
+                ctx.discard_next = !is_tail || discard;
+                let mut vals = compile_expr_multi(stmt, bcx, vars, ctx);
+                if is_tail && !discard {
+                    // The tail is the block's result, so it leaves this
+                    // statement and this block: a view of something either
+                    // drops is copied first.
+                    vals = keep_vals(bcx, ctx, &stmt.item.ty, vals);
                 }
                 pop_frame(bcx, ctx);
                 last = vals;
@@ -3318,11 +3337,11 @@ fn compile_expr_multi_inner(
         TypedExprKind::StructInit { fields, .. } => {
             // Already reordered into declared-field order by typeck — just
             // concatenate each field's own flattened leaf values in order.
+            // Ownership is per leaf, so each leaf stays what its field made it
+            // (a temporary or a view) until a consumer keeps the struct.
             let mut out = Vec::new();
             for (_, v) in fields {
-                let fv = compile_expr_multi(v, bcx, vars, ctx);
-                take_vals(bcx, ctx, &fv);
-                out.extend(fv);
+                out.extend(compile_expr_multi(v, bcx, vars, ctx));
             }
             out
         },
@@ -3345,7 +3364,7 @@ fn compile_expr_multi_inner(
                             let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
                             let leaves = unpack_union_member(&members, &members[0], &slots, bcx, ctx.structs);
                             let out = leaves[offset..offset + leaf_types.len()].to_vec();
-                            let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
+                            let out = share_extracted(bcx, &expr.item.ty, out, ctx);
                             return out;
                         }
                     }
@@ -3356,14 +3375,14 @@ fn compile_expr_multi_inner(
                     // `for_each_heap_producer`'s matching arm).
                     let ptr = compile_expr_transient(target, bcx, vars, ctx);
                     let out = read_variant_slots(ptr, offset, &leaf_types, bcx, ctx);
-                    let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
+                    let out = share_extracted(bcx, &expr.item.ty, out, ctx);
                     out
                 },
                 None => {
                     let target_vals = compile_expr_multi_transient(target, bcx, vars, ctx);
                     let (start, len) = field_slice_range(&target.item.ty, field, ctx.structs);
                     let out = target_vals[start..start + len].to_vec();
-                    let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
+                    let out = share_extracted(bcx, &expr.item.ty, out, ctx);
                     out
                 },
             }
@@ -3400,13 +3419,13 @@ fn compile_expr_multi_inner(
                     let member_ty = Type::strukt(format!("{}.{}", enum_name, variant));
                     let leaves = unpack_union_member(&members, &member_ty, &slots, bcx, ctx.structs);
                     let out = leaves[offset..offset + leaf_types.len()].to_vec();
-                    let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
+                    let out = share_extracted(bcx, &expr.item.ty, out, ctx);
                     return out;
                 }
             }
             let ptr = compile_expr_transient(target, bcx, vars, ctx);
             let out = read_variant_slots(ptr, offset, &leaf_types, bcx, ctx);
-            let out = share_extracted(bcx, &expr.item.ty, out, transient || crate::frontend::conventions::is_borrowed_arg(expr.item.id), ctx);
+            let out = share_extracted(bcx, &expr.item.ty, out, ctx);
             out
         },
 
@@ -3416,14 +3435,8 @@ fn compile_expr_multi_inner(
 
         TypedExprKind::Widen { value, tag } => compile_widen(&expr.item.ty, value, *tag, bcx, vars, ctx),
 
-        TypedExprKind::Narrow { value, .. } => {
-            let vals = compile_narrow(&expr.item.ty, value, bcx, vars, ctx);
-            if ctx.ownership && !transient {
-                copy_owned(bcx, ctx, &expr.item.ty, vals)
-            } else {
-                vals
-            }
-        },
+        // A view of the union's payload.
+        TypedExprKind::Narrow { value, .. } => compile_narrow(&expr.item.ty, value, bcx, vars, ctx),
 
         TypedExprKind::TypeTag { target, tag } => {
             let members = match &target.item.ty {
@@ -3433,10 +3446,12 @@ fn compile_expr_multi_inner(
             if union_is_inline(&members, ctx.structs) {
                 // The tag is a plain register field (slot 0's low 3 bits) —
                 // no load, no branch on representation, just mask and compare.
-                let slots = compile_expr_multi(target, bcx, vars, ctx);
+                // Only the tag is read, so the target is a view: under
+                // ownership a live union is not copied just to test it.
+                let slots = compile_expr_multi_transient(target, bcx, vars, ctx);
                 vec![emit_inline_tag_test(bcx, &slots, *tag as usize)]
             } else {
-                let val = compile_expr(target, bcx, vars, ctx);
+                let val = compile_expr_transient(target, bcx, vars, ctx);
                 let target_is_immediate = members.get(*tag as usize) == Some(&Type::None);
                 let any_immediate = members.contains(&Type::None);
                 vec![emit_tag_test(bcx, val, target_is_immediate, any_immediate, *tag)]
@@ -3471,18 +3486,6 @@ fn negate_if_ne(op: &Token, eq: Value, bcx: &mut FunctionBuilder) -> Value {
     }
 }
 
-/// An operand of an operator is read in place, never kept, so it is a view.
-fn compile_operand(e: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Value {
-    ctx.view_next = true;
-    compile_expr(e, bcx, vars, ctx)
-}
-
-/// `compile_operand` for a multi-leaf operand.
-fn compile_operand_multi(e: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
-    ctx.view_next = true;
-    compile_expr_multi(e, bcx, vars, ctx)
-}
-
 fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedExpr>, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
     // ── Dict membership (`k in d`) — must short-circuit before the `Str`
     // dispatch just below: `left` (the key) may itself be a `Str`, which
@@ -3492,7 +3495,7 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
     // scalar, always exactly one leaf.
     if *op == Token::In && right.item.ty.is_dict() {
         let key_ty = right.item.ty.as_dict_kv().expect("is_dict implies key/value types").0.clone();
-        let lv = compile_operand(left, bcx, vars, ctx);
+        let lv = compile_expr(left, bcx, vars, ctx);
         let key_wire = to_i64_repr(bcx, &key_ty, lv);
         let rv = compile_expr_transient(right, bcx, vars, ctx);
         let find_id = ctx.func_ids["frog_dict_find"];
@@ -3505,8 +3508,8 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
 
     // ── String operations (must short-circuit before numeric path) ──
     if left.item.ty == Type::Str {
-        let lv = compile_operand(left,  bcx, vars, ctx);
-        let rv = compile_operand(right, bcx, vars, ctx);
+        let lv = compile_expr(left,  bcx, vars, ctx);
+        let rv = compile_expr(right, bcx, vars, ctx);
         return vec![match op {
             Token::Plus => {
                 let id     = ctx.func_ids["frog_str_concat"];
@@ -3562,8 +3565,8 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
     // (no pointer, so `_transient` vs. non-`_transient` is moot — see the
     // `TypedExprKind::Range` codegen arm), so membership is just two `icmp`s.
     if *op == Token::In && right.item.ty.is_range() {
-        let lv = compile_operand(left, bcx, vars, ctx);
-        let range_vals = compile_operand_multi(right, bcx, vars, ctx);
+        let lv = compile_expr(left, bcx, vars, ctx);
+        let range_vals = compile_expr_multi(right, bcx, vars, ctx);
         let (start_val, end_val) = (range_vals[0], range_vals[1]);
         let ge_start = bcx.ins().icmp(IntCC::SignedGreaterThanOrEqual, lv, start_val);
         let lt_end   = bcx.ins().icmp(IntCC::SignedLessThan, lv, end_val);
@@ -3578,7 +3581,7 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
     // `eq_value` (`list_contains`), short-circuiting on the first hit.
     if *op == Token::In && right.item.ty.is_list() {
         let elem = right.item.ty.as_list_elem().expect("is_list implies an element type").clone();
-        let lv = compile_operand_multi(left, bcx, vars, ctx);
+        let lv = compile_expr_multi(left, bcx, vars, ctx);
         let elem_leaf_tys: Vec<Type> = struct_fields(&elem, ctx.structs).into_iter().map(|(_, t)| t).collect();
         declare_gc_leaves(bcx, &lv, &elem_leaf_tys);
         let rv = compile_expr_transient(right, bcx, vars, ctx);
@@ -3623,8 +3626,8 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
     // what used to abort codegen on a multi-leaf operand.
     if matches!(left.item.ty, Type::Union(_)) && matches!(op, Token::EqEq | Token::NotEq) {
         let members = match &left.item.ty { Type::Union(m) => m.clone(), _ => unreachable!() };
-        let lv = compile_operand_multi(left,  bcx, vars, ctx);
-        let rv = compile_operand_multi(right, bcx, vars, ctx);
+        let lv = compile_expr_multi(left,  bcx, vars, ctx);
+        let rv = compile_expr_multi(right, bcx, vars, ctx);
         let eq = eq_union(&members, &lv, &rv, bcx, ctx);
         return vec![negate_if_ne(op, eq, bcx)];
     }
@@ -3633,7 +3636,7 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
     // effects, e.g. `print`, and must not run when `left` already
     // decides the result) ────────────────────────────────────────
     if *op == Token::And || *op == Token::Or {
-        let lv = compile_operand(left, bcx, vars, ctx);
+        let lv = compile_expr(left, bcx, vars, ctx);
 
         let rhs_bb   = bcx.create_block();
         let merge_bb = bcx.create_block();
@@ -3651,7 +3654,7 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
 
         bcx.switch_to_block(rhs_bb);
         bcx.seal_block(rhs_bb);
-        let rv = compile_operand(right, bcx, vars, ctx);
+        let rv = compile_expr(right, bcx, vars, ctx);
         bcx.ins().jump(merge_bb, &[BlockArg::from(rv)]);
 
         bcx.switch_to_block(merge_bb);
@@ -3660,8 +3663,8 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
     }
 
     // ── Numeric operations ──────────────────────────────────────────
-    let lv = compile_operand(left,  bcx, vars, ctx);
-    let rv = compile_operand(right, bcx, vars, ctx);
+    let lv = compile_expr(left,  bcx, vars, ctx);
+    let rv = compile_expr(right, bcx, vars, ctx);
     let op_ty = numeric_join(&left.item.ty, &right.item.ty).unwrap_or_else(|| left.item.ty.clone());
     let lv = coerce_value(lv, &left.item.ty, &op_ty, bcx);
     let rv = coerce_value(rv, &right.item.ty, &op_ty, bcx);
@@ -3694,11 +3697,49 @@ fn compile_binary(op: &Token, left: &Spanned<TypedExpr>, right: &Spanned<TypedEx
 /// node (needed for `expr.item.ty`, both to pick the `Never`/scalar/
 /// multi-leaf join shape and, in the multi-leaf case, to lay out
 /// `merge_bb`'s block params via `struct_fields`).
+/// A conditional's branches are conditional code, so they run at one more depth.
+///
+/// Under `FROG_OWNERSHIP` each branch owns its value before it reaches the
+/// merge (`keep_vals`), so the merged value is a temporary whichever branch ran.
+/// A `discard`ed conditional's branches are discarded too, and the merge
+/// receives placeholders instead, since nobody reads it.
+#[allow(clippy::too_many_arguments)]
 fn compile_conditional(
     expr: &Spanned<TypedExpr>,
     cond: &Spanned<TypedExpr>,
     true_branch: &Spanned<TypedExpr>,
     false_branch: &Option<TypedExprRef>,
+    discard: bool,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> Vec<Value> {
+    ctx.depth += 1;
+    let vals = compile_conditional_inner(expr, cond, true_branch, false_branch, discard, bcx, vars, ctx);
+    ctx.depth -= 1;
+    vals
+}
+
+/// One branch of a conditional: owned for the merge, or discarded (see `compile_conditional`).
+fn compile_branch(branch: &Spanned<TypedExpr>, merge_tys: &[types::Type], discard: bool, bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Variable>, ctx: &mut Ctx) -> Vec<Value> {
+    ctx.discard_next = discard;
+    let vals = compile_expr_multi(branch, bcx, vars, ctx);
+    if branch.item.ty == Type::Never {
+        return vals;
+    }
+    if discard {
+        return merge_tys.iter().map(|&t| placeholder_value(bcx, t)).collect();
+    }
+    keep_vals(bcx, ctx, &branch.item.ty, vals)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_conditional_inner(
+    expr: &Spanned<TypedExpr>,
+    cond: &Spanned<TypedExpr>,
+    true_branch: &Spanned<TypedExpr>,
+    false_branch: &Option<TypedExprRef>,
+    discard: bool,
     bcx: &mut FunctionBuilder,
     vars: &mut HashMap<String, Variable>,
     ctx: &mut Ctx,
@@ -3796,8 +3837,8 @@ fn compile_conditional(
         // branch (a `return`) yields zero values, which the
         // single-value wrapper's assertion would reject; every other
         // scalar branch still yields exactly one, unpacked below.
-        let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
-        take_vals(bcx, ctx, &tv);
+        let merge_tys: Vec<types::Type> = if has_value { vec![result_ty] } else { Vec::new() };
+        let tv = compile_branch(true_branch, &merge_tys, discard, bcx, vars, ctx);
         // A `Never`-typed branch has already emitted its own
         // terminator — jumping to `merge_bb` on top of that would
         // be a second terminator in the same block, which
@@ -3805,7 +3846,7 @@ fn compile_conditional(
         // normally and joins as before.
         if true_branch.item.ty != Type::Never {
             if has_value {
-                let tv = ensure_width(tv[0], &true_branch.item.ty, result_ty, bcx);
+                let tv = if discard { tv[0] } else { ensure_width(tv[0], &true_branch.item.ty, result_ty, bcx) };
                 bcx.ins().jump(merge_bb, &[BlockArg::from(tv)]);
             } else {
                 bcx.ins().jump(merge_bb, &[]);
@@ -3814,11 +3855,10 @@ fn compile_conditional(
         bcx.switch_to_block(false_bb);
         bcx.seal_block(false_bb);
         if let Some(fb) = false_branch {
-            let fv = compile_expr_multi(fb, bcx, vars, ctx);
-            take_vals(bcx, ctx, &fv);
+            let fv = compile_branch(fb, &merge_tys, discard, bcx, vars, ctx);
             if fb.item.ty != Type::Never {
                 if has_value {
-                    let fv = ensure_width(fv[0], &fb.item.ty, result_ty, bcx);
+                    let fv = if discard { fv[0] } else { ensure_width(fv[0], &fb.item.ty, result_ty, bcx) };
                     bcx.ins().jump(merge_bb, &[BlockArg::from(fv)]);
                 } else {
                     bcx.ins().jump(merge_bb, &[]);
@@ -3867,8 +3907,7 @@ fn compile_conditional(
 
         bcx.switch_to_block(true_bb);
         bcx.seal_block(true_bb);
-        let tv = compile_expr_multi(true_branch, bcx, vars, ctx);
-        take_vals(bcx, ctx, &tv);
+        let tv = compile_branch(true_branch, &param_tys, discard, bcx, vars, ctx);
         // See the scalar path above for why a `Never`-typed branch
         // must not also jump — it already terminated itself.
         if true_branch.item.ty != Type::Never {
@@ -3878,8 +3917,7 @@ fn compile_conditional(
         bcx.seal_block(false_bb);
         match false_branch {
             Some(fb) => {
-                let fv = compile_expr_multi(fb, bcx, vars, ctx);
-            take_vals(bcx, ctx, &fv);
+                let fv = compile_branch(fb, &param_tys, discard, bcx, vars, ctx);
                 if fb.item.ty != Type::Never {
                     bcx.ins().jump(merge_bb, &block_args(&fv));
                 }
@@ -3920,7 +3958,7 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
         let list_val = emit_mutable_container(place, &Type::list(Type::Int), bcx, vars, ctx);
         let leafs = struct_fields(&v_arg.item.ty, ctx.structs);
         let vvals = compile_expr_multi(v_arg, bcx, vars, ctx);
-        take_vals(bcx, ctx, &vvals);
+        let vvals = keep_vals(bcx, ctx, &v_arg.item.ty, vvals);
         // See `compile_list_lit`'s identical push via `push_element`.
         push_element(bcx, ctx, list_val, &vvals, &leafs);
         return vec![bcx.ins().iconst(types::I64, 0)];
@@ -4002,7 +4040,6 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
             print_fragment("\n", bcx, ctx);
             return vec![bcx.ins().iconst(types::I64, 0)];
         }
-        ctx.view_next = true;
         let arg_val = compile_expr(arg, bcx, vars, ctx);
         let rt_name = match &arg.item.ty {
             Type::Str => "print",
@@ -4108,6 +4145,11 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
     // writes the callee's final value back into that same place.
     let mut arg_places: Vec<(PlaceRef, Type)> = Vec::new();
     let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
+    // An argument the callee consumes is owned where it is read (`own_vals`), but
+    // taken only once every argument is compiled: until the call runs, the
+    // statement still owns it, so an early exit in a later argument
+    // (`g(make_str(), h()?)`) frees it. A borrowed argument is passed as it is.
+    let mut owned_args: Vec<Value> = Vec::new();
     for (i, arg) in args.iter().enumerate() {
         let a = match arg {
             Arg::Value(e) => e,
@@ -4126,16 +4168,18 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
             // happens earlier, at the `Widen` node itself) — either
             // way, flatten straight into the call's arg list, in
             // the same K-`AbiParam`-per-arg order `make_sig` uses.
-            let borrowed = crate::frontend::conventions::is_borrowed_arg(a.item.id);
-            ctx.view_next = borrowed;
-            let av = compile_expr_multi(a, bcx, vars, ctx);
-            if !borrowed { take_vals(bcx, ctx, &av); }
+            let mut av = compile_expr_multi(a, bcx, vars, ctx);
+            if !crate::frontend::conventions::is_borrowed_arg(a.item.id) {
+                av = own_vals(bcx, ctx, &a.item.ty, av);
+                owned_args.extend(&av);
+            }
             arg_vals.extend(av);
         } else {
-            let borrowed = crate::frontend::conventions::is_borrowed_arg(a.item.id);
-            ctx.view_next = borrowed;
             let mut v = compile_expr(a, bcx, vars, ctx);
-            if !borrowed { take_vals(bcx, ctx, &[v]); }
+            if !crate::frontend::conventions::is_borrowed_arg(a.item.id) {
+                v = own_vals(bcx, ctx, &a.item.ty, vec![v])[0];
+                owned_args.push(v);
+            }
             if let Some(param_ty) = param_types.get(i) {
                 v = coerce_value(v, &a.item.ty, param_ty, bcx);
             }
@@ -4143,6 +4187,7 @@ fn compile_call(callable: &Spanned<TypedExpr>, args: &[Arg], bcx: &mut FunctionB
         }
     }
 
+    take_vals(bcx, ctx, &owned_args);
     let call = bcx.ins().call(local_callee, &arg_vals);
     if return_ty == Type::Never {
         // The callee never actually hands control back here —
@@ -4244,13 +4289,11 @@ fn compile_host_call(func_name: &str, callable: &Spanned<TypedExpr>, args: &[&Sp
         if is_multi_leaf_type(&a.item.ty, ctx.structs) {
             let leafs = struct_fields(&a.item.ty, ctx.structs);
             // A host function borrows its arguments (`conventions`' borrowers).
-            ctx.view_next = true;
             let vals = compile_expr_multi(a, bcx, vars, ctx);
             for (v, (_, lty)) in vals.iter().zip(leafs.iter()) {
                 arg_leaves.push((to_i64_repr(bcx, lty, *v), lty.clone()));
             }
         } else {
-            ctx.view_next = true;
             let v = compile_expr(a, bcx, vars, ctx);
             arg_leaves.push((to_i64_repr(bcx, &a.item.ty, v), a.item.ty.clone()));
         }
@@ -4312,6 +4355,11 @@ fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut Func
     // element expression (e.g. a Str) can allocate and trigger a
     // collection, and the list must already be reachable by then.
     declare_gc_ptr(bcx, list_ptr);
+    // Ownership: the statement owns the list while its elements compile, so an
+    // early exit in a later element (`[a(), b()?]`) frees the list and every
+    // element already pushed into it. Each element is taken once pushed, since
+    // the list owns it from then on.
+    reg_heap(bcx, ctx, list_ty, &[list_ptr]);
 
     for elem in elems {
         // A struct element compiles to `leafs.len()` values, pushed
@@ -4319,14 +4367,17 @@ fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut Func
         // list's flat backing store self-describing (see FrogList's
         // doc comment in runtime/gc.rs).
         let evs = compile_expr_multi(elem, bcx, vars, ctx);
-        take_vals(bcx, ctx, &evs);
+        let evs = own_vals(bcx, ctx, &elem.item.ty, evs);
         // The list's backing store is a flat i64 buffer (see FrogList in
         // runtime/gc.rs); Float and Bool elements need the same
         // bitcast/zero-extend conversion applied to every other
         // i64-wire-format value (see to_i64_repr and push_element).
         push_element(bcx, ctx, list_ptr, &evs, &leafs);
+        take_vals(bcx, ctx, &evs);
     }
 
+    // `compile_expr_multi` registers the finished list again as this node's result.
+    take_vals(bcx, ctx, &[list_ptr]);
     vec![list_ptr]
 }
 
@@ -4385,6 +4436,10 @@ fn compile_dict_lit(
     // dict must already be reachable by then — same reasoning as
     // `compile_list_lit`.
     declare_gc_ptr(bcx, dict_ptr);
+    // Ownership: as in `compile_list_lit`, the statement owns the dict while its
+    // pairs compile, and each key and value is taken once the dict holds it. An
+    // early exit in a value leaves its entry's value slots at 0, which a drop skips.
+    reg_heap(bcx, ctx, dict_ty, &[dict_ptr]);
 
     let insert_id = ctx.func_ids["frog_dict_insert"];
     let insert_ref = ctx.module.declare_func_in_func(insert_id, bcx.func);
@@ -4393,20 +4448,24 @@ fn compile_dict_lit(
 
     for (k, v) in pairs {
         let kv = compile_expr(k, bcx, vars, ctx);
-        take_vals(bcx, ctx, &[kv]);
+        let kv = own_vals(bcx, ctx, &key_ty, vec![kv])[0];
         let kv_wire = to_i64_repr(bcx, &key_ty, kv);
         let insert_call = bcx.ins().call(insert_ref, &[dict_ptr, kv_wire]);
         let entry = bcx.inst_results(insert_call)[0];
+        take_vals(bcx, ctx, &[kv]);
 
         let vvs = compile_expr_multi(v, bcx, vars, ctx);
-        take_vals(bcx, ctx, &vvs);
+        let vvs = own_vals(bcx, ctx, &v.item.ty, vvs);
         for (i, (vv, (_, lty))) in vvs.iter().zip(val_leafs.iter()).enumerate() {
             let wire = to_i64_repr(bcx, lty, *vv);
             let slot_val = bcx.ins().iconst(types::I64, kstride + i as i64);
             bcx.ins().call(set_slot_ref, &[dict_ptr, entry, slot_val, wire]);
         }
+        take_vals(bcx, ctx, &vvs);
     }
 
+    // `compile_expr_multi` registers the finished dict again as this node's result.
+    take_vals(bcx, ctx, &[dict_ptr]);
     vec![dict_ptr]
 }
 
@@ -4498,10 +4557,12 @@ fn compile_variant_init(
     let mut flat_types: Vec<Type> = Vec::new();
     for (_, v) in fields {
         let fv = compile_expr_multi(v, bcx, vars, ctx);
-        take_vals(bcx, ctx, &fv);
-        flat_vals.extend(fv);
+        flat_vals.extend(own_vals(bcx, ctx, &v.item.ty, fv));
         flat_types.extend(struct_fields(&v.item.ty, ctx.structs).into_iter().map(|(_, t)| t));
     }
+    // Taken only after every field is compiled, so an early exit in a later
+    // field still frees the earlier ones (see `compile_call`).
+    take_vals(bcx, ctx, &flat_vals);
 
     if let Type::Union(members) = union_ty {
         if union_is_inline(members, ctx.structs) {
@@ -4539,7 +4600,9 @@ fn compile_return(value: &Option<TypedExprRef>, bcx: &mut FunctionBuilder, vars:
         None => Vec::new(),
     };
     if ctx.ownership {
-        take_vals(bcx, ctx, &results);
+        if let Some(v) = value {
+            results = keep_vals(bcx, ctx, &v.item.ty, results);
+        }
         results.extend(mut_param_copyout_taken(bcx, vars, ctx));
         drop_all_frames(bcx, ctx);
         bcx.ins().return_(&results);
@@ -4586,7 +4649,7 @@ fn compile_widen(union_ty: &Type, value: &Spanned<TypedExpr>, tag: u32, bcx: &mu
         // retires `roadmap.md`'s top perf item — an `Int` widened into
         // `Int | PricingError` no longer round-trips through the heap.
         let vals = compile_expr_multi(value, bcx, vars, ctx);
-        take_vals(bcx, ctx, &vals);
+        let vals = keep_vals(bcx, ctx, &value.item.ty, vals);
         // A payload-less member contributes no leaves; `value` still
         // compiles (for its side effects, and because `None`'s own
         // single-slot form is not this union's representation of it).
@@ -4608,7 +4671,7 @@ fn compile_widen(union_ty: &Type, value: &Spanned<TypedExpr>, tag: u32, bcx: &mu
         return vec![bcx.ins().iconst(types::I64, gc::immediate_variant(tag))];
     }
     let flat_vals = compile_expr_multi(value, bcx, vars, ctx);
-    take_vals(bcx, ctx, &flat_vals);
+    let flat_vals = keep_vals(bcx, ctx, &value.item.ty, flat_vals);
     let flat_types: Vec<Type> = struct_fields(&value.item.ty, ctx.structs).into_iter().map(|(_, t)| t).collect();
     vec![box_into_variant(tag, &flat_vals, &flat_types, bcx, ctx)]
 }
@@ -4793,8 +4856,28 @@ fn dotted_leaf_range(ty: &Type, dotted: &str, structs: &StructDefs) -> (usize, u
 /// (the same pattern as the `Conditional`/short-circuit `and`/`or` merge
 /// blocks above) rather than `Variable`/`declare_var`, which this codebase
 /// doesn't otherwise use.
+///
+/// A loop's body runs once per iteration, so it is conditional code: one depth more.
 #[allow(clippy::too_many_arguments)]
 fn compile_for_loop(
+    var: &str,
+    iterable: &Spanned<TypedExpr>,
+    iter_via: &Option<IterVia>,
+    cond: &Option<Box<Spanned<TypedExpr>>>,
+    body: &Spanned<TypedExpr>,
+    output: LoopOutput,
+    bcx: &mut FunctionBuilder,
+    vars: &mut HashMap<String, Variable>,
+    ctx: &mut Ctx,
+) -> Option<Value> {
+    ctx.depth += 1;
+    let result = compile_for_loop_inner(var, iterable, iter_via, cond, body, output, bcx, vars, ctx);
+    ctx.depth -= 1;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_for_loop_inner(
     var: &str,
     iterable: &Spanned<TypedExpr>,
     iter_via: &Option<IterVia>,
@@ -4920,7 +5003,9 @@ fn compile_for_loop(
     declare_gc_leaves(bcx, &elem_vals, &elem_leaf_tys);
     // The list keeps its own path to every element, so a `List`-typed element
     // is aliased the moment it is bound — see `mark_shared_extracted`.
-    let elem_vals = share_extracted(bcx, &elem_ty, elem_vals, false, ctx);
+    let elem_vals = share_extracted(bcx, &elem_ty, elem_vals, ctx);
+    // Ownership: the loop variable keeps its own copy of the element.
+    let elem_vals = keep_vals(bcx, ctx, &elem_ty, elem_vals);
     for ((leaf_path, lty), elem_val) in elem_leafs.iter().zip(elem_vals) {
         let key = var_key(var, leaf_path);
         let var_id = get_or_declare_var(bcx, vars, &key, lty);
@@ -4949,8 +5034,7 @@ fn compile_for_loop(
         bcx.seal_block(do_bb);
     }
 
-    let body_vals = compile_expr_multi(body, bcx, vars, ctx);
-    consume_loop_body(bcx, ctx, result_list, &body_vals, body);
+    compile_loop_body(bcx, vars, ctx, result_list, body);
     pop_frame(bcx, ctx);
 
     let i_next = bcx.ins().iadd_imm_s(i, 1);
@@ -5048,8 +5132,7 @@ fn compile_for_loop_range(
         bcx.seal_block(do_bb);
     }
 
-    let body_vals = compile_expr_multi(body, bcx, vars, ctx);
-    consume_loop_body(bcx, ctx, result_list, &body_vals, body);
+    compile_loop_body(bcx, vars, ctx, result_list, body);
     pop_frame(bcx, ctx);
 
     let elem_next = bcx.ins().iadd_imm_s(elem, 1);
@@ -5090,7 +5173,7 @@ fn compile_iterable_for_loop(
     // loop. Its frame is released after the loop, at `exit_bb`.
     push_frame(ctx, true);
     let init_vals = compile_expr_multi(iterable, bcx, vars, ctx);
-    take_vals(bcx, ctx, &init_vals);
+    let init_vals = keep_vals(bcx, ctx, &iterable.item.ty, init_vals);
     let iter_leafs = struct_fields(&iterable.item.ty, ctx.structs);
     let iter_leaf_tys: Vec<Type> = iter_leafs.iter().map(|(_, t)| t.clone()).collect();
     declare_gc_leaves(bcx, &init_vals, &iter_leaf_tys);
@@ -5158,7 +5241,7 @@ fn compile_iterable_for_loop(
     // It is released at the body's end, or on the none and filter-skip paths.
     push_frame(ctx, true);
     let opt_vals = compile_expr_multi(&via.next_call, bcx, vars, ctx);
-    take_vals(bcx, ctx, &opt_vals);
+    let opt_vals = keep_vals(bcx, ctx, &via.next_call.item.ty, opt_vals);
     declare_gc_leaves(bcx, &opt_vals, &opt_leaf_tys);
     for ((path, lty), v) in opt_leafs.iter().zip(opt_vals.iter()) {
         let key = var_key(&opt_var, path);
@@ -5172,12 +5255,13 @@ fn compile_iterable_for_loop(
     // Mirrors `TypedExprKind::TypeTag`'s own codegen arm exactly (see
     // codegen/mod.rs's `compile_expr_multi` match) — reading `opt_var_node`
     // twice (here and in the `Narrow` call below) is fine and re-executes
-    // no side effect, since a plain `Var` read is pure.
+    // no side effect, since a plain `Var` read is pure. The read is a view, so
+    // under ownership the option is not copied just to test its tag.
     let is_none_val = if union_is_inline(members, ctx.structs) {
-        let slots = compile_expr_multi(&opt_var_node, bcx, vars, ctx);
+        let slots = compile_expr_multi_transient(&opt_var_node, bcx, vars, ctx);
         emit_inline_tag_test(bcx, &slots, none_tag as usize)
     } else {
-        let val = compile_expr(&opt_var_node, bcx, vars, ctx);
+        let val = compile_expr_transient(&opt_var_node, bcx, vars, ctx);
         emit_tag_test(bcx, val, true, true, none_tag)
     };
     let none_bb = bcx.create_block();
@@ -5191,7 +5275,7 @@ fn compile_iterable_for_loop(
     bcx.seal_block(body_bb);
     // Ownership: the loop variable is a copy of the element, owned by this iteration.
     let item_vals = compile_narrow(&item_ty, &opt_var_node, bcx, vars, ctx);
-    let item_vals = if ctx.ownership { copy_owned(bcx, ctx, &item_ty, item_vals) } else { item_vals };
+    let item_vals = keep_vals(bcx, ctx, &item_ty, item_vals);
     let elem_leafs = struct_fields(&item_ty, ctx.structs);
     for ((leaf_path, lty), elem_val) in elem_leafs.iter().zip(item_vals) {
         let key = var_key(var, leaf_path);
@@ -5220,8 +5304,7 @@ fn compile_iterable_for_loop(
         bcx.seal_block(do_bb);
     }
 
-    let body_vals = compile_expr_multi(body, bcx, vars, ctx);
-    consume_loop_body(bcx, ctx, result_list, &body_vals, body);
+    compile_loop_body(bcx, vars, ctx, result_list, body);
     pop_frame(bcx, ctx);
 
     bcx.ins().jump(header_bb, &[]);
@@ -5269,6 +5352,18 @@ impl<M: Module> Codegen<M> {
     /// declared across every entry so far, in declaration order.
     pub fn source_map(&self) -> &[FnSourceInfo] {
         &self.source_map
+    }
+
+    /// The callee names that resolve to imported code: runtime primitives
+    /// (`__repr_str`, `frog_read_*`, ...) and host functions. Neither takes
+    /// ownership of its arguments, so `conventions::infer` treats every one as
+    /// a borrower. A name a user function has since claimed is not imported.
+    pub fn imported_callees(&self) -> std::collections::HashSet<String> {
+        let decls = self.module.declarations();
+        self.func_ids.iter()
+            .filter(|(_, id)| decls.get_function_decl(**id).linkage == Linkage::Import)
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Replace `builder_ctx` with a fresh one. `FunctionBuilder::new` asserts
@@ -5921,10 +6016,10 @@ impl<M: Module> Codegen<M> {
             host_fns,
             cow_verify: cow_verify_enabled(),
             ownership: ownership_enabled(),
-            view_next: false,
             discard_next: false,
             frames: Vec::new(),
             temp_of: HashMap::new(),
+            depth: 0,
             owned_names: std::collections::HashSet::new(),
             known: Vec::new(),
         };
@@ -5945,12 +6040,12 @@ impl<M: Module> Codegen<M> {
                 }
             }
         }
-        let results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
+        let mut results = compile_expr_multi(body, &mut bcx, &mut vars, &mut ctx);
         // Ownership: the result and each `mut` parameter's final value leave the
         // function. Then the parameters and bindings are dropped. The copy-out is
         // read here, before those slots clear.
         let owned_copyout = if ctx.ownership {
-            take_vals(&mut bcx, &mut ctx, &results);
+            results = keep_vals(&mut bcx, &mut ctx, &body.item.ty, results);
             let copyout = mut_param_copyout_taken(&mut bcx, &vars, &mut ctx);
             pop_frame(&mut bcx, &mut ctx);
             Some(copyout)
@@ -6093,45 +6188,41 @@ impl<M: Module> Codegen<M> {
             host_fns,
             cow_verify: cow_verify_enabled(),
             ownership: ownership_enabled(),
-            view_next: false,
             discard_next: false,
             frames: Vec::new(),
             temp_of: HashMap::new(),
+            depth: 0,
             owned_names: std::collections::HashSet::new(),
             known: Vec::new(),
         };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();
-        // Ownership: the entry's temporaries live in one frame, dropped after its
-        // result is taken. Top-level bindings register nothing, since the environment keeps them.
-        push_frame(&mut ctx, false);
+        let is_func_decl = |s: &Spanned<TypedExpr>| matches!(&s.item.kind,
+            TypedExprKind::Assign { value, .. } if matches!(value.item.kind, TypedExprKind::Function { .. }));
+        // Only the last statement's value is the entry's result. Every other
+        // statement's value is discarded (`Ctx::discard_next`).
+        let result_idx = stmts.iter().rposition(|s| !is_func_decl(s));
 
         for (stmt_idx, stmt) in stmts.iter().enumerate() {
-            let is_last_stmt = stmt_idx + 1 == stmts.len();
-            if let TypedExprKind::Assign { name, value } = &stmt.item.kind {
-                if matches!(value.item.kind, TypedExprKind::Function { .. }) {
-                    continue;
-                }
-                // Ownership: the environment keeps the binding, so only the last
-                // statement's value is needed, and an earlier `let` hands out nothing.
-                ctx.discard_next = ctx.ownership && !is_last_stmt;
-                let vals = compile_expr_multi(stmt, &mut bcx, &mut vars, &mut ctx);
-                if ctx.ownership && !is_last_stmt {
-                    bindings.push((name.clone(), value.item.ty.clone()));
-                    continue;
-                }
-                if vals.is_empty() {
-                    // `value` is `Never`-typed (e.g. `let x = panic(...)`)
-                    // — the callee trapped and control never reaches here,
-                    // so there's no computed value to store and no real
-                    // binding to create. `bcx` is already on the dead
-                    // block the trap switched to, but later top-level
-                    // statements are still compiled into it (as dead code)
-                    // and may reference `name` — declare its leaf `vars`
-                    // with placeholder zeros so those unreachable
-                    // references don't crash the compiler with "unbound
-                    // variable in codegen". Not pushed to `bindings`: it
-                    // has no real value and nothing ever executes far
+            if is_func_decl(stmt) {
+                continue;
+            }
+            let is_result = Some(stmt_idx) == result_idx;
+            // Ownership: each statement's temporaries end with it. Top-level
+            // bindings register nothing, since the environment keeps them.
+            push_frame(&mut ctx, false);
+            ctx.discard_next = !is_result;
+            let vals = compile_expr_multi(stmt, &mut bcx, &mut vars, &mut ctx);
+            if vals.is_empty() {
+                // `stmt` is `Never`-typed (e.g. a bare top-level `panic(...)`,
+                // or `let x = panic(...)`): control never reaches here, and
+                // later statements compile into the dead block the trap
+                // switched to.
+                if let TypedExprKind::Assign { name, value } = &stmt.item.kind {
+                    // Later (dead) statements may still reference `name`, so
+                    // its leaf `vars` get placeholder zeros, or codegen would
+                    // fail on an unbound variable. Not pushed to `bindings`:
+                    // it has no real value, and nothing ever executes far
                     // enough to read or write its `out_ptr` slot.
                     for (path, lty) in struct_fields(&value.item.ty, structs) {
                         let key = var_key(name, &path);
@@ -6139,49 +6230,34 @@ impl<M: Module> Codegen<M> {
                         let zero = placeholder_value(&mut bcx, cl_type(&lty));
                         bcx.def_var(var, zero);
                     }
-                    continue;
                 }
-                last_val = vals[0];
+                pop_frame(&mut bcx, &mut ctx);
+                continue;
+            }
+            if let TypedExprKind::Assign { name, value } = &stmt.item.kind {
                 // Use `value.item.ty`, not `stmt.item.ty` (the Assign
                 // expression's own — possibly annotation-widened — type):
                 // `vals` was produced by flattening `value`, so its length
-                // is exactly `struct_fields(value.item.ty).len()`. Zipping
-                // against leafs derived from a different type could silently
-                // truncate the store loop below and desync every later
-                // binding's `out_ptr` slot from what `FrogState::eval` (the
-                // read side, `state.rs`) expects.
-                last_ty = &value.item.ty;
-                let leafs = struct_fields(last_ty, structs);
+                // is exactly `struct_fields(value.item.ty).len()`, and the
+                // `out_ptr` slots `FrogState::eval` (`state.rs`) reads back
+                // are laid out from the same type.
+                let leafs = struct_fields(&value.item.ty, structs);
                 assert_eq!(vals.len(), leafs.len(), "compile_expr_multi produced {} values for {} leaf fields", vals.len(), leafs.len());
-                bindings.push((name.clone(), last_ty.clone()));
-                continue;
+                bindings.push((name.clone(), value.item.ty.clone()));
+                last_ty = &value.item.ty;
+            } else {
+                last_ty = &stmt.item.ty;
             }
-            let vals = compile_expr_multi(stmt, &mut bcx, &mut vars, &mut ctx);
-            if vals.is_empty() {
-                // `stmt` is `Never`-typed (e.g. a bare top-level
-                // `panic(...)`) — control never reaches here; keep
-                // compiling into the dead block the trap switched to.
-                continue;
+            if is_result {
+                // __frog_main[_N] returns only the result's first leaf (see
+                // this function's doc comment), which leaves the entry: the
+                // caller releases it after reading it, so it must be owned.
+                let leaf0_ty = struct_fields(last_ty, structs).into_iter().next().map(|(_, t)| t).unwrap_or(Type::Int);
+                last_val = keep_vals(&mut bcx, &mut ctx, &leaf0_ty, vec![vals[0]])[0];
             }
-            last_val = vals[0];
-            last_ty = &stmt.item.ty;
-        }
-
-
-        // __frog_main[_N] always returns a single i64 (see this function's
-        // doc comment — a struct-typed final result only reports its first
-        // leaf here).
-        if ctx.ownership {
-            // A top-level `let` as the last statement gives out its binding's own
-            // object, which the environment keeps, so the result is a copy.
-            let last_is_let = stmts.last().is_some_and(|s| matches!(s.item.kind, TypedExprKind::Assign { .. }));
-            let first_is_heap = struct_fields(last_ty, structs).first().is_some_and(|(_, t)| is_heap_ty(t));
-            if last_is_let && first_is_heap {
-                last_val = clone_owned_word(&mut bcx, &mut ctx, last_val);
-            }
-            take_vals(&mut bcx, &mut ctx, &[last_val]);
             pop_frame(&mut bcx, &mut ctx);
         }
+
         // The environment keeps each top-level binding's value as it stands at the
         // end of the entry: a later rebinding replaces an earlier one, so the value
         // written at its `let` can be stale.
@@ -6484,6 +6560,15 @@ pub fn compile_and_run(src: &str) -> i64 {
     crate::frontend::liveness::number_nodes(&mut typed);
 
     let mut codegen = JitCodegen::new();
+    let owned = ownership_enabled();
+    // The same conventions `FrogState::eval_with_base` infers, so ownership
+    // codegen here is the codegen a real run gets.
+    if owned {
+        let mut borrowers = crate::frontend::conventions::builtin_borrowers();
+        borrowers.extend(codegen.imported_callees());
+        crate::frontend::conventions::publish(&crate::frontend::conventions::infer(&typed, &borrowers));
+    }
+    let result_ty = typed.item.ty.clone();
     let (main_id, bindings) = codegen.compile_entry(
         typed, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),
     );
@@ -6502,9 +6587,33 @@ pub fn compile_and_run(src: &str) -> i64 {
     // the duration of the call — see `gc::GcHeap::push_scanned_span`.
     let out_gc_slots = gc_slots_of_bindings(&bindings, tc.struct_defs());
     let out_ptr = out_buf.as_mut_ptr();
+    let live_before = gc::GC_HEAP.with(|h| h.borrow().live_objects());
     gc::GC_HEAP.with(|h| h.borrow_mut().push_scanned_span(out_ptr, out_gc_slots));
     let result = f(out_ptr as i64);
     gc::GC_HEAP.with(|h| h.borrow_mut().pop_scanned_span());
+    // Under ownership the bindings are this call's to free, as in `FrogState`'s
+    // teardown. The result is left live for the caller to read, so the leak
+    // check allows exactly its objects.
+    if owned {
+        gc::GC_HEAP.with(|h| {
+            let mut heap = h.borrow_mut();
+            let mut i = 0;
+            for (_, ty) in &bindings {
+                let leafs = struct_fields(ty, tc.struct_defs());
+                for v in heap_roots_in_leaves(&out_buf[i..i + leafs.len()], &leafs) {
+                    heap.drop_word(v);
+                }
+                i += leafs.len();
+            }
+            let result_leaf0 = struct_fields(&result_ty, tc.struct_defs());
+            let result_objects: usize = heap_roots_in_leaves(&[result], result_leaf0.get(..1).unwrap_or_default())
+                .into_iter().map(|v| heap.tree_len(v)).sum();
+            let leaked = heap.live_objects() - live_before - result_objects;
+            if heap.leak_check_enabled() && leaked != 0 {
+                panic!("leak: {leaked} GC object(s) still live after teardown");
+            }
+        });
+    }
     result
     // out_buf dropped here, after f() returns
 }

@@ -560,6 +560,9 @@ pub struct GcHeap {
     /// per `mark` call: `mark` is invoked once per root, so a fresh `Vec`
     /// each time is a `malloc`/`free` pair per root per collection.
     mark_worklist:   Vec<*mut GcHeader>,
+    /// Reusable `clone_obj_with` worklist. Separate from `mark_worklist`
+    /// because a clone's allocations can collect, which marks.
+    clone_worklist:  Vec<*mut GcHeader>,
     /// Builds the hash index every `FrogDict` this heap allocates uses —
     /// the "swappable from the host" seam (`plans/DATA.md`'s Dict design):
     /// an embedder can install a different `DictBackend` (e.g. a sorted
@@ -652,60 +655,50 @@ impl GcHeap {
         self.live_objects
     }
 
-    /// Free `obj` and every object it owns: recursively, through the same
-    /// pointer masks the collector traces. Only valid under `FROG_OWNERSHIP`,
-    /// where each object has exactly one owner.
-    pub unsafe fn drop_tree(&mut self, obj: *mut GcHeader) {
-        match (*obj).kind {
-            ObjKind::Str => {}
-            ObjKind::List => {
-                let list = obj as *mut FrogList;
-                let stride = ((*list).stride as usize).max(1);
-                let len = (*list).len as usize;
-                let mask = (*list).ptr_mask;
-                if mask != 0 {
-                    for i in 0..len / stride {
-                        for bit in 0..stride {
-                            if mask & (1u64 << bit) == 0 { continue; }
-                            let w = *(*list).data.add(i * stride + bit);
-                            if is_heap_ptr(w) { self.drop_tree(heap_ptr(w)); }
-                        }
-                    }
-                }
-            }
-            ObjKind::Dict => {
-                let dict = obj as *mut FrogDict;
-                let len = (*dict).len as usize;
-                let stride = ((*dict).kstride + (*dict).vstride).max(1) as usize;
-                let mask = (*dict).ptr_mask;
-                if mask != 0 {
-                    for i in 0..len {
-                        for bit in 0..stride {
-                            if mask & (1u64 << bit) == 0 { continue; }
-                            let w = *(*dict).entries.add(i * stride + bit);
-                            if is_heap_ptr(w) { self.drop_tree(heap_ptr(w)); }
-                        }
-                    }
-                }
-            }
-            ObjKind::Variant => {
-                let variant = obj as *mut FrogVariant;
-                let mask = (*variant).ptr_mask;
-                if mask != 0 {
-                    let data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
-                    for i in 0..(*variant).nslots as usize {
-                        if mask & (1u64 << i) == 0 { continue; }
-                        let w = *data.add(i);
-                        if is_heap_ptr(w) { self.drop_tree(heap_ptr(w)); }
-                    }
-                }
-            }
+    /// How many objects the tree `w` holds (zero for a scalar or immediate):
+    /// what `drop_word(w)` would free.
+    pub fn tree_len(&mut self, w: i64) -> usize {
+        if !is_heap_ptr(w) { return 0; }
+        let mut work = std::mem::take(&mut self.mark_worklist);
+        let mut n = 0;
+        work.push(heap_ptr(w));
+        while let Some(obj) = work.pop() {
+            n += 1;
+            unsafe { Self::for_each_slot(obj, &mut |p| if is_heap_ptr(*p) { work.push(heap_ptr(*p)) }) };
         }
-        self.free_shallow(obj);
+        self.mark_worklist = work;
+        n
+    }
+
+    /// Free `obj` and every object it owns, through the same slots the
+    /// collector traces. Only valid under `FROG_OWNERSHIP`, where each object
+    /// has exactly one owner, so the tree is freed without visiting anything
+    /// twice. Iterative, like `mark_from`: a 100k-long `Cons` list is a tree
+    /// that deep. An ownership heap never collects, so the mark worklist is
+    /// free to borrow.
+    ///
+    /// # Safety
+    ///
+    /// `obj` must be a live object of this heap that nothing else owns, and
+    /// nothing may use it or anything it owns afterwards.
+    pub unsafe fn drop_tree(&mut self, obj: *mut GcHeader) {
+        let mut work = std::mem::take(&mut self.mark_worklist);
+        work.push(obj);
+        while let Some(obj) = work.pop() {
+            Self::for_each_slot(obj, &mut |p| {
+                if is_heap_ptr(*p) { work.push(heap_ptr(*p)); }
+            });
+            self.free_shallow(obj);
+        }
+        self.mark_worklist = work;
     }
 
     /// Free `obj` alone, leaving whatever it points at alone. The caller has
     /// moved those children elsewhere (or does not own them).
+    ///
+    /// # Safety
+    ///
+    /// `obj` must be a live object of this heap, unused afterwards.
     pub unsafe fn free_shallow(&mut self, obj: *mut GcHeader) {
         if self.leak_check && !self.freed.insert(obj as usize) {
             panic!("double free of GC object {:p}", obj);
@@ -767,6 +760,7 @@ impl GcHeap {
             live_objects:    0,
             freed:           std::collections::HashSet::new(),
             mark_worklist:   Vec::new(),
+            clone_worklist:  Vec::new(),
             dict_backend:    std::sync::Arc::new(crate::runtime::dict::HashbrownBackend),
         }
     }
@@ -1003,7 +997,8 @@ impl GcHeap {
         while !obj.is_null() && count < 2 {
             unsafe {
                 if (*obj).marked {
-                    Self::for_each_slot(obj, &mut |w| {
+                    Self::for_each_slot(obj, &mut |p| {
+                        let w = *p;
                         if is_heap_ptr(w) && heap_ptr(w) == target { count += 1; }
                     });
                 }
@@ -1020,10 +1015,11 @@ impl GcHeap {
         count
     }
 
-    /// Call `f` with every scannable word inside `obj` — the same slots
-    /// `mark_from` traces, factored out so `count_refs` cannot drift from
-    /// the collector's idea of what an object points at.
-    unsafe fn for_each_slot(obj: *mut GcHeader, f: &mut impl FnMut(i64)) {
+    /// Call `f` with a pointer to every scannable word inside `obj` — the
+    /// same slots `mark_from` traces, factored out so `count_refs`,
+    /// `drop_tree` and `clone_obj_with` cannot drift from the collector's
+    /// idea of what an object points at.
+    unsafe fn for_each_slot(obj: *mut GcHeader, f: &mut impl FnMut(*mut i64)) {
         match (*obj).kind {
             ObjKind::Str => {}
             ObjKind::List => {
@@ -1034,7 +1030,7 @@ impl GcHeap {
                 for i in 0..((*list).len as usize / stride) {
                     for bit in 0..stride {
                         if mask & (1u64 << bit) == 0 { continue; }
-                        f(*(*list).data.add(i * stride + bit));
+                        f((*list).data.add(i * stride + bit));
                     }
                 }
             }
@@ -1046,7 +1042,7 @@ impl GcHeap {
                 for i in 0..(*dict).len as usize {
                     for bit in 0..stride {
                         if mask & (1u64 << bit) == 0 { continue; }
-                        f(*(*dict).entries.add(i * stride + bit));
+                        f((*dict).entries.add(i * stride + bit));
                     }
                 }
             }
@@ -1057,7 +1053,7 @@ impl GcHeap {
                 let data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
                 for i in 0..((*variant).nslots as usize) {
                     if mask & (1u64 << i) == 0 { continue; }
-                    f(*data.add(i));
+                    f(data.add(i));
                 }
             }
         }
@@ -1459,8 +1455,8 @@ impl GcHeap {
     /// - `Variant` gets a fresh payload the same way, tag bits preserved
     ///   identically.
     ///
-    /// **Assumes the object graph is acyclic** — plain structural recursion,
-    /// no visited-set. This holds today because a self-referential union
+    /// **Assumes the object graph is acyclic** — a plain worklist walk, no
+    /// visited-set. This holds today because a self-referential union
     /// always boxes as a single opaque node rather than being expressed as a
     /// cycle of clonable values, and there is no other way to build a cycle
     /// from surface syntax (MUTABILITY.md's "Graphs get arenas": cyclic or
@@ -1479,10 +1475,9 @@ impl GcHeap {
     /// that keeps every *original* descendant alive, since a collection
     /// simply marks the whole reachable graph from it. But a freshly
     /// allocated *destination* object is reachable from nothing until its
-    /// parent stores its pointer, so each recursion level roots its own new
-    /// object for the duration of that level (`push_root`/`pop_roots`,
-    /// popped only after every child has been written into it) rather than
-    /// relying on `RuntimeRoots` from within `GcHeap` itself.
+    /// parent stores its pointer. So the top copy is rooted for the whole
+    /// call, and every other copy is stored into its parent before the next
+    /// allocation (see `clone_obj_with`).
     pub unsafe fn clone_obj(&mut self, obj: *mut GcHeader) -> *mut GcHeader {
         self.clone_obj_with(obj, false)
     }
@@ -1490,7 +1485,52 @@ impl GcHeap {
     /// `clone_obj`, where `copy_str` also copies each `Str` it reaches. The GC
     /// model shares immutable `Str`s by pointer (`clone_obj`); ownership mode
     /// (NOGC §6 step 2) gives every owner its own object, so it asks for copies.
+    ///
+    /// Iterative: `shallow_copy` copies one object with its slots still
+    /// naming the originals, and the worklist then re-points each slot of
+    /// each copy at a shallow copy of its own. Every copy is written into its
+    /// parent before the next allocation, so rooting the top copy keeps the
+    /// whole partial tree alive through a collection.
+    ///
+    /// # Safety
+    ///
+    /// As `clone_obj`.
     pub unsafe fn clone_obj_with(&mut self, obj: *mut GcHeader, copy_str: bool) -> *mut GcHeader {
+        let top = self.shallow_copy(obj, copy_str);
+        if top == obj || !Self::has_slots(top) {
+            return top;
+        }
+        self.push_root(top as i64, true);
+        let mut work = std::mem::take(&mut self.clone_worklist);
+        work.push(top);
+        while let Some(copy) = work.pop() {
+            Self::for_each_slot(copy, &mut |p| {
+                let w = *p;
+                if !is_heap_ptr(w) { return; }
+                let child = self.shallow_copy(heap_ptr(w), copy_str);
+                *p = (child as i64) | (w & TAG_MASK);
+                if Self::has_slots(child) { work.push(child); }
+            });
+        }
+        self.clone_worklist = work;
+        self.pop_roots(1);
+        top
+    }
+
+    /// Whether `obj` can point at other objects at all.
+    unsafe fn has_slots(obj: *mut GcHeader) -> bool {
+        match (*obj).kind {
+            ObjKind::Str => false,
+            ObjKind::List => (*(obj as *mut FrogList)).ptr_mask != 0,
+            ObjKind::Dict => (*(obj as *mut FrogDict)).ptr_mask != 0,
+            ObjKind::Variant => (*(obj as *mut FrogVariant)).ptr_mask != 0,
+        }
+    }
+
+    /// A copy of `obj` alone, its slots still naming `obj`'s children (see
+    /// `clone_obj_with`). A `Str` is shared rather than copied unless
+    /// `copy_str`.
+    unsafe fn shallow_copy(&mut self, obj: *mut GcHeader, copy_str: bool) -> *mut GcHeader {
         match (*obj).kind {
             ObjKind::Str if copy_str => {
                 let len = (*(obj as *const FrogStr)).len as usize;
@@ -1502,29 +1542,11 @@ impl GcHeap {
                 let src = obj as *mut FrogList;
                 let stride = ((*src).stride as usize).max(1);
                 let len = (*src).len as usize;
-                let mask = (*src).ptr_mask;
-                let elem_cap = (len / stride).max(1);
-                let new_list = self.alloc_list(elem_cap, stride, mask);
-                self.push_root(new_list as i64, true);
+                let new_list = self.alloc_list((len / stride).max(1), stride, (*src).ptr_mask);
                 if len > 0 {
                     std::ptr::copy_nonoverlapping((*src).data, (*new_list).data, len);
                 }
                 (*new_list).len = len as u32;
-                if mask != 0 {
-                    let elem_len = len / stride;
-                    for i in 0..elem_len {
-                        let base = i * stride;
-                        for bit in 0..stride {
-                            if mask & (1u64 << bit) == 0 { continue; }
-                            let w = *(*new_list).data.add(base + bit);
-                            if is_heap_ptr(w) {
-                                let cloned = self.clone_obj_with(heap_ptr(w), copy_str);
-                                *(*new_list).data.add(base + bit) = (cloned as i64) | (w & TAG_MASK);
-                            }
-                        }
-                    }
-                }
-                self.pop_roots(1);
                 new_list as *mut GcHeader
             }
             ObjKind::Dict => {
@@ -1536,67 +1558,30 @@ impl GcHeap {
                 let mask = (*src).ptr_mask;
                 let key_kind = (*src).key_kind;
                 let new_dict = self.alloc_dict(len, kstride, vstride, mask, key_kind);
-                self.push_root(new_dict as i64, true);
                 if len > 0 {
                     std::ptr::copy_nonoverlapping((*src).entries, (*new_dict).entries, len * stride);
-                }
-                (*new_dict).len = len as u32;
-                if len > 0 {
-                    // A key's hash never changes when its owning `Str`
-                    // object is cloned below (clone preserves content, and
-                    // `hash_key` hashes content), so the source's cached
-                    // hashes carry straight over — no need to recompute one
-                    // per entry (re-scanning a `Str` key's bytes) just to
-                    // rebuild the index.
+                    // A key's hash is of its content, which a copy keeps, so
+                    // the cached hashes carry over and the index is rebuilt
+                    // from them without re-scanning any `Str` key — cheaper
+                    // than carrying the source index's layout across.
                     std::ptr::copy_nonoverlapping((*src).hashes, (*new_dict).hashes, len);
                 }
-                if mask != 0 {
-                    for i in 0..len {
-                        let base = i * stride;
-                        for bit in 0..stride {
-                            if mask & (1u64 << bit) == 0 { continue; }
-                            let w = *(*new_dict).entries.add(base + bit);
-                            if is_heap_ptr(w) {
-                                let cloned = self.clone_obj_with(heap_ptr(w), copy_str);
-                                *(*new_dict).entries.add(base + bit) = (cloned as i64) | (w & TAG_MASK);
-                            }
-                        }
-                    }
-                }
-                // Rebuild the index over the copied (and now possibly
-                // re-pointed, for a `Str` key) entries — cheaper than
-                // trying to carry the source index's internal layout
-                // across, and this is the only place a `FrogDict`'s index
-                // is ever built from existing entries rather than empty.
+                (*new_dict).len = len as u32;
                 let index = crate::runtime::dict::dict_index_mut(new_dict);
                 let mut pairs = (0..len).map(|i| (*(*new_dict).hashes.add(i), i as u32));
                 index.rebuild(&mut pairs);
-                self.pop_roots(1);
                 new_dict as *mut GcHeader
             }
             ObjKind::Variant => {
                 let src = obj as *mut FrogVariant;
-                let tag = (*src).tag;
                 let nslots = (*src).nslots as usize;
-                let mask = (*src).ptr_mask;
-                let new_variant = self.alloc_variant(tag, nslots, mask);
-                self.push_root(new_variant as i64, true);
-                let src_data = (obj as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
-                let dst_data = (new_variant as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64;
-                if nslots > 0 {
-                    std::ptr::copy_nonoverlapping(src_data, dst_data, nslots);
-                }
-                if mask != 0 {
-                    for i in 0..nslots {
-                        if mask & (1u64 << i) == 0 { continue; }
-                        let w = *dst_data.add(i);
-                        if is_heap_ptr(w) {
-                            let cloned = self.clone_obj_with(heap_ptr(w), copy_str);
-                            *dst_data.add(i) = (cloned as i64) | (w & TAG_MASK);
-                        }
-                    }
-                }
-                self.pop_roots(1);
+                let new_variant = self.alloc_variant((*src).tag, nslots, (*src).ptr_mask);
+                let header = std::mem::size_of::<FrogVariant>();
+                std::ptr::copy_nonoverlapping(
+                    (obj as *const u8).add(header) as *const i64,
+                    (new_variant as *mut u8).add(header) as *mut i64,
+                    nslots,
+                );
                 new_variant as *mut GcHeader
             }
         }

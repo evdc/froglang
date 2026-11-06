@@ -376,7 +376,7 @@ impl FrogState {
             || std::env::var_os("FROG_OWNERSHIP").is_some()
         {
             let mut borrowers = crate::frontend::conventions::builtin_borrowers();
-            borrowers.extend(self.tc.host_names().iter().cloned());
+            borrowers.extend(self.codegen.imported_callees());
             let conv = crate::frontend::conventions::infer(&typed, &borrowers);
             if std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
                 eprint!("{}", conv.dump());
@@ -522,8 +522,8 @@ impl FrogState {
 }
 
 /// `FROG_OWNERSHIP` teardown: release the bindings this state still holds, and
-/// with `FROG_LEAK_CHECK`, report any object that is still live. A leak prints a
-/// `leak:` line to stderr, so a run that leaks is visible without changing its result.
+/// with `FROG_LEAK_CHECK`, fail on any object that is still live. A leak panics
+/// with a `leak:` message, so a leaking run exits nonzero and a leaking test fails.
 impl Drop for FrogState {
     fn drop(&mut self) {
         if !self.heap.is_owned() {
@@ -537,8 +537,10 @@ impl Drop for FrogState {
                 }
             }
         }
-        if self.heap.leak_check_enabled() && self.heap.live_objects() != 0 {
-            eprintln!("leak: {} GC object(s) still live after teardown", self.heap.live_objects());
+        // Not while unwinding: a panicking entry leaves its temporaries behind,
+        // and a second panic would abort before the first one is reported.
+        if self.heap.leak_check_enabled() && self.heap.live_objects() != 0 && !std::thread::panicking() {
+            panic!("leak: {} GC object(s) still live after teardown", self.heap.live_objects());
         }
     }
 }

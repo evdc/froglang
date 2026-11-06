@@ -609,12 +609,105 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      convention is keyed by the body node. A callee from an earlier REPL entry is not known to the
      caller. The caller treats it as consuming, so the callee frees nothing it borrowed, which leaks
      rather than crashes.
-   - Performance (release, best of 3): `life` matches default (15 ms). `words` is 177 ms against 159
-     ms. `orders` is 80 ms against 49 ms, and the remaining cost is union temporaries and their
-     drops in the `?`/`catch` path, which is the next thing to tune.
+   - Performance (release, best of 5): see "Tuning `orders`" below for the current numbers. `life`
+     matches default and `words` is about 10% slower under ownership.
    - Known, not fixed: default mode (GC) still has the `values(d)` alias that ownership mode fixes.
      Collector unit tests and the GC-stress churn test now run only on a collected heap (`owned`
      is set false, or the sweep check is skipped).
+   **Tuning `orders` (2026-11-05, uncommitted except step 1).** Times are best of 5 in release.
+
+   | Build | default | ownership |
+   |---|---|---|
+   | before tuning | 49 ms | 80 ms |
+   | step 1: inline immediate check before clone calls (committed, `e9c4cd6`) | 49 ms | 73 ms |
+   | item 1: drop the drop of a temporary taken at its own depth (uncommitted) | 49 ms | 59 ms |
+
+   Measurements behind the tuning:
+   - Runtime counts on `orders` (before step 1): 2,000 `frog_drop` calls reach the runtime, since
+     the inline heap test already filters the rest. `frog_clone_owned` runs 5,333,334 times, and
+     every call receives an immediate. The copies were wasted calls, not work. The inline test
+     removed them all.
+   - Code size, per generated function (`FROG_DUMP_CLIF`): `modn`, `hash`, `category_of`,
+     `discount_for` and `apply` compile identically in both modes. `checked_gross`,
+     `price_item` and the loop body (`__frog_main_3`) grew: 14 → 106, 23 → 317 and 231 → 602
+     instructions (blocks 4 → 14, 4 → 32 and 24 → 52). Each registered temporary got a drop guard
+     at its frame's end, and each guard splits a block.
+   - Attribution: sampled with macOS `sample` on a 40,000-round copy of `orders`. Symbols came
+     from `FROG_JIT_SYMBOLS`, since the JIT code is anonymous. Each sample address was mapped to
+     its function by the symbol file's start addresses, where length 0 means "until the next
+     symbol". Shares of samples, default → ownership, before item 1: `checked_gross` 9.9% → 21.7%,
+     `price_item` 7.4% → 23.4%, the loop body 13.1% → 22.7%, and the three unchanged functions
+     together 53.7% → 32.4%.
+
+   Item 1 (what it changed): a temporary registered at branch depth d, and taken at depth d, is
+   taken on every path to its frame's end, since the depth counts only enclosing conditionals and
+   loops. So its slot is removed from the frame and no drop is emitted. An early `return` still
+   drops it while it is registered, which is right. Results: `checked_gross` 106 → 19
+   instructions, with no drop sites. `price_item` 317 → 225, with 12 → 7 drop sites. The loop
+   body 602 → 512, with 12 → 8. Re-sampled, `checked_gross` falls to 4.3% of samples (default
+   10.2%). `price_item` is 19.4% (default 7.2%), and the loop body is 26.1% (default 15.9%).
+
+   What remains, to tune next: the drops left in `price_item` and the loop body guard union
+   results that can hold a `PricingError`. They look necessary, since the union's pointer column
+   may hold an error object. Two smaller ideas follow. `is_heap_ty` treats every union as heap,
+   including an inline union whose members are all scalars, which is correct only because the
+   pointer columns of such a union don't exist. A stricter per-union test could avoid a few
+   registrations. And several guards in one statement could share one block, to cut block
+   splits.
+
+   **Copy on keep (2026-11-05, uncommitted).** Codegen used to copy a value when it was read,
+   unless the reading site marked itself as a view (`view_next`, `compile_operand`, the transient
+   helpers). Every read-only site that was not marked made a deep copy, and several were not:
+   `if xs` copied the list to read its length, `d[k]` copied the key, `Narrow` copied the payload,
+   and a loop body whose tail was `xs = Cons(t=xs)` copied the whole list on every iteration, then
+   dropped the copy. That last one was quadratic: 4,000 elements took 6.4 s in debug, against
+   0.01 s under the GC.
+   - Now a read is free. A compiled heap leaf is an owned temporary (registered with its statement)
+     or a view (a binding, an element, a field, a payload, or an assignment's value). Only a
+     consumer that keeps a value calls `own_vals`, which copies views and leaves temporaries alone,
+     and then `take_vals` once it has stored the value. A view must not outlive what it reads, so a
+     value leaving a frame is owned first: a block's tail, a conditional's branch, a function's
+     result, the entry's result. The exception is a value nobody uses: `discard_next` now marks
+     every non-tail statement and a discarding loop's body, and a discarded block or conditional
+     owns nothing. A struct literal passes its fields' leaves through unchanged, since ownership is
+     per leaf.
+   - Removed: `view_next`, `compile_operand(_multi)`, `copy_owned`, the `transient` parameter of
+     `compile_expr_multi_inner`, and the `Assign`-specific discard handling. The entry now gives
+     each top-level statement its own frame, like a block.
+   - Results (debug): the cons loop, `if xs` in a loop, and the `d[k]` loop now run within 2× of
+     the GC (`if xs`: 31 s → 0.02 s). Release, best of 5: `orders` 40 ms default, 50 ms ownership.
+     `words` 150 → 170 ms, `life` equal.
+   - Known limit: a view taken by an operator's operand stays valid only until something writes to
+     what it reads. A later operand of the same expression that writes there (`xs[0] + { xs[0] =
+     "z"; "" }`) leaves the earlier operand dangling. Rebinding a name is safe, since liveness
+     then makes the earlier read a `Move`.
+
+   **Worklists and leak checking (2026-11-06, uncommitted).**
+   - `drop_tree` and `clone_obj_with` recursed once per level, so dropping or copying a ~20,000-deep
+     `Cons` list overflowed the stack. That is the ownership free path itself, so removing the GC
+     would not have fixed it. Both now walk a worklist over `for_each_slot`, the slot iterator the
+     collector's `count_refs` already used: `drop_tree` pushes each object's children and frees it,
+     and `clone_obj_with` makes a `shallow_copy` of each object and then re-points its copy's slots
+     at shallow copies of their own. A 1,000,000-deep list now copies and frees in both modes.
+   - The 67 leak-check failures had one cause. Runtime primitives that `desugar_notation` and the
+     `read`/`json` lowerings call by name (`__repr_str`, `__str_join`, `frog_read_*`,
+     `frog_json_*`, ...) were not borrowers in `conventions::infer`, so their arguments were handed
+     over and never freed. `Codegen::imported_callees` now lists every name that resolves to an
+     imported symbol, runtime primitive or host shim, and `infer` treats each as a borrower. The list
+     comes from the module's declarations, so it cannot drift from `declare_runtime_imports`.
+   - How leaks are caught now:
+     - `FrogState`'s teardown panics on a leak under `FROG_LEAK_CHECK`, so a leaking run exits
+       nonzero and a leaking in-process test fails.
+     - `tests/common`'s `run` (about 360 programs) runs every program twice, as configured and under
+       `FROG_OWNERSHIP=1 FROG_LEAK_CHECK=1`, and requires the same output. A plain `cargo test`
+       therefore checks for leaks and for differences between the two modes.
+     - `codegen::compile_and_run`, the in-process test entry point, now runs the same conventions
+       pass as `FrogState`, frees its bindings under ownership, and fails if anything other than the
+       returned result is still live.
+     - The full gate is `FROG_OWNERSHIP=1 FROG_LEAK_CHECK=1 cargo test -p froglang-core`, which also
+       runs the in-process (`compile_and_run`, `FrogState::eval`) tests under ownership. It passes, as
+       does the default run.
+
 3. **Delete the GC:** stack maps, roots, COW, `RuntimeRoots`, and the AOT stack-map table.
    `SELFHOST.md` G6 disappears.
 4. **Allocator layer:** segment headers, task heap and bump arena; then `with Arena` with

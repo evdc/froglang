@@ -63,9 +63,17 @@ pub struct RunOutput {
 /// whether it succeeded or not. Use this for programs expected to fail; use
 /// [`run`] for programs expected to succeed.
 pub fn run_raw(src: &str) -> RunOutput {
+    run_with(src, &[])
+}
+
+/// [`run_raw`] with extra environment variables set for the child process.
+/// The runtime reads its mode switches (`FROG_OWNERSHIP`, `FROG_GC_STRESS`, ...)
+/// once per process, so a subprocess is the only way to pick one per test.
+pub fn run_with(src: &str, env: &[(&str, &str)]) -> RunOutput {
     let scratch = ScratchFile::new(src);
     let output = Command::new(env!("CARGO_BIN_EXE_froglang-core"))
         .args(["run", scratch.path.to_str().expect("scratch path is valid UTF-8")])
+        .envs(env.iter().copied())
         .output()
         .expect("failed to run froglang-core binary");
     RunOutput {
@@ -75,29 +83,27 @@ pub fn run_raw(src: &str) -> RunOutput {
     }
 }
 
+/// [`run_with`], asserting the program exited successfully; returns its stdout.
+fn run_ok(src: &str, env: &[(&str, &str)]) -> String {
+    let out = run_with(src, env);
+    assert_eq!(
+        out.status,
+        Some(0),
+        "program was expected to succeed under {:?} but exited with {:?}\n--- stderr ---\n{}",
+        env, out.status, out.stderr,
+    );
+    out.stdout
+}
+
 /// Run `src` with `FROG_GC_STRESS=1` and return its stdout, asserting it
 /// exited successfully.
 ///
 /// `GcHeap::new` reads that variable once per process, so forcing a
-/// collection on every allocation is only reachable from a subprocess —
-/// which is what makes this a separate helper rather than a flag on an
-/// in-process `compile_and_run`. Without it most programs never collect at
-/// all (the normal threshold is 1 MB), so a missing or clobbered GC root
-/// stays invisible.
+/// collection on every allocation is only reachable from a subprocess.
+/// Without it most programs never collect at all (the normal threshold is
+/// 1 MB), so a missing or clobbered GC root stays invisible.
 pub fn run_gc_stress(src: &str) -> String {
-    let scratch = ScratchFile::new(src);
-    let output = Command::new(env!("CARGO_BIN_EXE_froglang-core"))
-        .args(["run", scratch.path.to_str().expect("scratch path is valid UTF-8")])
-        .env("FROG_GC_STRESS", "1")
-        .output()
-        .expect("failed to run froglang-core binary");
-    assert!(
-        output.status.success(),
-        "program was expected to succeed but exited with {:?}\n--- stderr ---\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    run_ok(src, &[("FROG_GC_STRESS", "1")])
 }
 
 /// Run `src` under `FROG_COW_VERIFY=1` and return its stdout, asserting it
@@ -109,33 +115,18 @@ pub fn run_gc_stress(src: &str) -> String {
 /// recomputes the answer from the heap and aborts if anything else can
 /// actually reach it, so a program that mutates through an unmarked alias
 /// fails loudly here instead of silently producing the wrong value.
-///
-/// A subprocess for the same reason as `run_gc_stress`: codegen reads the
-/// variable once, when it builds its `Ctx`.
 pub fn run_cow_verify(src: &str) -> String {
-    let scratch = ScratchFile::new(src);
-    let output = Command::new(env!("CARGO_BIN_EXE_froglang-core"))
-        .args(["run", scratch.path.to_str().expect("scratch path is valid UTF-8")])
-        .env("FROG_COW_VERIFY", "1")
-        .output()
-        .expect("failed to run froglang-core binary");
-    assert!(
-        output.status.success(),
-        "program was expected to succeed but exited with {:?}\n--- stderr ---\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    run_ok(src, &[("FROG_COW_VERIFY", "1")])
 }
 
-/// Run `src` and return its stdout, asserting it exited successfully.
+/// Run `src` and return its stdout, asserting it exited successfully — once
+/// as configured, and once more under ownership (NOGC §6 step 2) with the leak
+/// check, which must print the same thing and free every object it allocated
+/// (`FrogState`'s teardown panics on a leak). So every program the suite runs
+/// through here is a leak test as well, with no environment to remember.
 pub fn run(src: &str) -> String {
-    let out = run_raw(src);
-    assert_eq!(
-        out.status,
-        Some(0),
-        "program was expected to succeed but exited with {:?}\n--- stderr ---\n{}",
-        out.status, out.stderr,
-    );
-    out.stdout
+    let stdout = run_ok(src, &[]);
+    let owned = run_ok(src, &[("FROG_OWNERSHIP", "1"), ("FROG_LEAK_CHECK", "1")]);
+    assert_eq!(owned, stdout, "ownership mode printed something different");
+    stdout
 }

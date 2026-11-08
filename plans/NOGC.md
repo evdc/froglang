@@ -835,6 +835,55 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      but no longer measures a collector. `SELFHOST.md` G6 has not been edited.
 4. **Allocator layer:** segment headers, task heap and bump arena; then `with Arena` with
    `freezes`, and the result allocator.
+
+   **Scope (2026-11-08).** Step 3 left one task heap (`GcHeap`: size-class free lists over the
+   system allocator). Step 4 adds the first region, `with Arena`, and nothing else. The task heap
+   per task, segment headers and the result allocator wait for tasks and measurements.
+
+   *Why no segment headers.* §2.2 needs `free(p)` to find its allocator from `p`. That is only
+   needed if a free can meet a pointer from either allocator. The `freezes` rule rules it out:
+   inside an arena block no outer place is written, moved from, or passed `mut`, so every free
+   there targets an arena object. While an arena is active, `free` is a no-op, whatever the
+   pointer. This is less code, and it is the property the design already guarantees.
+
+   - **4a. Runtime.** `GcHeap` gets a stack of bump arenas (chunked; a chunk grows by doubling,
+     and an oversized object gets its own chunk). `alloc_bytes` bumps from the top arena when
+     there is one. `free_bytes`, `drop_tree` and `free_shallow` return at once while one is
+     active, which makes drops in a block free. Entry points `frog_arena_enter()` and
+     `frog_arena_exit(result_word, tymask...)`: exit deep-copies the result into the enclosing
+     allocator (the next arena down, or the heap) using the existing `clone_obj` walk with the
+     arena popped first, then releases the chunks in one go. The live-object count must stay
+     right: objects allocated in an arena are subtracted at exit, so the leak oracle still
+     proves everything outside was freed. Unit tests in Rust: allocate and drop in an arena,
+     nested arenas, an oversized object, evacuation of a nested list/dict/union/`Str`, and the
+     oracle across enter/exit.
+   - **4b. Language.** `with Arena { body }` is an expression of the body's type. Parse it in
+     the existing expression grammar (`with` is a keyword now; check the lexer and that no
+     test program uses it as an identifier). In typeck, add the `freezes` check. Inside the
+     body, a place rooted at a binding made outside it may only be read: assignment, `push`
+     and the other mutators, `mut` arguments, and moves out of it (a `Move` read, a consuming
+     call argument) are errors, and the message says to copy it or push the block's result.
+     Reads that copy into the arena are fine, since copy-on-keep already does that. Bindings made
+     inside the block are unrestricted. Reuse the places and conventions machinery; do not
+     invent a second analysis.
+   - **4c. Codegen.** Enter, body, exit, and the result is the evacuated word. A `return`, `?`
+     or `break` that leaves the block must exit the arena on the way out, evacuating its value.
+     If the frame-popping code makes that natural, do it. If it needs more than a few lines,
+     reject such an exit from inside an arena block with a clear error, and record that as
+     known. Under the arena, scope-end and statement-end drops still run and are no-ops, so
+     codegen needs no special case.
+   - **Tests.** Blocks in loops, nested blocks, a block returning each of `Int`, `Str`, `List`,
+     `Dict`, a struct, a boxed union and `None`, and the freezes errors (one test per mutator
+     kind). A test that a loop of arena blocks keeps `bytes_allocated` flat. An AOT test. The
+     leak gate must still pass. Add a `pipeline.rs` workload that builds and discards a
+     tree-shaped value per iteration, with and without `with Arena`, to show the effect.
+   - **Acceptance.** `cargo test --workspace`, plain and with `FROG_LEAK_CHECK=1`; clippy no
+     worse than 18 warnings; `orders` 52, `words` 147, `life` 15 ms not slower (arena support
+     must cost nothing when no arena is active: the check in `alloc_bytes` is one branch, and
+     look for any measured cost); net line count recorded.
+   - **Out of scope.** Per-task heaps; segment headers; the result allocator (evacuation is by
+     copy, for now); `Pool<T>`/`Id<T>` (step 5); other `with` forms (`Scope`, `Deadline`, ...);
+     an arena lint for loop-carried reallocation; the `gc` rename.
 5. **`Pool<T>`/`Id<T>`.**
 6. **`Abort` and `?`.** This needs no allocator work and can land early, against today's GC
    runtime. It adds the trait, the error-arm desugar in typeck, the `Linear` requires `Abort`

@@ -8,10 +8,14 @@
 //! layout tables codegen itself uses, so a shim can build a `Str`/`List`/
 //! struct/union value without any layout baked into it at compile time.
 //!
-//! GC safety follows the same rule as every other allocating runtime
-//! function (`gc.rs`, "if a runtime function takes a GC pointer and can
-//! collect, it holds its pointer arguments for its whole body") — see
-//! `HostRootScope`.
+//! Ownership across the boundary (plans/NOGC.md §6 step 3): a host function
+//! **borrows** its arguments and **transfers** its result. Arguments are
+//! read in place and copied out into Rust values by `FromFrog`; the caller
+//! still owns them and frees them itself (`conventions::infer` treats every
+//! host function as a borrower). A result is built from fresh objects by
+//! `ToFrog` through this `FrogCtx` and written to `out`, and the caller
+//! takes ownership of whatever it finds there, exactly as for any other
+//! call's result. Nothing is rooted, since nothing is ever collected.
 
 use std::cell::Cell;
 
@@ -59,10 +63,8 @@ pub extern "C" fn frog_ctx_current() -> i64 {
 ///
 /// `entry` is `__frog_main`'s address (a C-ABI `(i64) -> i64` that writes its
 /// top-level bindings into `out_ptr`). `out_ptr` is a caller-owned buffer wide
-/// enough for those bindings; it needs no GC scan span, because every value
-/// written into it is simultaneously live in `__frog_main`'s own frame — hence
-/// already covered by that frame's stack map for the call's duration — and
-/// nothing reads the buffer back after the call returns.
+/// enough for those bindings. Nothing reads it back: the process exits, so
+/// the bindings it names are never freed.
 ///
 /// The `FrogCtx` carries *empty* struct/union tables (G6): no shipped
 /// `ToFrog`/`FromFrog` impl consults them — they compute layout compositionally
@@ -133,35 +135,14 @@ impl FrogCtx {
         unsafe { &*self.unions }
     }
 
-    /// Open a root scope: every value this `FrogCtx` allocates after this
-    /// call is rooted immediately (so a second allocation can't collect it
-    /// out from under a Rust-side local holding it), and released when the
-    /// returned guard drops. A `#[frog_fn]`-generated shim opens exactly
-    /// one, for its whole body — by the time it drops (the shim's return),
-    /// every value that's still wanted has already been written into `out`,
-    /// which is enough to keep it alive: `compile_call`'s host-call arm
-    /// `declare_gc_leaves`s the loaded-back `out` slots before this
-    /// function's own stack map would otherwise consider them dead.
-    pub fn scope(&mut self) -> HostRootScope {
-        let mark = self.heap().roots_len();
-        HostRootScope { heap: self.heap, mark }
-    }
-
-    /// Allocate a `Str` from `s` and root it for the enclosing `scope()`.
+    /// Allocate a `Str` from `s`. The caller owns it once it is in `out`.
     pub fn alloc_str(&mut self, s: &str) -> i64 {
-        let ptr = {
-            let heap = self.heap();
-            heap.maybe_collect();
-            heap.alloc_str(s.as_bytes()) as i64
-        };
-        self.heap().push_root(ptr, true);
-        ptr
+        self.heap().alloc_str(s.as_bytes()) as i64
     }
 
     /// Borrow a `Str` argument's bytes. `w` must be a live `FrogStr`
-    /// pointer — true of any `Str`-typed argument slot, since the caller's
-    /// stack map (or this ctx's own `scope()`) keeps it alive for the
-    /// call's duration.
+    /// pointer — true of any `Str`-typed argument slot, which the caller
+    /// owns until the call returns.
     ///
     /// # Safety
     /// `w` must be a valid, live `FrogStr` pointer.
@@ -171,23 +152,18 @@ impl FrogCtx {
 
     /// Allocate a `List<T>` of `stride`-wide elements (`stride == 1` for
     /// every non-struct `T` — see `FrogList`'s doc comment in `gc.rs`) from
-    /// a flat, already-wire-formatted `i64` buffer, and root the result.
+    /// a flat, already-wire-formatted `i64` buffer. The list takes ownership
+    /// of every object `elems` names.
     pub fn alloc_list(&mut self, elems: &[i64], stride: usize, ptr_mask: u64) -> i64 {
         let elem_count = if stride == 0 { 0 } else { elems.len() / stride.max(1) };
-        let ptr = {
-            let heap = self.heap();
-            heap.maybe_collect();
-            let list = heap.alloc_list(elem_count, stride, ptr_mask);
-            unsafe {
-                (*list).len = elems.len() as u32;
-                if !elems.is_empty() {
-                    std::ptr::copy_nonoverlapping(elems.as_ptr(), (*list).data, elems.len());
-                }
+        let list = self.heap().alloc_list(elem_count, stride, ptr_mask);
+        unsafe {
+            (*list).len = elems.len() as u32;
+            if !elems.is_empty() {
+                std::ptr::copy_nonoverlapping(elems.as_ptr(), (*list).data, elems.len());
             }
-            list as i64
-        };
-        self.heap().push_root(ptr, true);
-        ptr
+        }
+        list as i64
     }
 
     /// Read a `List`'s element count and one flattened element's slots
@@ -207,8 +183,8 @@ impl FrogCtx {
 
     /// Allocate a `Dict<K, V>` from `entries` — a flat, already-wire-
     /// formatted buffer of `kstride + vstride`-wide `(key, value)` blocks,
-    /// in the insertion order the resulting `Dict` should report — and
-    /// root the result. `key_kind` is a `runtime::dict::KeyKind`
+    /// in the insertion order the resulting `Dict` should report. The dict
+    /// takes ownership of every object `entries` names. `key_kind` is a `runtime::dict::KeyKind`
     /// discriminant. Builds the hash index in one pass (`rebuild`, the
     /// same one `GcHeap::clone_obj`'s `Dict` arm uses) rather than
     /// inserting one entry at a time.
@@ -223,27 +199,21 @@ impl FrogCtx {
         use crate::runtime::dict::{hash_key, dict_index_mut, KeyKind};
         let stride = (kstride + vstride).max(1);
         let elem_count = if stride == 0 { 0 } else { entries.len() / stride };
-        let ptr = {
-            let heap = self.heap();
-            heap.maybe_collect();
-            let dict = heap.alloc_dict(elem_count, kstride, vstride, ptr_mask, key_kind);
-            unsafe {
-                (*dict).len = elem_count as u32;
-                if !entries.is_empty() {
-                    std::ptr::copy_nonoverlapping(entries.as_ptr(), (*dict).entries, entries.len());
-                }
-                let kind = KeyKind::from_u32(key_kind);
-                let dict_entries = (*dict).entries;
-                let mut pairs = (0..elem_count).map(|i| {
-                    let key = *dict_entries.add(i * stride);
-                    (hash_key(kind, key), i as u32)
-                });
-                dict_index_mut(dict).rebuild(&mut pairs);
+        let dict = self.heap().alloc_dict(elem_count, kstride, vstride, ptr_mask, key_kind);
+        unsafe {
+            (*dict).len = elem_count as u32;
+            if !entries.is_empty() {
+                std::ptr::copy_nonoverlapping(entries.as_ptr(), (*dict).entries, entries.len());
             }
-            dict as i64
-        };
-        self.heap().push_root(ptr, true);
-        ptr
+            let kind = KeyKind::from_u32(key_kind);
+            let dict_entries = (*dict).entries;
+            let mut pairs = (0..elem_count).map(|i| {
+                let key = *dict_entries.add(i * stride);
+                (hash_key(kind, key), i as u32)
+            });
+            dict_index_mut(dict).rebuild(&mut pairs);
+        }
+        dict as i64
     }
 
     /// Read a `Dict`'s entry count and one entry's flattened slots
@@ -259,20 +229,5 @@ impl FrogCtx {
         let stride = (kstride + vstride).max(1);
         let dict_ptr = w as *const crate::runtime::gc::FrogDict;
         unsafe { *(*dict_ptr).entries.add(idx * stride + slot) }
-    }
-}
-
-/// Releases every root `FrogCtx` pushed since the scope opened. See
-/// `FrogCtx::scope`.
-pub struct HostRootScope {
-    heap: *mut GcHeap,
-    mark: usize,
-}
-
-impl Drop for HostRootScope {
-    fn drop(&mut self) {
-        let heap = unsafe { &mut *self.heap };
-        let held = heap.roots_len().saturating_sub(self.mark);
-        heap.pop_roots(held);
     }
 }

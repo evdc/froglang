@@ -13,7 +13,7 @@ fn conventions_of(src: &str) -> Conventions {
     tc.lower_function_values(&mut typed).expect("function value error");
     tc.desugar_notation(&mut typed).expect("notation error");
     number_nodes(&mut typed);
-    infer(&typed, &builtin_borrowers())
+    infer(&typed, &builtin_borrowers(), &Default::default())
 }
 
 #[test]
@@ -96,6 +96,6 @@ fn external_callee_not_in_borrowers_consumes() {
     tc.lower_function_values(&mut typed).expect("function value error");
     tc.desugar_notation(&mut typed).expect("notation error");
     number_nodes(&mut typed);
-    let c = infer(&typed, &std::collections::HashSet::new());
+    let c = infer(&typed, &std::collections::HashSet::new(), &Default::default());
     assert_eq!(c.convention("f", 0), Some(Convention::Consume));
 }

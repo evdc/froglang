@@ -30,7 +30,7 @@
 
 use std::cell::RefCell;
 
-use super::gc::{FrogStr, GcHeap, RuntimeRoots};
+use super::gc::{FrogStr, GcHeap};
 use super::ffi::with_heap;
 use crate::frontend::expression::Expression;
 use crate::frontend::parser::Parser;
@@ -123,8 +123,6 @@ pub(super) fn read_str_arg(s: i64) -> String {
 
 #[no_mangle]
 pub extern "C" fn frog_read_open(s: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
-    let _roots = RuntimeRoots::hold(&[s]);
     let src = read_str_arg(s);
 
     // `parse_data`, not `parse`: this is frog *notation*, where `${` in a
@@ -173,11 +171,9 @@ pub extern "C" fn frog_read_offset() -> i64 {
 /// — kept total rather than panicking.
 #[no_mangle]
 pub extern "C" fn frog_read_msg() -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let msg = READ_STATE.with(|st| st.borrow().as_ref().and_then(|s| s.err.clone()).map(|(m, _)| m))
         .unwrap_or_default();
     with_heap(|heap: &mut GcHeap| {
-        heap.maybe_collect();
         heap.alloc_str(msg.as_bytes()) as i64
     })
 }
@@ -267,7 +263,6 @@ pub extern "C" fn frog_read_bool(node: i64) -> i8 {
 
 #[no_mangle]
 pub extern "C" fn frog_read_str(node: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     use crate::frontend::expression::LiteralExpr;
     use crate::frontend::tokens::Token;
     // `Err` carries the mismatched node's position rather than `()`: the
@@ -279,7 +274,6 @@ pub extern "C" fn frog_read_str(node: i64) -> i64 {
     });
     let s = s.unwrap_or_else(|pos| { mark_failed_at("expected a Str literal", pos); String::new() });
     with_heap(|heap: &mut GcHeap| {
-        heap.maybe_collect();
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
@@ -293,8 +287,6 @@ pub extern "C" fn frog_read_str(node: i64) -> i64 {
 /// version of this the way `print`'s punctuation fragments have.
 #[no_mangle]
 pub extern "C" fn frog_read_field(node: i64, name: i64) -> i64 {
-    // No `RuntimeRoots::hold` needed: nothing below can trigger a
-    // collection (`mark_failed` builds a Rust `String`, not a `FrogStr`).
     let name = read_str_arg(name);
     with_node(node, |n| {
         let Expression::Call(c) = &n.item else {

@@ -10,7 +10,7 @@
 //! needs no knowledge of the value representation, the word encoding, or
 //! the GC.
 
-use super::gc::{frog_str_as_str, FrogDict, FrogStr, GcHeap, RuntimeRoots};
+use super::gc::{frog_str_as_str, FrogDict, FrogStr, GcHeap};
 use super::ffi::{with_heap, frog_abort};
 
 // ── Key hashing / equality ──────────────────────────────────────────────────
@@ -154,9 +154,7 @@ pub unsafe fn dict_index_mut<'a>(dict: *mut FrogDict) -> &'a mut Box<dyn DictInd
 /// is a `KeyKind` discriminant.
 #[no_mangle]
 pub extern "C" fn frog_alloc_dict(cap: i64, kstride: i64, vstride: i64, ptr_mask: i64, key_kind: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_dict(cap as usize, kstride as usize, vstride as usize, ptr_mask as u64, key_kind as u32) as i64
     })
 }
@@ -170,9 +168,7 @@ fn stride_of(d: *const FrogDict) -> usize {
     unsafe { ((*d).kstride + (*d).vstride).max(1) as usize }
 }
 
-/// Find `key`'s entry index, or `-1` if absent. `d`/`key` are not
-/// rooted here — this never allocates, so nothing can move or collect
-/// out from under the caller.
+/// Find `key`'s entry index, or `-1` if absent. The dict only borrows `key`.
 #[no_mangle]
 pub extern "C" fn frog_dict_find(d: i64, key: i64) -> i64 {
     let dict = d as *mut FrogDict;
@@ -198,17 +194,8 @@ pub extern "C" fn frog_dict_find(d: i64, key: i64) -> i64 {
 /// `{1: "a", 1: "b"}`).
 #[no_mangle]
 pub extern "C" fn frog_dict_insert(d: i64, key: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let dict = d as *mut FrogDict;
     let kind = unsafe { KeyKind::from_u32((*dict).key_kind) };
-    // Only a `Str` key is a GC pointer — the caller's stack map doesn't
-    // cover `key` past this call (it "died" from the JIT's point of view
-    // at the call site), so it must be re-rooted before `with_heap`'s
-    // closure has any chance to allocate/collect. An `Int`/`Float`/`Bool`
-    // key has no tag bits and must never be pushed as a root (`RuntimeRoots
-    // ::hold`'s doc comment) — `hold_masked` scopes the root to just this
-    // one case.
-    let _roots = RuntimeRoots::hold_masked(&[key], &[kind == KeyKind::Str]);
     with_heap(|heap| {
         let stride = stride_of(dict);
         let hash = hash_key(kind, key);
@@ -219,10 +206,10 @@ pub extern "C" fn frog_dict_insert(d: i64, key: i64) -> i64 {
             index.find(hash, &mut eq)
         };
         if let Some(e) = found {
-            // Ownership: the caller gave its `Str` key to the dict, which keeps
-            // it only when the key is new. An existing entry keeps its own key,
-            // so this copy is released here.
-            if heap.is_owned() && kind == KeyKind::Str {
+            // The caller gave its `Str` key to the dict, which keeps it only
+            // when the key is new. An existing entry keeps its own key, so
+            // this copy is released here.
+            if kind == KeyKind::Str {
                 heap.drop_word(key);
             }
             return e as i64;
@@ -348,9 +335,8 @@ pub extern "C" fn frog_dict_key_missing(_d: i64, _key: i64) -> ! {
     frog_abort(format_args!("key not found in Dict"));
 }
 
-/// `FROG_OWNERSHIP`: free the heap leaves of entry `e`, which is leaving the dict.
-/// A no-op unless the heap is owned, and it reads only the leaves the dict's
-/// pointer mask marks as objects.
+/// Free the heap leaves of entry `e`, which is leaving the dict. It reads only
+/// the leaves the dict's pointer mask marks as objects.
 fn release_entry(dict: *mut FrogDict, e: usize, stride: usize) {
     let mask = unsafe { (*dict).ptr_mask };
     if mask == 0 {
@@ -358,9 +344,6 @@ fn release_entry(dict: *mut FrogDict, e: usize, stride: usize) {
     }
     let entries = unsafe { (*dict).entries };
     with_heap(|heap| {
-        if !heap.is_owned() {
-            return;
-        }
         for bit in 0..stride {
             if mask & (1u64 << bit) == 0 {
                 continue;

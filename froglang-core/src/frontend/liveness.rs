@@ -17,7 +17,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::frontend::tokens::Spanned;
 use crate::frontend::typed_ast::{Arg, NodeId, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
-use crate::frontend::typeck::TypeChecker;
 
 /// Stamp every node reachable from `expr` (including nested `Function`
 /// bodies — unlike `codegen::for_each_heap_producer`, which skips them
@@ -181,27 +180,11 @@ pub struct Liveness {
     /// that statement (computed at `Block`/entry statement boundaries as
     /// `live_in(stmt) \ live_out(stmt)`).
     dead_after: HashMap<NodeId, Vec<String>>,
-    /// `Var` node id -> where its value flows (`CopySite`). Only filled under
-    /// `FROG_COPY_STATS`; every other node reads back as `CopySite::Other`.
-    sites: HashMap<NodeId, CopySite>,
 }
-
-/// Where a `Var` read's value flows, for the copy-statistics split (`FROG_COPY_STATS`,
-/// plans/NOGC.md §6 step 0). Separates copies that borrow inference (§1.2) could
-/// remove (a call argument that is only read) from copies that store a value
-/// into a new home.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopySite { CallArg = 0, Let = 1, Store = 2, Literal = 3, Return = 4, Other = 5 }
 
 impl Liveness {
     fn empty() -> Self {
-        Liveness { last_use: HashSet::new(), dead_after: HashMap::new(), sites: HashMap::new() }
-    }
-
-    /// The context the `Var` node `var_node`'s value flows into. `Other` for
-    /// anything not classified (including every node when stats are off).
-    pub fn copy_site(&self, var_node: NodeId) -> CopySite {
-        self.sites.get(&var_node).copied().unwrap_or(CopySite::Other)
+        Liveness { last_use: HashSet::new(), dead_after: HashMap::new() }
     }
 
     /// `Ownership::Move` iff the `Var` node `var_node` (its `TypedExpr::id`)
@@ -227,10 +210,9 @@ struct Ctx {
     /// `return` (or falling off the end) must keep alive. See
     /// `analyze_body`/`analyze_entry`'s doc comments for what belongs here;
     /// getting this wrong for `analyze_entry` is a real memory-safety bug,
-    /// not just lost precision (`FrogState::eval` rebuilds the GC root set
-    /// from `env` after every REPL entry — `state.rs:299-335` — so a name
-    /// this analysis fails to keep alive across an entry gets its root
-    /// cleared while `env` still points at it).
+    /// not just lost precision (`FrogState::eval` keeps every binding in
+    /// `env` after every REPL entry, so a name this analysis wrongly marks
+    /// `Move` would be handed away while `env` still points at it).
     exit_live: NameSet,
 }
 
@@ -243,41 +225,7 @@ pub fn analyze_body(body: &Spanned<TypedExpr>, exit_live: &NameSet) -> Liveness 
     let ctx = Ctx { exit_live: exit_live.clone() };
     let mut out = Liveness::empty();
     transfer(body, exit_live, &ctx, &mut out);
-    if std::env::var_os("FROG_COPY_STATS").is_some() {
-        classify_copy_sites(body, CopySite::Return, &mut out.sites);
-    }
     out
-}
-
-/// Record, for every `Var` under `expr`, the `CopySite` its value flows into.
-/// `site` is the context `expr` itself flows into. A block's tail and a
-/// conditional's branches pass that context through, since their value is the
-/// whole expression's value. Anything not listed here is `Other`.
-fn classify_copy_sites(expr: &Spanned<TypedExpr>, site: CopySite, out: &mut HashMap<NodeId, CopySite>) {
-    // Extractions (`xs[i]`, `xs[a..b]`, `p.f`) are recorded too: under NOGC §1.3
-    // each one copies its heap leaves, so it needs the same flow context.
-    if matches!(expr.item.kind, TypedExprKind::Var(_) | TypedExprKind::Index { .. }
-        | TypedExprKind::Slice { .. } | TypedExprKind::FieldAccess { .. }) {
-        out.insert(expr.item.id, site);
-    }
-    let children = TypeChecker::children(expr);
-    let last = children.len().checked_sub(1);
-    for (i, child) in children.iter().enumerate() {
-        let child_site = match &expr.item.kind {
-            TypedExprKind::Block(_) if Some(i) == last => site,
-            TypedExprKind::Block(_) => CopySite::Other,
-            TypedExprKind::Conditional { .. } if i > 0 => site,
-            TypedExprKind::Widen { .. } => site,
-            TypedExprKind::Function { .. } | TypedExprKind::Return(_) => CopySite::Return,
-            TypedExprKind::Assign { .. } => CopySite::Let,
-            TypedExprKind::PlaceAssign { .. } => CopySite::Store,
-            TypedExprKind::List(_) | TypedExprKind::Dict(_)
-            | TypedExprKind::StructInit { .. } | TypedExprKind::VariantInit { .. } => CopySite::Literal,
-            TypedExprKind::Call { callable, .. } if !std::ptr::eq(*child, &**callable) => CopySite::CallArg,
-            _ => CopySite::Other,
-        };
-        classify_copy_sites(child, child_site, out);
-    }
 }
 
 /// Analyze one top-level/REPL entry's statement list (`build_main_body`'s
@@ -288,15 +236,11 @@ fn classify_copy_sites(expr: &Spanned<TypedExpr>, site: CopySite, out: &mut Hash
 /// treats every `env` binding as live after every entry
 /// (`state.rs:305-335`) whether or not this entry's code happens to use it.
 /// Passing just this entry's own `Assign` names here would let a name used
-/// once, early, in this entry get its GC root cleared before the entry
-/// finishes — the entry still runs to completion holding a dangling
-/// pointer's *slot*, but the object behind it may already be swept.
+/// once, early, in this entry be moved out (and freed) before the entry
+/// finishes, leaving `env` holding a dangling pointer.
 pub fn analyze_entry(stmts: &[Spanned<TypedExpr>], exit_live: &NameSet) -> Liveness {
     let ctx = Ctx { exit_live: exit_live.clone() };
     let mut out = Liveness::empty();
-    if std::env::var_os("FROG_COPY_STATS").is_some() {
-        for s in stmts { classify_copy_sites(s, CopySite::Other, &mut out.sites); }
-    }
     let mut live_out = exit_live.clone();
     for s in stmts.iter().rev() {
         let live_in = transfer(s, &live_out, &ctx, &mut out);
@@ -310,16 +254,9 @@ pub fn analyze_entry(stmts: &[Spanned<TypedExpr>], exit_live: &NameSet) -> Liven
 /// `analyze_body`) to stderr as `name @ span -> Copy|Move`, one line each,
 /// in source order — gated on `FROG_DUMP_LIVENESS` at the two call sites in
 /// `codegen::build_func_body`/`build_main_body`, since walking the whole
-/// tree a second time only to throw the result away isn't free. This is
-/// currently the *only* consumer of `Ownership`: nothing in codegen acts on
-/// a `Move` mark yet — GC roots are now Cranelift's own stack maps
-/// (RUNTIME.md Part 2), tied to each `Variable`'s real live range, so the
-/// per-binding-slot problem this analysis was designed against no longer
-/// exists on the GC side. A future consumer (move-on-last-use for a
-/// non-GC resource, or a mid-level IR) still has to define its own
-/// ownership discipline; nothing here presumes one. So this dump is the only way
-/// to inspect the analysis today, and it's what a future semantic consumer
-/// (copy elision, `mut` container operations) should be checked against.
+/// tree a second time only to throw the result away isn't free. Codegen's
+/// `Var` arm acts on each `Move` mark (an owned binding hands its value over
+/// on its last use), so this dump is how to check where that happens.
 pub fn dump_body(name: &str, body: &Spanned<TypedExpr>, liveness: &Liveness) {
     eprintln!("-- liveness: {} --", name);
     dump_walk(body, liveness);

@@ -15,10 +15,9 @@ use syn::{FnArg, ItemFn, Pat, ReturnType};
 ///
 /// - `__frog_shim_read_file`, a `#[no_mangle] extern "C" fn(ctx, args, out)`
 ///   matching the uniform shim ABI every host function shares regardless of
-///   its frog type (`compile_host_call` in `codegen/mod.rs`). It expands
-///   `jit_frame_guard!()` directly in its own body — that macro's doc
-///   comment (`gc.rs`) states this must happen in the function the mutator
-///   calls, not a helper it calls, so this can't be factored out.
+///   its frog type (`compile_host_call` in `codegen/mod.rs`). It borrows its
+///   arguments (copying them out with `FromFrog`) and hands its result to
+///   the caller (`runtime::host`'s module doc).
 /// - `read_file_host() -> froglang_core::host::HostFn`, the descriptor
 ///   `FrogStateBuilder::func` wants. A function rather than a `const`:
 ///   `HostFn::params` is a `Vec<Type>`, and `Type` (`Str`, `List`, ...)
@@ -77,23 +76,6 @@ fn _frog_fn(f: ItemFn) -> syn::Result<TokenStream> {
     }
     let total_arg_slots = cum;
 
-    // Per-*leaf* GC-pointer mask for the flattened argument buffer, so the
-    // shim only roots slots that actually hold a heap pointer — a raw
-    // `Int`/`Float` slot has no tag bits and must never be mistaken for one
-    // (see `RuntimeRoots::hold_masked`'s doc comment). Built from each
-    // param's own `leaves()` — a multi-leaf (struct-shaped) argument's
-    // scalar and pointer columns are not uniform, so this can't be a single
-    // repeated bit the way it could when every `FromFrog` impl was
-    // single-slot.
-    let arg_ptr_mask_pushes = param_types.iter().map(|ty| {
-        quote! {
-            __frog_ptr_mask.extend(
-                <#ty as ::froglang_core::host::FromFrog>::leaves().iter()
-                    .map(::froglang_core::codegen::is_heap_ty)
-            );
-        }
-    });
-
     let unmarshal_args = param_idents.iter().zip(param_types.iter()).zip(offsets.iter()).map(|((ident, ty), start)| {
         quote! {
             let #ident = <#ty as ::froglang_core::host::FromFrog>::from_frog(
@@ -123,27 +105,10 @@ fn _frog_fn(f: ItemFn) -> syn::Result<TokenStream> {
             __frog_args_ptr: *const i64,
             __frog_out_ptr: *mut i64,
         ) {
-            let _jit_frame = ::froglang_core::jit_frame_guard!();
             let ctx: &mut ::froglang_core::runtime::host::FrogCtx = unsafe { &mut *__frog_ctx };
             let __frog_args: &[i64] = unsafe {
                 ::std::slice::from_raw_parts(__frog_args_ptr, #total_arg_slots)
             };
-            // Every argument slot died at this call from the JIT caller's
-            // point of view (no stack map covers a raw stack-slot buffer
-            // either) — held for this shim's whole body per the runtime's
-            // GC-safety rule (`gc.rs`, `RuntimeRoots`). Only the slots that
-            // actually hold a heap pointer are rooted as such — a raw
-            // `Int`/`Float` slot has no tag bits, and rooting it as a
-            // pointer would make the collector dereference an arbitrary
-            // address.
-            let mut __frog_ptr_mask: ::std::vec::Vec<bool> = ::std::vec::Vec::with_capacity(__frog_args.len());
-            #(#arg_ptr_mask_pushes)*
-            let _roots = ::froglang_core::runtime::gc::RuntimeRoots::hold_masked(__frog_args, &__frog_ptr_mask);
-            // Roots everything this shim allocates via `ctx` until it
-            // drops at the end of this function — i.e. after the result
-            // has been written into `__frog_out_ptr` below.
-            let mut _scope = ctx.scope();
-
             #(#unmarshal_args)*
 
             let __frog_result: #ret_ty = #fn_name(#(#param_idents),*);

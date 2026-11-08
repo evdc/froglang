@@ -213,10 +213,10 @@ fn test_mixed_enum_unboxed_and_boxed_variants_match() {
 }
 
 #[test]
-fn test_unboxed_variants_survive_collection_inside_a_list() {
-    // A list of enum values has its element slots marked as pointers, so the
-    // mark phase walks straight over these immediates; without the low-bit
-    // check it would dereference `(tag << 1) | 1` as a `GcHeader`.
+fn test_unboxed_variants_inside_a_list_persist_across_entries() {
+    // A list of enum values has its element slots marked as pointers, so a
+    // drop or copy of the list walks straight over these immediates; without
+    // the low-bit check it would dereference `(tag << 3) | 7` as a header.
     use froglang_core::state::FrogState;
 
     let mut s = FrogState::new();
@@ -224,7 +224,6 @@ fn test_unboxed_variants_survive_collection_inside_a_list() {
         "data Opt is None_ | Some_(v: Int)\n\
          let opts = [for i in 0..200 do if i == 0 then Some_(v=1) else None_]"
     ).unwrap();
-    s.heap.force_collect();
     let (value, _) = s.eval(
         "mut n = 0\n\
          for o in opts do { n = n + match o {\nis None_ then 1\nis Some_(v) then v\n} }\n\
@@ -234,7 +233,7 @@ fn test_unboxed_variants_survive_collection_inside_a_list() {
 }
 
 #[test]
-fn test_unboxed_variant_in_a_struct_field_survives_collection() {
+fn test_unboxed_variant_in_a_struct_field_persists_across_entries() {
     use froglang_core::state::FrogState;
 
     let mut s = FrogState::new();
@@ -243,9 +242,8 @@ fn test_unboxed_variant_in_a_struct_field_survives_collection() {
          data Tag(name: Str, color: Color)\n\
          let t = Tag(name=\"hello\", color=Blue)"
     ).unwrap();
-    s.heap.force_collect();
-    // `name` must still be intact: the struct's `color` slot is marked as a
-    // pointer, and mis-following it would corrupt the trace of `name`.
+    // `name` must still be intact: the struct's `color` slot is a pointer
+    // column, and mis-following it would free or corrupt the wrong object.
     let (value, _) = s.eval("t.name + (if t.color is Blue then \"!\" else \"?\")").unwrap();
     assert!(matches!(&value, froglang_core::state::FrogValue::Str(s) if s == "hello!"), "got {:?}", value);
 }

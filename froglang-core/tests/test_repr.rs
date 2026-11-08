@@ -5,7 +5,7 @@
 //! and the type errors `is_repr`'s checks raise.
 
 mod common;
-use common::{run, run_raw, run_gc_stress};
+use common::{run, run_raw};
 
 fn type_error(src: &str) -> String {
     let ast = froglang_core::frontend::parser::Parser::parse(src).expect("parse error");
@@ -201,15 +201,15 @@ fn repr_with_the_wrong_arity_is_a_type_error() {
     assert_ne!(run_raw("repr()").status, Some(0));
 }
 
-// ── GC ───────────────────────────────────────────────────────────────────────
+// ── heap ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn repr_of_nested_structures_survives_gc_stress() {
+fn repr_of_nested_structures() {
     let src = r#"data Person(name: Str, age: Int)
 let people = [Person(name="Ada", age=36), Person(name="Bo", age=1)]
 print(repr(people))"#;
     assert_eq!(
-        run_gc_stress(src),
+        run(src),
         "[Person(name=\"Ada\", age=36), Person(name=\"Bo\", age=1)]\n",
     );
 }

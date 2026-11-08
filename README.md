@@ -1,7 +1,7 @@
 # froglang
 
 🐸 A compiled, statically-typed, expression-oriented language with a Cranelift JIT backend
-and a mark-sweep GC. Designed to be embeddable in Rust applications, fast compilation, decent runtime performance.
+and no garbage collector: every value has one owner, which frees it. Designed to be embeddable in Rust applications, fast compilation, decent runtime performance.
 Inspirations include Go (but better usability) and Lua.
 
 🐸 froglang is a programming language in development. 
@@ -9,7 +9,7 @@ Design points:
 - static types + bidirectional type inference
 - [mutable value semantics](https://research.google/pubs/mutable-value-semantics/)
 - fast compilation, decent runtime performance (currently uses Cranelift)
-- systems-ish (e.g., errors-as-values), but features a GC, like Go
+- systems-ish (e.g., errors-as-values), with single ownership and no GC
 - lightweight, ergonomic syntax
 - embeddable in Rust apps or standalone (WIP)
 
@@ -343,15 +343,7 @@ is generic over Cranelift's `Module`; the JIT drives a `JITModule`, `build` driv
 `cranelift-object` `ObjectModule`), emits a relocatable object, and links it against the
 runtime as a static library (`libfroglang_core.a`) with the system `cc`.
 
-Two things make this work despite the runtime's GC and host-function machinery:
-
-- **Stack maps are registered at load time.** The JIT files each function's GC stack maps by
-  its finalized address; an AOT binary doesn't know those addresses until it loads, so the
-  object carries a serialized stack-map table (each function's base filled by a relocation),
-  and a generated `main` calls `frog_register_stackmaps` once at startup before running any
-  froglang code. Verified against `FROG_GC_STRESS=1` — collecting on every allocation — so a
-  live value held across an allocation is never lost.
-- **The program runs for its side effects.** Like every other AOT-compiled language, a built
+**The program runs for its side effects.** Like every other AOT-compiled language, a built
   binary's output comes from explicit `print(...)`; the program's final expression value is
   evaluated and then **discarded**, not printed. (`frog run` still prints it, REPL-style —
   that is the one deliberate behavioral difference between `run` and `build`.)
@@ -359,12 +351,13 @@ Two things make this work despite the runtime's GC and host-function machinery:
 The AOT backend compiles at `opt_level=speed` (the JIT stays at `none`, where its one-time-
 per-run compile cost dominates); `build` pays codegen once, so the optimizer is free.
 
-## Runtime / GC
+## Runtime / memory
 
-Heap-allocated values (`Str`, `List`) are managed by a **mark-sweep garbage collector**.
-Each object has a `GcHeader` in an intrusive linked list. The GC triggers automatically
-after each JIT call when `bytes_allocated > threshold` (initial: 1 MB; grows with the
-live set).
+Heap-allocated values (`Str`, `List`, `Dict`, boxed unions) have exactly one owner, and
+codegen frees each one when its owner's scope ends (`plans/NOGC.md`). There is no
+garbage collector. A consumer that keeps a value it only has a view of deep-copies it;
+a binding's last use hands its value over instead. Freed blocks go onto size-class free
+lists for reuse. Debug builds check at teardown that every object was freed.
 
 - `FrogStr` — immutable, inline bytes after the header; NUL-terminated
 - `FrogList` — header + separate `i64` data buffer; grows via `realloc`
@@ -378,7 +371,7 @@ heap, set via an `ACTIVE_HEAP` thread-local pointer during JIT execution.
 | Name | Type | Description |
 |---|---|---|
 | `print(value)` | `Any -> None` | Coerce a value to text and print it with a newline |
-| `gc_dump()` | `() -> None` | Dump GC heap contents to stderr |
+| `gc_dump()` | `() -> None` | Print the live heap object count and bytes to stderr |
 | `panic(msg: Str)` | `Str -> Never` | Trap the process; `!`'s error arm just calls this, so it's callable directly too |
 
 ## REPL
@@ -399,7 +392,7 @@ entries remain in scope.
 **REPL meta-commands:**
 
 ```
-:gc    — dump live GC heap objects to stderr
+:gc    — print the live heap object count to stderr
 :help  — show available commands
 ```
 
@@ -419,8 +412,8 @@ let (value, ty) = state.eval("x")?;
 assert!(matches!(value, FrogValue::Int(42)));
 ```
 
-`FrogValue` deep-copies strings and lists out of the GC heap on return, so the host's
-lifetime is independent of the GC. Multiple `FrogState` instances on different threads
+`FrogValue` deep-copies strings and lists out of the heap on return (and frees the heap's
+copy), so the host owns what it gets. Multiple `FrogState` instances on different threads
 need no coordination — each owns its heap and JIT module (Lua model, no GIL).
 
 **Host functions** — froglang code can call back into Rust via `FrogState::builder()` and
@@ -603,7 +596,7 @@ cargo run -- build program.frog -o program
 # Run all tests
 cargo test
 
-# Verbose GC tracing (allocations, marks, frees to stderr)
+# Verbose heap tracing (allocations and frees to stderr)
 cargo test --features gc_trace
 
 # Dump the Cranelift IR codegen emitted, per function, to stderr

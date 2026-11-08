@@ -40,16 +40,13 @@ fn shout(s: String) -> String {
 }
 
 #[test]
-fn str_arg_and_return_round_trip_and_survive_a_collection() {
+fn str_arg_and_return_round_trip_and_persist_across_entries() {
     let mut s = FrogState::builder().func(shout_host()).build().unwrap();
     let (v, _) = s.eval("let r = shout(\"hi\")\nr").unwrap();
     assert_eq!(string(&v), "HI!");
 
-    // The returned Str must have been rooted (by `compile_host_call`'s
-    // `declare_gc_leaves` on the way out, and by `FrogState::eval`'s own
-    // root rebuild once it's bound to `r`) — force a collection and read
-    // it back through a fresh binding to prove it wasn't swept.
-    s.heap.force_collect();
+    // The returned Str is owned by the binding `r`, so a later entry can
+    // still read it.
     let (v2, _) = s.eval("r").unwrap();
     assert_eq!(string(&v2), "HI!");
 }
@@ -91,7 +88,7 @@ fn dict_arg_and_return_round_trip() {
 }
 
 #[test]
-fn dict_returned_from_a_host_fn_survives_a_collection() {
+fn dict_returned_from_a_host_fn_persists_across_entries() {
     let mut s = FrogState::builder().func(double_values_host()).build().unwrap();
     let (v, _) = s.eval(r#"let r = double_values(["a": 1])
 r"#).unwrap();
@@ -99,7 +96,6 @@ r"#).unwrap();
         FrogValue::Dict(pairs) => assert_eq!(pairs.len(), 1),
         other => panic!("expected Dict, got {:?}", other),
     }
-    s.heap.force_collect();
     let (v2, _) = s.eval("r").unwrap();
     match v2 {
         FrogValue::Dict(pairs) => {
@@ -148,11 +144,7 @@ fn type_mismatch_is_a_clean_type_error() {
 }
 
 /// A host function that allocates several values before any of them is
-/// written into `out` must keep every one of them alive — the scenario
-/// `FrogCtx::scope`'s root guard exists for. Exercised harder under
-/// `FROG_GC_STRESS=1` (collect on every allocation), which the test suite
-/// doesn't force globally, but this shape (multiple allocations, threshold
-/// forced low) is exactly what that mode stresses.
+/// written into `out` hands every one of them to the caller.
 #[frog_fn]
 fn build_three_strings(a: String, b: String, c: String) -> Vec<String> {
     vec![a, b, c]
@@ -161,7 +153,6 @@ fn build_three_strings(a: String, b: String, c: String) -> Vec<String> {
 #[test]
 fn multiple_allocations_in_one_host_call_all_survive() {
     let mut s = FrogState::builder().func(build_three_strings_host()).build().unwrap();
-    s.heap.force_collect(); // drop the threshold's slack so the next few allocations are likelier to trigger one
     let (v, _) = s.eval(r#"build_three_strings("a", "b", "c")"#).unwrap();
     match v {
         FrogValue::List(items) => {
@@ -169,25 +160,6 @@ fn multiple_allocations_in_one_host_call_all_survive() {
         }
         other => panic!("expected List, got {:?}", other),
     }
-}
-
-/// A raw `Int`/`Float` argument slot must never be rooted as a GC pointer
-/// (`RuntimeRoots::hold_masked`) — an integer big enough to look like a
-/// heap address, followed by an argument that actually allocates, used to
-/// crash the collector when it dereferenced the int as if it were a
-/// pointer.
-#[frog_fn]
-fn tag_it(n: i64, s: String) -> String {
-    format!("{}{}", s, n)
-}
-
-#[test]
-fn a_large_int_argument_slot_is_never_mistaken_for_a_gc_pointer() {
-    std::env::set_var("FROG_GC_STRESS", "1");
-    let mut s = FrogState::builder().func(tag_it_host()).build().unwrap();
-    let (v, _) = s.eval(r#"tag_it(123456789, "x")"#).unwrap();
-    std::env::remove_var("FROG_GC_STRESS");
-    assert_eq!(string(&v), "x123456789");
 }
 
 /// A host function that returns `()` and takes further arguments after

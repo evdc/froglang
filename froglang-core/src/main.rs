@@ -27,7 +27,7 @@ pub fn repl() {
                         }
                         ":help" => {
                             println!("REPL commands:");
-                            println!("  :gc    — dump GC heap state to stderr");
+                            println!("  :gc    — print the live heap object count to stderr");
                             println!("  :help  — show this message");
                             println!("froglang builtins: print(s), gc_dump()");
                         }
@@ -277,9 +277,6 @@ fn main() {
         }
         // no args → REPL
         _ => repl(),
-    }
-    if std::env::var_os("FROG_COPY_STATS").is_some() {
-        eprint!("{}", froglang_core::runtime::ffi::copy_stats_report());
     }
 }
 

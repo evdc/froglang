@@ -109,17 +109,3 @@ if r is Str then -1 else 404"#).unwrap();
     assert_eq!(int(&v), 404);
 }
 
-/// A collection that survives `FROG_GC_STRESS=1` — the `Err` arm allocates
-/// a `List` before the union around it is ever written to `out`, exactly
-/// the `FrogCtx::scope()` incremental-rooting scenario `test_host_fns.rs`'s
-/// `multiple_allocations_in_one_host_call_all_survive` already covers for a
-/// non-union return.
-#[test]
-fn err_arms_list_allocation_survives_a_collection() {
-    std::env::set_var("FROG_GC_STRESS", "1");
-    let mut s = FrogState::builder().func(first_word_host()).build().unwrap();
-    let (v, _) = s.eval(r#"let r = first_word("")
-if r is Str then -1 else 404"#).unwrap();
-    std::env::remove_var("FROG_GC_STRESS");
-    assert_eq!(int(&v), 404);
-}

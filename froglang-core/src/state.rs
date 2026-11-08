@@ -14,7 +14,8 @@ use crate::runtime;
 // ── Public value type ─────────────────────────────────────────────────────────
 
 /// A froglang value returned across the embedding boundary.
-/// Strings and lists are deep-copied out of the GC heap on return.
+/// Strings and lists are deep-copied out of the heap on return, and the
+/// heap's own copy is freed, so the host owns a `FrogValue` outright.
 #[derive(Debug, Clone)]
 pub enum FrogValue {
     Int(i64),
@@ -206,6 +207,11 @@ pub struct FrogState {
     /// never gets one, matching `entry_count`'s own "only successful entries
     /// consume a number" behavior below.
     pub entry_sources: Vec<EntrySource>,
+    /// The parameter conventions of every function an earlier entry
+    /// compiled, by name. Those functions free exactly the parameters they
+    /// consume, so a later entry calling one must hand over the same ones
+    /// (`conventions::infer`'s `prior`).
+    signatures:       crate::frontend::conventions::Signatures,
 }
 
 impl Default for FrogState {
@@ -250,13 +256,7 @@ impl FrogState {
 
     /// Set `ACTIVE_HEAP` to this state's heap, call `func_ptr` with the
     /// out-buffer pointer, then clear it.
-    fn call_jit(&mut self, func_ptr: fn(i64) -> i64, out_ptr: i64, out_gc_slots: Vec<usize>) -> i64 {
-        // `func_ptr` writes each top-level binding into `out_ptr` as soon as
-        // it is created, and the roots below are only rebuilt after this
-        // returns — so for the length of the call that buffer is the only
-        // thing keeping some of those values reachable. See
-        // `GcHeap::push_scanned_span`.
-        self.heap.push_scanned_span(out_ptr as *const i64, out_gc_slots);
+    fn call_jit(&mut self, func_ptr: fn(i64) -> i64, out_ptr: i64) -> i64 {
         ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut GcHeap));
         // Publish a `FrogCtx` a host call can fetch via `frog_ctx_current`
         // (`runtime::host`) — built from raw pointers into `self.heap`/
@@ -273,7 +273,6 @@ impl FrogState {
         };
         let result = crate::runtime::host::with_active_ctx(&mut host_ctx, || func_ptr(out_ptr));
         ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
-        self.heap.pop_scanned_span();
         result
     }
 
@@ -368,21 +367,15 @@ impl FrogState {
         // get real ids too.
         crate::frontend::liveness::number_nodes(&mut typed);
 
-        // NOGC step 1 (plans/NOGC.md §6): parameter conventions. Codegen reads
-        // them only under `FROG_OWNERSHIP` (step 2) and for the copy statistics.
-        // Gated so ordinary runs pay nothing.
-        if std::env::var_os("FROG_COPY_STATS").is_some()
-            || std::env::var_os("FROG_DUMP_CONVENTIONS").is_some()
-            || std::env::var_os("FROG_OWNERSHIP").is_some()
-        {
-            let mut borrowers = crate::frontend::conventions::builtin_borrowers();
-            borrowers.extend(self.codegen.imported_callees());
-            let conv = crate::frontend::conventions::infer(&typed, &borrowers);
-            if std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
-                eprint!("{}", conv.dump());
-            }
-            crate::frontend::conventions::publish(&conv);
+        // Parameter conventions (plans/NOGC.md §1.2): which arguments a callee
+        // only borrows, so codegen knows who frees them.
+        let mut borrowers = crate::frontend::conventions::builtin_borrowers();
+        borrowers.extend(self.codegen.imported_callees());
+        let conv = crate::frontend::conventions::infer(&typed, &borrowers, &self.signatures);
+        if std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
+            eprint!("{}", conv.dump());
         }
+        crate::frontend::conventions::publish(&conv);
 
         // `TRAITS.md` Part 7: `Linear` violations are type errors, and must
         // be caught here — before codegen, which has no way to report a
@@ -443,6 +436,7 @@ impl FrogState {
         // both are keyed by the same `entry_count` captured above.
         self.entry_sources.push(EntrySource { filename, source: src.to_string() });
         self.entry_count += 1;
+        conv.record_signatures(&mut self.signatures);
 
         let ptr = self.codegen.module.get_finalized_function(main_id);
         let func_ptr: fn(i64) -> i64 = unsafe { std::mem::transmute(ptr) };
@@ -455,8 +449,7 @@ impl FrogState {
             .sum();
         let mut out_buf: Vec<i64> = vec![0i64; total_slots];
         let out_ptr = out_buf.as_mut_ptr() as i64;
-        let out_gc_slots = crate::codegen::gc_slots_of_bindings(&bindings, self.tc.struct_defs());
-        let bits = self.call_jit(func_ptr, out_ptr, out_gc_slots);
+        let bits = self.call_jit(func_ptr, out_ptr);
 
         let mut cursor = 0usize;
         for (name, ty) in &bindings {
@@ -466,73 +459,31 @@ impl FrogState {
             cursor += width;
         }
 
-        // Rebuild the GC's explicit root set from scratch every time, from
-        // exactly what's currently live: this entry's own result (which
-        // needs to survive long enough for `FrogValue::from_bits` below)
-        // plus every heap-typed binding still in `env`. The old code only
-        // ever pushed roots and never popped them, so every string or list
-        // any entry had ever produced — including ones since shadowed or
-        // rebound — stayed alive for the process's lifetime.
-        self.heap.clear_roots();
-        // `Type::Union` belongs here alongside `Str`/`List`: a union value
-        // is a GC-visible word (`codegen::is_heap_ty`) exactly like the
-        // other two. It used to be missing, so the result of an entry that
-        // produced a `data`-union value was left unrooted for as long as
-        // `from_bits` needed it below.
-        //
-        // Not a bare `matches!` on `result_ty`, though: `bits` is only ever
-        // *leaf 0* of the result's flattened value (`build_main_body`'s
-        // return is always a single i64), and whether that leaf is a
-        // scannable column is a property of the column, not of the whole
-        // type — route through `heap_roots_in_leaves` so it is decided the
-        // same way the bindings loop below decides it.
-        //
-        // `get(..1)` rather than `[..1]`: a zero-leaf result type (`Type::None`
-        // flattens to one leaf, but a struct with no fields flattens to none)
-        // would otherwise panic on the slice.
+        // `bits` is only *leaf 0* of the result's flattened value
+        // (`build_main_body`'s return is always a single i64); whether that
+        // leaf owns an object is a property of its column, so route through
+        // `heap_leaves` as the bindings are. `get(..1)` rather than
+        // `[..1]`: a struct with no fields flattens to no leaves at all.
         let result_leaf0 = crate::codegen::struct_fields(&result_ty, self.tc.struct_defs());
-        for v in crate::codegen::heap_roots_in_leaves(&[bits], result_leaf0.get(..1).unwrap_or_default()) {
-            self.heap.push_root(v, true);
-        }
-        for (name, ty) in &self.env_types {
-            if let Some(vals) = self.env.get(name) {
-                let leafs = crate::codegen::struct_fields(ty, self.tc.struct_defs());
-                // Not a plain per-leaf `matches!` on the type: which
-                // flattened leaves are GC-scannable columns is
-                // `struct_fields`'s business, not something to re-derive
-                // here. See `codegen::heap_roots_in_leaves`.
-                for v in crate::codegen::heap_roots_in_leaves(vals, &leafs) {
-                    self.heap.push_root(v, true);
-                }
-            }
-        }
-
-        self.heap.maybe_collect();
-
         let value = FrogValue::from_bits(bits, &result_ty, &self.heap);
-        // Ownership: the entry handed its result over, and `value` is a deep copy,
-        // so the result's own objects are released here.
-        if self.heap.is_owned() {
-            for v in crate::codegen::heap_roots_in_leaves(&[bits], result_leaf0.get(..1).unwrap_or_default()) {
-                self.heap.drop_word(v);
-            }
+        // The entry handed its result over, and `value` is a deep copy, so
+        // the result's own objects are released here.
+        for v in crate::codegen::heap_leaves(&[bits], result_leaf0.get(..1).unwrap_or_default()) {
+            self.heap.drop_word(v);
         }
         Ok((value, result_ty))
     }
 }
 
-/// `FROG_OWNERSHIP` teardown: release the bindings this state still holds, and
-/// with `FROG_LEAK_CHECK`, fail on any object that is still live. A leak panics
+/// Teardown: release the bindings this state still holds, and fail on any
+/// object that is still live (in debug builds, or under `FROG_LEAK_CHECK`). A leak panics
 /// with a `leak:` message, so a leaking run exits nonzero and a leaking test fails.
 impl Drop for FrogState {
     fn drop(&mut self) {
-        if !self.heap.is_owned() {
-            return;
-        }
         for (name, ty) in &self.env_types {
             if let Some(vals) = self.env.get(name) {
                 let leafs = crate::codegen::struct_fields(ty, self.tc.struct_defs());
-                for v in crate::codegen::heap_roots_in_leaves(vals, &leafs) {
+                for v in crate::codegen::heap_leaves(vals, &leafs) {
                     self.heap.drop_word(v);
                 }
             }
@@ -540,7 +491,7 @@ impl Drop for FrogState {
         // Not while unwinding: a panicking entry leaves its temporaries behind,
         // and a second panic would abort before the first one is reported.
         if self.heap.leak_check_enabled() && self.heap.live_objects() != 0 && !std::thread::panicking() {
-            panic!("leak: {} GC object(s) still live after teardown", self.heap.live_objects());
+            panic!("leak: {} heap object(s) still live after teardown", self.heap.live_objects());
         }
     }
 }
@@ -676,6 +627,7 @@ impl FrogStateBuilder {
             env_types:    HashMap::new(),
             entry_count:  0,
             entry_sources: Vec::new(),
+            signatures:   Default::default(),
         };
 
         // Host `data` types, if any, before anything references them.

@@ -24,7 +24,7 @@
 //!    the type checker had already accepted.
 
 mod common;
-use common::{run, run_gc_stress, run_raw};
+use common::{run, run_raw};
 use froglang_core::state::{FrogState, FrogValue};
 
 fn int(v: &FrogValue) -> i64 {
@@ -399,12 +399,11 @@ fn two_textually_identical_lambdas_are_still_two_lambdas() {
 // ── captured heap values ─────────────────────────────────────────────────────
 
 #[test]
-fn a_captured_list_is_rooted() {
-    // A capture becomes an ordinary parameter, and parameters are already
-    // GC roots — so this should need nothing new. Under stress it either
-    // proves that or exposes the assumption.
+fn a_captured_list_is_read_through_its_parameter() {
+    // A capture becomes an ordinary parameter, which the lifted function
+    // only borrows, so the list is neither copied nor freed by the call.
     assert_eq!(
-        run_gc_stress("let xs = [1, 2, 3]\n\
+        run("let xs = [1, 2, 3]\n\
                        let f = i -> xs[i] * 10\n\
                        print(f(0) + f(1) + f(2))"),
         "60\n",
@@ -412,9 +411,9 @@ fn a_captured_list_is_rooted() {
 }
 
 #[test]
-fn a_captured_str_survives_collection_in_a_loop() {
+fn a_captured_str_is_reused_across_a_loop() {
     assert_eq!(
-        run_gc_stress("let prefix = \"item-\"\n\
+        run("let prefix = \"item-\"\n\
                        func label(n: Int): Str = prefix + int_to_str(n)\n\
                        for i in 0..3 do print(label(i))"),
         "item-0\nitem-1\nitem-2\n",
@@ -423,8 +422,8 @@ fn a_captured_str_survives_collection_in_a_loop() {
 
 #[test]
 fn a_captured_list_keeps_value_semantics() {
-    // Capture is a read of the binding like any other, so the existing
-    // copy-on-write share-mark applies and the original is untouched.
+    // Capture is a read of the binding like any other, so `mut ys = xs`
+    // copies it and the original is untouched.
     assert_eq!(
         run("let xs = [1, 2, 3]\n\
              func total(): Int = {\n\

@@ -32,7 +32,7 @@ pub mod dom;
 use std::cell::RefCell;
 
 use super::ffi::with_heap;
-use super::gc::{GcHeap, RuntimeRoots};
+use super::gc::{GcHeap};
 use super::read::read_str_arg;
 use dom::{Json, Kind};
 
@@ -93,11 +93,8 @@ fn null_doc() -> Json {
 /// two tiers must not share an escape table).
 #[no_mangle]
 pub extern "C" fn frog_json_escape(s: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
-    let _roots = RuntimeRoots::hold(&[s]);
     let escaped = dom::escape(&read_str_arg(s));
     with_heap(|heap: &mut GcHeap| {
-        heap.maybe_collect();
         heap.alloc_str(escaped.as_bytes()) as i64
     })
 }
@@ -107,10 +104,8 @@ pub extern "C" fn frog_json_escape(s: i64) -> i64 {
 /// `null` rather than an error.
 #[no_mangle]
 pub extern "C" fn frog_json_float_repr(f: f64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let s = dom::float(f);
     with_heap(|heap: &mut GcHeap| {
-        heap.maybe_collect();
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
@@ -119,8 +114,6 @@ pub extern "C" fn frog_json_float_repr(f: f64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn frog_json_open(s: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
-    let _roots = RuntimeRoots::hold(&[s]);
     let src = read_str_arg(s);
 
     let (root, err) = match dom::parse(&src) {
@@ -153,11 +146,9 @@ pub extern "C" fn frog_json_offset() -> i64 {
 /// — kept total rather than panicking, exactly like `frog_read_msg`.
 #[no_mangle]
 pub extern "C" fn frog_json_msg() -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let msg = JSON_STATE.with(|st| st.borrow().as_ref().and_then(|s| s.err.clone()).map(|(m, _)| m))
         .unwrap_or_default();
     with_heap(|heap: &mut GcHeap| {
-        heap.maybe_collect();
         heap.alloc_str(msg.as_bytes()) as i64
     })
 }
@@ -256,15 +247,9 @@ pub extern "C" fn frog_json_bool(node: i64) -> i8 {
 
 #[no_mangle]
 pub extern "C" fn frog_json_str(node: i64) -> i64 {
-    // ⚠ The `jit_frame_guard!` is load-bearing and its absence is silent:
-    // this is the one accessor here that allocates *and* is reachable from
-    // a loop (`List<Str>`). `frog_read_str` shipped without it in stage 5
-    // and aliased list elements under `FROG_GC_STRESS=1`.
-    let _jit_frame = crate::jit_frame_guard!();
     let s: Option<String> = with_node(node, |n| dom::as_str(n).map(str::to_string));
     let s = s.unwrap_or_else(|| { mark_failed("expected a Str"); String::new() });
     with_heap(|heap: &mut GcHeap| {
-        heap.maybe_collect();
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
@@ -324,15 +309,12 @@ pub extern "C" fn frog_json_obj_len(node: i64) -> i64 {
     })
 }
 
-/// `node`'s `i`th member's key, as a fresh `Str`. `frog_json_str`'s twin —
-/// see its doc comment for why `jit_frame_guard!` is load-bearing here too.
+/// `node`'s `i`th member's key, as a fresh `Str`. `frog_json_str`'s twin.
 #[no_mangle]
 pub extern "C" fn frog_json_key_at(node: i64, i: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let k: Option<String> = with_node(node, |n| dom::entry_at(n, i as usize).map(|(k, _)| k.to_string()));
     let k = k.unwrap_or_else(|| { mark_failed(format!("missing object member {}", i)); String::new() });
     with_heap(|heap: &mut GcHeap| {
-        heap.maybe_collect();
         heap.alloc_str(k.as_bytes()) as i64
     })
 }

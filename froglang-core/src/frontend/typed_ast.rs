@@ -174,7 +174,7 @@ pub enum TypedExprKind {
     StrLit(String),
     /// The `none` literal — the singleton `Type::None` value. Standing on
     /// its own it compiles to `gc::IMMEDIATE_NONE`, a word in the reserved
-    /// `111` class that the collector never follows. As a *member* of a
+    /// `111` class that never names an object. As a *member* of a
     /// union it is not that at all: an inline union represents it as its
     /// member tag, a boxed one as `gc::immediate_variant` of its tag — see
     /// `TypedExprKind::Widen`.

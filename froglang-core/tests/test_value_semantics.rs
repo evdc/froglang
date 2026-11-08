@@ -1,31 +1,17 @@
 //! Value semantics for `List<T>`, and `push` — MUTABILITY.md stages 6 and 7.
 //!
-//! Distinct from `test_gc_roots.rs`: that file guards against a *missing
-//! root* (a value the collector should have kept alive but didn't). This
-//! file guards against an alias becoming observable — two live bindings
-//! sharing one heap object where value semantics say they must not. Both bug
-//! classes can be forced into the open by `FROG_GC_STRESS=1` (a wrongly
-//! shared buffer that gets mutated and then collected/recycled corrupts a
-//! second binding's contents), so every behavioral test here runs through
-//! both `run` and `run_gc_stress`, same discipline as `test_gc_roots.rs`.
+//! These guard against an alias becoming observable — two live bindings
+//! sharing one heap object where value semantics say they must not.
 //!
-//! The mechanism is copy-on-write (Stage 7). A `Copy`-classified read of a
-//! `List` binding, and any read of one *out of a container*, marks the
-//! object `shared` (`codegen::mark_shared_if_aliased` /
-//! `mark_shared_extracted`); the two mutations that exist — `push` and index
-//! assignment — copy first if that bit is set (`codegen::emit_unshare`) and
-//! rebind their root to the copy. A `Move`-classified read is the name's
-//! last use, so it marks nothing; `push`'s own receiver is always `Move` by
-//! construction (`liveness.rs`'s `Call`/`mut_args` handling), which is the
-//! elision this whole design exists to deliver.
-//!
-//! Stage 6 deep-copied at the read instead. Stage 7's tests below carry
-//! `run_cow_verify` in addition, because moving the copy to the write
-//! introduces a failure mode the earlier scheme did not have: an aliasing
-//! site that forgets to mark.
+//! The mechanism is single ownership (plans/NOGC.md §6 step 2). Every heap
+//! value has exactly one owner, and a consumer that keeps a value it only
+//! has a view of (a binding read that is not the name's last use, an
+//! element or field read out of a container) deep-copies it
+//! (`codegen::own_vals`). A `Move`-classified read is the name's last use,
+//! so the binding hands its value over and nothing is copied.
 
 mod common;
-use common::{run, run_cow_verify, run_gc_stress};
+use common::run;
 
 /// The canonical case: aliasing a `mut` list and mutating the alias must
 /// not be observable through the original binding. If `mut b = a`'s `Var`
@@ -41,7 +27,6 @@ print(a)
 print(b)
 "#;
     assert_eq!(run(src), "[1, 2, 3]\n[1, 2, 3, 4]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2, 3]\n[1, 2, 3, 4]\n");
 }
 
 /// Struct-element variant: exercises `stride > 1` in `frog_clone`'s `List`
@@ -59,7 +44,6 @@ print(b[2].x)
 print(b[2].name)
 "#;
     assert_eq!(run(src), "1\n3\nc\n");
-    assert_eq!(run_gc_stress(src), "1\n3\nc\n");
 }
 
 /// Loop-carried alias — the highest-risk shape, since it exercises
@@ -86,7 +70,6 @@ func go(): Int = {
 print(go())
 "#;
     assert_eq!(run(src), "3002\n");
-    assert_eq!(run_gc_stress(src), "3002\n");
 }
 
 /// Pure correctness of `push` in a loop with no aliasing at all. This is
@@ -101,7 +84,6 @@ for i in 0..5 do push(mut xs, i)
 print(xs)
 "#;
     assert_eq!(run(src), "[0, 1, 2, 3, 4]\n");
-    assert_eq!(run_gc_stress(src), "[0, 1, 2, 3, 4]\n");
 }
 
 /// Composition with a user `func`'s own `mut` parameter: `push` inside a
@@ -119,7 +101,6 @@ print(a)
 print(b)
 "#;
     assert_eq!(run(src), "[1, 2, 3]\n[1, 2, 3, 99]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2, 3]\n[1, 2, 3, 99]\n");
 }
 
 /// An empty-list literal passed as a `mut` argument, into a parameter whose
@@ -186,17 +167,7 @@ fn push_with_the_same_root_as_both_arguments_is_rejected() {
     );
 }
 
-// ── MUTABILITY.md Stage 7: copy-on-write ─────────────────────────────────────
-//
-// Stage 6 protected an alias by deep-copying it at the *read*. Stage 7 marks
-// it and copies at the *write* instead, which is what made the three
-// extraction cases below affordable to fix at all — under eager copying,
-// closing them meant a clone per element read.
-//
-// These run under `run_cow_verify` as well as `run`/`run_gc_stress`: the
-// failure mode copy-on-write has is a missed `shared` mark, and that check
-// catches it at the barrier rather than waiting for a wrong value to
-// surface. See `common::run_cow_verify`.
+// ── extraction: a value read out of a container ─────────────────────────────
 
 /// Reading a list *out of a container* aliases it — the container keeps its
 /// own path to it — so pushing through the extracted binding must not be
@@ -212,8 +183,6 @@ print(rows)
 print(inner)
 "#;
     assert_eq!(run(src), "[[1, 2], [3, 4]]\n[1, 2, 9]\n");
-    assert_eq!(run_gc_stress(src), "[[1, 2], [3, 4]]\n[1, 2, 9]\n");
-    assert_eq!(run_cow_verify(src), "[[1, 2], [3, 4]]\n[1, 2, 9]\n");
 }
 
 /// The same aliasing through a `for`-loop's element binding, which is the
@@ -230,8 +199,6 @@ for row in rows do {
 print(rows)
 "#;
     assert_eq!(run(src), "[[1, 2], [3, 4]]\n");
-    assert_eq!(run_gc_stress(src), "[[1, 2], [3, 4]]\n");
-    assert_eq!(run_cow_verify(src), "[[1, 2], [3, 4]]\n");
 }
 
 /// And through a struct field. Before Stage 7 both lines printed
@@ -247,8 +214,6 @@ print(b.items)
 print(got)
 "#;
     assert_eq!(run(src), "[1, 2]\n[1, 2, 3]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2]\n[1, 2, 3]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2]\n[1, 2, 3]\n");
 }
 
 /// A list bound to an *immutable* name and then aliased into a `mut` one:
@@ -265,8 +230,6 @@ print(a)
 print(b)
 "#;
     assert_eq!(run(src), "[1, 2, 3]\n[1, 2, 3, 4]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2, 3]\n[1, 2, 3, 4]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2, 3]\n[1, 2, 3, 4]\n");
 }
 
 /// A callee rebinding an immutable parameter to a `mut` local and pushing:
@@ -286,8 +249,6 @@ print(f(a))
 print(a)
 "#;
     assert_eq!(run(src), "4\n[1, 2, 3]\n");
-    assert_eq!(run_gc_stress(src), "4\n[1, 2, 3]\n");
-    assert_eq!(run_cow_verify(src), "4\n[1, 2, 3]\n");
 }
 
 /// Index assignment is the other mutation the write barrier guards, and it
@@ -303,8 +264,6 @@ print(a)
 print(b)
 "#;
     assert_eq!(run(src), "[1, 2, 3]\n[99, 2, 3]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2, 3]\n[99, 2, 3]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2, 3]\n[99, 2, 3]\n");
 }
 
 /// The elision that makes this worth doing: a list only ever *read* — passed
@@ -324,8 +283,6 @@ print(total)
 print(grid)
 "#;
     assert_eq!(run(src), "10\n[[1, 2], [3, 4]]\n");
-    assert_eq!(run_gc_stress(src), "10\n[[1, 2], [3, 4]]\n");
-    assert_eq!(run_cow_verify(src), "10\n[[1, 2], [3, 4]]\n");
 }
 
 /// Reading a list for its length creates no alias, so it must not mark the
@@ -353,7 +310,6 @@ print(seen)
     // seen is 0+1+...+1999 = 1999000 only if every `len` observed the list
     // the pushes are actually growing — i.e. no copy diverted them.
     assert_eq!(run(src), "2000\n1999000\n");
-    assert_eq!(run_cow_verify(src), "2000\n1999000\n");
 }
 
 /// The same for `print`, which walks a list and stores nothing.
@@ -374,7 +330,6 @@ for i in 0..3 do {
 print(xs)
 "#;
     assert_eq!(run(src), "[]\n[0]\n[0, 1]\n[0, 1, 2]\n");
-    assert_eq!(run_cow_verify(src), "[]\n[0]\n[0, 1]\n[0, 1, 2]\n");
 }
 
 // ── Stage 8: mutable places ─────────────────────────────────────────────────
@@ -396,18 +351,14 @@ push(mut b.items, 3)
 print(b.items)
 "#;
     assert_eq!(run(src), "[1, 2, 3]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2, 3]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2, 3]\n");
 }
 
 /// Copying a struct aliases the lists hanging off it, so mutating one
 /// through the original must not be visible through the copy.
 ///
-/// This was a real soundness hole, and it predates Stage 8 — the
-/// index-assign half of it (`b.items[0] = 99`) has always been legal.
-/// `mark_shared_if_aliased` only marked a value whose *own* type was
-/// `List`, so copying the enclosing struct marked nothing; see its doc
-/// comment.
+/// This was a real soundness hole under copy-on-write, which only marked a
+/// value whose *own* type was `List`, so copying the enclosing struct marked
+/// nothing.
 #[test]
 fn copying_a_struct_does_not_share_its_list_field() {
     let src = r#"
@@ -420,8 +371,6 @@ print(c.items)
 print(b.items)
 "#;
     assert_eq!(run(src), "[1, 2]\n[99, 2, 3]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2]\n[99, 2, 3]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2]\n[99, 2, 3]\n");
 }
 
 /// Assignment through nested list indices — the Game-of-Life shape, and the
@@ -435,8 +384,6 @@ rows[1][0] = 99
 print(rows)
 "#;
     assert_eq!(run(src), "[[1, 2], [99, 4]]\n");
-    assert_eq!(run_gc_stress(src), "[[1, 2], [99, 4]]\n");
-    assert_eq!(run_cow_verify(src), "[[1, 2], [99, 4]]\n");
 }
 
 /// ...and pushing to an inner list reached by index.
@@ -448,8 +395,6 @@ push(mut rows[0], 7)
 print(rows)
 "#;
     assert_eq!(run(src), "[[1, 2, 7], [3, 4]]\n");
-    assert_eq!(run_gc_stress(src), "[[1, 2, 7], [3, 4]]\n");
-    assert_eq!(run_cow_verify(src), "[[1, 2, 7], [3, 4]]\n");
 }
 
 /// A path that alternates field and index steps, so the walk has to add a
@@ -465,8 +410,6 @@ push(mut g.cells[0], 9)
 print(g.cells)
 "#;
     assert_eq!(run(src), "[[1, 2, 9], [3, 42]]\n");
-    assert_eq!(run_gc_stress(src), "[[1, 2, 9], [3, 42]]\n");
-    assert_eq!(run_cow_verify(src), "[[1, 2, 9], [3, 42]]\n");
 }
 
 /// Value semantics through a nested write: an alias of the *outer* list must
@@ -485,8 +428,6 @@ print(copy)
 print(rows)
 "#;
     assert_eq!(run(src), "[[1, 2], [3, 4]]\n[[99, 2], [3, 4, 7]]\n");
-    assert_eq!(run_gc_stress(src), "[[1, 2], [3, 4]]\n[[99, 2], [3, 4, 7]]\n");
-    assert_eq!(run_cow_verify(src), "[[1, 2], [3, 4]]\n[[99, 2], [3, 4, 7]]\n");
 }
 
 /// The other direction: a binding extracted *out* of the outer list must not
@@ -502,8 +443,6 @@ print(inner)
 print(rows)
 "#;
     assert_eq!(run(src), "[1, 2, 7]\n[[99, 2], [3, 4]]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2, 7]\n[[99, 2], [3, 4]]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2, 7]\n[[99, 2], [3, 4]]\n");
 }
 
 /// One list stored twice in an outer list is still one object, so pushing
@@ -519,8 +458,6 @@ print(xs)
 print(rows)
 "#;
     assert_eq!(run(src), "[1, 2]\n[[1, 2, 99], [1, 2]]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2]\n[[1, 2, 99], [1, 2]]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2]\n[[1, 2, 99], [1, 2]]\n");
 }
 
 /// A `mut` argument still has to be a place, not an arbitrary expression.
@@ -554,8 +491,6 @@ print(b.items)
 print(rows)
 "#;
     assert_eq!(run(src), "[1, 2, 9]\n[[1], [2, 9]]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2, 9]\n[[1], [2, 9]]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2, 9]\n[[1], [2, 9]]\n");
 }
 
 /// ...and it stays value-semantic: an alias taken before the call must not
@@ -579,6 +514,4 @@ print(c.items)
 print(b.items)
 "#;
     assert_eq!(run(src), "[1, 2]\n[1, 2, 9]\n");
-    assert_eq!(run_gc_stress(src), "[1, 2]\n[1, 2, 9]\n");
-    assert_eq!(run_cow_verify(src), "[1, 2]\n[1, 2, 9]\n");
 }

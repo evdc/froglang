@@ -123,11 +123,7 @@ fn test_let_in_conditional_branch_is_a_type_error_not_a_crash() {
     assert!(s2.eval("let c = true\nif c then let y = 5 else 0\ny").is_err());
 }
 
-/// Rebinding the same name must let the *old* value become garbage. Before
-/// this was fixed, `GcHeap`'s explicit root set only ever grew (every value
-/// any entry had ever produced was pushed once and never popped), so a
-/// shadowed/rebound value stayed live — and rooted — for the rest of the
-/// process, even though nothing could reach it anymore.
+/// Rebinding the same name across entries must free the *old* value.
 #[test]
 fn test_rebinding_same_name_does_not_leak_old_value() {
     let mut s = FrogState::new();
@@ -135,16 +131,7 @@ fn test_rebinding_same_name_does_not_leak_old_value() {
     for _ in 0..500 {
         s.eval(&format!(r#"let s = "{}""#, big)).unwrap();
     }
-    // gc_threshold grows to 2x the live set on every collection, so an
-    // automatic collection can legitimately skip several hundred KB of
-    // *real* garbage before the next one fires — force one final sweep for
-    // a deterministic check, rather than assert on however far the
-    // self-growing threshold happened to get in 500 iterations.
-    // Under `FROG_OWNERSHIP` each rebinding frees the value it replaces, so
-    // there is nothing to sweep: the bound below holds without a collection.
-    if !s.heap.is_owned() {
-        s.heap.force_collect();
-    }
+    // Each rebinding frees the value it replaces.
     // Only the *latest* `s` (~4000 bytes plus its GC header) should still be
     // live. Under the old accumulate-forever roots, this would be on the
     // order of 500 * 4000 = 2,000,000 bytes instead.
@@ -204,32 +191,13 @@ fn test_let_in_conditional_branch_visible_within_branch_and_state_recovers() {
     assert_eq!(int(&recovered), 2);
 }
 
-/// End-to-end stress for the two GC mechanisms a program exercises on every
-/// heap-touching call: Cranelift's stack-map roots (RUNTIME.md Part 2,
-/// `gc.rs`'s "Precise roots"), and the size-class free lists `GcHeap::sweep`
-/// recycles blocks onto.
-///
-/// Both replaced simpler-but-slower designs (a hand-written shadow stack,
-/// and a straight `alloc`/`dealloc` per object). Their failure mode is not
-/// a wrong answer in the small — every existing test still passes against a
-/// that drops a frame, or a free list that hands out a block still reachable
-/// from somewhere — but corruption that only appears once collections
-/// actually fire *while* a deep call stack holds heap values in registers.
-/// That needs three things at once, which is what this builds:
-///
-///   * a large structure that stays reachable across many collections
-///     (`spine`), so the mark phase has to find it through the shadow chain
-///     rather than trivially through the entry frame;
-///   * enough garbage churn to drive many collections and so recycle
-///     thousands of blocks through the free lists;
-///   * recursion deep enough that the shadow chain is many frames long when
-///     a collection fires mid-call.
-///
-/// The assertion is that the retained structure still sums correctly at the
-/// end. A dropped frame or a prematurely recycled block shows up here as a
-/// wrong total or a crash, not as a subtle slowdown.
+/// End-to-end stress for the size-class free lists: a large structure
+/// (`spine`) bound in one entry stays intact while a later entry builds and
+/// frees thousands of blocks of garbage through deep recursion, which the
+/// free lists recycle. A block freed while still owned, or handed out
+/// twice, shows up here as a wrong total or a crash.
 #[test]
-fn test_gc_survives_churn_against_a_deep_retained_structure() {
+fn test_churn_against_a_deep_retained_structure() {
     let mut s = FrogState::new();
     s.eval(
         r#"
@@ -247,8 +215,7 @@ func total(c: Chain): Int = match c {
     s.eval("let spine = build(800, Nil)").unwrap();
 
     // Churn: each round builds and discards a chain of its own, and also
-    // re-walks `spine` — so `spine`'s cells are live, in registers, and
-    // deep in the shadow chain at the moment a collection fires.
+    // re-walks `spine`, borrowing it.
     let (v, _) = s
         .eval(
             r#"
@@ -268,13 +235,9 @@ checksum
     let (after, _) = s.eval("total(spine)").unwrap();
     assert_eq!(int(&after), 320400);
 
-    // And a forced sweep must reclaim all the garbage, leaving only the
-    // spine — the free lists recycle blocks rather than returning them to
-    // the system allocator, but `bytes_allocated` still counts live bytes
-    // only, so this is the same bound it always was.
-    if !s.heap.is_owned() {
-        s.heap.force_collect();
-    }
+    // Every round's garbage was freed, leaving only the spine. The free
+    // lists recycle blocks rather than returning them to the system
+    // allocator, but `bytes_allocated` counts live bytes only.
     assert!(
         s.heap.bytes_allocated < 200_000,
         "expected the churn to be collected, but {} bytes are still live",
@@ -500,4 +463,21 @@ fn test_a_rejected_impl_leaves_the_registries_clean_and_can_be_retried() {
     s.eval("data Circle(r: Int) provides Shape { func area(c: Circle): Int = c.r }").unwrap();
     let (v, _) = s.eval("Circle(r=4).area()").unwrap();
     assert_eq!(int(&v), 4);
+}
+
+// ── Ownership across entries (plans/NOGC.md §6 step 3c) ──────────────────────
+
+/// A function an earlier entry compiled frees exactly the parameters it
+/// consumes, so a later entry's calls must hand over the same ones. `size`
+/// only borrows its list: when later entries treated it as consuming, every
+/// argument they passed was handed to a callee that never freed it, and the
+/// teardown leak check (on in debug builds) failed.
+#[test]
+fn a_borrowing_function_from_an_earlier_entry_is_called_as_a_borrower() {
+    let mut s = FrogState::new();
+    s.eval("func size(xs: List<Str>): Int = len(xs)").unwrap();
+    s.eval("func keep(xs: List<Str>): List<Str> = xs").unwrap();
+    let (v, _) = s.eval("let a = [\"x\", \"y\"]\nsize(a) + size([\"z\"]) + len(keep(a))").unwrap();
+    assert_eq!(int(&v), 5);
+    assert_eq!(s.heap.live_objects(), 3, "only `a` and its two strings remain");
 }

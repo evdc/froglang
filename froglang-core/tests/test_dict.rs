@@ -4,7 +4,7 @@
 //! exercises.
 
 mod common;
-use common::{run, run_raw, run_gc_stress, run_cow_verify};
+use common::{run, run_raw};
 
 fn type_error(src: &str) -> String {
     let ast = froglang_core::frontend::parser::Parser::parse(src).expect("parse error");
@@ -216,7 +216,7 @@ fn nested_dict_mutation_works_and_does_not_alias() {
 }
 
 #[test]
-fn mutation_survives_under_the_cow_aliasing_verifier() {
+fn mutating_a_copy_does_not_affect_the_original() {
     let src = r#"
         mut a = ["a": 1]
         mut b = a
@@ -224,7 +224,7 @@ fn mutation_survives_under_the_cow_aliasing_verifier() {
         print(a)
         print(b)
     "#;
-    assert_eq!(run_cow_verify(src), "[\"a\": 1]\n[\"a\": 2]\n");
+    assert_eq!(run(src), "[\"a\": 1]\n[\"a\": 2]\n");
 }
 
 // ── remove ───────────────────────────────────────────────────────────────────
@@ -345,11 +345,11 @@ fn json_to_str_rejects_a_non_str_keyed_dict() {
 }
 
 #[test]
-fn a_dict_survives_a_forced_collection_with_str_keys_and_values() {
+fn a_dict_with_str_keys_and_values_grows_past_its_capacity() {
     let src = r#"
         mut d = [:]
         for i in 0..64 do d[repr(i)] = repr(i)
         print(len(d))
     "#;
-    assert_eq!(run_gc_stress(src), "64\n");
+    assert_eq!(run(src), "64\n");
 }

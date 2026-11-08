@@ -5,8 +5,8 @@
 //! self-referential is flattened into `codegen::UnionLayout`'s columns
 //! instead of being boxed: pointer columns first (slot 0 carrying the member
 //! tag in its low 3 bits), then scalar columns. Every column's pointer-ness
-//! is then a static property of the column, which is what lets the collector
-//! run one uniform `gc::is_heap_ptr` rule over every word in the system.
+//! is then a static property of the column, which is what lets drops and
+//! copies run one uniform `gc::is_heap_ptr` rule over every word.
 //!
 //! What is worth testing here is the boundaries, since the middle of the
 //! range is covered by every other union test in the suite:
@@ -29,16 +29,12 @@
 //!   * an exhaustive `match` emits no tag test for its rightmost arm, and
 //!     the arms around it still bind, guard and fall through correctly.
 //!
-//! Each runs under `FROG_GC_STRESS=1` as well as normally: a collection on
-//! every allocation is what turns a mis-encoded word from a latent bug into
-//! a failure, and the encoding is the whole point of the change.
 
 mod common;
-use common::{run, run_gc_stress};
+use common::run;
 
 fn both(src: &str, expected: &str) {
-    assert_eq!(run(src), expected, "normal run");
-    assert_eq!(run_gc_stress(src), expected, "under FROG_GC_STRESS=1");
+    assert_eq!(run(src), expected);
 }
 
 // ── inline layout: scalars only ───────────────────────────────────────────────
@@ -71,9 +67,7 @@ print(Percent(pct=7))
 
 /// A payload-less member of an inline union is no longer an immediate at
 /// all — it is simply its tag, sitting in slot 0 with the pointer part
-/// zero, so it masks to `0` and the collector correctly declines to follow
-/// it. Allocating hard between constructing and reading it is what makes
-/// that observable.
+/// zero, so it masks to `0` and a drop correctly declines to follow it.
 #[test]
 fn payload_less_member_of_an_inline_union_is_just_its_tag() {
     both(

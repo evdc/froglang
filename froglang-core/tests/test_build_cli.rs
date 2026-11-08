@@ -31,8 +31,8 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
-/// Build `src` and run the binary (optionally under `FROG_GC_STRESS`).
-fn build_and_run(test: &str, src: &str, gc_stress: bool) -> Output {
+/// Build `src` and run the binary.
+fn build_and_run(test: &str, src: &str) -> Output {
     ensure_runtime_lib();
     let dir = scratch(test);
     let out = dir.join("prog");
@@ -40,11 +40,7 @@ fn build_and_run(test: &str, src: &str, gc_stress: bool) -> Output {
         .output().unwrap();
     assert!(build.status.success(), "build failed:\n{}{}",
         String::from_utf8_lossy(&build.stdout), String::from_utf8_lossy(&build.stderr));
-    let mut cmd = Command::new(&out);
-    if gc_stress {
-        cmd.env("FROG_GC_STRESS", "1");
-    }
-    let run = cmd.output().unwrap();
+    let run = Command::new(&out).output().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     run
 }
@@ -54,14 +50,10 @@ fn build_and_run(test: &str, src: &str, gc_stress: bool) -> Output {
 /// trailing result that a built binary (which discards it) wouldn't.
 fn assert_aot_matches_jit(test: &str, src: &str) -> String {
     let jit = Command::new(FROG).arg("run").arg(src).output().unwrap();
-    for stress in [false, true] {
-        let aot = build_and_run(test, src, stress);
-        assert_eq!(String::from_utf8_lossy(&aot.stdout), String::from_utf8_lossy(&jit.stdout),
-            "stdout differs (gc_stress={})", stress);
-        assert_eq!(String::from_utf8_lossy(&aot.stderr), String::from_utf8_lossy(&jit.stderr),
-            "stderr differs (gc_stress={})", stress);
-        assert_eq!(aot.status.code(), jit.status.code(), "exit code differs (gc_stress={})", stress);
-    }
+    let aot = build_and_run(test, src);
+    assert_eq!(String::from_utf8_lossy(&aot.stdout), String::from_utf8_lossy(&jit.stdout), "stdout differs");
+    assert_eq!(String::from_utf8_lossy(&aot.stderr), String::from_utf8_lossy(&jit.stderr), "stderr differs");
+    assert_eq!(aot.status.code(), jit.status.code(), "exit code differs");
     String::from_utf8(jit.stdout).unwrap()
 }
 
@@ -111,6 +103,6 @@ fn build_host_calls_survive_collections() {
 /// unless `frog_rt_main` does — output after the last newline would be lost.
 #[test]
 fn build_flushes_stdout_without_trailing_newline() {
-    let run = build_and_run("flush", "write_stdout(\"no newline\")!", false);
+    let run = build_and_run("flush", "write_stdout(\"no newline\")!");
     assert_eq!(String::from_utf8_lossy(&run.stdout), "no newline");
 }

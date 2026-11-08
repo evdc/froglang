@@ -37,8 +37,9 @@
 //! regression points at a culprit rather than just "something got slower".
 //! Between them they cover: raw call/arithmetic throughput with no heap at
 //! all (`fib`), unboxed struct field access and copying (`structs`), the
-//! allocator and collector under pure churn (`alloc`) and under a large
-//! *retained* live set that every collection must re-mark (`gc_pressure`),
+//! allocator and drops under pure churn (`alloc`) and under a large
+//! *retained* live set alongside the churn (`gc_pressure`, named for the
+//! collector it used to measure),
 //! string building and comparison (`strings`), list allocation, growth and
 //! indexing (`lists`), recursive boxed unions and `match` dispatch (`tree`),
 //! and everything at once (`orders`).
@@ -146,9 +147,9 @@ total
 ";
 
 /// Allocation-dominated: every iteration builds a fresh string and a fresh
-/// list, so this is really a measurement of `frog_alloc_*` plus the
-/// mark-sweep collector and the shadow-stack rooting around them. The
-/// counterpart to `fib`, which never touches the heap at all.
+/// list, so this is really a measurement of `frog_alloc_*` plus the drops
+/// that free them. The counterpart to `fib`, which never touches the heap
+/// at all.
 const ALLOC: &str = "\
 func label(i: Int): Str = \"item-\" + \"x\"
 mut sink = 0
@@ -337,13 +338,11 @@ for i in 0..40 do { total = total + sum(build(12, i)) }
 total
 ";
 
-/// Collector scaling against a large *retained* live set. `live` is a
-/// 4000-cell chain that stays reachable for the whole run, so every
-/// collection triggered by the garbage in the loop below must re-mark all
-/// of it. `alloc` measures allocation with almost nothing live; this
-/// measures the mark phase, which is the half that grows with the heap
-/// rather than with the allocation rate — a non-generational collector's
-/// characteristic cliff.
+/// Churn against a large *retained* live set. `live` is a 4000-cell chain
+/// that stays owned for the whole run while the loop below builds and drops
+/// garbage. Under the old mark-sweep collector every collection re-marked
+/// all of `live`; without one, this should cost the same as `alloc` per
+/// object, and a gap between the two is worth investigating.
 const GC_PRESSURE: &str = "\
 data Node is Empty | Cell(v: Int, rest: Node)
 func chain(n: Int, acc: Node): Node = if n == 0 then acc else chain(n - 1, Cell(v=n, rest=acc))

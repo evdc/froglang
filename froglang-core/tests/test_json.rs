@@ -15,7 +15,7 @@
 //!    nothing in this file may depend on which one is in play.
 
 mod common;
-use common::{run, run_raw, run_gc_stress};
+use common::{run, run_raw};
 
 fn type_error(src: &str) -> String {
     let ast = froglang_core::frontend::parser::Parser::parse(src).expect("parse error");
@@ -398,20 +398,19 @@ fn json_to_str_works_inside_a_generic_function() {
     assert_eq!(run(src), "1\n\"a\"\n[1,2]\n");
 }
 
-// ── GC ───────────────────────────────────────────────────────────────────────
+// ── heap ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn heap_allocating_reads_are_rooted() {
-    // `frog_json_str` allocates inside a loop for a `List<Str>` — the
-    // exact shape whose missing `jit_frame_guard!` made `frog_read_str`
-    // alias list elements in stage 5, and invisible without this.
+fn heap_allocating_reads_build_independent_elements() {
+    // `frog_json_str` allocates inside a loop for a `List<Str>`: each
+    // element must be its own object.
     let src = "let xs: List<Str> | JsonError = json.parse(\"[\\\"a\\\",\\\"bb\\\",\\\"ccc\\\",\\\"dddd\\\"]\")\n\
                print(repr(xs!))\n\
                data Person(name: Str, note: Str)\n\
                let ps: List<Person> | JsonError = json.parse(\"[{\\\"name\\\":\\\"a\\\",\\\"note\\\":\\\"x\\\"},{\\\"name\\\":\\\"b\\\",\\\"note\\\":\\\"y\\\"}]\")\n\
                print(json.to_str(ps!))";
     assert_eq!(
-        run_gc_stress(src),
+        run(src),
         "[\"a\", \"bb\", \"ccc\", \"dddd\"]\n[{\"name\":\"a\",\"note\":\"x\"},{\"name\":\"b\",\"note\":\"y\"}]\n",
     );
 }

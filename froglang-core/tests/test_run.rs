@@ -454,16 +454,12 @@ fn test_reassignment_inside_if_else_branches() {
     assert_eq!(result, 99);
 }
 
-/// Regression test for GC rooting under deep recursion: a string bound
-/// early must survive many subsequent string allocations (and the GC
-/// collections they trigger) deep inside recursive calls. Before rooting
-/// existed at all, `keep` had no root visible to the collector while
-/// `pad`'s recursive calls were executing, so the collector could free it
-/// out from under a still-live JIT register — this used to trip a
-/// `ptr::copy_nonoverlapping` UB check (or silently corrupt memory in
-/// release builds).
+/// A string bound early must be intact after many string allocations (and
+/// frees) deep inside recursive calls. Originally a GC-rooting regression
+/// test; now it checks that the recursion's temporaries are freed without
+/// touching `keep`.
 #[test]
-fn test_gc_survives_recursive_allocation() {
+fn test_binding_survives_recursive_allocation() {
     let src = r#"func pad(n: Int): Str = if n <= 0 then "" else pad(n - 1) + "0123456789012345678901234567890123456789"
 let keep = "SENTINEL"
 let big = pad(3000)

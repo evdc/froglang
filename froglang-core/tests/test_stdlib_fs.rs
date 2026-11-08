@@ -159,14 +159,11 @@ fn flush_stdout_succeeds() {
     assert!(boolean(&v));
 }
 
-/// `FROG_GC_STRESS=1` across a file round trip — `read_file`'s `Ok(String)`
-/// allocates inside the shim's `FrogCtx::scope()` exactly like every other
-/// allocating shim already covered elsewhere; this is the file-IO-specific
-/// instance of that same guarantee.
+/// A file round trip: `read_file`'s `Ok(String)` is allocated by the shim
+/// and handed to the caller.
 #[test]
-fn file_round_trip_survives_gc_stress() {
+fn file_round_trip_returns_what_was_written() {
     let scratch = ScratchPath::new();
-    std::env::set_var("FROG_GC_STRESS", "1");
     let mut s = FrogState::with_stdlib().unwrap();
     let src = format!(
         "let n = write_file(\"{p}\", \"stress test content\")\n\
@@ -175,7 +172,6 @@ fn file_round_trip_survives_gc_stress() {
         p = scratch.as_str(),
     );
     let (v, _) = s.eval(&src).unwrap();
-    std::env::remove_var("FROG_GC_STRESS");
     assert_eq!(string(&v), "stress test content");
 }
 

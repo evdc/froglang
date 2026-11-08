@@ -298,12 +298,10 @@ fn test_for_loop_over_scalar_union_list_allocating_in_the_body() {
     // `compile_for_loop` used to root each element leaf on `is_heap_ty(leaf)`
     // alone, which was `true` for a two-slot union's payload — so the
     // *scalar* payload of an `Int` element (a raw integer, not a pointer)
-    // got rooted as if it were one. The collector dereferenced every
-    // non-zero root unchecked, so any collection triggered from inside the
-    // loop body dereferenced 4000004 as a heap object. `codegen::UnionLayout`
-    // now makes a scalar column statically un-scannable, so there's nothing
-    // left for this class of bug to trip over; `burn` allocates hard enough
-    // to force real collections while the loop variable is live.
+    // was treated as one, and dereferenced as a heap object.
+    // `codegen::UnionLayout` makes a scalar column statically not a pointer
+    // column, so a drop or copy never follows it; `burn` allocates and frees
+    // hard while the loop variable is live.
     assert_eq!(compile_and_run(
         "data Point(x: Int, y: Int)\n\
          func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\
@@ -320,9 +318,8 @@ fn test_for_loop_over_scalar_union_list_allocating_in_the_body() {
 #[test]
 fn test_indexing_a_scalar_union_list_allocating_between_reads() {
     // The same mis-rooting as above, on the `xs[i]` path
-    // (`TypedExprKind::Index`): the read below is interleaved with an
-    // allocation heavy enough to collect while the indexed element is
-    // still rooted.
+    // (`TypedExprKind::Index`): the read below is interleaved with heavy
+    // allocation while the indexed element is still live.
     assert_eq!(compile_and_run(
         "data Point(x: Int, y: Int)\n\
          func burn(k: Int): Int = [for i in 0..40000 do Point(x=i, y=i)][k].x\n\

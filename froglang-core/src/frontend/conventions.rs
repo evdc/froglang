@@ -7,13 +7,13 @@
 //! Escape is judged from the body, then propagated through call sites by a
 //! fixpoint: a parameter passed on to a consuming parameter consumes too.
 //!
-//! This is analysis only. Codegen is unchanged. `FROG_DUMP_CONVENTIONS` prints
-//! the result, and `FROG_COPY_STATS` counts, under site `call-arg-borrow`, the
-//! copies a borrowing callee would make unnecessary.
+//! Codegen reads the result through `publish`: a borrowed argument stays its
+//! caller's to free, and a borrowed parameter is never freed by its callee.
+//! `FROG_DUMP_CONVENTIONS` prints the result.
 //!
-//! Scope: one program (a file, or one REPL entry). A callee defined in another
-//! entry is unknown here and treated as a host function, so the result is only
-//! sound for whole-program analysis. Names defined twice are ambiguous and are
+//! Scope: one program (a file, or one REPL entry). A callee an earlier REPL
+//! entry defined is resolved through that entry's `Signatures`, which
+//! `FrogState` keeps. Names defined twice in one entry are ambiguous and are
 //! treated as consuming.
 
 use std::cell::RefCell;
@@ -32,14 +32,6 @@ pub enum Convention {
     Consume,
 }
 
-/// Site index used by `FROG_COPY_STATS` for a call argument that a borrowing
-/// callee would not need copied. One past `liveness::CopySite`'s indices.
-pub const BORROWED_SITE: i64 = 6;
-
-/// Added to a site index to mark an extraction (`xs[i]`) rather than a `Var`
-/// read. Sites `0..=6` are `Var` reads and `7..=13` their extraction twins.
-pub const EXTRACT_SITE_BASE: i64 = 7;
-
 /// Why a value escapes: the flow that moves it out of a borrow.
 type Reason = &'static str;
 
@@ -57,6 +49,11 @@ pub struct FnSummary {
     pub name:   String,
     pub params: Vec<ParamSummary>,
 }
+
+/// Each analysed function's per-parameter conventions, by name. What a later
+/// REPL entry needs to call a function an earlier entry compiled: the callee
+/// already frees exactly the parameters it consumes, so its callers must agree.
+pub type Signatures = HashMap<String, Vec<Convention>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct Conventions {
@@ -81,6 +78,18 @@ impl Conventions {
     /// Whether parameter `index` of the function whose body is `body` is borrowed.
     pub fn is_borrowed_param(&self, body: NodeId, index: usize) -> bool {
         self.borrowed_params.get(&body).and_then(|v| v.get(index)).copied().unwrap_or(false)
+    }
+
+    /// Record this program's functions in `sigs`, for later entries: an
+    /// analysed function replaces any earlier one of its name, and an
+    /// ambiguous name is forgotten, so calls to it consume.
+    pub fn record_signatures(&self, sigs: &mut Signatures) {
+        for f in &self.functions {
+            sigs.insert(f.name.clone(), f.params.iter().map(|p| p.conv).collect());
+        }
+        for name in &self.ambiguous {
+            sigs.remove(name);
+        }
     }
 
     /// Human-readable dump for `FROG_DUMP_CONVENTIONS`.
@@ -139,9 +148,9 @@ pub fn builtin_borrowers() -> HashSet<String> {
 ///
 /// `external_borrowers` names the callees that are not defined in `program`
 /// but are known to only read their arguments (host functions and builtins).
-/// Any other name that is not defined in `program` must have been defined in
-/// an earlier REPL entry, and is treated as consuming, since its body is unknown.
-pub fn infer(program: &Spanned<TypedExpr>, external_borrowers: &HashSet<String>) -> Conventions {
+/// `prior` holds the functions earlier REPL entries defined. Any other name
+/// that is not defined in `program` is treated as consuming.
+pub fn infer(program: &Spanned<TypedExpr>, external_borrowers: &HashSet<String>, prior: &Signatures) -> Conventions {
     let mut defs = Vec::new();
     collect_defs(program, &mut defs);
 
@@ -154,6 +163,7 @@ pub fn infer(program: &Spanned<TypedExpr>, external_borrowers: &HashSet<String>)
         fns: HashMap::new(),
         ambiguous: ambiguous_names.clone(),
         external_borrowers: external_borrowers.clone(),
+        prior,
     };
     for d in &defs {
         if table.ambiguous.contains(&d.name) { continue; }
@@ -242,12 +252,14 @@ fn collect_defs<'a>(expr: &'a Spanned<TypedExpr>, out: &mut Vec<FnDef<'a>>) {
 }
 
 /// Per-name signatures used to resolve a call's convention.
-struct Table {
+struct Table<'p> {
     /// Each uniquely-named function: per parameter, whether it is `mut` and its convention.
     fns: HashMap<String, Vec<(bool, Convention)>>,
     ambiguous: HashSet<String>,
     /// Callees defined outside the program that only read their arguments.
     external_borrowers: HashSet<String>,
+    /// Functions earlier REPL entries defined.
+    prior: &'p Signatures,
 }
 
 enum ArgFlow {
@@ -276,9 +288,16 @@ fn arg_flow(table: &Table, callable: &Spanned<TypedExpr>, index: usize) -> ArgFl
     if name == "push" && index == 1 {
         return ArgFlow::Escapes("push");
     }
-    // Not defined in this program. A known host function or builtin borrows:
-    // host arguments are marshalled, which copies them. Anything else was
-    // defined in an earlier entry, so its body is unknown and it must consume.
+    // Not defined in this program. A function an earlier entry defined keeps
+    // the conventions it was compiled with.
+    if let Some(params) = table.prior.get(name) {
+        return match params.get(index) {
+            Some(Convention::Consume) => ArgFlow::Escapes("call-arg"),
+            _ => ArgFlow::Borrows,
+        };
+    }
+    // A known host function or builtin borrows: host arguments are
+    // marshalled, which copies them. Anything else is unknown, so it consumes.
     if table.external_borrowers.contains(name) {
         return ArgFlow::Borrows;
     }
@@ -308,7 +327,7 @@ fn child_flow(expr: &Spanned<TypedExpr>, child: &Spanned<TypedExpr>, flow: Optio
 
 /// Walks a body and records, per target parameter, the first flow that lets its value escape.
 struct Scan<'t> {
-    table: &'t Table,
+    table: &'t Table<'t>,
     targets: HashSet<String>,
     reasons: HashMap<String, Reason>,
     borrowed_args: Vec<NodeId>,

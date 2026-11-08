@@ -178,16 +178,11 @@ fn test_no_early_return_still_behaves_normally() {
 }
 
 #[test]
-fn test_early_returned_heap_value_survives_a_collection_triggered_before_it() {
-    // Every `Str`/`List` allocation checks the GC threshold (`maybe_collect`
-    // in `runtime::ffi`), so enough throwaway string allocations inside the
-    // loop below force a real, non-forced collection to happen *before* the
-    // early `return` executes. If the early-return codegen path (the
-    // `TypedExprKind::Return` arm in `codegen::compile_expr_multi`) failed
-    // to declare its result to Cranelift as a GC root — the string built on the
-    // final iteration and returned here would already be collected garbage
-    // by the time `print` reads it back, and this would print corrupted
-    // bytes or crash rather than the exact string constructed.
+fn test_early_return_keeps_its_result_and_frees_the_loop_temporaries() {
+    // Every iteration allocates a throwaway string, which its statement
+    // frees. The early `return` leaves through every open frame
+    // (`drop_all_frames`) but hands its own result to the caller, which must
+    // read exactly the string constructed.
     let src = "\
         func make(n: Int): Str = {\n\
             for i in 0..n do {\n\

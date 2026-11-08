@@ -35,7 +35,7 @@
 //!
 //! **Known gap, deliberately not solved here**: at top-level/REPL-entry
 //! scope, `FrogState` treats every prior binding as live forever (`env`
-//! re-roots all of it after every entry — see `check`'s own `exit_live`
+//! keeps all of it after every entry — see `check`'s own `exit_live`
 //! comment below) so that a later entry can still reference it. That is
 //! exactly the aliasing rule 1 exists to catch, so a top-level `Linear`
 //! binding can never pass a `Copy`-classified read at all today — including
@@ -88,7 +88,7 @@ struct Ctx<'a> {
 /// `prior_exit_live` is every name a previous entry bound (`FrogState::
 /// env_types.keys()` at the call site) — the same set `build_main_body`
 /// unions with this entry's own top-level bindings, since `FrogState::eval`
-/// re-roots every `env` binding after every entry regardless of whether
+/// keeps every `env` binding after every entry regardless of whether
 /// this entry's code touches it again. See this module's own doc comment
 /// for what that means for a top-level `Linear` binding today.
 pub fn check(

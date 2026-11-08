@@ -710,6 +710,129 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
 
 3. **Delete the GC:** stack maps, roots, COW, `RuntimeRoots`, and the AOT stack-map table.
    `SELFHOST.md` G6 disappears.
+
+   **Scope (2026-11-06).** Ownership becomes the only mode, and then everything that exists only
+   for the collector goes. The deliverable is less code. Do it in three slices, with the suite
+   green after each.
+
+   - **3a. One mode.**
+     - Remove `FROG_OWNERSHIP` and its three readers:
+       - `codegen::ownership_enabled`;
+       - the `owned` field set in `GcHeap::new`;
+       - the env check in `state.rs`.
+     - Codegen always emits the ownership path. Delete the GC-mode branches: `mark_shared` calls,
+       the `shared` bit, the COW checks before writes, and `CopySite` copies made only for stats.
+     - The heap no longer needs an `owned` flag.
+     - `tests/common::run` drops its second run, since there is only one mode.
+     - Delete `run_gc_stress` and `run_cow_verify`, and the tests that only exercise
+       collector or COW behavior.
+     - Keep tests that check value semantics through the language.
+   - **3b. No collector.** Delete:
+     - mark/sweep, `mark_worklist`, `count_refs`, and the collection trigger in the allocator;
+     - shadow frames and `push_root`/`pop_root`;
+     - Cranelift stack maps and their safepoint bookkeeping;
+     - `RuntimeRoots`, and the AOT stack-map table;
+     - the `GC_HEAP` and `ACTIVE_HEAP` rooting the collector needed.
+
+     Also:
+     - `clone_obj_with` no longer roots its top copy.
+     - `GcHeap` stays as the allocator, holding free lists, live accounting and `drop_tree`.
+       Renaming it is optional and belongs in a separate commit.
+     - Host marshalling (`ffi.rs`, `host.rs`, `froglang-macros`) and `FrogState` bindings must
+       own or borrow explicitly, with no roots. A value handed to the host is either copied out
+       or transferred, and the plan does not choose between them: pick whichever is simpler and
+       say which one.
+   - **3c. Close the known leaks** that the GC used to hide:
+     - **Dict literal with a duplicate key:** the overwritten value is never freed.
+     - **REPL cross-entry calls:** a callee compiled in an earlier `FrogState::eval` entry is
+       treated as consuming by the caller, so its borrowed arguments leak. Keep each entry's
+       inferred conventions in `FrogState`, keyed by function name, and feed them to `infer`
+       for later entries.
+   - **Leak checking after the change.**
+     - Keep the live-object count unconditionally, since it is cheap.
+     - Turn the teardown leak check on by default in debug builds (`cfg(debug_assertions)`),
+       so plain `cargo test` covers the in-process tests too.
+     - Double-free detection may stay behind `FROG_LEAK_CHECK` if it costs a set lookup.
+   - **Acceptance.**
+     - `cargo test` (workspace) and `cargo clippy` pass with no new warnings.
+     - The AOT build tests pass. Run `cargo build --lib` first; see the stale staticlib note.
+     - `orders`, `words` and `life` in release are no slower than the ownership column above:
+       48/54, 157/175 and 14/15 ms. They should be faster, since frames and safepoints go.
+     - Measure the net line count of the deletion and record it here.
+   - **Out of scope.** Static drop placement at last use, the per-union heap test, sharing guard
+     blocks, the operand-view limitation, and RC for `Str`.
+
+   **Status (2026-11-06): done, uncommitted.** Ownership is the only mode and the collector is
+   gone. Net change, excluding `plans/`: 651 lines added, 3,238 deleted (−2,587). Source alone
+   is −2,149, tests and benches −431, the README −7.
+   - **3a, one mode.** `FROG_OWNERSHIP` and its three readers are gone, and so are the GC-mode
+     branches. That removed `mark_shared_if_aliased`, `share_extracted`, `emit_unshare(_nested)`,
+     the `shared` header bit, `FROG_COW_VERIFY` (`frog_cow_verify`, `count_refs`), and the
+     `FROG_COPY_STATS` machinery (`frog_copy_stat`, `liveness::CopySite`, the site constants). The
+     place walk (`emit_place_ref`, `emit_mutable_container`) no longer copies or writes back
+     anything. There is one clone, `frog_clone`, and it copies `Str`s too, since `clone_obj` lost
+     its `copy_str` switch. The GC-mode copy-out and return paths are gone, so `mut_param_copyout`
+     is the taking version. Conventions now always run. `tests/common::run` runs each program
+     once. `run_gc_stress`, `run_cow_verify` and `test_gc_roots.rs` are deleted, along with the
+     collector unit tests and the in-process `FROG_GC_STRESS` tests. A test whose only assertion
+     ran under stress became a plain `run` test.
+   - **3b, no collector.** Deleted: mark/sweep (`collect`, `mark_from`, `sweep`, the root
+     walks), the threshold and `maybe_collect`/`force_collect`; `push_root`/`pop_roots`, scanned
+     spans and `RuntimeRoots`; `JitFrameGuard`, `jit_frame_guard!`, `caller_frame_pointer!`;
+     every `declare_gc_*` call, `take_stack_maps`, `JIT_CODE`/`JitCode`, and the AOT stack-map
+     registry with `frog_register_stackmaps`. `preserve_frame_pointers` (JIT and AOT) and
+     `.cargo/config.toml`'s `force-frame-pointers` existed only for the stack walk, so they went
+     too. `tests/test_cranelift_stack_maps.rs` is deleted. `GcHeader` is just `kind` now: no
+     `next`, `marked` or `shared`. So a `FrogStr` header is 8 bytes and a `FrogVariant` 24, down
+     from 16 and 32. `GcHeap` keeps the free lists, live accounting, `drop_tree` and
+     `clone_obj`, and one worklist shared by the tree walks. The name stays for now. `GC_HEAP` and
+     `ACTIVE_HEAP` stay too: they choose which heap a runtime call allocates into, and they were
+     never roots. `gc_dump()` and the REPL's `:gc` print the live object count and bytes, since
+     there is no object list to walk any more.
+   - **Host marshalling: arguments are borrowed, results are transferred.** A host function
+     reads its arguments in place and copies them into Rust values (`FromFrog`). The caller keeps
+     them and frees them, because `conventions::infer` treats every imported callee as a
+     borrower. The result is built from fresh objects through `FrogCtx` and written to `out`, and
+     the caller owns whatever it finds there, as for any other call. `FrogCtx::scope`,
+     `HostRootScope` and the shim's argument rooting are deleted. `FrogValue` copies out of the
+     heap, and `eval` frees the heap's copy of the result. Nothing new was needed: this is what
+     ownership mode already did, minus the roots.
+   - **3c, the known leaks.** A dict literal with a repeated key now frees the value it replaces.
+     Every pair after the first loads the entry's pointer leaves and drops them before storing,
+     and a new entry's slots hold 0. `FrogState` keeps `signatures` (`conventions::Signatures`,
+     name to per-parameter conventions) and passes them to `infer` as `prior`. So a function from
+     an earlier REPL entry is called with the conventions it was compiled with. A name defined
+     twice in one entry is dropped from the map, and calls to it consume.
+   - **Found on the way.** `keys(d)`/`values(d)` copied the result only when the element had a
+     `Str`, `List` or `Dict` leaf. A boxed-union value was shared with the dict and freed twice,
+     and HEAD aborts with a double free on `values` of a `Dict<Str, T>` where `T` has seven
+     members. It now tests `is_heap_ty`, as `slice` does.
+   - **Leak checking.** The teardown check (`FrogState`'s drop and `compile_and_run`) is on in
+     every debug build. Double-free tracking costs a set lookup per allocation, so it stays
+     behind `FROG_LEAK_CHECK` and adds to the teardown check in release. Sabotage check: skipping
+     the free of strings shorter than 8 bytes makes plain `cargo test --workspace --no-fail-fast`
+     fail 279 tests in 33 binaries, the in-process `test_run` and `test_state` among them.
+   - **Results.** `cargo test --workspace`: 1,198 passed, 0 failed, 2 ignored, both plain and
+     under `FROG_LEAK_CHECK=1`. That count includes the AOT build tests (libraries rebuilt first)
+     and three new tests: the repeated dict key, `values` of boxed unions, and a cross-entry
+     borrow. `cargo clippy --workspace --all-targets` has 18 warnings, against 23 at HEAD, and
+     none of them are new.
+   - **Performance.** Release, best of 7, wall clock including JIT compilation:
+
+     | Benchmark | HEAD, GC | HEAD, ownership | step 3 |
+     |---|---|---|---|
+     | `orders` | 48 ms | 54 ms | 52 ms |
+     | `words` | 157 ms | 176 ms | 147 ms |
+     | `life` | 15 ms | 15 ms | 15 ms |
+
+     `words` beats the GC now, likely from the smaller headers and from losing the frame
+     pointers and spills. `orders` is still 4 ms slower than the GC. Its remaining drop guards
+     are the per-union heap test and guard-sharing items above.
+   - **Left open.** `GcHeap`, `gc.rs`, `gc_mask`, `GC_HEAP`, `gc_dump` and the `gc_trace`
+     feature keep their names, so a rename can be its own commit. JIT frames no longer carry
+     frame pointers, so a native profiler's stack attribution may get worse.
+     `FROG_JIT_SYMBOLS` is unaffected. The `pipeline.rs` workload `gc_pressure` keeps its name
+     but no longer measures a collector. `SELFHOST.md` G6 has not been edited.
 4. **Allocator layer:** segment headers, task heap and bump arena; then `with Arena` with
    `freezes`, and the result allocator.
 5. **`Pool<T>`/`Id<T>`.**

@@ -4,7 +4,7 @@
 //! and `runtime::read`'s sticky-error accessors raise.
 
 mod common;
-use common::{run, run_raw, run_gc_stress};
+use common::{run, run_raw};
 
 fn type_error(src: &str) -> String {
     let ast = froglang_core::frontend::parser::Parser::parse(src).expect("parse error");
@@ -296,13 +296,13 @@ fn read_with_the_wrong_arity_is_a_type_error() {
     assert_ne!(run_raw("let x: Int | ReadError = read(\"1\", \"2\")").status, Some(0));
 }
 
-// ── GC ───────────────────────────────────────────────────────────────────────
+// ── heap ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn reading_nested_structures_survives_gc_stress() {
+fn reading_nested_structures_round_trips() {
     let src = r#"data Person(name: Str, age: Int)
 let x = [Person(name="Ada", age=36), Person(name="Bo", age=1)]
 let back: List<Person> | ReadError = read(repr(x))
 print(back! == x)"#;
-    assert_eq!(run_gc_stress(src), "true\n");
+    assert_eq!(run(src), "true\n");
 }

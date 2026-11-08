@@ -1,7 +1,7 @@
 use std::alloc::Layout;
 use std::io::Write;
 
-use super::gc::{FrogList, FrogStr, FrogVariant, GcHeap, RuntimeRoots, GC_HEAP, ACTIVE_HEAP};
+use super::gc::{FrogList, FrogStr, FrogVariant, GcHeap, GC_HEAP, ACTIVE_HEAP};
 
 /// Call `f` with a mutable reference to the active GcHeap.
 /// Uses the `FrogState`-owned heap if one is executing on this thread,
@@ -25,9 +25,7 @@ where
 
 #[no_mangle]
 pub extern "C" fn frog_alloc_str(data: i64, len: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_str(unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) }) as i64
     })
 }
@@ -39,8 +37,6 @@ pub extern "C" fn frog_str_len(s: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn frog_str_concat(a: i64, b: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
-    let _roots = RuntimeRoots::hold(&[a, b]);
     let a_ptr = a as *const FrogStr;
     let b_ptr = b as *const FrogStr;
     let struct_size = std::mem::size_of::<FrogStr>();
@@ -57,7 +53,6 @@ pub extern "C" fn frog_str_concat(a: i64, b: i64) -> i64 {
     }
 
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_str(&buf) as i64
     })
 }
@@ -213,41 +208,32 @@ pub extern "C" fn frog_bool_print(b: i8) { print!("{}", b != 0); }
 
 #[no_mangle]
 pub extern "C" fn frog_int_repr(n: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let s = n.to_string();
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
 
 #[no_mangle]
 pub extern "C" fn frog_float_repr(n: f64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let s = crate::notation::float_repr(n);
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
 
 #[no_mangle]
 pub extern "C" fn frog_bool_repr(b: i8) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let s = if b != 0 { "true" } else { "false" };
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
 
 #[no_mangle]
 pub extern "C" fn frog_str_repr(s: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
-    let _roots = RuntimeRoots::hold(&[s]);
     let escaped = escaped_str(s);
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_str(escaped.as_bytes()) as i64
     })
 }
@@ -262,8 +248,6 @@ pub extern "C" fn frog_str_repr(s: i64) -> i64 {
 /// a call to it — it is never a name user source can spell).
 #[no_mangle]
 pub extern "C" fn frog_str_join(list: i64, sep: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
-    let _roots = RuntimeRoots::hold(&[list, sep]);
     let len = frog_list_len(list);
     let sep_ptr = sep as *const FrogStr;
     let (sep_data, sep_len) = unsafe {
@@ -285,7 +269,6 @@ pub extern "C" fn frog_str_join(list: i64, sep: i64) -> i64 {
     }
 
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_str(&buf) as i64
     })
 }
@@ -294,9 +277,7 @@ pub extern "C" fn frog_str_join(list: i64, sep: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn frog_alloc_list(cap: i64, stride: i64, ptr_mask: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_list(cap as usize, stride as usize, ptr_mask as u64) as i64
     })
 }
@@ -422,11 +403,6 @@ fn clamp_bound(idx: i64, len: i64) -> i64 {
 /// `list[:end]` / `list[start:]` / `list[:]`) — see codegen's `Slice` arm.
 #[no_mangle]
 pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
-    // `list` is read again after the allocation below, which can collect —
-    // and the caller's stack map does not cover it, since from the JIT's
-    // point of view the value died at this call. See `gc::RuntimeRoots`.
-    let _roots = RuntimeRoots::hold(&[list]);
     let list_ptr = list as *const FrogList;
     let (stride, ptr_mask) = unsafe { ((*list_ptr).stride as i64, (*list_ptr).ptr_mask) };
     let stride = stride.max(1);
@@ -439,7 +415,6 @@ pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
     let slice_slots = slice_elems * stride as usize;
 
     with_heap(|heap| {
-        heap.maybe_collect();
         let new_list = heap.alloc_list(slice_elems.max(1), stride as usize, ptr_mask);
         unsafe {
             (*new_list).len = slice_slots as u32;
@@ -452,108 +427,23 @@ pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
     })
 }
 
-// ── Copy statistics (plans/NOGC.md §6 step 0) ─────────────────────────────────
-// Measurement only. With `FROG_COPY_STATS` set at compile time, codegen calls
-// `frog_copy_stat` at every `Copy`-classified read of a `Str`/`List`/`Dict`
-// leaf. That deep-copies the value (what unique ownership would copy there)
-// and discards the copy. Output is unchanged, but the extra garbage changes GC
-// pressure, so stats runs are for counts and bytes, never for timing.
-// Counters are indexed `site * 3 + kind`; sites follow `liveness::CopySite`.
-pub const COPY_KIND_NAMES: [&str; 3] = ["Str", "List", "Dict"];
-pub const COPY_SITE_NAMES: [&str; 7] = ["call-arg", "let", "store", "literal", "return", "other", "call-arg-borrow"];
-// Sites `0..7` are `Var` reads, `7..14` their extraction twins (`EXTRACT_SITE_BASE`).
-static COPY_EVENTS: [std::sync::atomic::AtomicU64; 42] = [const { std::sync::atomic::AtomicU64::new(0) }; 42];
-static COPY_BYTES: [std::sync::atomic::AtomicU64; 42] = [const { std::sync::atomic::AtomicU64::new(0) }; 42];
-
-#[no_mangle]
-pub extern "C" fn frog_copy_stat(w: i64, kind: i64, site: i64) {
-    if !super::gc::is_heap_ptr(w) {
-        return;
-    }
-    let _jit_frame = crate::jit_frame_guard!();
-    let _roots = RuntimeRoots::hold(&[w]);
-    let copied = with_heap(|heap| {
-        heap.maybe_collect();
-        let before = heap.bytes_allocated;
-        let obj = super::gc::heap_ptr(w);
-        unsafe {
-            if kind == 0 {
-                // `clone_obj` returns an immutable `Str` as-is (a pointer copy
-                // is already free), so measure a fresh allocation of its bytes.
-                let len = (*(obj as *const FrogStr)).len as usize;
-                let data = std::slice::from_raw_parts(
-                    (obj as *const u8).add(std::mem::size_of::<FrogStr>()), len);
-                heap.alloc_str(data);
-            } else {
-                heap.clone_obj(obj);
-            }
-        }
-        heap.bytes_allocated - before
-    });
-    let idx = site as usize * 3 + kind as usize;
-    COPY_EVENTS[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    COPY_BYTES[idx].fetch_add(copied as u64, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Human-readable totals for the copies counted by `frog_copy_stat`: one line
-/// per (site, kind) with any events, then a total.
-pub fn copy_stats_report() -> String {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut out = String::from("copy stats: Copy-classified heap reads that unique ownership would deep-copy\n");
-    let (mut total_events, mut total_bytes) = (0u64, 0u64);
-    for s in 0..2 * COPY_SITE_NAMES.len() {
-        let (origin, site) = if s < COPY_SITE_NAMES.len() {
-            ("var", COPY_SITE_NAMES[s])
-        } else {
-            ("extract", COPY_SITE_NAMES[s - COPY_SITE_NAMES.len()])
-        };
-        for (k, kind) in COPY_KIND_NAMES.iter().enumerate() {
-            let idx = s * 3 + k;
-            let (e, b) = (COPY_EVENTS[idx].load(Relaxed), COPY_BYTES[idx].load(Relaxed));
-            total_events += e;
-            total_bytes += b;
-            if e > 0 {
-                out += &format!("  {:<7} {:<18} {:<5} events={:<12} bytes={}\n", origin, site, kind, e, b);
-            }
-        }
-    }
-    out += &format!("  total events={} bytes={}\n", total_events, total_bytes);
-    out
-}
-
-/// Deep-clone the heap value `w` — the runtime primitive codegen's
-/// `Ownership::Copy`-gated clone-on-read (see `codegen::compile_expr_multi`'s
-/// `Var` arm) calls whenever a binding's value is duplicated and might still
-/// be observed elsewhere. `w` may be `0` (an empty/absent slot) or a
-/// non-pointer immediate, in which case it's returned unchanged — only an
-/// actual heap pointer (`is_heap_ptr`) is cloned.
-///
-/// `w` itself may carry tag bits (an inline union's tagged pointer word, not
-/// just a plain `List`/`Str` pointer — `is_heap_ty` covers `Type::Union` too,
-/// so this is called on those leaves as well). The clone must carry the same
-/// tag, or a union value would silently forget which member it was — the
-/// same reasoning `GcHeap::clone_obj`'s `Variant` case already applies to a
-/// tagged pointer nested *inside* a payload, just one level further out.
+/// Deep-copy the heap value `w`, `Str`s included, so the result shares no
+/// object with its source: what a consumer that keeps a view of a value calls
+/// (`codegen::own_vals`). `w` may be `0` or an immediate, which is returned
+/// unchanged. `w` may carry tag bits (an inline union's tagged pointer word),
+/// and the copy carries the same tag.
 #[no_mangle]
 pub extern "C" fn frog_clone(w: i64) -> i64 {
     if !super::gc::is_heap_ptr(w) {
         return w;
     }
-    let _jit_frame = crate::jit_frame_guard!();
-    // `w` is read (recursively) throughout `clone_obj`, which allocates and
-    // can therefore collect — and the caller's stack map does not cover it,
-    // since from the JIT's point of view the value died at this call. See
-    // `gc::RuntimeRoots`, and `GcHeap::clone_obj`'s own doc comment for how
-    // the objects it allocates along the way are separately kept alive.
-    let _roots = RuntimeRoots::hold(&[w]);
     with_heap(|heap| {
-        heap.maybe_collect();
         let cloned = unsafe { heap.clone_obj(super::gc::heap_ptr(w)) };
         (cloned as i64) | (w & super::gc::TAG_MASK)
     })
 }
 
-/// Free the object `w` and everything it owns (NOGC §6 step 2, `FROG_OWNERSHIP`).
+/// Free the object `w` and everything it owns.
 /// A no-op for immediates, scalars and null, so codegen may drop a slot that
 /// was never filled or was already moved out of (both hold 0).
 #[no_mangle]
@@ -572,22 +462,6 @@ pub extern "C" fn frog_drop_shallow(w: i64) {
         return;
     }
     with_heap(|heap| unsafe { heap.free_shallow(super::gc::heap_ptr(w)) });
-}
-
-/// `frog_clone` for ownership mode (NOGC §6 step 2): also copies every `Str`
-/// reached, so the result shares no object with its source.
-#[no_mangle]
-pub extern "C" fn frog_clone_owned(w: i64) -> i64 {
-    if !super::gc::is_heap_ptr(w) {
-        return w;
-    }
-    let _jit_frame = crate::jit_frame_guard!();
-    let _roots = RuntimeRoots::hold(&[w]);
-    with_heap(|heap| {
-        heap.maybe_collect();
-        let cloned = unsafe { heap.clone_obj_with(super::gc::heap_ptr(w), true) };
-        (cloned as i64) | (w & super::gc::TAG_MASK)
-    })
 }
 
 /// Doubles a raw (non-GC-managed) buffer of 8-byte-aligned words from
@@ -655,11 +529,9 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
 /// "never errors, just clamps" convention rather than `frog_list_get`'s.
 #[no_mangle]
 pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     let len = if end > start { (end - start) as usize } else { 0 };
 
     with_heap(|heap| {
-        heap.maybe_collect();
         let list = heap.alloc_list(len.max(1), 1, 0);
         unsafe {
             (*list).len = len as u32;
@@ -681,9 +553,7 @@ pub extern "C" fn frog_range(start: i64, end: i64) -> i64 {
 /// `frog_variant_set` right after this returns.
 #[no_mangle]
 pub extern "C" fn frog_alloc_variant(tag: i64, nslots: i64, ptr_mask: i64) -> i64 {
-    let _jit_frame = crate::jit_frame_guard!();
     with_heap(|heap| {
-        heap.maybe_collect();
         heap.alloc_variant(tag as u32, nslots as usize, ptr_mask as u64) as i64
     })
 }
@@ -721,38 +591,6 @@ pub extern "C" fn frog_variant_set(variant: i64, slot: i64, val: i64) {
     }
 }
 
-/// `FROG_COW_VERIFY`'s check: called from the write barrier's *unshared*
-/// path (`codegen::emit_unshare`), only in a build whose codegen saw the env
-/// var set. Aborts if `w` turns out to be reachable by more live references
-/// than this position in a place walk permits — i.e. an aliasing site failed
-/// to mark, which is the one failure mode copy-on-write actually has.
-///
-/// `allowed` is how many references reaching `w` are legitimate here. It is
-/// 1 for a place rooted directly in a binding: the JIT slot holding the
-/// pointer about to be written through. It is 2 for a list reached *through*
-/// another list (`rows[y][x] = v`, `push(mut rows[0], v)`), where the parent
-/// list's own slot is a second, expected reference — and mutating through it
-/// is exactly what the walk is entitled to do, because `emit_place_ref`
-/// unshared that parent immediately beforehand. Passing the depth in rather
-/// than relaxing the check to `> 2` everywhere keeps the outer case strict.
-///
-/// See `GcHeap::count_refs` for why this is worth the cost, and
-/// MUTABILITY.md Stages 7 and 8.
-#[no_mangle]
-pub extern "C" fn frog_cow_verify(w: i64, allowed: i64) {
-    let _jit_frame = crate::jit_frame_guard!();
-    if !super::gc::is_heap_ptr(w) { return; }
-    let refs = with_heap(|heap| heap.count_refs(super::gc::heap_ptr(w)));
-    if refs as i64 > allowed {
-        frog_abort(format_args!(
-            "FROG_COW_VERIFY: about to mutate {:#x} in place, but {} live references reach it \
-             ({} expected here) — an aliasing site failed to set the shared bit \
-             (MUTABILITY.md Stage 7)",
-            w, refs, allowed,
-        ));
-    }
-}
-
 // ── GC diagnostics ───────────────────────────────────────────────────────────
 
 /// Print a full heap dump to stderr. Callable as `gc_dump()` from froglang.
@@ -760,19 +598,6 @@ pub extern "C" fn frog_cow_verify(w: i64, allowed: i64) {
 pub extern "C" fn frog_gc_dump() {
     super::gc::gc_dump();
 }
-
-// ── GC roots for JIT-local heap pointers ──────────────────────────────────────
-//
-// Deliberately absent: there is no `frog_frame_push`/`frog_frame_pop` FFI
-// pair, and no runtime function here maintains a root of its own for a
-// value it merely passes through. Roots for JIT-produced values are
-// Cranelift's stack maps (RUNTIME.md Part 2, `gc.rs`'s "Precise roots") —
-// `Codegen` declares every GC-scannable SSA value as it is produced, and the
-// collector walks the native stack directly rather than any structure this
-// module maintains. The one thing a runtime function does still have to get
-// right is `gc::RuntimeRoots`, just below `with_heap`: an argument it still
-// needs *after* a call that can collect is not otherwise rooted, since from
-// the JIT's point of view that argument died at the call.
 
 #[cfg(test)]
 mod tests {
@@ -797,34 +622,22 @@ mod tests {
 
     #[test]
     fn test_frog_str_eq() {
-        // Root each string immediately — these
-        // tests call the FFI entry points directly, so nothing else roots
-        // `pa`/`pb`/`pc`, and under `FROG_GC_STRESS` every further
-        // allocation collects for real: an unrooted earlier string is
-        // exactly the "no observer" case the collector is entitled to
-        // sweep.
         let a = b"abc";
         let b = b"abc";
         let c = b"xyz";
         let pa = frog_alloc_str(a.as_ptr() as i64, a.len() as i64);
-        with_heap(|heap| heap.push_root(pa, true));
         let pb = frog_alloc_str(b.as_ptr() as i64, b.len() as i64);
-        with_heap(|heap| heap.push_root(pb, true));
         let pc = frog_alloc_str(c.as_ptr() as i64, c.len() as i64);
-        with_heap(|heap| heap.push_root(pc, true));
         assert_eq!(frog_str_eq(pa, pb), 1);
         assert_eq!(frog_str_eq(pa, pc), 0);
     }
 
     #[test]
     fn test_frog_str_cmp() {
-        // See `test_frog_str_eq`'s comment on why these are rooted by hand.
         let a = b"abc";
         let b = b"abd";
         let pa = frog_alloc_str(a.as_ptr() as i64, a.len() as i64);
-        with_heap(|heap| heap.push_root(pa, true));
         let pb = frog_alloc_str(b.as_ptr() as i64, b.len() as i64);
-        with_heap(|heap| heap.push_root(pb, true));
         assert_eq!(frog_str_cmp(pa, pb), -1);
         assert_eq!(frog_str_cmp(pb, pa), 1);
         assert_eq!(frog_str_cmp(pa, pa), 0);
@@ -875,7 +688,6 @@ mod tests {
     fn test_frog_str_repr_escapes_and_quotes() {
         let s = b"a\nb";
         let ptr = frog_alloc_str(s.as_ptr() as i64, s.len() as i64);
-        with_heap(|heap| heap.push_root(ptr, true));
         assert_eq!(read_str(frog_str_repr(ptr)), "\"a\\nb\"");
     }
 
@@ -884,24 +696,20 @@ mod tests {
         // stride 1, ptr_mask 1: one pointer-typed slot per element — the
         // `List<Str>` layout `desugar_notation`'s `List<T>` arm produces.
         let list = frog_alloc_list(3, 1, 1);
-        with_heap(|heap| heap.push_root(list, true));
         for s in [&b"a"[..], &b"b"[..], &b"c"[..]] {
             let ptr = frog_alloc_str(s.as_ptr() as i64, s.len() as i64);
             frog_list_push(list, ptr);
         }
         let sep = b", ";
         let sep_ptr = frog_alloc_str(sep.as_ptr() as i64, sep.len() as i64);
-        with_heap(|heap| heap.push_root(sep_ptr, true));
         assert_eq!(read_str(frog_str_join(list, sep_ptr)), "a, b, c");
     }
 
     #[test]
     fn test_frog_str_join_empty_list_is_empty_string() {
         let list = frog_alloc_list(0, 1, 1);
-        with_heap(|heap| heap.push_root(list, true));
         let sep = b", ";
         let sep_ptr = frog_alloc_str(sep.as_ptr() as i64, sep.len() as i64);
-        with_heap(|heap| heap.push_root(sep_ptr, true));
         assert_eq!(read_str(frog_str_join(list, sep_ptr)), "");
     }
 }

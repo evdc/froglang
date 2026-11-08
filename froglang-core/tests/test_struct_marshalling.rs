@@ -91,12 +91,6 @@ fn vec_of_structs_round_trips_with_correct_stride_and_mask() {
         .unwrap();
     let (v, _) = s.eval("sum_points([Point(x=1, y=2), Point(x=3, y=4)])").unwrap();
     assert_eq!(int(&v), 10);
-    // Force a collection between allocating the list/points and the host
-    // call reading them back, to prove the per-leaf pointer mask actually
-    // roots every heap-typed leaf (there are none here — Point is all
-    // `Int` — but this also stands in as the "doesn't crash" smoke test
-    // for the stride math itself).
-    s.heap.force_collect();
 }
 
 // A positional ("tuple struct") field list — frog's `Lit(5)` construction

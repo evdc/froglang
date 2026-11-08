@@ -16,7 +16,7 @@
 //!    keep interpreting `${` as two ordinary characters.
 
 mod common;
-use common::{run, run_raw, run_gc_stress};
+use common::{run, run_raw};
 
 use froglang_core::frontend::lexer::Lexer;
 use froglang_core::frontend::tokens::Token;
@@ -246,10 +246,10 @@ print(s!)"#), "cost: ${x}\n");
 // ── heap behaviour ───────────────────────────────────────────────────────────
 
 #[test]
-fn interpolation_survives_gc_stress() {
+fn interpolation_folds_through_a_rebound_accumulator() {
     // Every piece allocates, and the fold holds an intermediate string
-    // alive while building the next one.
-    assert_eq!(run_gc_stress(r#"data P(name: Str, age: Int)
+    // alive while building the next one, then frees the one it replaced.
+    assert_eq!(run(r#"data P(name: Str, age: Int)
 mut out = ""
 for i in 0..20 do {
     let p = P(name="n${i}", age=i)

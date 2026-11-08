@@ -67,8 +67,8 @@ pub fn run_raw(src: &str) -> RunOutput {
 }
 
 /// [`run_raw`] with extra environment variables set for the child process.
-/// The runtime reads its mode switches (`FROG_OWNERSHIP`, `FROG_GC_STRESS`, ...)
-/// once per process, so a subprocess is the only way to pick one per test.
+/// The runtime reads its switches (`FROG_LEAK_CHECK`, ...) once per process,
+/// so a subprocess is the only way to pick one per test.
 pub fn run_with(src: &str, env: &[(&str, &str)]) -> RunOutput {
     let scratch = ScratchFile::new(src);
     let output = Command::new(env!("CARGO_BIN_EXE_froglang-core"))
@@ -95,38 +95,10 @@ fn run_ok(src: &str, env: &[(&str, &str)]) -> String {
     out.stdout
 }
 
-/// Run `src` with `FROG_GC_STRESS=1` and return its stdout, asserting it
-/// exited successfully.
-///
-/// `GcHeap::new` reads that variable once per process, so forcing a
-/// collection on every allocation is only reachable from a subprocess.
-/// Without it most programs never collect at all (the normal threshold is
-/// 1 MB), so a missing or clobbered GC root stays invisible.
-pub fn run_gc_stress(src: &str) -> String {
-    run_ok(src, &[("FROG_GC_STRESS", "1")])
-}
-
-/// Run `src` under `FROG_COW_VERIFY=1` and return its stdout, asserting it
-/// exited successfully — MUTABILITY.md Stage 7.
-///
-/// Complements `run_gc_stress`: that one forces a *missing GC root* into
-/// the open, this one forces a *missing `shared` mark* into the open. Every
-/// copy-on-write write barrier that decides an object is unshared
-/// recomputes the answer from the heap and aborts if anything else can
-/// actually reach it, so a program that mutates through an unmarked alias
-/// fails loudly here instead of silently producing the wrong value.
-pub fn run_cow_verify(src: &str) -> String {
-    run_ok(src, &[("FROG_COW_VERIFY", "1")])
-}
-
-/// Run `src` and return its stdout, asserting it exited successfully — once
-/// as configured, and once more under ownership (NOGC §6 step 2) with the leak
-/// check, which must print the same thing and free every object it allocated
-/// (`FrogState`'s teardown panics on a leak). So every program the suite runs
-/// through here is a leak test as well, with no environment to remember.
+/// Run `src` and return its stdout, asserting it exited successfully. The
+/// test binary is a debug build, so `FrogState`'s teardown panics if the
+/// program left any object allocated: every program the suite runs through
+/// here is a leak test as well. `FROG_LEAK_CHECK` adds double-free detection.
 pub fn run(src: &str) -> String {
-    let stdout = run_ok(src, &[]);
-    let owned = run_ok(src, &[("FROG_OWNERSHIP", "1"), ("FROG_LEAK_CHECK", "1")]);
-    assert_eq!(owned, stdout, "ownership mode printed something different");
-    stdout
+    run_ok(src, &[("FROG_LEAK_CHECK", "1")])
 }

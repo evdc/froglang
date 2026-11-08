@@ -1,7 +1,6 @@
-//! Programs whose output must not depend on the memory model: each one exercises
-//! a path that ownership codegen (`FROG_OWNERSHIP`, plans/NOGC.md §6 step 2)
-//! frees or copies, and that the GC model handles by collection instead. The suite
-//! runs in both modes, and `FROG_LEAK_CHECK` reports any object a run leaves live.
+//! Programs that exercise a path ownership codegen (plans/NOGC.md §6 step 2)
+//! frees or copies. `common::run` runs each under the leak check, which
+//! reports any object a run leaves live.
 
 mod common;
 use common::run;
@@ -231,4 +230,28 @@ func go(n: Int): Int = {
 print(go(200000))
 "#;
     assert_eq!(run(src), "200006\n");
+}
+
+#[test]
+fn dict_literal_with_a_repeated_key_frees_the_value_it_replaces() {
+    let src = r#"
+let d = ["a": "x", "a": "y", "b": "z", "a": "w"]
+print(d)
+let e = [1: [1, 2], 1: [3]]
+print(e)
+"#;
+    assert_eq!(run(src), "[\"a\": \"w\", \"b\": \"z\"]\n[1: [3]]\n");
+}
+
+#[test]
+fn values_of_a_dict_of_boxed_unions_owns_its_elements() {
+    // Seven members, so `T` is boxed: `values(d)` must copy each union
+    // object rather than share it with `d`, or both free it.
+    let src = r#"
+data T is A(s: Str) | B(n: Int) | C | D | E | F | G
+let d = ["x": A(s="hi"), "y": B(n=2)]
+let vs = values(d)
+print(len(vs))
+"#;
+    assert_eq!(run(src), "2\n");
 }

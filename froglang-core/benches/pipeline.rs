@@ -359,6 +359,40 @@ for i in 0..400 do {
 sink + total(live)
 ";
 
+/// A tree-shaped value built and thrown away every iteration, and the same
+/// loop with the build inside `with Arena`. Without the arena every node is
+/// freed one by one at the end of the iteration; with it the nodes are
+/// bump-allocated and released in one step, and only the `Int` result is
+/// copied out. The pair's ratio is the arena's effect.
+const TREE_DISCARD: &str = "\
+data Tree is Leaf | Node(left: Tree, right: Tree, v: Int)
+func build(d: Int, v: Int): Tree = if d == 0 then Leaf else Node(left=build(d - 1, v * 2), right=build(d - 1, v * 2 + 1), v=v)
+func total(t: Tree): Int = match t {
+    is Leaf then 0
+    is Node(l, r, v) then v + total(l) + total(r)
+}
+mut sink = 0
+for i in 0..300 do {
+    let t = build(9, i)
+    sink = sink + total(t)
+}
+sink
+";
+
+const TREE_ARENA: &str = "\
+data Tree is Leaf | Node(left: Tree, right: Tree, v: Int)
+func build(d: Int, v: Int): Tree = if d == 0 then Leaf else Node(left=build(d - 1, v * 2), right=build(d - 1, v * 2 + 1), v=v)
+func total(t: Tree): Int = match t {
+    is Leaf then 0
+    is Node(l, r, v) then v + total(l) + total(r)
+}
+mut sink = 0
+for i in 0..300 do {
+    sink = sink + with Arena { total(build(9, i)) }
+}
+sink
+";
+
 /// The control half of the `?`/`catch` pair: a plain arithmetic pipeline of
 /// ordinary `Int`-returning calls. Identical in shape and result to
 /// `FALLIBLE`; the only difference is that nothing here is fallible.
@@ -442,7 +476,7 @@ z
 /// pairs: same computation, return-and-rebind vs `mut`-parameter/place
 /// write-back, so their ratio is the copy-elision headroom MUTABILITY.md
 /// §4 describes.
-fn runnable() -> [(&'static str, &'static str); 14] {
+fn runnable() -> [(&'static str, &'static str); 16] {
     [
         ("fib", FIB),
         ("structs", STRUCTS),
@@ -455,6 +489,8 @@ fn runnable() -> [(&'static str, &'static str); 14] {
         ("list_push_loop", LIST_PUSH_LOOP),
         ("list_push_aliased", LIST_PUSH_ALIASED),
         ("tree", TREE),
+        ("tree_discard", TREE_DISCARD),
+        ("tree_arena", TREE_ARENA),
         ("infallible", INFALLIBLE),
         ("fallible", FALLIBLE),
         ("orders", ORDERS),

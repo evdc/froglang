@@ -744,6 +744,9 @@ struct Binding {
     /// binding, which is the ordinary monomorphic case. Non-empty only for
     /// an immutable binding; see `TypeChecker::generalize`/`instantiate`.
     binders: Vec<(String, Vec<Trait>)>,
+    /// `ScopeStack::depth` when this binding was made: how many scopes were
+    /// open around it. `with Arena` compares it to the block's depth.
+    level: usize,
     /// The name the *code generator* knows this binding by, when that
     /// differs from the source name it's bound under. `None` — the
     /// ordinary case — means "the same name".
@@ -780,7 +783,7 @@ impl ScopeStack {
     /// ever introduce a mutable one.
     fn new(bindings: HashMap<String, Type>) -> Self {
         let bindings = bindings.into_iter()
-            .map(|(k, ty)| (k, Binding { ty, mutable: false, binders: Vec::new(), symbol: None }))
+            .map(|(k, ty)| (k, Binding { ty, mutable: false, binders: Vec::new(), level: 0, symbol: None }))
             .collect();
         ScopeStack { bindings, log: Vec::new(), depth: 0 }
     }
@@ -812,6 +815,11 @@ impl ScopeStack {
         self.bindings.get(name).map(|b| b.mutable)
     }
 
+    /// How many scopes were open when `name`'s current binding was made.
+    fn level(&self, name: &str) -> Option<usize> {
+        self.bindings.get(name).map(|b| b.level)
+    }
+
     fn contains_key(&self, name: &str) -> bool {
         self.bindings.contains_key(name)
     }
@@ -830,7 +838,7 @@ impl ScopeStack {
     /// As `insert`, but the caller states the binding's mutability
     /// explicitly — the declaration path in `lower_assign`.
     fn insert_mut(&mut self, name: String, ty: Type, mutable: bool) {
-        self.insert_raw(name, Binding { ty, mutable, binders: Vec::new(), symbol: None });
+        self.insert_raw(name, Binding { ty, mutable, binders: Vec::new(), level: 0, symbol: None });
     }
 
     /// A generalized (`TRAITS.md` Stage 2) immutable binding — a `func` or
@@ -842,10 +850,11 @@ impl ScopeStack {
     /// trivially-generalized (zero-binder) `func` is monomorphic and needs
     /// no separate identity.
     fn insert_generalized(&mut self, name: String, ty: Type, binders: Vec<(String, Vec<Trait>)>, symbol: Option<String>) {
-        self.insert_raw(name, Binding { ty, mutable: false, binders, symbol });
+        self.insert_raw(name, Binding { ty, mutable: false, binders, level: 0, symbol });
     }
 
-    fn insert_raw(&mut self, name: String, binding: Binding) {
+    fn insert_raw(&mut self, name: String, mut binding: Binding) {
+        binding.level = self.depth;
         let previous = self.bindings.insert(name.clone(), binding);
         if self.depth > 0 {
             self.log.push((name, previous));
@@ -1001,6 +1010,9 @@ pub struct TypeChecker {
     /// `check_and_lower`'s `Function` arm, or `lower_expected`'s
     /// lambda-against-`Type::Function` case.
     return_types: Vec<Type>,
+    /// `ScopeStack::depth` at each enclosing `with Arena` block, innermost
+    /// last. See `lower_arena`.
+    arena_levels: Vec<usize>,
     /// Trait names granted to a struct or union-member by name — populated
     /// from a `data`/`error` declaration's trailing `provides Clause`
     /// (`hoist_data_decls`). Keyed by the same qualified name `struct_defs`
@@ -1362,14 +1374,14 @@ impl TypeChecker {
     }
 
     pub fn empty() -> Self {
-        let mut tc = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
+        let mut tc = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), arena_levels: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
         tc.seed_iterable_container_traits();
         tc.seed_base_prelude();
         tc
     }
 
     pub fn new() -> Self {
-        let mut tc = TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
+        let mut tc = TypeChecker { ctx: ScopeStack::new(TypeChecker::default_context()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), arena_levels: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
         tc.seed_iterable_container_traits();
         tc.seed_base_prelude();
         tc
@@ -1457,7 +1469,7 @@ impl TypeChecker {
                 Expression::Block(stmts) => stmts,
                 other => vec![Spanned::from(other, ast.span)],
             };
-            let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
+            let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), arena_levels: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
             boot.hoist_trait_names(&stmts).expect("builtin Iterable/Container trait names must hoist");
             boot.hoist_trait_members(&stmts).expect("builtin Iterable/Container trait members must hoist");
             let iterable = boot.traits.remove("Iterable").expect("hoisted above");
@@ -5045,6 +5057,7 @@ impl TypeChecker {
             TypedExprKind::Narrow { value, .. } => self.validate_codegen_constraints(value),
             TypedExprKind::TypeTag { target, .. } => self.validate_codegen_constraints(target),
             TypedExprKind::Truthy(value) => self.validate_codegen_constraints(value),
+            TypedExprKind::Arena(body) => self.validate_codegen_constraints(body),
             TypedExprKind::Coerce(value) => self.validate_codegen_constraints(value),
         }
     }
@@ -5381,6 +5394,7 @@ impl TypeChecker {
             TypedExprKind::Narrow { value, .. } => self.collect_generic_var_types(value, seen),
             TypedExprKind::TypeTag { target, .. } => self.collect_generic_var_types(target, seen),
             TypedExprKind::Truthy(value) => self.collect_generic_var_types(value, seen),
+            TypedExprKind::Arena(body) => self.collect_generic_var_types(body, seen),
             TypedExprKind::Coerce(value) => self.collect_generic_var_types(value, seen),
         }
     }
@@ -5531,6 +5545,7 @@ impl TypeChecker {
             TypedExprKind::Narrow { value, .. } => Self::walk_vars_mut(value, f),
             TypedExprKind::TypeTag { target, .. } => Self::walk_vars_mut(target, f),
             TypedExprKind::Truthy(value) => Self::walk_vars_mut(value, f),
+            TypedExprKind::Arena(body) => Self::walk_vars_mut(body, f),
             TypedExprKind::Coerce(value) => Self::walk_vars_mut(value, f),
         }
     }
@@ -6073,7 +6088,7 @@ impl TypeChecker {
             TypedExprKind::Return(v) => if let Some(v) = v { out.push(v) },
             TypedExprKind::Widen { value, .. } | TypedExprKind::Narrow { value, .. } => out.push(value),
             TypedExprKind::TypeTag { target, .. } => out.push(target),
-            TypedExprKind::Truthy(v) | TypedExprKind::Coerce(v) => out.push(v),
+            TypedExprKind::Truthy(v) | TypedExprKind::Coerce(v) | TypedExprKind::Arena(v) => out.push(v),
         }
         out
     }
@@ -6742,7 +6757,7 @@ impl TypeChecker {
             TypedExprKind::Return(v) => if let Some(v) = v { out.push(v) },
             TypedExprKind::Widen { value, .. } | TypedExprKind::Narrow { value, .. } => out.push(value),
             TypedExprKind::TypeTag { target, .. } => out.push(target),
-            TypedExprKind::Truthy(v) | TypedExprKind::Coerce(v) => out.push(v),
+            TypedExprKind::Truthy(v) | TypedExprKind::Coerce(v) | TypedExprKind::Arena(v) => out.push(v),
         }
         out
     }
@@ -6895,6 +6910,7 @@ impl TypeChecker {
             TypedExprKind::Narrow { value, .. } => self.substitute_types_deep(value, mapping),
             TypedExprKind::TypeTag { target, .. } => self.substitute_types_deep(target, mapping),
             TypedExprKind::Truthy(value) => self.substitute_types_deep(value, mapping),
+            TypedExprKind::Arena(body) => self.substitute_types_deep(body, mapping),
             TypedExprKind::Coerce(value) => self.substitute_types_deep(value, mapping),
         }
     }
@@ -7085,6 +7101,7 @@ impl TypeChecker {
             Expression::Return(value)        => self.lower_return(value, span),
             Expression::Try(inner)           => self.lower_try(*inner, span),
             Expression::Unwrap(inner)        => self.lower_unwrap(*inner, span),
+            Expression::Arena(body)          => self.lower_arena(*body, span),
             Expression::Catch { value, handler } => self.lower_catch(*value, *handler, span),
             // `mut name` is only meaningful as one of `lower_call`'s own
             // arguments, which pattern-matches it before this dispatch is
@@ -7557,6 +7574,7 @@ impl TypeChecker {
             }, span)),
             Some(true) => {},
         }
+        self.check_not_frozen(&root, span)?;
         let mut cur_ty = self.ctx.get(&root).expect("checked mutable above").clone();
         let mut path = Vec::with_capacity(raw_path.len());
         for seg in raw_path {
@@ -7677,6 +7695,15 @@ impl TypeChecker {
                     if self.host_names.contains(&name) {
                         return Err(Spanned::from(TypeError {
                             msg: format!("'{}' is a registered host function and can't be redeclared", name),
+                        }, span));
+                    }
+                    // Codegen keeps one variable per name, so a declaration
+                    // that shadows an outer binding would overwrite it. In an
+                    // arena block that leaves the outer name pointing into
+                    // the released arena.
+                    if self.ctx.level(&name).is_some() && self.check_not_frozen(&name, span).is_err() {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!("'{name}' would shadow a binding declared outside this 'with Arena' block — pick another name")
                         }, span));
                     }
                     let mutable = mutability == Mutability::Mutable;
@@ -8016,6 +8043,7 @@ impl TypeChecker {
                         }, span)),
                         Some(true) => {},
                     }
+                    self.check_not_frozen(&name, span)?;
                     let existing_ty = self.ctx.get(&name).expect("checked mutable above").clone();
                     let value = self.lower_expected(*a.value, &existing_ty)?;
                     (TypedExprKind::Assign { name, value: Box::new(value) }, existing_ty)
@@ -8975,7 +9003,7 @@ impl TypeChecker {
             Some(false) => Err(Spanned::from(TypeError {
                 msg: format!("'{}' is not mutable — declare it with 'mut {} = ...' to call a mutating method on it", root, root)
             }, target_span)),
-            Some(true) => Ok(()),
+            Some(true) => self.check_not_frozen(root, target_span),
         }
     }
 
@@ -9943,6 +9971,34 @@ impl TypeChecker {
     // `lower_expected` assumes its expectation is already concrete —
     // so that case unifies directly instead, exactly like any other
     // site that pins down a fresh var from a synthesized type.
+    /// `with Arena { body }`. The body is lowered in a scope of its own, and
+    /// `arena_levels` remembers how deep the enclosing scopes go, so a write
+    /// to any binding at or below that depth is rejected (`check_not_frozen`).
+    fn lower_arena(&mut self, body: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        self.arena_levels.push(self.ctx.depth);
+        let body = self.in_scope(|t| t.check_and_lower(body));
+        self.arena_levels.pop();
+        let body = body?;
+        let ty = body.item.ty.clone();
+        Ok(Spanned::from(TypedExpr { id: 0, ty, kind: TypedExprKind::Arena(Box::new(body)) }, span))
+    }
+
+    /// Inside `with Arena`, a binding declared outside the block is read-only:
+    /// the arena frees nothing, so a write could leave an arena object in an
+    /// outer place, and the old value would never be freed. Rejects a write
+    /// to `root` in that case. Every in-place write passes through here.
+    fn check_not_frozen(&self, root: &str, span: Span) -> Result<(), Spanned<TypeError>> {
+        match (self.arena_levels.last(), self.ctx.level(root)) {
+            (Some(&arena), Some(level)) if level <= arena => Err(Spanned::from(TypeError {
+                msg: format!(
+                    "'{root}' is declared outside this 'with Arena' block, which can only read it — \
+                     copy it into the block, or return the block's result and update '{root}' after it"
+                )
+            }, span)),
+            _ => Ok(()),
+        }
+    }
+
     fn lower_return(&mut self, value: Option<Box<Spanned<Expression>>>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let return_ty = self.return_types.last().cloned().ok_or_else(|| Spanned::from(
             TypeError { msg: "'return' used outside of a function".to_string() }, span
@@ -10815,6 +10871,7 @@ impl TypeChecker {
             TypedExprKind::Narrow { value, .. } => self.desugar_notation(value)?,
             TypedExprKind::TypeTag { target, .. } => self.desugar_notation(target)?,
             TypedExprKind::Truthy(value) => self.desugar_notation(value)?,
+            TypedExprKind::Arena(body) => self.desugar_notation(body)?,
             TypedExprKind::Coerce(value) => self.desugar_notation(value)?,
         }
         Ok(())

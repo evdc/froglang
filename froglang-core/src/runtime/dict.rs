@@ -248,12 +248,12 @@ fn grow_if_full(heap: &mut GcHeap, dict: *mut FrogDict, stride: usize) {
         }
         let old_size = old_cap * stride * std::mem::size_of::<i64>();
         let new_size = new_cap * stride * std::mem::size_of::<i64>();
-        let new_data = super::ffi::grow_raw_buffer((*dict).entries as *mut u8, old_size, new_size) as *mut i64;
+        let new_data = heap.grow_buffer((*dict).entries as *mut u8, old_size, new_size) as *mut i64;
         heap.bytes_allocated += new_size - old_size;
 
         let old_hashes_size = old_cap * std::mem::size_of::<u64>();
         let new_hashes_size = new_cap * std::mem::size_of::<u64>();
-        let new_hashes = super::ffi::grow_raw_buffer((*dict).hashes as *mut u8, old_hashes_size, new_hashes_size) as *mut u64;
+        let new_hashes = heap.grow_buffer((*dict).hashes as *mut u8, old_hashes_size, new_hashes_size) as *mut u64;
         heap.bytes_allocated += new_hashes_size - old_hashes_size;
 
         (*dict).entries = new_data;

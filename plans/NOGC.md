@@ -884,6 +884,82 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    - **Out of scope.** Per-task heaps; segment headers; the result allocator (evacuation is by
      copy, for now); `Pool<T>`/`Id<T>` (step 5); other `with` forms (`Scope`, `Deadline`, ...);
      an arena lint for loop-carried reallocation; the `gc` rename.
+
+   **Step 4 status (2026-11-08): done, uncommitted.** `with Arena { body }` works in the JIT and
+   the AOT build, and the leak gate holds.
+   - **4a, runtime** (`gc.rs`). `GcHeap` has a stack of bump arenas (first chunk 16 KiB, then
+     doubling, an oversized object gets a chunk of its own, chunks are taken lazily on the
+     first allocation). Three entry points replace the planned `frog_arena_exit(result, mask)`:
+     `frog_arena_enter`, `frog_arena_evac` (the top arena stops accepting allocations, so the
+     enclosing allocator is current) and `frog_arena_release`. Codegen clones each heap leaf of the
+     result between the last two, with the same `emit_clone_word` that copy-on-keep uses. That
+     needs no type mask and handles multi-leaf structs and inline unions for free.
+     `drop_tree` and `free_shallow` return at once while an arena is active. The live-object and
+     byte counts are snapshotted at enter and at evac, and release subtracts the difference, so
+     the leak oracle still sees only outside objects. List and dict growth goes through
+     `GcHeap::grow_buffer` (it was the free function `grow_raw_buffer`), which bump-allocates and
+     copies in an arena. Dicts record themselves in their arena, because their hash index is a
+     Rust `Box` that release has to drop.
+   - **Zero cost when idle.** While an arena is active the real free lists are swapped out for
+     empty ones, so `alloc_bytes`'s hot path is unchanged and the arena check lives only in
+     `alloc_slow`, behind the free-list miss. Putting the check in `alloc_bytes` itself cost
+     `words` about 5% (147 to 154 ms) through inlining, not through the branch.
+   - **4b, language.** `with` is a keyword and `Expression::Arena` / `TypedExprKind::Arena`
+     are new nodes (about 16 walker arms, all one line). Typeck records `ScopeStack` depth at
+     entry (`arena_levels`) and every in-place write site (`lower_place`, plain reassignment,
+     `check_mut_receiver`) calls `check_not_frozen`, which rejects a binding declared at or
+     outside that depth. That covers assignment, place assignment, `push`, mutating methods and
+     `mut` arguments with one rule and no second analysis. Parse errors for any other `with` form
+     say that only `Arena` exists.
+   - **Deviation: moves are not errors, they are copies.** The scope said a `Move` read or a
+     consuming call argument of an outer binding is an error. That would make `with Arena
+     { summarize(text) }` illegal whenever `text` is not used afterwards. Instead liveness treats
+     the outer names as live through the whole body (`transfer`'s `Arena` arm, which also covers
+     `return` in the body), so every read of one is a `Copy` and copy-on-keep copies it into the
+     arena. Nothing outer is ever moved in, so the property the scope relied on still holds. This is
+     six lines in `liveness.rs` and removes a class of error message.
+   - **Found: shadowing.** Codegen keeps one Cranelift variable per name, so `let xs = ...` in an
+     inner block overwrites an outer `xs` (true for plain blocks today: `mut n = 1; { mut n = 10 };
+     print(n)` prints 10). In an arena that would leave the outer name pointing into released
+     memory. A `let`/`mut` that shadows an outer binding inside an arena block is therefore
+     rejected. Loop variables, parameters and match binders are not checked; shadowing an outer
+     heap name with one of those inside an arena block is still unsound. Fixing the conflation
+     itself is the real remedy.
+   - **4c, codegen.** The arm is enter, body in a frame of its own (so a non-block body's
+     temporaries end before release), pop, evac, clone leaves, release. `return` and `?`
+     leaving the block fit in a few lines: `compile_return` evacuates once per open arena
+     (`Ctx::arena_marks`), innermost first, and `drop_all_frames` drops only the frames outside the
+     outermost arena. There is no `break` in the language, so `return` and `?` are the only
+     exits; nothing was rejected. A discarded block releases without copying.
+   - **Checked: the scope's "a free never meets an outer pointer" claim.** It holds. Writes are
+     frozen by typeck, outer moves became copies, a callee's `mut` and consumed parameters can only
+     be fed arena values or copies, and a function called inside runs against the same arena, so its
+     allocations and drops are consistent. The one hole found was the shadowing conflation above,
+     and the one bug found was `return outer` moving an outer local into the arena (the `Return`
+     arm of liveness ignores `live_out`), fixed by the same liveness rule.
+   - **Tests.** 24 in `tests/test_arena.rs` (each result type, loops, nesting, outer reads, last
+     use of an outer name, consuming callee, return, nested return, `?`, bare `return`, a flat
+     `bytes_allocated` across 3,000 blocks, one freeze error per write kind, the nested-arena
+     freeze, shadowing, bad `with` form), 6 Rust unit tests in `gc.rs`, one AOT test, and the
+     `tree_discard` / `tree_arena` criterion workloads. `cargo test --workspace`: 1,229 passed,
+     0 failed, 2 ignored, plain and under `FROG_LEAK_CHECK=1`. Clippy: 18 warnings, none new.
+   - **Results.** Release, best of 7, wall clock including JIT compilation:
+
+     | Benchmark | step 3 (HEAD) | step 4 |
+     |---|---|---|
+     | `orders` | 52 ms | 52 ms |
+     | `words` | 148 ms | 148 ms |
+     | `life` | 15 ms | 15 ms |
+     | `tree_discard` (300 trees of depth 9) | 37 ms | 37 ms |
+     | `tree_arena` (same, in `with Arena`) | | 27 ms |
+
+   - **Size.** `git diff` for `froglang-core/src` is +490/-50. Of that, 130 lines are the `gc.rs` unit
+     tests, so about +310 net of real source (runtime about +165, frontend about +85, codegen
+     about +60). Tests and benches add about +540 (test_arena 361, unit tests 130, pipeline 38,
+     AOT 9).
+   - **Left open.** Shadowing by loop variables, parameters and match binders (above). The result is copied out, not built in
+     place, so a block whose result is large pays a copy. No arena lint for loop-carried
+     reallocation. No arena-aware `gc_dump` line.
 5. **`Pool<T>`/`Id<T>`.**
 6. **`Abort` and `?`.** This needs no allocator work and can land early, against today's GC
    runtime. It adds the trait, the error-arm desugar in typeck, the `Linear` requires `Abort`

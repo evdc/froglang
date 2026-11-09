@@ -468,6 +468,9 @@ pub enum Expression {
     /// anywhere else `TypeChecker` rejects it, since it's only meaningful
     /// as one of `lower_call`'s own arguments.
     MutArg(ExprRef),
+    /// `with Arena { body }` — the body's allocations live in a bump region
+    /// that is freed when the block ends (`plans/NOGC.md` step 4).
+    Arena(ExprRef),
 }
 
 
@@ -868,6 +871,7 @@ impl fmt::Display for Expression {
 
             Expression::Try(inner) => write!(f, "{}?", inner),
             Expression::Unwrap(inner) => write!(f, "{}!", inner),
+            Expression::Arena(body) => write!(f, "with Arena {}", body),
             Expression::Catch { value, handler } => write!(f, "{} catch {}", value, handler),
             Expression::MutArg(name) => write!(f, "mut {}", name),
         }

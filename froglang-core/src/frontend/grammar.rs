@@ -579,6 +579,22 @@ impl Grammar {
         })
     }
 
+    /// `with Arena { body }`: the only `with` form so far. The body must be a
+    /// `{ }` block, so the region's extent is always visible in the source.
+    pub fn with_expr(parser: &mut Parser, t: Spanned<Token>) -> ParseResult {
+        let kind = parser.identifier()?;
+        if kind.item != Token::Identifier("Arena".to_string()) {
+            let msg = format!("unknown `with` form `{}`: only `with Arena {{ ... }}` exists", kind.item);
+            return Err(kind.to(ParseError::Other(msg)));
+        }
+        if !parser.check(&Token::LeftBrace) {
+            let found = parser.current_token.clone();
+            return Err(found.map(|f| ParseError::ExpectedButFound(Token::LeftBrace, f)));
+        }
+        let body = parser.expression(Precedence::Assign)?;
+        Ok(Spanned { span: t.span.merge(body.span), item: Expression::Arena(Box::new(body)) })
+    }
+
     /// `e?` — postfix, no right operand to parse (mirrors `call`/`index`'s
     /// shape but consumes nothing further). See `TypeChecker::lower_try`.
     pub fn postfix_try(_parser: &mut Parser, t: Spanned<Token>, left: Spanned<Expression>, _prec: Precedence) -> ParseResult {

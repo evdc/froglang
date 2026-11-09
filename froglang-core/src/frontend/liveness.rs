@@ -123,6 +123,7 @@ fn number_kind(kind: &mut TypedExprKind, next: &mut NodeId) {
         TypedExprKind::TypeTag { target, .. } => number(target, next),
         TypedExprKind::Truthy(value) => number(value, next),
         TypedExprKind::Coerce(value) => number(value, next),
+        TypedExprKind::Arena(body) => number(body, next),
     }
 }
 
@@ -325,6 +326,7 @@ fn dump_walk_kind(kind: &TypedExprKind, liveness: &Liveness) {
         TypedExprKind::TypeTag { target, .. } => dump_walk(target, liveness),
         TypedExprKind::Truthy(value) => dump_walk(value, liveness),
         TypedExprKind::Coerce(value) => dump_walk(value, liveness),
+        TypedExprKind::Arena(body) => dump_walk(body, liveness),
     }
 }
 
@@ -394,6 +396,24 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
         | TypedExprKind::TypeTag { target: inner, .. }
         | TypedExprKind::IsVariant { target: inner, .. }
         | TypedExprKind::VariantField { target: inner, .. } => transfer(inner, live_out, ctx, out),
+
+        // A `with Arena` body only reads the names it uses from outside, so
+        // none of those reads may be a last use: a `Move` would hand an
+        // outer object to the arena, which neither frees it nor lets the
+        // outer scope keep it. Marking every outer name live through the
+        // body makes each read a copy. The names live into the body are the
+        // outer ones, since an inner `let` kills its own; a first pass over
+        // a scratch result finds them. The first pass's own `return`s may
+        // mark moves, but it records nothing.
+        TypedExprKind::Arena(body) => {
+            let outer = transfer(body, live_out, ctx, &mut Liveness::empty());
+            let kept: NameSet = live_out.union(&outer).cloned().collect();
+            // A `return` in the body leaves the arena too, and still must not
+            // move an outer name.
+            let inner = Ctx { exit_live: ctx.exit_live.union(&outer).cloned().collect() };
+            transfer(body, &kept, &inner, out);
+            outer
+        }
 
         // `FieldAccess`'s `enum_name: Some` arm reads out of heap memory via
         // `target`'s value and never touches `target`'s own leaves
@@ -741,6 +761,7 @@ mod tests {
             TypedExprKind::TypeTag { target, .. } => collect_ids(target, out),
             TypedExprKind::Truthy(value) => collect_ids(value, out),
             TypedExprKind::Coerce(value) => collect_ids(value, out),
+            TypedExprKind::Arena(body) => collect_ids(body, out),
         }
     }
 
@@ -882,6 +903,7 @@ mod tests {
             TypedExprKind::TypeTag { target, .. } => collect_var_ids(target, name, out),
             TypedExprKind::Truthy(value) => collect_var_ids(value, name, out),
             TypedExprKind::Coerce(value) => collect_var_ids(value, name, out),
+            TypedExprKind::Arena(body) => collect_var_ids(body, name, out),
         }
     }
 

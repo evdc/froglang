@@ -415,4 +415,11 @@ pub enum TypedExprKind {
     /// codegen coerces those against the callee's signature — this makes
     /// every other slot behave the same way.
     Coerce(TypedExprRef),
+
+    /// `with Arena { body }`, typed as the body. At runtime the body's
+    /// allocations bump a region, its frees are no-ops, and the result is
+    /// copied out to the enclosing allocator when it ends. Typeck guarantees
+    /// the body never writes a place declared outside it, and liveness never
+    /// moves an outer binding into it. See `plans/NOGC.md` step 4.
+    Arena(TypedExprRef),
 }

@@ -184,6 +184,10 @@ struct Ctx<'a> {
     /// not register the variable again in an inner frame, or the outer binding
     /// would be freed at the inner block's end. One entry per declaration.
     known: Vec<Variable>,
+    /// For each `with Arena` block being compiled, innermost last: how many
+    /// frames were open outside it. The frames above that index hold arena
+    /// objects, whose drops are no-ops, so an early exit skips them.
+    arena_marks: Vec<usize>,
 }
 
 /// One scope of owned slots (see `Ctx::frames`).
@@ -937,7 +941,10 @@ fn compile_loop_body(bcx: &mut FunctionBuilder, vars: &mut HashMap<String, Varia
 
 /// Drop every slot of every open frame, for an early exit that leaves the whole function.
 fn drop_all_frames(bcx: &mut FunctionBuilder, ctx: &mut Ctx) {
-    let vars: Vec<Variable> = ctx.frames.iter().rev()
+    // Frames inside a `with Arena` hold arena objects, which the exit already
+    // released and whose drops would have been no-ops.
+    let open = ctx.arena_marks.first().copied().unwrap_or(ctx.frames.len());
+    let vars: Vec<Variable> = ctx.frames[..open].iter().rev()
         .flat_map(|f| f.slots.iter().rev().copied()).collect();
     for var in vars {
         drop_var(bcx, ctx, var);
@@ -2613,7 +2620,7 @@ fn compile_expr_multi(
     let registers = match &expr.item.kind {
         K::Var(_) | K::Index { .. } | K::FieldAccess { .. } | K::VariantField { .. }
         | K::Narrow { .. } | K::Assign { .. } | K::Function { .. } | K::StructInit { .. } => false,
-        K::Block(_) | K::Conditional { .. } => !discard,
+        K::Block(_) | K::Conditional { .. } | K::Arena(_) => !discard,
         _ => true,
     };
     if registers {
@@ -2972,7 +2979,49 @@ fn compile_expr_multi_inner(
         },
 
         TypedExprKind::Truthy(value) => compile_truthy(value, bcx, vars, ctx),
+
+        TypedExprKind::Arena(body) => {
+            call_rt(bcx, ctx, "frog_arena_enter");
+            ctx.arena_marks.push(ctx.frames.len());
+            // A frame of its own, so the temporaries of a body that is not a
+            // block end inside the arena, before it is released.
+            push_frame(ctx, false);
+            ctx.discard_next = discard;
+            let vals = compile_expr_multi(body, bcx, vars, ctx);
+            pop_frame(bcx, ctx);
+            ctx.arena_marks.pop();
+            if bcx.is_unreachable() {
+                return vals;
+            }
+            if discard {
+                call_rt(bcx, ctx, "frog_arena_evac");
+                call_rt(bcx, ctx, "frog_arena_release");
+                return vals;
+            }
+            arena_exit(bcx, ctx, &expr.item.ty, vals)
+        },
     }
+}
+
+/// Call the argument-less runtime function `name`.
+fn call_rt(bcx: &mut FunctionBuilder, ctx: &mut Ctx, name: &str) {
+    let id = ctx.func_ids[name];
+    let callee = ctx.module.declare_func_in_func(id, bcx.func);
+    bcx.ins().call(callee, &[]);
+}
+
+/// Leave the innermost `with Arena`: the block's result `vals` (of type `ty`)
+/// is deep-copied into the enclosing allocator, and then the arena is released.
+/// The copy happens after `frog_arena_evac`, which makes the enclosing
+/// allocator the current one.
+fn arena_exit(bcx: &mut FunctionBuilder, ctx: &mut Ctx, ty: &Type, vals: Vec<Value>) -> Vec<Value> {
+    call_rt(bcx, ctx, "frog_arena_evac");
+    let leafs = struct_fields(ty, ctx.structs);
+    let out = vals.into_iter().zip(leafs.iter())
+        .map(|(v, (_, lty))| if is_heap_ty(lty) { emit_clone_word(bcx, ctx, v) } else { v })
+        .collect();
+    call_rt(bcx, ctx, "frog_arena_release");
+    out
 }
 
 /// The structural comparisons all compute equality; `!=` is its negation.
@@ -4038,6 +4087,15 @@ fn compile_return(value: &Option<TypedExprRef>, bcx: &mut FunctionBuilder, vars:
     // the function, then every open frame is dropped.
     if let Some(v) = value {
         results = keep_vals(bcx, ctx, &v.item.ty, results);
+        // Leaving every open `with Arena` on the way out, innermost first.
+        for _ in 0..ctx.arena_marks.len() {
+            results = arena_exit(bcx, ctx, &v.item.ty, results);
+        }
+    } else {
+        for _ in 0..ctx.arena_marks.len() {
+            call_rt(bcx, ctx, "frog_arena_evac");
+            call_rt(bcx, ctx, "frog_arena_release");
+        }
     }
     results.extend(mut_param_copyout(bcx, vars, ctx));
     drop_all_frames(bcx, ctx);
@@ -4859,6 +4917,9 @@ impl Codegen<JITModule> {
         builder.symbol("frog_clone",       ffi::frog_clone       as *const u8);
         builder.symbol("frog_drop",        ffi::frog_drop        as *const u8);
         builder.symbol("frog_drop_shallow", ffi::frog_drop_shallow as *const u8);
+        builder.symbol("frog_arena_enter", ffi::frog_arena_enter as *const u8);
+        builder.symbol("frog_arena_evac", ffi::frog_arena_evac as *const u8);
+        builder.symbol("frog_arena_release", ffi::frog_arena_release as *const u8);
         builder.symbol("frog_ctx_current", crate::runtime::host::frog_ctx_current as *const u8);
         // `repr` leaves (plans/DATA.md stage 5) — see `desugar_notation` in typeck.rs.
         builder.symbol("frog_int_repr",    ffi::frog_int_repr    as *const u8);
@@ -5027,6 +5088,9 @@ fn declare_runtime_imports(
     declare_rt(module, &mut func_ids, "frog_clone",       "frog_clone",       &[I64],           Some(I64));
     declare_rt(module, &mut func_ids, "frog_drop",        "frog_drop",        &[I64],           None);
     declare_rt(module, &mut func_ids, "frog_drop_shallow", "frog_drop_shallow", &[I64],         None);
+    declare_rt(module, &mut func_ids, "frog_arena_enter", "frog_arena_enter", &[], None);
+    declare_rt(module, &mut func_ids, "frog_arena_evac", "frog_arena_evac", &[], None);
+    declare_rt(module, &mut func_ids, "frog_arena_release", "frog_arena_release", &[], None);
     // Fetches the `FrogCtx*` a host call passes as its own argument 0
     // — never an `iconst` of a host address (see `plans/EMBEDDING.md`,
     // "Getting the ctx pointer without baking an address").
@@ -5322,6 +5386,7 @@ impl<M: Module> Codegen<M> {
             depth: 0,
             owned_names: std::collections::HashSet::new(),
             known: Vec::new(),
+            arena_marks: Vec::new(),
         };
         // The function owns every parameter that is not borrowed, and its
         // `mut` parameters too. Those are dropped at its end, or handed back
@@ -5479,6 +5544,7 @@ impl<M: Module> Codegen<M> {
             depth: 0,
             owned_names: std::collections::HashSet::new(),
             known: Vec::new(),
+            arena_marks: Vec::new(),
         };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();

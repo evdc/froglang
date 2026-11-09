@@ -212,6 +212,30 @@ pub fn immediate_variant_tag(v: i64) -> i64 {
 
 // ── GcHeap ───────────────────────────────────────────────────────────────────
 
+/// One `with Arena` region: a bump allocator whose objects are all released
+/// together. See `GcHeap::arena_enter`.
+struct Arena {
+    /// Every chunk this arena owns, with its size.
+    chunks:  Vec<(*mut u8, usize)>,
+    /// The unused tail of the newest chunk.
+    ptr:     *mut u8,
+    end:     *mut u8,
+    /// Dicts allocated here. Each holds a Rust-side index that is not arena
+    /// memory, so releasing the arena has to drop it.
+    dicts:   Vec<*mut FrogDict>,
+    /// `bytes_allocated` and `live_objects` when the arena was entered, and
+    /// when it stopped accepting allocations (`arena_evac_begin`). The
+    /// difference is what the arena added, and release takes it back out.
+    bytes0:  usize,
+    live0:   usize,
+    bytes1:  usize,
+    live1:   usize,
+}
+
+/// The first chunk of an arena. Later chunks double, and an object larger
+/// than the next chunk gets a chunk of its own.
+const ARENA_FIRST_CHUNK: usize = 16 * 1024;
+
 pub struct GcHeap {
     /// Bytes held by live objects, buffers included.
     pub bytes_allocated: usize,
@@ -240,6 +264,17 @@ pub struct GcHeap {
     /// `clone_obj`), so a walk is not a `malloc`/`free` pair. None of them
     /// calls another while it holds the list.
     worklist:        Vec<*mut GcHeader>,
+    /// `with Arena` regions, innermost last. The first `arenas_active` of them
+    /// accept allocations; the one after (at most one) is being evacuated.
+    /// While `arenas_active` is non-zero, allocation bumps the top arena and
+    /// every free is a no-op, which is sound because nothing outside the
+    /// arena is freed inside it (`plans/NOGC.md` step 4).
+    arenas:          Vec<Arena>,
+    arenas_active:   usize,
+    /// While any arena is active, this holds the real free lists and
+    /// `free_lists` is all null, which sends `alloc_bytes` to its slow path,
+    /// the only place that checks for an arena. Swapped on the 0/1 edge.
+    free_lists_aside: Vec<*mut u8>,
     /// Builds the hash index every `FrogDict` this heap allocates uses —
     /// the "swappable from the host" seam (`plans/DATA.md`'s Dict design):
     /// an embedder can install a different `DictBackend` (e.g. a sorted
@@ -341,13 +376,14 @@ impl GcHeap {
     /// `obj` must be a live object of this heap that nothing else owns, and
     /// nothing may use it or anything it owns afterwards.
     pub unsafe fn drop_tree(&mut self, obj: *mut GcHeader) {
+        if self.arenas_active != 0 { return; }
         let mut work = std::mem::take(&mut self.worklist);
         work.push(obj);
         while let Some(obj) = work.pop() {
             Self::for_each_slot(obj, &mut |p| {
                 if is_heap_ptr(*p) { work.push(heap_ptr(*p)); }
             });
-            self.free_shallow(obj);
+            self.free_object(obj);
         }
         self.worklist = work;
     }
@@ -359,6 +395,12 @@ impl GcHeap {
     ///
     /// `obj` must be a live object of this heap, unused afterwards.
     pub unsafe fn free_shallow(&mut self, obj: *mut GcHeader) {
+        if self.arenas_active != 0 { return; }
+        self.free_object(obj);
+    }
+
+    /// `free_shallow` for a caller that has checked no arena is active.
+    unsafe fn free_object(&mut self, obj: *mut GcHeader) {
         if self.track_frees && !self.freed.insert(obj as usize) {
             panic!("double free of heap object {:p}", obj);
         }
@@ -382,6 +424,17 @@ impl GcHeap {
                 return head;
             }
         }
+        // The free lists are empty while an arena is active (`arena_enter`),
+        // so every allocation in one reaches here.
+        self.alloc_slow(words)
+    }
+
+    /// `alloc_bytes` when no recycled block fits: bump the top arena if one
+    /// is active (the free lists are empty then, see `arena_enter`), and
+    /// otherwise ask the system allocator.
+    #[inline(never)]
+    fn alloc_slow(&mut self, words: usize) -> *mut u8 {
+        if self.arenas_active != 0 { return self.arena_alloc(words * 8); }
         let layout = Layout::from_size_align(words * 8, 8).expect("gc block layout");
         // `alloc` signals failure with a null pointer, which every caller
         // here would otherwise write a header through. Route it to the
@@ -404,6 +457,93 @@ impl GcHeap {
         unsafe { dealloc(ptr, layout) }
     }
 
+    // ── Arenas ───────────────────────────────────────────────────────────────
+
+    /// Bump `size` bytes (a whole number of words) from the top arena.
+    #[inline(never)]
+    fn arena_alloc(&mut self, size: usize) -> *mut u8 {
+        let arena = &mut self.arenas[self.arenas_active - 1];
+        if (arena.end as usize) - (arena.ptr as usize) < size {
+            let last = arena.chunks.last().map_or(ARENA_FIRST_CHUNK / 2, |c| c.1);
+            let chunk = (last * 2).max(size);
+            let layout = Layout::from_size_align(chunk, 8).expect("arena chunk layout");
+            let p = unsafe { alloc(layout) };
+            if p.is_null() { handle_alloc_error(layout); }
+            arena.chunks.push((p, chunk));
+            arena.ptr = p;
+            arena.end = unsafe { p.add(chunk) };
+        }
+        let p = arena.ptr;
+        arena.ptr = unsafe { p.add(size) };
+        p
+    }
+
+    /// Start a `with Arena` region. Allocation bumps it, and frees do
+    /// nothing, until `arena_evac_begin`.
+    pub fn arena_enter(&mut self) {
+        debug_assert_eq!(self.arenas.len(), self.arenas_active, "arena_enter during an evacuation");
+        let none = std::ptr::null_mut();
+        self.arenas.push(Arena {
+            chunks: Vec::new(), ptr: none, end: none, dicts: Vec::new(),
+            bytes0: self.bytes_allocated, live0: self.live_objects, bytes1: 0, live1: 0,
+        });
+        if self.arenas_active == 0 { std::mem::swap(&mut self.free_lists, &mut self.free_lists_aside); }
+        self.arenas_active += 1;
+    }
+
+    /// The top arena stops accepting allocations: the next one down (or the
+    /// heap) does, so the caller can copy the block's result out with
+    /// `clone_obj`. Then `arena_release` frees the arena.
+    pub fn arena_evac_begin(&mut self) {
+        let arena = self.arenas.last_mut().expect("arena_evac_begin without arena_enter");
+        arena.bytes1 = self.bytes_allocated;
+        arena.live1 = self.live_objects;
+        self.arenas_active -= 1;
+        if self.arenas_active == 0 { std::mem::swap(&mut self.free_lists, &mut self.free_lists_aside); }
+    }
+
+    /// Free the arena `arena_evac_begin` detached: its chunks, and the index
+    /// of each dict in it. The live-object and byte counts drop by what it
+    /// held, so the leak check still sees only objects from outside.
+    pub fn arena_release(&mut self) {
+        debug_assert_eq!(self.arenas.len(), self.arenas_active + 1, "arena_release without arena_evac_begin");
+        let arena = self.arenas.pop().expect("arena_release without arena_enter");
+        for d in arena.dicts {
+            unsafe { drop(Box::from_raw((*d).index as *mut Box<dyn crate::runtime::dict::DictIndex>)) };
+        }
+        for (p, size) in arena.chunks {
+            unsafe { dealloc(p, Layout::from_size_align(size, 8).expect("arena chunk layout")) };
+        }
+        self.bytes_allocated -= arena.bytes1 - arena.bytes0;
+        self.live_objects -= arena.live1 - arena.live0;
+    }
+
+    /// Grow a list's or dict's buffer from `old_size` to `new_size` bytes,
+    /// keeping its contents: `alloc` when there is nothing to carry forward
+    /// (`old_size == 0`, a dict's buffers before its first insert), `realloc`
+    /// otherwise. In an arena the old buffer stays where it is, unfreed. The
+    /// caller adds `new_size - old_size` to `bytes_allocated`.
+    ///
+    /// # Safety
+    ///
+    /// `old_ptr` is null iff `old_size == 0`, and otherwise a buffer of
+    /// `old_size` bytes this heap allocated.
+    pub(crate) unsafe fn grow_buffer(&mut self, old_ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
+        if self.arenas_active != 0 {
+            let p = self.arena_alloc(new_size.next_multiple_of(8));
+            if old_size > 0 { std::ptr::copy_nonoverlapping(old_ptr, p, old_size); }
+            return p;
+        }
+        let new_layout = Layout::from_size_align(new_size, 8).expect("buffer layout");
+        let p = if old_size == 0 {
+            alloc(new_layout)
+        } else {
+            std::alloc::realloc(old_ptr, Layout::from_size_align(old_size, 8).expect("buffer layout"), new_size)
+        };
+        if p.is_null() { handle_alloc_error(new_layout); }
+        p
+    }
+
     pub fn new() -> Self {
         GcHeap {
             bytes_allocated: 0,
@@ -412,6 +552,9 @@ impl GcHeap {
             live_objects:    0,
             freed:           std::collections::HashSet::new(),
             worklist:        Vec::new(),
+            arenas:          Vec::new(),
+            arenas_active:   0,
+            free_lists_aside: vec![std::ptr::null_mut(); MAX_FREE_WORDS + 1],
             dict_backend:    std::sync::Arc::new(crate::runtime::dict::HashbrownBackend),
         }
     }
@@ -660,6 +803,9 @@ impl GcHeap {
             (*ptr).index     = Box::into_raw(boxed) as *mut ();
         }
 
+        if self.arenas_active != 0 {
+            self.arenas[self.arenas_active - 1].dicts.push(ptr);
+        }
         self.note_alloc(ptr as *mut GcHeader);
         self.bytes_allocated += dict_size + entries_size + hashes_size;
         gc_trace!("alloc Dict {} bytes -> {:p}  (total: {} bytes)",
@@ -819,5 +965,134 @@ mod tests {
                 assert_eq!(txt, "hello");
             }
         });
+    }
+
+    // ── Arenas ───────────────────────────────────────────────────────────────
+
+    /// A list of `n` strings, as an owning tree (`ptr_mask` 1).
+    fn str_list(h: &mut GcHeap, n: usize) -> *mut FrogList {
+        let list = h.alloc_list(n, 1, 1);
+        for i in 0..n {
+            let s = h.alloc_str(format!("item {i}").as_bytes());
+            unsafe { *(*list).data.add(i) = s as i64; (*list).len += 1; }
+        }
+        list
+    }
+
+    #[test]
+    fn arena_frees_nothing_until_release_then_counts_return() {
+        let mut h = GcHeap::new();
+        let outer = h.alloc_str(b"outer");
+        let (bytes, live) = (h.bytes_allocated, h.live_objects());
+        h.arena_enter();
+        let list = str_list(&mut h, 10);
+        assert_eq!(h.live_objects(), live + 11);
+        // A drop in an arena is a no-op, and the objects stay readable.
+        h.drop_word(list as i64);
+        assert_eq!(h.live_objects(), live + 11);
+        unsafe { assert_eq!(frog_str_as_str(*(*list).data as *const FrogStr), "item 0"); }
+        h.arena_evac_begin();
+        h.arena_release();
+        assert_eq!((h.bytes_allocated, h.live_objects()), (bytes, live));
+        h.drop_word(outer as i64);
+        assert_eq!(h.live_objects(), 0);
+    }
+
+    #[test]
+    fn arena_outer_frees_still_work_after_exit() {
+        let mut h = GcHeap::new();
+        h.arena_enter();
+        h.alloc_str(b"scratch");
+        h.arena_evac_begin();
+        h.arena_release();
+        let s = h.alloc_str(b"after");
+        h.drop_word(s as i64);
+        assert_eq!((h.live_objects(), h.bytes_allocated), (0, 0));
+    }
+
+    #[test]
+    fn arena_oversized_object_gets_its_own_chunk() {
+        let mut h = GcHeap::new();
+        h.arena_enter();
+        let big = vec![b'x'; 3 * ARENA_FIRST_CHUNK];
+        let a = h.alloc_str(b"small");
+        let b = h.alloc_str(&big);
+        let c = h.alloc_str(b"after");
+        unsafe {
+            assert_eq!((*b).len as usize, big.len());
+            assert_eq!(frog_str_as_str(a as *const FrogStr), "small");
+            assert_eq!(frog_str_as_str(c as *const FrogStr), "after");
+        }
+        h.arena_evac_begin();
+        h.arena_release();
+        assert_eq!((h.live_objects(), h.bytes_allocated), (0, 0));
+    }
+
+    #[test]
+    fn arena_list_growth_keeps_contents() {
+        let mut h = GcHeap::new();
+        ACTIVE_HEAP.with(|p| p.set(&mut h as *mut GcHeap));
+        h.arena_enter();
+        let list = h.alloc_list(1, 1, 0);
+        for i in 0..1000 { crate::runtime::ffi::frog_list_push(list as i64, i); }
+        unsafe {
+            assert_eq!((*list).len, 1000);
+            assert_eq!(*(*list).data.add(999), 999);
+        }
+        h.arena_evac_begin();
+        h.arena_release();
+        ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
+        assert_eq!((h.live_objects(), h.bytes_allocated), (0, 0));
+    }
+
+    #[test]
+    fn arena_nested_evacuates_into_the_enclosing_arena() {
+        let mut h = GcHeap::new();
+        h.arena_enter();
+        let outer_list = str_list(&mut h, 3);
+        h.arena_enter();
+        let inner = str_list(&mut h, 5);
+        let live_inner = h.live_objects();
+        h.arena_evac_begin();
+        // The copy lands in the outer arena, so it survives the inner release.
+        let copy = unsafe { h.clone_obj(inner as *mut GcHeader) } as *mut FrogList;
+        h.arena_release();
+        assert_eq!(h.live_objects(), live_inner - 6 + 6);
+        unsafe {
+            assert_eq!((*copy).len, 5);
+            assert_eq!(frog_str_as_str(*(*copy).data.add(4) as *const FrogStr), "item 4");
+        }
+        let _ = outer_list;
+        h.arena_evac_begin();
+        h.arena_release();
+        assert_eq!((h.live_objects(), h.bytes_allocated), (0, 0));
+    }
+
+    #[test]
+    fn arena_evacuates_list_variant_dict_and_str() {
+        let mut h = GcHeap::new();
+        ACTIVE_HEAP.with(|p| p.set(&mut h as *mut GcHeap));
+        h.arena_enter();
+        let list = str_list(&mut h, 4);
+        // A variant holding the list, and a dict whose values are variants.
+        let var = h.alloc_variant(1, 1, 1);
+        unsafe { *((var as *mut u8).add(std::mem::size_of::<FrogVariant>()) as *mut i64) = list as i64; }
+        let dict = h.alloc_dict(2, 1, 1, 0b10, 0);
+        let d = dict as i64;
+        let e = crate::runtime::dict::frog_dict_insert(d, 7);
+        crate::runtime::dict::frog_dict_set_slot(d, e, 1, var as i64);
+        let name = h.alloc_str(b"name");
+        h.arena_evac_begin();
+        let dict2 = unsafe { h.clone_obj(dict as *mut GcHeader) };
+        let name2 = unsafe { h.clone_obj(name as *mut GcHeader) };
+        h.arena_release();
+        ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
+        // 1 dict + 1 variant + 1 list + 4 strs, and the name.
+        assert_eq!(h.live_objects(), 7 + 1);
+        let found = crate::runtime::dict::frog_dict_find(dict2 as i64, 7);
+        assert!(found >= 0);
+        h.drop_word(dict2 as i64);
+        h.drop_word(name2 as i64);
+        assert_eq!((h.live_objects(), h.bytes_allocated), (0, 0));
     }
 }

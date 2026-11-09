@@ -223,6 +223,7 @@ fn walk(
         TypedExprKind::Unary { expr, .. }
         | TypedExprKind::Truthy(expr)
         | TypedExprKind::Coerce(expr)
+        | TypedExprKind::Arena(expr)
         | TypedExprKind::Widen { value: expr, .. }
         | TypedExprKind::Narrow { value: expr, .. }
         | TypedExprKind::TypeTag { target: expr, .. }

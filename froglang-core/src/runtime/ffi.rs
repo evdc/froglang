@@ -1,4 +1,3 @@
-use std::alloc::Layout;
 use std::io::Write;
 
 use super::gc::{FrogList, FrogStr, FrogVariant, GcHeap, GC_HEAP, ACTIVE_HEAP};
@@ -454,6 +453,25 @@ pub extern "C" fn frog_drop(w: i64) {
     with_heap(|heap| unsafe { heap.drop_tree(super::gc::heap_ptr(w)) });
 }
 
+/// Start a `with Arena` region (`GcHeap::arena_enter`).
+#[no_mangle]
+pub extern "C" fn frog_arena_enter() {
+    with_heap(|heap| heap.arena_enter());
+}
+
+/// The region's block has its result: allocation returns to the enclosing
+/// allocator, so the result can be copied out (`GcHeap::arena_evac_begin`).
+#[no_mangle]
+pub extern "C" fn frog_arena_evac() {
+    with_heap(|heap| heap.arena_evac_begin());
+}
+
+/// Free the region, once the result is copied out (`GcHeap::arena_release`).
+#[no_mangle]
+pub extern "C" fn frog_arena_release() {
+    with_heap(|heap| heap.arena_release());
+}
+
 /// Free only the object `w` itself, not what it points at. Used for the
 /// intermediate list that `keys`/`values`/`slice` build before deep-copying it.
 #[no_mangle]
@@ -462,37 +480,6 @@ pub extern "C" fn frog_drop_shallow(w: i64) {
         return;
     }
     with_heap(|heap| unsafe { heap.free_shallow(super::gc::heap_ptr(w)) });
-}
-
-/// Doubles a raw (non-GC-managed) buffer of 8-byte-aligned words from
-/// `old_size` to `new_size` bytes: `std::alloc::alloc` when there's
-/// nothing to carry forward (`old_size == 0` — `Dict`'s entries/hashes
-/// buffers before their first insert), `realloc` otherwise (`List`'s data
-/// buffer, which `GcHeap::alloc_list` guarantees always starts non-empty,
-/// so `old_size` is never 0 there). Aborts the process on allocation
-/// failure — there's no error path out of JIT code.
-///
-/// Caller does the capacity-doubling arithmetic and the `u32::MAX`
-/// overflow check first (`frog_list_push`'s and `dict::grow_if_full`'s
-/// units differ — words vs. entries — so that check can't live here), and
-/// updates `heap.bytes_allocated` by `new_size - old_size` afterward.
-///
-/// # Safety
-/// `old_ptr` must be a pointer previously returned by this function (or
-/// null iff `old_size == 0`) allocated with `old_size` bytes at 8-byte
-/// alignment.
-pub(crate) unsafe fn grow_raw_buffer(old_ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
-    let new_layout = Layout::from_size_align(new_size, 8).expect("buffer layout");
-    let new_data = if old_size == 0 {
-        std::alloc::alloc(new_layout)
-    } else {
-        let old_layout = Layout::from_size_align(old_size, 8).expect("buffer layout");
-        std::alloc::realloc(old_ptr, old_layout, new_size)
-    };
-    if new_data.is_null() {
-        std::alloc::handle_alloc_error(new_layout);
-    }
-    new_data
 }
 
 #[no_mangle]
@@ -511,7 +498,7 @@ pub extern "C" fn frog_list_push(list: i64, val: i64) -> i64 {
                 }
                 let old_size = old_cap * std::mem::size_of::<i64>();
                 let new_size = new_cap * std::mem::size_of::<i64>();
-                let new_data = grow_raw_buffer((*list_ptr).data as *mut u8, old_size, new_size) as *mut i64;
+                let new_data = heap.grow_buffer((*list_ptr).data as *mut u8, old_size, new_size) as *mut i64;
                 (*list_ptr).data = new_data;
                 (*list_ptr).cap = new_cap as u32;
                 heap.bytes_allocated += new_size - old_size;

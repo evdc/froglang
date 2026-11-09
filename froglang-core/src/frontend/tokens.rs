@@ -265,6 +265,11 @@ pub enum Token {
     #[lex("#")]
     Hash,
 
+    /// `with Arena { body }` — see `Grammar::with_expr`.
+    #[prefix(Grammar::with_expr)]
+    #[lex("with")]
+    With,
+
     /// `x catch y` / `x catch [e] -> body` — see `Grammar::catch_expr`.
     #[infix(Grammar::catch_expr, Precedence::Catch)]
     #[lex("catch")]

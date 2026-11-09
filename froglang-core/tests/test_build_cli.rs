@@ -106,3 +106,12 @@ fn build_flushes_stdout_without_trailing_newline() {
     let run = build_and_run("flush", "write_stdout(\"no newline\")!");
     assert_eq!(String::from_utf8_lossy(&run.stdout), "no newline");
 }
+
+/// `with Arena` end to end: the arena entry points are linked from the
+/// staticlib, a `return` leaves the block, and the result is copied out.
+#[test]
+fn build_runs_arena_blocks() {
+    let out = assert_aot_matches_jit("arena",
+        "func pick(n: Int): Str = {\n  let keep = \"k\" + repr(n)\n  let r = with Arena {\n    let s = keep + \"-\" + repr(n * 2)\n    if n > 2 then return s + \"!\"\n    s\n  }\n  r + \".\"\n}\nfor i in 0..5 do { print(pick(i)) }");
+    assert_eq!(out, "k0-0.\nk1-2.\nk2-4.\nk3-6!\nk4-8!\n");
+}

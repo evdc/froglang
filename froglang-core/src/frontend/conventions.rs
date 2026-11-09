@@ -236,7 +236,7 @@ struct FnDef<'a> {
 }
 
 fn collect_defs<'a>(expr: &'a Spanned<TypedExpr>, out: &mut Vec<FnDef<'a>>) {
-    if let TypedExprKind::Assign { name, value } = &expr.item.kind {
+    if let TypedExprKind::Assign { name, value, .. } = &expr.item.kind {
         if let TypedExprKind::Function { params, body, .. } = &value.item.kind {
             let body: &Spanned<TypedExpr> = body;
             out.push(FnDef {

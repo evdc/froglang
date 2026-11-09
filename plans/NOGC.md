@@ -922,9 +922,9 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      inner block overwrites an outer `xs` (true for plain blocks today: `mut n = 1; { mut n = 10 };
      print(n)` prints 10). In an arena that would leave the outer name pointing into released
      memory. A `let`/`mut` that shadows an outer binding inside an arena block is therefore
-     rejected. Loop variables, parameters and match binders are not checked; shadowing an outer
-     heap name with one of those inside an arena block is still unsound. Fixing the conflation
-     itself is the real remedy.
+     rejected. Loop variables, parameters and match binders were not checked; shadowing an outer
+     heap name with one of those inside an arena block was still unsound. Fixed properly
+     afterwards: see "One variable per name" below.
    - **4c, codegen.** The arm is enter, body in a frame of its own (so a non-block body's
      temporaries end before release), pop, evac, clone leaves, release. `return` and `?`
      leaving the block fit in a few lines: `compile_return` evacuates once per open arena
@@ -957,9 +957,61 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      tests, so about +310 net of real source (runtime about +165, frontend about +85, codegen
      about +60). Tests and benches add about +540 (test_arena 361, unit tests 130, pipeline 38,
      AOT 9).
-   - **Left open.** Shadowing by loop variables, parameters and match binders (above). The result is copied out, not built in
+   - **Left open.** The result is copied out, not built in
      place, so a block whose result is large pays a copy. No arena lint for loop-carried
-     reallocation. No arena-aware `gc_dump` line.
+     reallocation. No arena-aware `gc_dump` line. (The shadowing hole above is closed: see
+     "One variable per name".)
+   - **One variable per name (2026-11-09, uncommitted).** Fixes the conflation found above, so
+     an inner declaration, loop variable, comprehension variable, match binder or `catch` binder
+     that shadows an outer name no longer touches it. The arena restriction in `lower_assign`
+     and its test are gone.
+     - *Design.* `TypedExprKind::Assign` gained `decl: bool` (true for `let`/`mut` and every
+       synthesized binding, false for `name = value`). Codegen's name map is now `Vars`
+       (`codegen/mod.rs`): `declare_fresh_var` gives each declaring occurrence a new Cranelift
+       `Variable` and logs what it displaced; `Vars::open`/`close` bracket a scope and put the
+       displaced entries back. Scopes opened: `Block`, each loop iteration (the loop variable is
+       declared inside it), the whole iterator-protocol loop, a conditional branch, a `with Arena`
+       body. These mirror `TypeChecker::in_scope`. `get_or_declare_var` stays for reassignment.
+       Match binders and `catch` binders needed no code of their own: typeck lowers them to
+       `decl` assigns at the top of an arm `Block`.
+     - *Name-keyed state.* `Ctx::owned_names` became `owned_vars` keyed by `Variable`, so a
+       shadow is its own owner (a borrowed parameter shadowed by an owned `let` no longer makes
+       later reads of the parameter look owned). `mut_param_copyout` reads the parameters' own
+       `Variable`s (`Ctx::mut_vars`), so an early `return` inside a shadow of a `mut` parameter
+       hands back the parameter. `known`, `temp_of` and the frame slots were already keyed by
+       `Variable` or `Value`.
+     - *Liveness.* The unsound case was real: a declaration killed its name, so for
+       `let x = ..; read(x); { let x = ..}; use(x)` the first read looked like the last use of `x`
+       and moved the outer binding away. `transfer`'s `Block` arm now keeps a name live through
+       the block when it is declared there and also live after it (`keep`); a bare `let` as a
+       branch, loop body or arena body gets the same through `transfer_scoped`. Cost: reads of
+       the inner binding are copies when the outer name is live after the block. The for-loop
+       transfer needed nothing, since its header set already re-adds `live_out`.
+       `conventions.rs` and `linear.rs` stay name-based: for conventions a shadow's uses only add
+       escapes to the parameter (conservative); `linear.rs` was not changed or audited beyond the
+       tests passing.
+     - *Top level.* A top-level `let` of a name the entry or an earlier entry already bound
+       releases the old leaves first (`release_top_level_binding`) and forgets their keys, so
+       redeclaring at another type works and nothing leaks. `build_main_body` keeps one binding
+       per name. Inside blocks the old variable stays in its frame and is dropped at the block's
+       end.
+     - *Two fixes that fell out.* The parser unwrapped `{ e }` to `e`, so `{ mut n = 10 }` was
+       not a scope and redeclared `n` (the original repro). A lone `let`/`mut` now stays a
+       `Block`. And a bare `let` as an `if` branch (usually under a `Widen`) had no frame to
+       own its value and leaked; the branch now gets one.
+     - *Tests.* `tests/test_shadowing.rs`: 44 tests, most run over seven value kinds (Int, Str,
+       List, Dict, struct, boxed union, inline union): blocks, `mut`, reassignment, three-deep
+       nesting, if/else, loop bodies, loop/comprehension/match/`catch` binders, same-scope
+       redeclaration (all 49 ordered type pairs, top level and block), parameters (incl. a `mut`
+       parameter with early `return`), arenas, outer-read-then-shadow (the liveness case), moved
+       shadows, and four REPL tests. All under the leak oracle.
+     - *Results.* `cargo test --workspace`: 56 test binaries, 0 failed, plain and under
+       `FROG_LEAK_CHECK=1`. Clippy: 18 warnings, none new. Release, best of 7: `orders` 52 ms,
+       `words` 149 ms, `life` 15 ms (HEAD: 52, 147, 15).
+     - *Left open.* `linear.rs` is name-based (above). An else-less `if` whose branch is a bare
+       `let` of a union-typed value hits the existing "widening a union into a different union"
+       error, as any such branch does. Dropped-late same-scope redeclaration: the shadowed value
+       lives to the end of its block rather than to the redeclaration.
 5. **`Pool<T>`/`Id<T>`.**
 6. **`Abort` and `?`.** This needs no allocator work and can land early, against today's GC
    runtime. It adds the trait, the error-arm desugar in typeck, the `Linear` requires `Abort`

@@ -196,6 +196,10 @@ pub enum TypedExprKind {
     Assign {
         name:  String,
         value: TypedExprRef,
+        /// `true` for a `let`/`mut` declaration (and every synthesized binding),
+        /// which introduces a new variable that shadows any outer one of the
+        /// same name; `false` for `name = value`, which rebinds the existing one.
+        decl:  bool,
     },
 
     /// Parameters are `(name, resolved_type)` — the `Option<ExprRef>` annotation

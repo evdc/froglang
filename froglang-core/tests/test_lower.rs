@@ -98,7 +98,7 @@ fn test_assign_int() {
     let r = lower("let x = 5");
     assert_eq!(r.ty, Type::Int);
     match r.kind {
-        TypedExprKind::Assign { name, value } => {
+        TypedExprKind::Assign { name, value, .. } => {
             assert_eq!(name, "x");
             assert_eq!(value.item.ty, Type::Int);
         },

@@ -1694,7 +1694,7 @@ impl TypeChecker {
         let subject_ty = Type::Union(members.clone());
         let subject_name = format!("__truthy_subject_{}", self.next_id); self.next_id += 1;
         let subject_assign = Spanned::from(
-            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(e) } },
+            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(e), decl: true } },
             span,
         );
 
@@ -2536,7 +2536,7 @@ impl TypeChecker {
         let result_name = format!("__read_result{}", self.next_id); self.next_id += 1;
 
         let open_call = Self::read_leaf_call("frog_read_open", Type::Str, Type::Int, arg, span);
-        let open_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(open_call) } }, span);
+        let open_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(open_call), decl: true } }, span);
 
         // `t_members.len() == 1` — an ordinary single-type `read`
         // (`Int | ReadError`, `Person | ReadError`, ...): build against
@@ -2579,7 +2579,7 @@ impl TypeChecker {
         // downstream of the read it's supposed to be checking, rather
         // than racing ahead of it.
         let happy_name = format!("__read_happy{}", self.next_id); self.next_id += 1;
-        let happy_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: happy_name.clone(), value: Box::new(happy_widened) } }, span);
+        let happy_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: happy_name.clone(), value: Box::new(happy_widened), decl: true } }, span);
         let happy_var = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Var(happy_name) }, span);
 
         let failed_test = Self::read_call0("frog_read_failed", Type::Bool, span);
@@ -2587,7 +2587,7 @@ impl TypeChecker {
             id: 0, ty: expected.clone(),
             kind: TypedExprKind::Conditional { cond: Box::new(failed_test), true_branch: Box::new(error_widened), false_branch: Some(Box::new(happy_var)) },
         }, span);
-        let result_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: result_name.clone(), value: Box::new(dispatch) } }, span);
+        let result_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: result_name.clone(), value: Box::new(dispatch), decl: true } }, span);
         let close_call = Self::read_call0("frog_read_close", Type::None, span);
         let result_var = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Var(result_name) }, span);
 
@@ -5242,6 +5242,7 @@ impl TypeChecker {
                 ty: fn_ty.clone(),
                 kind: TypedExprKind::Assign {
                     name: mangled.clone(),
+                    decl: true,
                     value: Box::new(Spanned::from(TypedExpr {
                         id: 0,
                         ty: fn_ty,
@@ -5833,7 +5834,7 @@ impl TypeChecker {
                 let mut replaced: Vec<Spanned<TypedExpr>> = Vec::with_capacity(stmts.len());
                 for s in stmts.iter_mut() {
                     let decl = match &s.item.kind {
-                        TypedExprKind::Assign { name, value } if matches!(value.item.kind, TypedExprKind::Function { .. }) =>
+                        TypedExprKind::Assign { name, value, .. } if matches!(value.item.kind, TypedExprKind::Function { .. }) =>
                             Some(name.clone()),
                         _ => None,
                     };
@@ -5843,7 +5844,7 @@ impl TypeChecker {
                             scopes.last_mut().expect("just pushed").insert(name, Some(hoisted.clone()));
                             let mut decl_node = std::mem::replace(s, Spanned::from(
                                 TypedExpr { id: 0, ty: Type::None, kind: TypedExprKind::NoneLit }, s.span));
-                            let TypedExprKind::Assign { name: decl_name, value } = &mut decl_node.item.kind else { unreachable!() };
+                            let TypedExprKind::Assign { name: decl_name, value, .. } = &mut decl_node.item.kind else { unreachable!() };
                             *decl_name = hoisted;
                             self.hoist_function_value(value, scopes, out, mutated, failed);
                             // The snapshots stand where the declaration
@@ -5891,7 +5892,7 @@ impl TypeChecker {
                 out.push(Spanned::from(TypedExpr {
                     id: 0,
                     ty,
-                    kind: TypedExprKind::Assign { name: hoisted, value: Box::new(value) },
+                    kind: TypedExprKind::Assign { name: hoisted, value: Box::new(value), decl: true },
                 }, span));
             },
 
@@ -6005,6 +6006,7 @@ impl TypeChecker {
                 ty: ty.clone(),
                 kind: TypedExprKind::Assign {
                     name: snap.clone(),
+                    decl: true,
                     value: Box::new(Spanned::from(TypedExpr {
                         id: 0, ty: ty.clone(), kind: TypedExprKind::Var(n.clone()),
                     }, span)),
@@ -6263,6 +6265,7 @@ impl TypeChecker {
             ty: fn_ty.clone(),
             kind: TypedExprKind::Assign {
                 name: mangled.to_string(),
+                decl: true,
                 value: Box::new(Spanned::from(TypedExpr {
                     id: 0,
                     ty: fn_ty,
@@ -6478,7 +6481,7 @@ impl TypeChecker {
 
         // ── 3. Receive them as parameters ────────────────────────────────
         for s in stmts.iter_mut().chain(tail.iter_mut()) {
-            let TypedExprKind::Assign { name, value } = &mut s.item.kind else { continue };
+            let TypedExprKind::Assign { name, value, .. } = &mut s.item.kind else { continue };
             let Some(caps) = captures.get(name.as_str()) else { continue };
             let name = name.clone();
             let TypedExprKind::Function { params, body, .. } = &mut value.item.kind else { continue };
@@ -6510,7 +6513,7 @@ impl TypeChecker {
 
     /// `(name, params, body)` if this statement is a function declaration.
     fn as_fn_decl(s: &Spanned<TypedExpr>) -> Option<FnDecl<'_>> {
-        let TypedExprKind::Assign { name, value } = &s.item.kind else { return None };
+        let TypedExprKind::Assign { name, value, .. } = &s.item.kind else { return None };
         let TypedExprKind::Function { params, body, .. } = &value.item.kind else { return None };
         Some((name, params, body))
     }
@@ -7697,15 +7700,6 @@ impl TypeChecker {
                             msg: format!("'{}' is a registered host function and can't be redeclared", name),
                         }, span));
                     }
-                    // Codegen keeps one variable per name, so a declaration
-                    // that shadows an outer binding would overwrite it. In an
-                    // arena block that leaves the outer name pointing into
-                    // the released arena.
-                    if self.ctx.level(&name).is_some() && self.check_not_frozen(&name, span).is_err() {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!("'{name}' would shadow a binding declared outside this 'with Arena' block — pick another name")
-                        }, span));
-                    }
                     let mutable = mutability == Mutability::Mutable;
                     match &a.typ {
                         Some(ann) => {
@@ -7718,7 +7712,7 @@ impl TypeChecker {
                             let value = self.lower_expected(*a.value, &annotated_ty)?;
                             if mutable { self.mut_names.insert(name.clone()); }
                             self.ctx.insert_mut(name.clone(), annotated_ty.clone(), mutable);
-                            (TypedExprKind::Assign { name, value: Box::new(value) }, annotated_ty)
+                            (TypedExprKind::Assign { name, value: Box::new(value), decl: true }, annotated_ty)
                         },
                         None => {
                             // `let f = g`, where `g` names a function: an
@@ -8019,7 +8013,7 @@ impl TypeChecker {
                             if let TypedExprKind::Function { params, .. } = &value.item.kind {
                                 self.func_mut_params.insert(name.clone(), params.iter().map(|(_, _, m)| *m).collect());
                             }
-                            (TypedExprKind::Assign { name: decl_name, value: Box::new(value) }, ty)
+                            (TypedExprKind::Assign { name: decl_name, value: Box::new(value), decl: true }, ty)
                         },
                     }
                 },
@@ -8046,7 +8040,7 @@ impl TypeChecker {
                     self.check_not_frozen(&name, span)?;
                     let existing_ty = self.ctx.get(&name).expect("checked mutable above").clone();
                     let value = self.lower_expected(*a.value, &existing_ty)?;
-                    (TypedExprKind::Assign { name, value: Box::new(value) }, existing_ty)
+                    (TypedExprKind::Assign { name, value: Box::new(value), decl: false }, existing_ty)
                 },
             }
         };
@@ -8546,7 +8540,7 @@ impl TypeChecker {
         self.next_id += 1;
         let k_assign = Spanned::from(TypedExpr {
             id: 0, ty: key_ty.clone(),
-            kind: TypedExprKind::Assign { name: k_name.clone(), value: Box::new(k_lowered) },
+            kind: TypedExprKind::Assign { name: k_name.clone(), value: Box::new(k_lowered), decl: true },
         }, k_span);
         let read_k = || Spanned::from(TypedExpr { id: 0, ty: key_ty.clone(), kind: TypedExprKind::Var(k_name.clone()) }, k_span);
         let read_d = || Spanned::from(TypedExpr { id: 0, ty: d_ty.clone(), kind: TypedExprKind::Var(root.clone()) }, d_span);
@@ -8571,7 +8565,7 @@ impl TypeChecker {
         self.next_id += 1;
         let v_assign = Spanned::from(TypedExpr {
             id: 0, ty: result_ty.clone(),
-            kind: TypedExprKind::Assign { name: v_name.clone(), value: Box::new(index_widened) },
+            kind: TypedExprKind::Assign { name: v_name.clone(), value: Box::new(index_widened), decl: true },
         }, span);
         let read_v = Spanned::from(TypedExpr { id: 0, ty: result_ty.clone(), kind: TypedExprKind::Var(v_name) }, span);
 
@@ -8736,7 +8730,7 @@ impl TypeChecker {
     fn finish_get_ufcs(&mut self, xs_lowered: Spanned<TypedExpr>, i_arg: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let xs_ty = xs_lowered.item.ty.clone();
         let xs_assign = Spanned::from(
-            TypedExpr { id: 0, ty: xs_ty.clone(), kind: TypedExprKind::Assign { name: "__get_xs".to_string(), value: Box::new(xs_lowered) } },
+            TypedExpr { id: 0, ty: xs_ty.clone(), kind: TypedExprKind::Assign { name: "__get_xs".to_string(), value: Box::new(xs_lowered), decl: true } },
             span,
         );
         // `Dict` gets its own desugaring (membership check + `KeyError`,
@@ -10264,7 +10258,7 @@ impl TypeChecker {
         // `TypeVar` that merely points at it.
         let subject_ty = resolved_subject.clone();
         let subject_assign = Spanned::from(
-            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject) } },
+            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject), decl: true } },
             span,
         );
 
@@ -10302,7 +10296,7 @@ impl TypeChecker {
                         span,
                     );
                     prelude.push(Spanned::from(
-                        TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
+                        TypedExpr { id: 0, ty: fty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value), decl: true } },
                         span,
                     ));
                     bindings.push((bind.clone(), fty.clone(), false));
@@ -10341,7 +10335,7 @@ impl TypeChecker {
                     span,
                 );
                 prelude.push(Spanned::from(
-                    TypedExpr { id: 0, ty: narrowed_ty.clone(), kind: TypedExprKind::Assign { name: name.clone(), value: Box::new(value) } },
+                    TypedExpr { id: 0, ty: narrowed_ty.clone(), kind: TypedExprKind::Assign { name: name.clone(), value: Box::new(value), decl: true } },
                     span,
                 ));
                 // Preserve the subject's own mutability across the rebind
@@ -10571,7 +10565,7 @@ impl TypeChecker {
         // See the matching note in `lower_match_lowered`.
         let subject_ty = Type::Union(members.clone());
         let subject_assign = Spanned::from(
-            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject) } },
+            TypedExpr { id: 0, ty: subject_ty.clone(), kind: TypedExprKind::Assign { name: subject_name.clone(), value: Box::new(subject), decl: true } },
             span,
         );
 
@@ -10613,7 +10607,7 @@ impl TypeChecker {
                         span,
                     );
                     prelude.push(Spanned::from(
-                        TypedExpr { id: 0, ty: member_ty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value) } },
+                        TypedExpr { id: 0, ty: member_ty.clone(), kind: TypedExprKind::Assign { name: bind.clone(), value: Box::new(value), decl: true } },
                         span,
                     ));
                     // An explicit pattern bind is always a fresh, immutable
@@ -10643,8 +10637,8 @@ impl TypeChecker {
         let left_ty = left.item.ty.clone();
         let right_ty = right.item.ty.clone();
 
-        let l_assign = Spanned::from(TypedExpr { id: 0, ty: left_ty.clone(), kind: TypedExprKind::Assign { name: l_name.clone(), value: Box::new(left) } }, span);
-        let r_assign = Spanned::from(TypedExpr { id: 0, ty: right_ty.clone(), kind: TypedExprKind::Assign { name: r_name.clone(), value: Box::new(right) } }, span);
+        let l_assign = Spanned::from(TypedExpr { id: 0, ty: left_ty.clone(), kind: TypedExprKind::Assign { name: l_name.clone(), value: Box::new(left), decl: true } }, span);
+        let r_assign = Spanned::from(TypedExpr { id: 0, ty: right_ty.clone(), kind: TypedExprKind::Assign { name: r_name.clone(), value: Box::new(right), decl: true } }, span);
         let l_var = Spanned::from(TypedExpr { id: 0, ty: left_ty, kind: TypedExprKind::Var(l_name) }, span);
         let r_var = Spanned::from(TypedExpr { id: 0, ty: right_ty, kind: TypedExprKind::Var(r_name) }, span);
 
@@ -10768,7 +10762,7 @@ impl TypeChecker {
         }
         let temp_name = format!("__repr_v{}", self.next_id); self.next_id += 1;
         let temp_assign = Spanned::from(
-            TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Assign { name: temp_name.clone(), value: Box::new(arg) } },
+            TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Assign { name: temp_name.clone(), value: Box::new(arg), decl: true } },
             span,
         );
         let temp_var = Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Var(temp_name) }, span);
@@ -11093,7 +11087,7 @@ impl TypeChecker {
         let elem_name = format!("__repr_e{}", self.next_id); self.next_id += 1;
         let list_ty = Type::list(elem_ty.clone());
 
-        let list_assign = Spanned::from(TypedExpr { id: 0, ty: list_ty.clone(), kind: TypedExprKind::Assign { name: list_name.clone(), value: Box::new(v) } }, span);
+        let list_assign = Spanned::from(TypedExpr { id: 0, ty: list_ty.clone(), kind: TypedExprKind::Assign { name: list_name.clone(), value: Box::new(v), decl: true } }, span);
         let list_var = Spanned::from(TypedExpr { id: 0, ty: list_ty, kind: TypedExprKind::Var(list_name) }, span);
         let elem_var = Spanned::from(TypedExpr { id: 0, ty: elem_ty.clone(), kind: TypedExprKind::Var(elem_name.clone()) }, span);
         let elem_repr = self.build_repr(elem_ty, elem_var, span)?;
@@ -11127,7 +11121,7 @@ impl TypeChecker {
         let dict_ty = Type::dict(key_ty.clone(), val_ty.clone());
 
         let dict_var = |name: &str| Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Var(name.to_string()) }, span);
-        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(v) } }, span);
+        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(v), decl: true } }, span);
 
         let keys_call = self.finish_keys_values(dict_var(&dict_name), true, span, span)?;
         let key_var = Spanned::from(TypedExpr { id: 0, ty: key_ty.clone(), kind: TypedExprKind::Var(key_name.clone()) }, span);
@@ -11171,7 +11165,7 @@ impl TypeChecker {
     fn build_repr_union(&mut self, members: &[Type], v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let union_ty = Type::Union(members.to_vec());
         let subj_name = format!("__repr_u{}", self.next_id); self.next_id += 1;
-        let subj_assign = Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Assign { name: subj_name.clone(), value: Box::new(v) } }, span);
+        let subj_assign = Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Assign { name: subj_name.clone(), value: Box::new(v), decl: true } }, span);
 
         let resolved = self.resolve_union(&union_ty).map(|(n, d)| (n.to_string(), d.clone()));
         let body = match resolved {
@@ -11407,7 +11401,7 @@ impl TypeChecker {
         let elem_name = format!("__json_e{}", self.next_id); self.next_id += 1;
         let list_ty = Type::list(elem_ty.clone());
 
-        let list_assign = Spanned::from(TypedExpr { id: 0, ty: list_ty.clone(), kind: TypedExprKind::Assign { name: list_name.clone(), value: Box::new(v) } }, span);
+        let list_assign = Spanned::from(TypedExpr { id: 0, ty: list_ty.clone(), kind: TypedExprKind::Assign { name: list_name.clone(), value: Box::new(v), decl: true } }, span);
         let list_var = Spanned::from(TypedExpr { id: 0, ty: list_ty, kind: TypedExprKind::Var(list_name) }, span);
         let elem_var = Spanned::from(TypedExpr { id: 0, ty: elem_ty.clone(), kind: TypedExprKind::Var(elem_name.clone()) }, span);
         let elem_json = self.build_json(elem_ty, elem_var, span)?;
@@ -11437,7 +11431,7 @@ impl TypeChecker {
         let dict_ty = Type::dict(Type::Str, val_ty.clone());
 
         let dict_var = |name: &str| Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Var(name.to_string()) }, span);
-        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(v) } }, span);
+        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(v), decl: true } }, span);
 
         let keys_call = self.finish_keys_values(dict_var(&dict_name), true, span, span)?;
         let key_var = Spanned::from(TypedExpr { id: 0, ty: Type::Str, kind: TypedExprKind::Var(key_name.clone()) }, span);
@@ -11469,7 +11463,7 @@ impl TypeChecker {
     fn build_json_union(&mut self, members: &[Type], v: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let union_ty = Type::Union(members.to_vec());
         let subj_name = format!("__json_u{}", self.next_id); self.next_id += 1;
-        let subj_assign = Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Assign { name: subj_name.clone(), value: Box::new(v) } }, span);
+        let subj_assign = Spanned::from(TypedExpr { id: 0, ty: union_ty.clone(), kind: TypedExprKind::Assign { name: subj_name.clone(), value: Box::new(v), decl: true } }, span);
 
         let resolved = self.resolve_union(&union_ty).map(|(n, d)| (n.to_string(), d.clone()));
         let body = match resolved {
@@ -11642,7 +11636,7 @@ impl TypeChecker {
         // arbitrary accessor call, and re-evaluating `frog_json_get(...)`
         // per field would re-navigate (and re-mark) each time.
         let node_name = format!("__json_s{}", self.next_id); self.next_id += 1;
-        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node), decl: true } }, span);
         let out = self.build_read_json_fields(&fields, &node_name, span)?;
         let init = Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::StructInit { name: name.to_string(), fields: out } }, span);
         Ok(Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Block(vec![node_assign, init]) }, span))
@@ -11699,7 +11693,7 @@ impl TypeChecker {
     fn build_read_json_list(&mut self, elem_ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let node_name = format!("__json_n{}", self.next_id); self.next_id += 1;
         let idx_name = format!("__json_i{}", self.next_id); self.next_id += 1;
-        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node), decl: true } }, span);
 
         let len_call = Self::read_leaf_call("frog_json_len", Type::Int, Type::Int, Self::node_var(&node_name, span), span);
         let range = Spanned::from(TypedExpr {
@@ -11723,11 +11717,11 @@ impl TypeChecker {
     /// count, no comprehension-shaped `Dict` builder to reuse).
     fn build_read_json_dict(&mut self, val_ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let node_name = format!("__json_dn{}", self.next_id); self.next_id += 1;
-        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node), decl: true } }, span);
 
         let len_call = Self::read_leaf_call("frog_json_obj_len", Type::Int, Type::Int, Self::node_var(&node_name, span), span);
         let len_name = format!("__json_dl{}", self.next_id); self.next_id += 1;
-        let len_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: len_name.clone(), value: Box::new(len_call) } }, span);
+        let len_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: len_name.clone(), value: Box::new(len_call), decl: true } }, span);
 
         let range = Spanned::from(TypedExpr {
             id: 0, ty: Type::range(Type::Int),
@@ -11738,7 +11732,7 @@ impl TypeChecker {
         let dict_name = format!("__json_dd{}", self.next_id); self.next_id += 1;
         let dict_ty = Type::dict(Type::Str, val_ty.clone());
         let alloc_dict = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Dict(Vec::new()) }, span);
-        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(alloc_dict) } }, span);
+        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(alloc_dict), decl: true } }, span);
 
         // `frog_json_key_at` returns a fresh `Str` directly (no further
         // `build_read_json` dispatch needed — it's already the right leaf
@@ -11774,7 +11768,7 @@ impl TypeChecker {
     fn build_read_json_union_as(&mut self, members: &[Type], node: Spanned<TypedExpr>, target_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let union_ty = Type::Union(members.to_vec());
         let node_name = format!("__json_u{}", self.next_id); self.next_id += 1;
-        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node), decl: true } }, span);
 
         let resolved = self.resolve_union(&union_ty).map(|(n, d)| (n.to_string(), d.clone()));
         let body = match resolved {
@@ -11808,7 +11802,7 @@ impl TypeChecker {
             // re-mark on a malformed input as well as being wasteful.
             let payload_name = format!("__json_p{}", self.next_id); self.next_id += 1;
             let payload = Self::read_call2("frog_json_get", Type::Int, Type::Str, Type::Int, Self::node_var(node_name, span), Self::str_lit(vname.clone(), span), span);
-            let payload_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: payload_name.clone(), value: Box::new(payload) } }, span);
+            let payload_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: payload_name.clone(), value: Box::new(payload), decl: true } }, span);
             let fields_out = self.build_read_json_fields(&flat, &payload_name, span)?;
 
             let variant_ty = Type::strukt(format!("{}.{}", enum_name, vname));
@@ -12023,7 +12017,7 @@ impl TypeChecker {
         let result_name = format!("__json_result{}", self.next_id); self.next_id += 1;
 
         let open_call = Self::read_leaf_call("frog_json_open", Type::Str, Type::Int, arg, span);
-        let open_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(open_call) } }, span);
+        let open_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(open_call), decl: true } }, span);
 
         let happy_widened = if t_members.len() == 1 {
             let t = t_members.into_iter().next().expect("len checked above");
@@ -12048,7 +12042,7 @@ impl TypeChecker {
         let error_widened = self.lower_widen(error_value, expected)?;
 
         let happy_name = format!("__json_happy{}", self.next_id); self.next_id += 1;
-        let happy_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: happy_name.clone(), value: Box::new(happy_widened) } }, span);
+        let happy_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: happy_name.clone(), value: Box::new(happy_widened), decl: true } }, span);
         let happy_var = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Var(happy_name) }, span);
 
         let failed_test = Self::read_call0("frog_json_failed", Type::Bool, span);
@@ -12056,7 +12050,7 @@ impl TypeChecker {
             id: 0, ty: expected.clone(),
             kind: TypedExprKind::Conditional { cond: Box::new(failed_test), true_branch: Box::new(error_widened), false_branch: Some(Box::new(happy_var)) },
         }, span);
-        let result_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: result_name.clone(), value: Box::new(dispatch) } }, span);
+        let result_assign = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Assign { name: result_name.clone(), value: Box::new(dispatch), decl: true } }, span);
         let close_call = Self::read_call0("frog_json_close", Type::None, span);
         let result_var = Spanned::from(TypedExpr { id: 0, ty: expected.clone(), kind: TypedExprKind::Var(result_name) }, span);
 
@@ -12193,7 +12187,7 @@ impl TypeChecker {
     fn build_read_list(&mut self, elem_ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let node_name = format!("__read_n{}", self.next_id); self.next_id += 1;
         let idx_name = format!("__read_i{}", self.next_id); self.next_id += 1;
-        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node), decl: true } }, span);
 
         let len_call = Self::read_leaf_call("frog_read_list_len", Type::Int, Type::Int, Self::node_var(&node_name, span), span);
         // `Type::range(Int)`, not `Type::list(Int)`: `TypedExprKind::Range`'s
@@ -12232,11 +12226,11 @@ impl TypeChecker {
     /// loop construct that doesn't otherwise exist for building a `Dict`.
     fn build_read_dict(&mut self, key_ty: &Type, val_ty: &Type, node: Spanned<TypedExpr>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let node_name = format!("__read_d{}", self.next_id); self.next_id += 1;
-        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node), decl: true } }, span);
 
         let len_call = Self::read_leaf_call("frog_read_dict_len", Type::Int, Type::Int, Self::node_var(&node_name, span), span);
         let len_name = format!("__read_dn{}", self.next_id); self.next_id += 1;
-        let len_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: len_name.clone(), value: Box::new(len_call) } }, span);
+        let len_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: len_name.clone(), value: Box::new(len_call), decl: true } }, span);
 
         // `Trait::Hash` keys are scalar and can't fail to hash, so nothing
         // here needs the loop `build_read_list` uses to stay within a
@@ -12259,7 +12253,7 @@ impl TypeChecker {
         let dict_name = format!("__read_dd{}", self.next_id); self.next_id += 1;
         let dict_ty = Type::dict(key_ty.clone(), val_ty.clone());
         let alloc_dict = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Dict(Vec::new()) }, span);
-        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(alloc_dict) } }, span);
+        let dict_assign = Spanned::from(TypedExpr { id: 0, ty: dict_ty.clone(), kind: TypedExprKind::Assign { name: dict_name.clone(), value: Box::new(alloc_dict), decl: true } }, span);
 
         let place = Place { root: dict_name.clone(), path: vec![PlaceSeg::Index {
             index: Box::new(key_val),
@@ -12314,7 +12308,7 @@ impl TypeChecker {
     fn build_read_union_as(&mut self, members: &[Type], node: Spanned<TypedExpr>, target_ty: &Type, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let union_ty = Type::Union(members.to_vec());
         let node_name = format!("__read_u{}", self.next_id); self.next_id += 1;
-        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node) } }, span);
+        let node_assign = Spanned::from(TypedExpr { id: 0, ty: Type::Int, kind: TypedExprKind::Assign { name: node_name.clone(), value: Box::new(node), decl: true } }, span);
 
         let resolved = self.resolve_union(&union_ty).map(|(n, d)| (n.to_string(), d.clone()));
         let body = match resolved {

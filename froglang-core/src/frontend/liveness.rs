@@ -164,11 +164,12 @@ pub type NameSet = BTreeSet<String>;
 /// This is name-based, so it inherits the one piece of imprecision that
 /// choice buys: the typed AST does not resolve shadowing (`let x = 1` then,
 /// in an inner scope, another `let x = 2`, are both just `Var("x")`/
-/// `Assign{name: "x", ..}` — see `codegen::var_key`'s doc comment for why
-/// codegen already conflates them into one `Variable`). A liveness result
-/// computed over plain names is sound for that representation and would
-/// need scope-qualified names — which nothing downstream understands yet —
-/// to do any better.
+/// `Assign{name: "x", ..}`), although codegen gives them separate
+/// `Variable`s (`codegen::Vars`). Soundness for that comes from the scope
+/// rule in the `Block` arm of `transfer`: a name declared in a scope and
+/// live after it keeps its outer binding live through the whole scope, at the
+/// cost of reads of the inner binding being copies. A move only ever clears
+/// the one binding the read resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ownership { Copy, Move }
 
@@ -362,6 +363,30 @@ fn fold_fields_reverse(fields: &[(String, TypedExprRef)], live_out: &NameSet, ct
     lo
 }
 
+/// `(name, value)` if `e` is a declaration of a variable (not a function).
+fn declared(e: &Spanned<TypedExpr>) -> Option<(&str, &Spanned<TypedExpr>)> {
+    match &e.item.kind {
+        TypedExprKind::Assign { name, value, decl: true }
+            if !matches!(value.item.kind, TypedExprKind::Function { .. }) => Some((name, value)),
+        _ => None,
+    }
+}
+
+fn declared_name(e: &Spanned<TypedExpr>) -> Option<&str> {
+    declared(e).map(|(n, _)| n)
+}
+
+/// `transfer` for the body of a scope that is not a `Block` (a conditional's
+/// branch, a loop body, an arena body). A bare `let` there declares a name
+/// that ends with the scope, so it must not end the liveness of an outer
+/// binding of the same name that is live after it — see the `Block` arm.
+fn transfer_scoped(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liveness) -> NameSet {
+    match declared(e) {
+        Some((name, value)) if live_out.contains(name) => transfer(value, live_out, ctx, out),
+        _ => transfer(e, live_out, ctx, out),
+    }
+}
+
 /// Live-in of `e` given `live_out` (live immediately after `e` finishes).
 /// Records `last_use`/`dead_after` facts into `out` as a side effect. See
 /// this file's module-level comment for the ordering discipline every arm
@@ -406,12 +431,12 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
         // a scratch result finds them. The first pass's own `return`s may
         // mark moves, but it records nothing.
         TypedExprKind::Arena(body) => {
-            let outer = transfer(body, live_out, ctx, &mut Liveness::empty());
+            let outer = transfer_scoped(body, live_out, ctx, &mut Liveness::empty());
             let kept: NameSet = live_out.union(&outer).cloned().collect();
             // A `return` in the body leaves the arena too, and still must not
             // move an outer name.
             let inner = Ctx { exit_live: ctx.exit_live.union(&outer).cloned().collect() };
-            transfer(body, &kept, &inner, out);
+            transfer_scoped(body, &kept, &inner, out);
             outer
         }
 
@@ -481,10 +506,27 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
         // the last use of a name, so this records a `dead_after` boundary
         // at each one, exactly like `analyze_entry` does for a bare
         // statement list.
+        //
+        // A declaration here is a *new* variable (`Assign::decl`), so it
+        // kills its name only for the statements after it. A name declared in
+        // this block and also live after it is an outer binding the block
+        // shadows: that outer binding is live through the whole block, so the
+        // declaration must not end its liveness (`keep`), or a read of the
+        // outer binding before the block would look like its last use and
+        // hand the binding away.
         TypedExprKind::Block(stmts) => {
+            let keep: NameSet = stmts.iter()
+                .filter_map(|s| declared_name(s))
+                .filter(|n| live_out.contains(*n))
+                .map(str::to_string)
+                .collect();
             let mut lo = live_out.clone();
             for s in stmts.iter().rev() {
-                let li = transfer(s, &lo, ctx, out);
+                let mut li = match declared(s) {
+                    Some((name, value)) if keep.contains(name) => transfer(value, &lo, ctx, out),
+                    _ => transfer(s, &lo, ctx, out),
+                };
+                li.extend(keep.iter().cloned());
                 record_dead_after(out, s.item.id, &li, &lo);
                 lo = li;
             }
@@ -497,7 +539,7 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
         // so `name` never enters this analysis's namespace and `value`
         // (a `Function` node, itself never descended into either — see
         // below) contributes nothing.
-        TypedExprKind::Assign { name, value } => {
+        TypedExprKind::Assign { name, value, .. } => {
             if matches!(value.item.kind, TypedExprKind::Function { .. }) {
                 live_out.clone()
             } else {
@@ -551,9 +593,9 @@ fn transfer(e: &Spanned<TypedExpr>, live_out: &NameSet, ctx: &Ctx, out: &mut Liv
         // `MUTABILITY.md`/this analysis's plan). It can only make a name
         // look live where it's actually dead, never the reverse.
         TypedExprKind::Conditional { cond, true_branch, false_branch } => {
-            let true_live = transfer(true_branch, live_out, ctx, out);
+            let true_live = transfer_scoped(true_branch, live_out, ctx, out);
             let false_live = match false_branch {
-                Some(fb) => transfer(fb, live_out, ctx, out),
+                Some(fb) => transfer_scoped(fb, live_out, ctx, out),
                 None => live_out.clone(),
             };
             let joined: NameSet = true_live.union(&false_live).cloned().collect();
@@ -654,7 +696,7 @@ fn transfer_loop(
     // live-in) or straight back to the header on a false guard (live-out
     // `b` itself) — before dropping `var`, which the header never carries.
     let round = |b: &NameSet, out: &mut Liveness| -> NameSet {
-        let mut l = transfer(body, b, ctx, out);
+        let mut l = transfer_scoped(body, b, ctx, out);
         if let Some(c) = cond {
             let mut guard_live_out = l.clone();
             guard_live_out.extend(b.iter().cloned());

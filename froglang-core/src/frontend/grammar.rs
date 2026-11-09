@@ -300,7 +300,11 @@ impl Grammar {
         // `TypeChecker::strip_and_validate_annotations`, which runs over a
         // block's statement list, so unwrapping here would let it escape
         // into expression position, where nothing knows what to do with it.
-        if stmts.len() == 1 && !matches!(stmts[0].item, Expression::Decorated(_)) {
+        //
+        // A lone `let`/`mut` is not handed back either: the braces are what
+        // end its scope, so `{ mut n = 10 }` must not redeclare an outer `n`.
+        let lone_declaration = matches!(&stmts[0].item, Expression::Assign(a) if a.decl.is_some());
+        if stmts.len() == 1 && !lone_declaration && !matches!(stmts[0].item, Expression::Decorated(_)) {
             Ok(stmts.into_iter().next().unwrap())
         } else {
             Ok(Spanned { span: t.span.merge(closing.span), item: Expression::Block(stmts) })

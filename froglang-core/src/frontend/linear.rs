@@ -113,7 +113,7 @@ pub fn check(
     // ask. If that computation changes, this one needs to change with it.
     let mut exit_live = prior_exit_live.clone();
     for s in stmts {
-        if let TypedExprKind::Assign { name, value } = &s.item.kind {
+        if let TypedExprKind::Assign { name, value, .. } = &s.item.kind {
             if !matches!(value.item.kind, TypedExprKind::Function { .. }) {
                 exit_live.insert(name.clone());
             }

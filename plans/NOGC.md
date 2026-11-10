@@ -1033,8 +1033,12 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      which every compile path (JIT, `frog build`, `check`, `check --copies`) shares. This differs from the plan's "typeck-level desugar", which assumed a live set
      typeck does not have; codegen still needs nothing new.
    - **What is aborted.** A binding of the enclosing function (a `let`/`mut` or a non-`mut`
-     parameter) in scope at the edge, whose type provides `Abort`, with no `Move`-classified read
-     before the edge. For `Linear` a move is consumption, so this is exact. For a plain `Abort` type a
+     parameter it owns) in scope at the edge, whose type provides `Abort`, with no `Move`-classified
+     read before the edge that handed it off. Ownership follows the parameter conventions, inferred
+     *before* the calls are inserted: a borrowed parameter is its caller's, and a last use lent to a
+     borrowing position is not a hand-off, so the owner aborts it, once. `Linear` values ignore
+     conventions (no aliasing, so a `Move` read always hands off). `lower_checked` re-infers
+     conventions after insertion, because they are keyed by node id. For `Linear` a move is consumption, so this is exact. For a plain `Abort` type a
      move is only the last use, so a value whose last use is the failing expression itself is dropped,
      not aborted. `catch`, `!`, a plain `return` and panic abort nothing.
    - **Not aborted (conservative, never twice):** a binding shadowed, at the edge, by a later

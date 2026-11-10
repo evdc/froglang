@@ -53,6 +53,7 @@
 use std::collections::HashSet;
 use std::hash::Hash;
 
+use crate::frontend::conventions::Conventions;
 use crate::frontend::liveness::{self, Liveness, NameSet, Ownership};
 use crate::frontend::tokens::{Span, Spanned};
 use crate::frontend::typed_ast::{Arg, PlaceSeg, TypedExpr, TypedExprKind};
@@ -520,7 +521,7 @@ fn unconsumed_error(name: &str, at_return: Option<bool>, span: Span) -> Spanned<
 /// followed by another `number_nodes`, because it adds nodes.
 ///
 /// A value is aborted when its type provides `Abort`, it is a binding of the
-/// enclosing function (a `let`/`mut` or a non-`mut` parameter) in scope at the
+/// enclosing function (a `let`/`mut`, or a non-`mut` parameter it owns) in scope at the
 /// edge, and no earlier read of it was a `Move` (its last use: handed to
 /// whoever took it). Moved values are the receiver's to abort or consume. For a
 /// `Linear` value a move is exactly consumption; for a plain `Abort` type it is
@@ -532,26 +533,39 @@ fn unconsumed_error(name: &str, at_return: Option<bool>, span: Span) -> Spanned<
 /// a binding shadowed by a later declaration of the same name, a loop,
 /// comprehension or union-typed binding, and anything declared outside the
 /// enclosing `with Arena` block (outer places are frozen there).
-pub fn insert_aborts(root: &mut Spanned<TypedExpr>, tc: &TypeChecker) {
-    sweep(root, tc);
+///
+/// Ownership follows the parameter conventions in `conv`, which must be
+/// inferred on this same numbering, before the calls are added (they are
+/// keyed by node id, and an inserted `abort(p)` would otherwise make a
+/// borrowed `p` look consumed). A borrowed parameter is still its caller's,
+/// so the callee does not abort it; a value passed to a borrowing position
+/// is likewise not handed off, so its owner still aborts it. A `Linear`
+/// value ignores both rules: it cannot be aliased, so whoever holds it after
+/// a `Move` read is its only owner, whatever its memory convention.
+pub fn insert_aborts(root: &mut Spanned<TypedExpr>, tc: &TypeChecker, conv: &Conventions) {
+    sweep(root, tc, conv);
 }
 
 /// Find every function body in the tree, wherever it sits, and fix each one.
-fn sweep(e: &mut Spanned<TypedExpr>, tc: &TypeChecker) {
+fn sweep(e: &mut Spanned<TypedExpr>, tc: &TypeChecker, conv: &Conventions) {
     if let TypedExprKind::Function { .. } = &e.item.kind {
-        fix_function(e, tc);
+        fix_function(e, tc, conv);
         return;
     }
-    for c in TypeChecker::children_mut(e) { sweep(c, tc); }
+    for c in TypeChecker::children_mut(e) { sweep(c, tc, conv); }
 }
 
-fn fix_function(f: &mut Spanned<TypedExpr>, tc: &TypeChecker) {
+fn fix_function(f: &mut Spanned<TypedExpr>, tc: &TypeChecker, conv: &Conventions) {
     let TypedExprKind::Function { params, body, .. } = &mut f.item.kind else { return };
     let mut_names: NameSet = params.iter().filter(|(_, _, m)| *m).map(|(n, _, _)| n.clone()).collect();
     let live = liveness::analyze_body(body, &mut_names);
-    let mut fx = Aborts { tc, live, scope: Scope::new(), floor: 0 };
-    for (name, ty, is_mut) in params.iter() {
-        if !*is_mut { fx.declare(name, ty); }
+    let body_id = body.item.id;
+    let mut fx = Aborts { tc, conv, live, scope: Scope::new(), floor: 0 };
+    for (i, (name, ty, is_mut)) in params.iter().enumerate() {
+        if *is_mut { continue; }
+        let owned = tc.implements_linear(ty) || !conv.is_borrowed_param(body_id, i);
+        // Still declared when borrowed: it may shadow an outer binding.
+        if owned { fx.declare(name, ty) } else { fx.scope.declare(name, None) }
     }
     fx.go(body);
 }
@@ -647,6 +661,7 @@ type AbortInfo = Option<(Type, String)>;
 
 struct Aborts<'a> {
     tc: &'a TypeChecker,
+    conv: &'a Conventions,
     live: Liveness,
     scope: Scope<AbortInfo>,
     /// Entries below this index belong to a scope the body may not touch.
@@ -662,11 +677,14 @@ impl Aborts<'_> {
     fn go(&mut self, e: &mut Spanned<TypedExpr>) {
         let (id, span) = (e.item.id, e.span);
         match &mut e.item.kind {
+            // A last use hands the value off, unless it only lends it to a
+            // borrowing parameter (see `insert_aborts`).
             TypedExprKind::Var(name) => {
-                if self.live.ownership(id) == Ownership::Move { self.scope.mark_moved(name); }
+                let handed_off = self.tc.implements_linear(&e.item.ty) || !self.conv.borrowed_args.contains(&id);
+                if self.live.ownership(id) == Ownership::Move && handed_off { self.scope.mark_moved(name); }
             }
 
-            TypedExprKind::Function { .. } => fix_function(e, self.tc),
+            TypedExprKind::Function { .. } => fix_function(e, self.tc, self.conv),
 
             TypedExprKind::Call { callable, args } => {
                 if matches!(&callable.item.kind, TypedExprKind::Var(n) if n == ABORT_EDGE_NAME) {

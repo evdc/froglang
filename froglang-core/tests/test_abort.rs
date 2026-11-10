@@ -438,3 +438,73 @@ match f(-1, true) {
 "#);
     assert_eq!(run(&src), "close 1\nclose 2\nerr\n");
 }
+
+// ── Parameters the callee only borrows ──────────────────────────────────
+
+/// `t` is only read in `use_tmp`, so it is borrowed: still the caller's, and
+/// the caller's own `?` is what aborts it. The callee used to abort it too,
+/// which also made `t` consuming, so the caller deep-copied it for the call
+/// and the one failure aborted it twice.
+const TMP: &str = r#"
+error Bad(msg: Str)
+data Tmp(id: Int) provides Abort {
+    func abort(t: Tmp): None = print("undo ${t.id}")
+}
+func step(n: Int): Int | Bad = if n < 0 then Bad(msg="neg") else n
+func use_tmp(t: Tmp, n: Int): Int | Bad = {
+    let v = step(n)?
+    v + t.id
+}
+"#;
+
+#[test]
+fn a_borrowed_parameter_is_aborted_once_by_its_owner() {
+    let src = format!("{TMP}{}", r#"
+func g(n: Int): Int | Bad = {
+    let t = Tmp(id=9)
+    let v = use_tmp(t, n)?
+    v + t.id
+}
+match g(-1) {
+    is Int(v) then print("ok ${v}")
+    is Bad(e) then print("err")
+}
+"#);
+    assert_eq!(run(&src), "undo 9\nerr\n");
+}
+
+#[test]
+fn a_value_lent_to_a_borrowing_callee_at_its_last_use_is_still_aborted() {
+    let src = format!("{TMP}{}", r#"
+func g(n: Int): Int | Bad = {
+    let t = Tmp(id=9)
+    let v = use_tmp(t, n)?
+    v
+}
+match g(-1) {
+    is Int(v) then print("ok ${v}")
+    is Bad(e) then print("err")
+}
+"#);
+    assert_eq!(run(&src), "undo 9\nerr\n");
+}
+
+#[test]
+fn a_consumed_parameter_is_aborted_by_the_callee() {
+    let src = format!("{TMP}{}", r#"
+func keep(t: Tmp, n: Int): Tmp | Bad = {
+    let v = step(n)?
+    t
+}
+func g(n: Int): Int | Bad = {
+    let t = Tmp(id=9)
+    let k = keep(t, n)?
+    k.id
+}
+match g(-1) {
+    is Int(v) then print("ok ${v}")
+    is Bad(e) then print("err")
+}
+"#);
+    assert_eq!(run(&src), "undo 9\nerr\n");
+}

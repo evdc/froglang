@@ -103,26 +103,29 @@ fn check(src: &str, path: Option<&std::path::Path>) {
     // `check` should not accept a program `run` rejects, so it runs every
     // rejecting pass `run` does, not just type-checking.
     let (mut tc, _) = stdlib_checker();
-    let typed = lower_checked_or_exit(&mut tc, ast);
+    let (typed, _) = lower_checked_or_exit(&mut tc, ast, &froglang_core::frontend::conventions::builtin_borrowers());
     println!(":: {}", typed.item.ty);
 }
 
 /// Type-check `ast` as a whole program and run `frontend::pipeline::
 /// lower_checked`, the same passes `FrogState::eval_with_base` runs. Exits
-/// the process on a type error.
+/// the process on a type error. Returns the tree and its parameter conventions.
 fn lower_checked_or_exit(
     tc: &mut froglang_core::frontend::typeck::TypeChecker,
     ast: froglang_core::frontend::tokens::Spanned<froglang_core::frontend::expression::Expression>,
-) -> froglang_core::frontend::tokens::Spanned<froglang_core::frontend::typed_ast::TypedExpr> {
+    borrowers: &std::collections::HashSet<String>,
+) -> (
+    froglang_core::frontend::tokens::Spanned<froglang_core::frontend::typed_ast::TypedExpr>,
+    froglang_core::frontend::conventions::Conventions,
+) {
     let mut typed = match tc.check_and_lower(ast) {
         Ok(typed) => typed,
         Err(e)    => { println!("Type error: {}", e); process::exit(1); }
     };
-    if let Err(e) = froglang_core::frontend::pipeline::lower_checked(tc, &mut typed, &Default::default()) {
-        println!("Type error: {}", e);
-        process::exit(1);
+    match froglang_core::frontend::pipeline::lower_checked(tc, &mut typed, &Default::default(), borrowers, &Default::default()) {
+        Ok(conv) => (typed, conv),
+        Err(e) => { println!("Type error: {}", e); process::exit(1); }
     }
-    typed
 }
 
 /// The lowering both native paths (`build`, `check --copies`) run before
@@ -138,15 +141,14 @@ fn lower_for_object(
     use froglang_core::frontend::conventions;
 
     let (mut tc, hosts) = stdlib_checker();
-    let typed = lower_checked_or_exit(&mut tc, ast);
-
     let codegen = match ObjectCodegen::new_object(&hosts) {
         Ok(c) => c,
         Err(e) => { println!("{}", e); process::exit(1); }
     };
     let mut borrowers = conventions::builtin_borrowers();
     borrowers.extend(codegen.imported_callees());
-    conventions::publish(&conventions::infer(&typed, &borrowers, &Default::default()));
+    let (typed, conv) = lower_checked_or_exit(&mut tc, ast, &borrowers);
+    conventions::publish(&conv);
     (tc, typed, codegen)
 }
 

@@ -99,3 +99,21 @@ fn external_callee_not_in_borrowers_consumes() {
     let c = infer(&typed, &std::collections::HashSet::new(), &Default::default());
     assert_eq!(c.convention("f", 0), Some(Convention::Consume));
 }
+
+/// `?` inserts `abort(t)` calls, which must not decide `t`'s convention: a
+/// parameter only read stays borrowed through the whole pipeline, even when
+/// `abort` itself consumes its argument (it binds it).
+#[test]
+fn an_abort_on_a_question_mark_edge_does_not_make_a_parameter_consuming() {
+    let src = "error Bad(msg: Str)\n\
+               data Tmp(id: Int) provides Abort { func abort(t: Tmp): None = { let k = t\n print(\"undo\") } }\n\
+               func step(n: Int): Int | Bad = if n < 0 then Bad(msg=\"neg\") else n\n\
+               func f(t: Tmp, n: Int): Int | Bad = { let v = step(n)?\n v + t.id }\n";
+    let ast = Parser::parse(src).expect("parse error");
+    let mut tc = TypeChecker::new();
+    let mut typed = tc.check_and_lower(ast).expect("type error");
+    let c = froglang_core::frontend::pipeline::lower_checked(
+        &mut tc, &mut typed, &Default::default(), &builtin_borrowers(), &Default::default(),
+    ).expect("type error");
+    assert_eq!(c.convention("f", 0), Some(Convention::Borrow));
+}

@@ -6078,14 +6078,14 @@ pub fn compile_and_run(src: &str) -> i64 {
     let ast = Parser::parse(src).expect("parse error");
     let mut tc = TypeChecker::new();
     let mut typed = tc.check_and_lower(ast).expect("type error");
-    crate::frontend::pipeline::lower_checked(&mut tc, &mut typed, &Default::default()).expect("type error");
-
     let mut codegen = JitCodegen::new();
-    // The same conventions `FrogState::eval_with_base` infers, so codegen
-    // here is the codegen a real run gets.
+    // The same pipeline and conventions as `FrogState::eval_with_base`, so
+    // codegen here is the codegen a real run gets.
     let mut borrowers = crate::frontend::conventions::builtin_borrowers();
     borrowers.extend(codegen.imported_callees());
-    crate::frontend::conventions::publish(&crate::frontend::conventions::infer(&typed, &borrowers, &Default::default()));
+    let conv = crate::frontend::pipeline::lower_checked(&mut tc, &mut typed, &Default::default(), &borrowers, &Default::default())
+        .expect("type error");
+    crate::frontend::conventions::publish(&conv);
     let result_ty = typed.item.ty.clone();
     let (main_id, bindings) = codegen.compile_entry(
         typed, 0, &HashMap::new(), &HashMap::new(), tc.struct_defs(), tc.union_defs(),

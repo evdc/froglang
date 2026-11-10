@@ -325,17 +325,21 @@ impl FrogState {
         // Every pass that can still reject the program, and the rewrites
         // codegen relies on — shared with `frog build`/`check` so they accept
         // exactly what this does. See `frontend::pipeline`.
+        // Parameter conventions (plans/NOGC.md §1.2), which it also returns,
+        // say which arguments a callee only borrows, so codegen knows who
+        // frees them.
         let prior_exit_live: crate::frontend::liveness::NameSet = self.env_types.keys().cloned().collect();
-        if let Err(e) = crate::frontend::pipeline::lower_checked(&mut self.tc, &mut typed, &prior_exit_live) {
-            self.tc.restore(cp);
-            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-        }
-
-        // Parameter conventions (plans/NOGC.md §1.2): which arguments a callee
-        // only borrows, so codegen knows who frees them.
         let mut borrowers = crate::frontend::conventions::builtin_borrowers();
         borrowers.extend(self.codegen.imported_callees());
-        let conv = crate::frontend::conventions::infer(&typed, &borrowers, &self.signatures);
+        let conv = match crate::frontend::pipeline::lower_checked(
+            &mut self.tc, &mut typed, &prior_exit_live, &borrowers, &self.signatures,
+        ) {
+            Ok(conv) => conv,
+            Err(e) => {
+                self.tc.restore(cp);
+                return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
+            }
+        };
         if std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
             eprint!("{}", conv.dump());
         }

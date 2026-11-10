@@ -173,10 +173,10 @@ pub enum TypedExprKind {
     BoolLit(bool),
     StrLit(String),
     /// The `none` literal — the singleton `Type::None` value. Standing on
-    /// its own it compiles to `gc::IMMEDIATE_NONE`, a word in the reserved
+    /// its own it compiles to `heap::IMMEDIATE_NONE`, a word in the reserved
     /// `111` class that never names an object. As a *member* of a
     /// union it is not that at all: an inline union represents it as its
-    /// member tag, a boxed one as `gc::immediate_variant` of its tag — see
+    /// member tag, a boxed one as `heap::immediate_variant` of its tag — see
     /// `TypedExprKind::Widen`.
     NoneLit,
     /// Variable reference — name resolved from environment.
@@ -244,7 +244,7 @@ pub enum TypedExprKind {
     /// Dict literal (parsed as `["k": v, ...]`/`[:]`, inferred as
     /// `Dict<K, V>`), in source (insertion) order — `plans/DATA.md`
     /// requires deterministic print order, and this is also the order
-    /// entries are inserted into `runtime::gc::FrogDict` at construction.
+    /// entries are inserted into `runtime::heap::FrogDict` at construction.
     Dict(Vec<(Spanned<TypedExpr>, Spanned<TypedExpr>)>),
 
     Block(Vec<Spanned<TypedExpr>>),

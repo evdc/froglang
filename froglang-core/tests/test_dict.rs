@@ -1,6 +1,6 @@
 //! `Dict<K, V>` — literal syntax, indexing, equality, mutation, iteration,
 //! and the `Trait::Hash` key restriction. See `plans/DATA.md`'s Dict design
-//! and `runtime::gc::FrogDict`'s doc comment for the representation this
+//! and `runtime::heap::FrogDict`'s doc comment for the representation this
 //! exercises.
 
 mod common;

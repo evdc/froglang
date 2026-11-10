@@ -28,6 +28,12 @@ use crate::frontend::tokens::Span;
 /// zero-span) renders an empty source line rather than panicking —
 /// diagnostics must never be the thing that crashes over a bad span.
 pub fn render_span(filename: &str, source: &str, span: Span, msg: &str) -> String {
+    render_span_as("error", filename, source, span, msg)
+}
+
+/// `render_span` with a different severity word, for diagnostics that are not
+/// errors (`frog check --copies` reports lints as `warning`).
+pub fn render_span_as(level: &str, filename: &str, source: &str, span: Span, msg: &str) -> String {
     let line_no = span.start.line as usize + 1;
     let col_no = span.start.col as usize + 1;
     let line_text = source.lines().nth(line_no - 1).unwrap_or("");
@@ -44,7 +50,7 @@ pub fn render_span(filename: &str, source: &str, span: Span, msg: &str) -> Strin
     let caret = "^".repeat(caret_len);
 
     format!(
-        "error: {msg}\n{pad} --> {filename}:{line_no}:{col_no}\n{pad} |\n{gutter} | {line_text}\n{pad} | {caret_pad}{caret}"
+        "{level}: {msg}\n{pad} --> {filename}:{line_no}:{col_no}\n{pad} |\n{gutter} | {line_text}\n{pad} | {caret_pad}{caret}"
     )
 }
 

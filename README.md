@@ -105,7 +105,7 @@ type of `return`, `panic`, and any expression that never produces a value)
   parens wrap the *whole* type, arrow included: `(Int -> Int)`, `(Int, Int -> Int)`. That is
   what makes an annotation unambiguous without a lookahead — `f: Int -> Int` is rejected with
   a message telling you to add them (see `Grammar::type_annotation`)
-- `List<T>` — homogeneous GC-managed lists
+- `List<T>` — homogeneous owned lists
 - Type variables with optional trait bounds
 - `T1 | T2` — sum / union types
 - `T?` — sugar for `T | None`
@@ -218,7 +218,7 @@ the condition under which lifting a capture into a parameter is semantics-preser
 escape analysis. A lambda sees its captures as of where it was created, not where it is
 called.
 
-Escaping closures — a real `(code pointer, captured environment)` value, traced by the GC —
+Escaping closures — a real `(code pointer, captured environment)` value, owned, with drop glue —
 are deliberately unbuilt. See `tests/test_closures.rs`, whose rejection cases pin that
 boundary.
 
@@ -359,6 +359,14 @@ garbage collector. A consumer that keeps a value it only has a view of deep-copi
 a binding's last use hands its value over instead. Freed blocks go onto size-class free
 lists for reuse. Debug builds check at teardown that every object was freed.
 
+Copies are implicit, so `frog check --copies program.frog` lists them: each site where a value
+that is still in use gets deep-copied because something else keeps it, with its location
+and type. Passing a list to a function that only reads it, or using a binding for the last
+time, costs no copy.
+
+When `?` returns early it calls `abort(x)` on each live value whose type `provides Abort`,
+newest first, before returning the error. `provides Linear` requires `Abort`.
+
 - `FrogStr` — immutable, inline bytes after the header; NUL-terminated
 - `FrogList` — header + separate `i64` data buffer; grows via `realloc`
 
@@ -371,7 +379,7 @@ heap, set via an `ACTIVE_HEAP` thread-local pointer during JIT execution.
 | Name | Type | Description |
 |---|---|---|
 | `print(value)` | `Any -> None` | Coerce a value to text and print it with a newline |
-| `gc_dump()` | `() -> None` | Print the live heap object count and bytes to stderr |
+| `heap_dump()` | `() -> None` | Print the live heap object count and bytes to stderr |
 | `panic(msg: Str)` | `Str -> Never` | Trap the process; `!`'s error arm just calls this, so it's callable directly too |
 
 ## REPL
@@ -392,7 +400,7 @@ entries remain in scope.
 **REPL meta-commands:**
 
 ```
-:gc    — print the live heap object count to stderr
+:heap  — print the live heap object count to stderr
 :help  — show available commands
 ```
 
@@ -547,7 +555,7 @@ of them must print the same result — a differing row means one of them is wron
   every item into a `Discount` union variant, matches on that variant, and
   runs the result through a fallible `price_item` using `?` and `catch`.
   Exercises structs, unions + `match`, error propagation, list construction,
-  and the GC. The other four implementations have no equivalent of `?`/
+  and allocation/free traffic. The other four implementations have no equivalent of `?`/
   `catch`, but since the error branch is never actually taken on this data,
   all five implementations must still print the same total.
 - **`life`** — Conway's Game of Life on a 48x48 grid for 40 generations,
@@ -560,7 +568,7 @@ of them must print the same result — a differing row means one of them is wron
   fixing them.
 - **`words`** — builds a 400-word document from a fixed vocabulary, splits
   it back apart and folds over the words, 800 times. The only benchmark that
-  allocates `Str`s, so it is the one that covers variable-size GC objects,
+  allocates `Str`s, so it is the one that covers variable-size heap objects,
   byte-wise string comparison, and the `Str` stdlib (`split`/`join`/
   `to_upper`/`starts_with`) — which, being host functions, means it also
   covers the embedding boundary in a hot loop.
@@ -597,7 +605,7 @@ cargo run -- build program.frog -o program
 cargo test
 
 # Verbose heap tracing (allocations and frees to stderr)
-cargo test --features gc_trace
+cargo test --features heap_trace
 
 # Dump the Cranelift IR codegen emitted, per function, to stderr
 FROG_DUMP_CLIF=1 cargo run -- run program.frog

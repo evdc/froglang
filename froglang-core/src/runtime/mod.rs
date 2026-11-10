@@ -1,4 +1,4 @@
-pub mod gc;
+pub mod heap;
 pub mod dict;
 pub mod ffi;
 pub mod host;

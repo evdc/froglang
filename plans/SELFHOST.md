@@ -134,6 +134,10 @@ representation as C types. Decisions to pin here, all inherited from `RUNTIME.md
 This header is also independently useful: it is the documented C ABI of the runtime.
 
 ### G6 — GC roots for emitted C (**the crux — spike this first**)
+
+> **Superseded (2026-11-10):** the GC was deleted (`plans/NOGC.md` step 3), so there are no roots to
+> track and G6 no longer exists. The text below is kept for history; the spike it asks for is moot.
+
 The precise root story (`RUNTIME.md` Part 2: Cranelift user stack maps, keyed by return address,
 walked via frame pointers) is **Cranelift-specific and does not apply to C frames** — we do not
 control C's stack layout, so we cannot produce those maps. The collector must find roots in

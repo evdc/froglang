@@ -4,7 +4,7 @@
 //! A host (Rust) function compiled to a shim callable from JIT code has the
 //! uniform signature `extern "C" fn(ctx: *mut FrogCtx, args: *const i64, out:
 //! *mut i64)`. `FrogCtx` is that shim's only way to touch the heap — it
-//! carries the executing `FrogState`'s `GcHeap` plus the struct/union
+//! carries the executing `FrogState`'s `Heap` plus the struct/union
 //! layout tables codegen itself uses, so a shim can build a `Str`/`List`/
 //! struct/union value without any layout baked into it at compile time.
 //!
@@ -20,12 +20,12 @@
 use std::cell::Cell;
 
 use crate::frontend::typeck::{StructDefs, UnionDefs};
-use crate::runtime::gc::{GcHeap, ACTIVE_HEAP, GC_HEAP};
+use crate::runtime::heap::{Heap, ACTIVE_HEAP, TASK_HEAP};
 
 thread_local! {
     /// The `FrogCtx` for the `FrogState` currently executing on this
     /// thread, published by `FrogState::call_jit` around each JIT call —
-    /// mirrors `gc::ACTIVE_HEAP`, kept separate because it carries strictly
+    /// mirrors `heap::ACTIVE_HEAP`, kept separate because it carries strictly
     /// more (and shorter-lived: valid only inside one `call_jit`, not for
     /// the `FrogState`'s whole lifetime) than a heap pointer.
     static ACTIVE_CTX: Cell<*mut FrogCtx> = const { Cell::new(std::ptr::null_mut()) };
@@ -33,7 +33,7 @@ thread_local! {
 
 /// Publish `ctx` as the active one for the duration of `f`. Used by
 /// `FrogState::call_jit`; nests correctly with re-entrant JIT calls the
-/// same way `gc::JitFrameGuard` does, by saving and restoring rather than
+/// same way `heap::JitFrameGuard` does, by saving and restoring rather than
 /// clearing.
 pub fn with_active_ctx<R>(ctx: &mut FrogCtx, f: impl FnOnce() -> R) -> R {
     let previous = ACTIVE_CTX.with(|c| c.replace(ctx as *mut FrogCtx));
@@ -53,7 +53,7 @@ pub extern "C" fn frog_ctx_current() -> i64 {
 }
 
 /// AOT entry harness (`plans/AOT.md`, G5). The standalone-binary analogue of
-/// `FrogState::call_jit`: publish this thread's `GC_HEAP` as the active heap
+/// `FrogState::call_jit`: publish this thread's `TASK_HEAP` as the active heap
 /// (so every runtime `frog_*` call and host shim allocates into it through a
 /// raw pointer, exactly as the JIT does with `FrogState::heap`), publish a
 /// `FrogCtx` so host-function shims can fetch it via `frog_ctx_current`, then
@@ -78,11 +78,11 @@ pub extern "C" fn frog_ctx_current() -> i64 {
 pub unsafe extern "C" fn frog_rt_main(entry: usize, out_ptr: i64) -> i32 {
     let entry: extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
 
-    // A raw pointer to this thread's `GcHeap` without holding a `RefCell`
-    // borrow open — so the short `GC_HEAP.borrow_mut()` fallbacks inside
+    // A raw pointer to this thread's `Heap` without holding a `RefCell`
+    // borrow open — so the short `TASK_HEAP.borrow_mut()` fallbacks inside
     // `with_heap` never conflict. Publishing it as `ACTIVE_HEAP` routes all
     // heap access through this pointer instead, mirroring `call_jit`.
-    let heap_ptr = GC_HEAP.with(|h| h.as_ptr());
+    let heap_ptr = TASK_HEAP.with(|h| h.as_ptr());
     ACTIVE_HEAP.with(|p| p.set(heap_ptr));
 
     let empty_structs = StructDefs::default();
@@ -108,22 +108,22 @@ pub unsafe extern "C" fn frog_rt_main(entry: usize, out_ptr: i64) -> i32 {
 /// entry sees the same `FrogCtx`, not a fresh one per call.
 #[repr(C)]
 pub struct FrogCtx {
-    heap:    *mut GcHeap,
+    heap:    *mut Heap,
     structs: *const StructDefs,
     unions:  *const UnionDefs,
 }
 
 impl FrogCtx {
     /// # Safety
-    /// `heap` must be a valid, exclusively-owned `GcHeap` for the duration
+    /// `heap` must be a valid, exclusively-owned `Heap` for the duration
     /// this `FrogCtx` is published, and `structs`/`unions` must outlive it
     /// (both hold for `FrogState::call_jit`, which builds this from `self`
     /// and never lets it escape the call).
-    pub unsafe fn new(heap: *mut GcHeap, structs: *const StructDefs, unions: *const UnionDefs) -> Self {
+    pub unsafe fn new(heap: *mut Heap, structs: *const StructDefs, unions: *const UnionDefs) -> Self {
         FrogCtx { heap, structs, unions }
     }
 
-    fn heap(&mut self) -> &mut GcHeap {
+    fn heap(&mut self) -> &mut Heap {
         unsafe { &mut *self.heap }
     }
 
@@ -147,11 +147,11 @@ impl FrogCtx {
     /// # Safety
     /// `w` must be a valid, live `FrogStr` pointer.
     pub unsafe fn str_of<'a>(&self, w: i64) -> &'a str {
-        crate::runtime::gc::frog_str_as_str(w as *const crate::runtime::gc::FrogStr)
+        crate::runtime::heap::frog_str_as_str(w as *const crate::runtime::heap::FrogStr)
     }
 
     /// Allocate a `List<T>` of `stride`-wide elements (`stride == 1` for
-    /// every non-struct `T` — see `FrogList`'s doc comment in `gc.rs`) from
+    /// every non-struct `T` — see `FrogList`'s doc comment in `heap.rs`) from
     /// a flat, already-wire-formatted `i64` buffer. The list takes ownership
     /// of every object `elems` names.
     pub fn alloc_list(&mut self, elems: &[i64], stride: usize, ptr_mask: u64) -> i64 {
@@ -171,13 +171,13 @@ impl FrogCtx {
     /// over the same layout `ffi::frog_list_get`/`frog_list_len` use,
     /// exposed here so a shim doesn't need a second way to reach the heap.
     pub fn list_len(&self, w: i64, stride: usize) -> usize {
-        let list_ptr = w as *const crate::runtime::gc::FrogList;
+        let list_ptr = w as *const crate::runtime::heap::FrogList;
         let raw_len = unsafe { (*list_ptr).len as usize };
         raw_len / stride.max(1)
     }
 
     pub fn list_elem(&self, w: i64, idx: usize, stride: usize, slot: usize) -> i64 {
-        let list_ptr = w as *const crate::runtime::gc::FrogList;
+        let list_ptr = w as *const crate::runtime::heap::FrogList;
         unsafe { *(*list_ptr).data.add(idx * stride.max(1) + slot) }
     }
 
@@ -186,7 +186,7 @@ impl FrogCtx {
     /// in the insertion order the resulting `Dict` should report. The dict
     /// takes ownership of every object `entries` names. `key_kind` is a `runtime::dict::KeyKind`
     /// discriminant. Builds the hash index in one pass (`rebuild`, the
-    /// same one `GcHeap::clone_obj`'s `Dict` arm uses) rather than
+    /// same one `Heap::clone_obj`'s `Dict` arm uses) rather than
     /// inserting one entry at a time.
     ///
     /// A duplicate key in `entries` is **not** deduplicated here — the
@@ -221,13 +221,13 @@ impl FrogCtx {
     /// order the entries buffer holds them — insertion order (`FrogDict`'s
     /// doc comment). Thin wrapper mirroring `list_len`/`list_elem`.
     pub fn dict_len(&self, w: i64) -> usize {
-        let dict_ptr = w as *const crate::runtime::gc::FrogDict;
+        let dict_ptr = w as *const crate::runtime::heap::FrogDict;
         unsafe { (*dict_ptr).len as usize }
     }
 
     pub fn dict_entry_slot(&self, w: i64, idx: usize, kstride: usize, vstride: usize, slot: usize) -> i64 {
         let stride = (kstride + vstride).max(1);
-        let dict_ptr = w as *const crate::runtime::gc::FrogDict;
+        let dict_ptr = w as *const crate::runtime::heap::FrogDict;
         unsafe { *(*dict_ptr).entries.add(idx * stride + slot) }
     }
 }

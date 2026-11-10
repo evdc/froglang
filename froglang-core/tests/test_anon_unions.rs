@@ -225,7 +225,7 @@ fn test_assigning_into_a_union_typed_struct_field_widens() {
 // a tagged pointer column plus a scalar column, no allocation for the `Int`
 // case. Both columns' pointer-ness is static — the scalar column is never
 // scanned, and the pointer column is scanned unconditionally, with the
-// uniform `gc::is_heap_ptr` rule screening a tag-only word out. These tests
+// uniform `heap::is_heap_ptr` rule screening a tag-only word out. These tests
 // exercise it end to end, including under real GC pressure, where getting
 // the columns wrong would either free a still-live boxed member
 // (read-after-free) or follow a raw `Int` payload as if it were a pointer.

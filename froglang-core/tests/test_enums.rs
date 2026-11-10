@@ -110,7 +110,7 @@ fn test_enum_unit_variants_in_list_program() {
 
 /// GC stress: many enum-variant allocations, each holding a `Str` (heap
 /// pointer) payload slot, forcing multiple collections — regression test
-/// for `ObjKind::Variant`'s tracing in `GcHeap::mark` (runtime/gc.rs).
+/// for `ObjKind::Variant`'s tracing in `Heap::mark` (runtime/heap.rs).
 #[test]
 fn test_enum_variant_with_str_field_survives_gc() {
     assert_eq!(compile_and_run(
@@ -175,7 +175,7 @@ fn test_enum_unknown_variant_rejected() {
 //
 // A variant with no fields of its own, on an enum with no common fields,
 // compiles to an immediate tag rather than a `FrogVariant` allocation — see
-// gc.rs's "Immediate (unboxed) values". These pin the behaviour that makes
+// heap.rs's "Immediate (unboxed) values". These pin the behaviour that makes
 // that safe: such a value still matches, still round-trips through lists and
 // struct fields alongside *boxed* variants of the same enum, and the GC
 // leaves it alone rather than following it as a pointer.

@@ -1,19 +1,19 @@
 use std::io::Write;
 
-use super::gc::{FrogList, FrogStr, FrogVariant, GcHeap, GC_HEAP, ACTIVE_HEAP};
+use super::heap::{FrogList, FrogStr, FrogVariant, Heap, TASK_HEAP, ACTIVE_HEAP};
 
-/// Call `f` with a mutable reference to the active GcHeap.
+/// Call `f` with a mutable reference to the active Heap.
 /// Uses the `FrogState`-owned heap if one is executing on this thread,
-/// otherwise falls back to the thread-local GC_HEAP.
+/// otherwise falls back to the thread-local TASK_HEAP.
 pub(super) fn with_heap<F, R>(f: F) -> R
 where
-    F: FnOnce(&mut GcHeap) -> R,
+    F: FnOnce(&mut Heap) -> R,
 {
     let ptr = ACTIVE_HEAP.with(|h| h.get());
     if !ptr.is_null() {
         unsafe { f(&mut *ptr) }
     } else {
-        GC_HEAP.with(|h| {
+        TASK_HEAP.with(|h| {
             let mut borrowed = h.borrow_mut();
             f(&mut borrowed)
         })
@@ -433,12 +433,12 @@ pub extern "C" fn frog_list_slice(list: i64, start: i64, end: i64) -> i64 {
 /// and the copy carries the same tag.
 #[no_mangle]
 pub extern "C" fn frog_clone(w: i64) -> i64 {
-    if !super::gc::is_heap_ptr(w) {
+    if !super::heap::is_heap_ptr(w) {
         return w;
     }
     with_heap(|heap| {
-        let cloned = unsafe { heap.clone_obj(super::gc::heap_ptr(w)) };
-        (cloned as i64) | (w & super::gc::TAG_MASK)
+        let cloned = unsafe { heap.clone_obj(super::heap::heap_ptr(w)) };
+        (cloned as i64) | (w & super::heap::TAG_MASK)
     })
 }
 
@@ -447,26 +447,26 @@ pub extern "C" fn frog_clone(w: i64) -> i64 {
 /// was never filled or was already moved out of (both hold 0).
 #[no_mangle]
 pub extern "C" fn frog_drop(w: i64) {
-    if !super::gc::is_heap_ptr(w) {
+    if !super::heap::is_heap_ptr(w) {
         return;
     }
-    with_heap(|heap| unsafe { heap.drop_tree(super::gc::heap_ptr(w)) });
+    with_heap(|heap| unsafe { heap.drop_tree(super::heap::heap_ptr(w)) });
 }
 
-/// Start a `with Arena` region (`GcHeap::arena_enter`).
+/// Start a `with Arena` region (`Heap::arena_enter`).
 #[no_mangle]
 pub extern "C" fn frog_arena_enter() {
     with_heap(|heap| heap.arena_enter());
 }
 
 /// The region's block has its result: allocation returns to the enclosing
-/// allocator, so the result can be copied out (`GcHeap::arena_evac_begin`).
+/// allocator, so the result can be copied out (`Heap::arena_evac_begin`).
 #[no_mangle]
 pub extern "C" fn frog_arena_evac() {
     with_heap(|heap| heap.arena_evac_begin());
 }
 
-/// Free the region, once the result is copied out (`GcHeap::arena_release`).
+/// Free the region, once the result is copied out (`Heap::arena_release`).
 #[no_mangle]
 pub extern "C" fn frog_arena_release() {
     with_heap(|heap| heap.arena_release());
@@ -476,10 +476,10 @@ pub extern "C" fn frog_arena_release() {
 /// intermediate list that `keys`/`values`/`slice` build before deep-copying it.
 #[no_mangle]
 pub extern "C" fn frog_drop_shallow(w: i64) {
-    if !super::gc::is_heap_ptr(w) {
+    if !super::heap::is_heap_ptr(w) {
         return;
     }
-    with_heap(|heap| unsafe { heap.free_shallow(super::gc::heap_ptr(w)) });
+    with_heap(|heap| unsafe { heap.free_shallow(super::heap::heap_ptr(w)) });
 }
 
 #[no_mangle]
@@ -546,12 +546,12 @@ pub extern "C" fn frog_alloc_variant(tag: i64, nslots: i64, ptr_mask: i64) -> i6
 }
 
 /// A payload-less member of a *boxed* union is an immediate — the value
-/// carries its own tag and there is nothing to dereference. See gc.rs's
+/// carries its own tag and there is nothing to dereference. See heap.rs's
 /// "Word encoding" section.
 #[no_mangle]
 pub extern "C" fn frog_variant_tag(variant: i64) -> i64 {
-    if !super::gc::is_heap_ptr(variant) {
-        return super::gc::immediate_variant_tag(variant);
+    if !super::heap::is_heap_ptr(variant) {
+        return super::heap::immediate_variant_tag(variant);
     }
     unsafe { (*(variant as *const FrogVariant)).tag as i64 }
 }
@@ -580,10 +580,10 @@ pub extern "C" fn frog_variant_set(variant: i64, slot: i64, val: i64) {
 
 // ── GC diagnostics ───────────────────────────────────────────────────────────
 
-/// Print a full heap dump to stderr. Callable as `gc_dump()` from froglang.
+/// Print a full heap dump to stderr. Callable as `heap_dump()` from froglang.
 #[no_mangle]
-pub extern "C" fn frog_gc_dump() {
-    super::gc::gc_dump();
+pub extern "C" fn frog_heap_dump() {
+    super::heap::heap_dump();
 }
 
 #[cfg(test)]

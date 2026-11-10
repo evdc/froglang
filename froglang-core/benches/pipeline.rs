@@ -38,7 +38,7 @@
 //! Between them they cover: raw call/arithmetic throughput with no heap at
 //! all (`fib`), unboxed struct field access and copying (`structs`), the
 //! allocator and drops under pure churn (`alloc`) and under a large
-//! *retained* live set alongside the churn (`gc_pressure`, named for the
+//! *retained* live set alongside the churn (`alloc_pressure`, named for the
 //! collector it used to measure),
 //! string building and comparison (`strings`), list allocation, growth and
 //! indexing (`lists`), recursive boxed unions and `match` dispatch (`tree`),
@@ -343,7 +343,7 @@ total
 /// garbage. Under the old mark-sweep collector every collection re-marked
 /// all of `live`; without one, this should cost the same as `alloc` per
 /// object, and a gap between the two is worth investigating.
-const GC_PRESSURE: &str = "\
+const ALLOC_PRESSURE: &str = "\
 data Node is Empty | Cell(v: Int, rest: Node)
 func chain(n: Int, acc: Node): Node = if n == 0 then acc else chain(n - 1, Cell(v=n, rest=acc))
 func total(t: Node): Int = match t {
@@ -482,7 +482,7 @@ fn runnable() -> [(&'static str, &'static str); 16] {
         ("structs", STRUCTS),
         ("structs_mut_param", STRUCTS_MUT_PARAM),
         ("alloc", ALLOC),
-        ("gc_pressure", GC_PRESSURE),
+        ("alloc_pressure", ALLOC_PRESSURE),
         ("strings", STRINGS),
         ("lists", LISTS),
         ("list_mut_index", LIST_MUT_INDEX),

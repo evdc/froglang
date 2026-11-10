@@ -579,7 +579,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
 2. **Ownership codegen behind a flag:** drops at last use, drop glue from masks, deep copy at
    residual copies, no `shared` bit. Run the whole suite in both modes, with a leak checker
    (allocation count at exit is zero) as the oracle that replaces `FROG_GC_STRESS`.
-   **Status: first slice done, uncommitted** (`FROG_OWNERSHIP`). Every site that marked a list or
+   **Status: first slice done** (`FROG_OWNERSHIP`). Every site that marked a list or
    dict leaf `shared` (`Var` reads, extractions, for-loop elements) now deep-copies it, unless the
    read is a borrowed call argument or a transient target. The `shared` bit is never set in this
    mode. `values(d)` deep-copies its result. The GC still runs and frees nothing explicitly, so
@@ -590,7 +590,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    The COW verifier does not catch a missing copy in `let b = a`, because both bindings share one
    SSA value. The value-semantics tests do catch it: skipping the copy fails 18 of them.
 
-   **Status: second half done, uncommitted.** Drops and frees are in place under `FROG_OWNERSHIP`.
+   **Status: second half done.** Drops and frees are in place under `FROG_OWNERSHIP`.
    - Every owned heap value lives in a slot. A block frame holds bindings, and a statement frame
      holds the temporaries it produced. A consumer that keeps a value takes it out of its frame,
      which clears the slot. Popping a frame frees whatever its slots still hold. An early `return`
@@ -614,13 +614,13 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    - Known, not fixed: default mode (GC) still has the `values(d)` alias that ownership mode fixes.
      Collector unit tests and the GC-stress churn test now run only on a collected heap (`owned`
      is set false, or the sweep check is skipped).
-   **Tuning `orders` (2026-11-05, uncommitted except step 1).** Times are best of 5 in release.
+   **Tuning `orders` (2026-11-05, committed).** Times are best of 5 in release.
 
    | Build | default | ownership |
    |---|---|---|
    | before tuning | 49 ms | 80 ms |
    | step 1: inline immediate check before clone calls (committed, `e9c4cd6`) | 49 ms | 73 ms |
-   | item 1: drop the drop of a temporary taken at its own depth (uncommitted) | 49 ms | 59 ms |
+   | item 1: drop the drop of a temporary taken at its own depth | 49 ms | 59 ms |
 
    Measurements behind the tuning:
    - Runtime counts on `orders` (before step 1): 2,000 `frog_drop` calls reach the runtime, since
@@ -655,7 +655,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    registrations. And several guards in one statement could share one block, to cut block
    splits.
 
-   **Copy on keep (2026-11-05, uncommitted).** Codegen used to copy a value when it was read,
+   **Copy on keep (2026-11-05).** Codegen used to copy a value when it was read,
    unless the reading site marked itself as a view (`view_next`, `compile_operand`, the transient
    helpers). Every read-only site that was not marked made a deep copy, and several were not:
    `if xs` copied the list to read its length, `d[k]` copied the key, `Narrow` copied the payload,
@@ -682,7 +682,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      "z"; "" }`) leaves the earlier operand dangling. Rebinding a name is safe, since liveness
      then makes the earlier read a `Move`.
 
-   **Worklists and leak checking (2026-11-06, uncommitted).**
+   **Worklists and leak checking (2026-11-06).**
    - `drop_tree` and `clone_obj_with` recursed once per level, so dropping or copying a ~20,000-deep
      `Cons` list overflowed the stack. That is the ownership free path itself, so removing the GC
      would not have fixed it. Both now walk a worklist over `for_each_slot`, the slot iterator the
@@ -762,7 +762,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    - **Out of scope.** Static drop placement at last use, the per-union heap test, sharing guard
      blocks, the operand-view limitation, and RC for `Str`.
 
-   **Status (2026-11-06): done, uncommitted.** Ownership is the only mode and the collector is
+   **Status (2026-11-06): done.** Ownership is the only mode and the collector is
    gone. Net change, excluding `plans/`: 651 lines added, 3,238 deleted (−2,587). Source alone
    is −2,149, tests and benches −431, the README −7.
    - **3a, one mode.** `FROG_OWNERSHIP` and its three readers are gone, and so are the GC-mode
@@ -828,11 +828,14 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      `words` beats the GC now, likely from the smaller headers and from losing the frame
      pointers and spills. `orders` is still 4 ms slower than the GC. Its remaining drop guards
      are the per-union heap test and guard-sharing items above.
-   - **Left open.** `GcHeap`, `gc.rs`, `gc_mask`, `GC_HEAP`, `gc_dump` and the `gc_trace`
-     feature keep their names, so a rename can be its own commit. JIT frames no longer carry
+   - **Renamed (2026-11-10).** `GcHeap` is `Heap`, `gc.rs` is `heap.rs`, `GcHeader` is `ObjHeader`,
+     `GC_HEAP` is `TASK_HEAP`, `gc_mask` is `ptr_mask_of`, `gc_dump` is `heap_dump`, the `gc_trace`
+     feature is `heap_trace`, the REPL command `:gc` is `:heap`, and the `gc_pressure` workload is
+     `alloc_pressure`.
+   - **Left open.** JIT frames no longer carry
      frame pointers, so a native profiler's stack attribution may get worse.
      `FROG_JIT_SYMBOLS` is unaffected. The `pipeline.rs` workload `gc_pressure` keeps its name
-     but no longer measures a collector. `SELFHOST.md` G6 has not been edited.
+     but no longer measures a collector (since renamed). `SELFHOST.md` G6 has not been edited.
 4. **Allocator layer:** segment headers, task heap and bump arena; then `with Arena` with
    `freezes`, and the result allocator.
 
@@ -885,7 +888,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      copy, for now); `Pool<T>`/`Id<T>` (step 5); other `with` forms (`Scope`, `Deadline`, ...);
      an arena lint for loop-carried reallocation; the `gc` rename.
 
-   **Step 4 status (2026-11-08): done, uncommitted.** `with Arena { body }` works in the JIT and
+   **Step 4 status (2026-11-08): done.** `with Arena { body }` works in the JIT and
    the AOT build, and the leak gate holds.
    - **4a, runtime** (`gc.rs`). `GcHeap` has a stack of bump arenas (first chunk 16 KiB, then
      doubling, an oversized object gets a chunk of its own, chunks are taken lazily on the
@@ -961,7 +964,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      place, so a block whose result is large pays a copy. No arena lint for loop-carried
      reallocation. No arena-aware `gc_dump` line. (The shadowing hole above is closed: see
      "One variable per name".)
-   - **One variable per name (2026-11-09, uncommitted).** Fixes the conflation found above, so
+   - **One variable per name (2026-11-09).** Fixes the conflation found above, so
      an inner declaration, loop variable, comprehension variable, match binder or `catch` binder
      that shadows an outer name no longer touches it. The arena restriction in `lower_assign`
      and its test are gone.
@@ -1044,6 +1047,79 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    runtime. It adds the trait, the error-arm desugar in typeck, the `Linear` requires `Abort`
    check, and `linear.rs` treating `?` edges as consuming. Also add the `implicit-copy` lint, which
    is useful with or without the GC as a report of where COW marks happen.
+
+   **Status (2026-11-10): 6a (`Abort` and `?`) and 6b (the `implicit-copy` report) done; the deny annotation and `copy()` are not.**
+   - **The trait.** `Abort` is an ordinary source-declared trait, seeded next to `Iterable` and
+     `Container` (`trait Abort { func abort(x: Self) }`), so `provides Abort { func abort(...) }`
+     goes through the normal impl path. `data T provides Linear` without `Abort` is a type error at
+     the declaration. The rule is checked once an entry's impls are all registered, so it holds
+     however `Linear` is granted (a declaration's or union's `provides`, or a standalone `provides
+     Linear for T`), and the two may be granted separately.
+   - **The `?` edge.** Typeck cannot know which values are owned at a `?`, so the error arm is
+     `{ abort!edge(); return e }`, where `abort!edge` is a reserved builtin. `linear::insert_aborts`
+     runs after `number_nodes` (it reads liveness), replaces each placeholder with `abort(x)` calls,
+     newest binding first, and `number_nodes` runs again. It runs in `frontend::pipeline::lower_checked`,
+     which every compile path (JIT, `frog build`, `check`, `check --copies`) shares. This differs from the plan's "typeck-level desugar", which assumed a live set
+     typeck does not have; codegen still needs nothing new.
+   - **What is aborted.** A binding of the enclosing function (a `let`/`mut` or a non-`mut`
+     parameter it owns) in scope at the edge, whose type provides `Abort`, with no `Move`-classified
+     read before the edge that handed it off. Ownership follows the parameter conventions, inferred
+     *before* the calls are inserted: a borrowed parameter is its caller's, and a last use lent to a
+     borrowing position is not a hand-off, so the owner aborts it, once. `Linear` values ignore
+     conventions (no aliasing, so a `Move` read always hands off). `lower_checked` re-infers
+     conventions after insertion, because they are keyed by node id. For `Linear` a move is consumption, so this is exact. For a plain `Abort` type a
+     move is only the last use, so a value whose last use is the failing expression itself is dropped,
+     not aborted. `catch`, `!`, a plain `return` and panic abort nothing.
+   - **Not aborted (conservative, never twice):** a binding shadowed, at the edge, by a later
+     declaration of the same name; a loop or comprehension variable; an anonymous-union binding
+     whose members have different `abort` impls (a nominal union's one impl is found through its
+     variants); and any binding declared outside the enclosing `with Arena` block, since outer places are
+     frozen there. A `Linear` value in one of these cases makes the `?` a type error (rule 3 below)
+     rather than a leak. Bindings are tracked per declaration, not per name, so a shadow that has
+     gone out of scope no longer hides the outer binding.
+   - **`linear.rs` rule 2** no longer counts a branch that ends in `Never` (the `?` error arm), and
+     no longer counts a binding declared inside the branch's own block. The second was an existing bug:
+     a Linear `let` used inside one arm read as "consumed on only one branch".
+   - **`linear.rs` rule 3 (2026-11-10)**, §3.6's "failing to consume is a compile error":
+     `check_exits` requires every `Linear` binding of a function to be consumed before its scope ends
+     by falling through (end of its block, end of the body for a parameter) and before every
+     `return`. The `return` in a `?` arm sees the inserted `abort(x)` calls, so a `?` that cannot abort
+     a live `Linear` value is rejected. Exempt: `mut` parameters (copied out), the argument of a
+     type's own `abort`, and paths that panic. Still loose: a value declared outside a loop and
+     consumed inside it counts as consumed. Top-level entries are unchecked (see `linear.rs`).
+   - **`match` and containment (2026-11-10).** A `match` consumes its subject once, at the move into
+     its temporary, whose per-arm reads are exempt from all three passes. The arm owes what it got:
+     the narrowed subject, or each Linear field it bound. Taking a value apart consumes it, so an arm
+     may not leave a Linear part unbound. `?` inside a narrowed arm aborts the narrowed value, widened
+     back into its union. `Linear` is now contained: a struct, variant, `List` or `Dict` holding a
+     Linear value is Linear, and a union is Linear if any member is. A field read inspects a live
+     value; at its last use it takes the value apart, which must not drop another Linear field. A
+     type that is Linear only by containment needs its own `Abort` impl for `?` to abort it (there is
+     no derived one yet). Still open: indexing a `List` of Linear values copies the element, and
+     consuming the list drops the rest.
+   - **Not done:** the resource table and panic-time aborts belong to step 7.
+   - **Tests.** `tests/test_abort.rs`, 17 tests, observing order and absence of calls through printing
+     `abort` bodies, all under the leak oracle. `test_linear.rs` gained `Abort` impls. `cargo test
+     --workspace`: 1,289 passed. Clippy: 18 warnings, none new. `orders`, `words` and `life` match the
+     previous commit measured side by side (56/186/17 ms against 56/191/19 on a slower machine day).
+   - **6b, the lint.** `frog check --copies <file|expr>` compiles to a native object (no link, no run)
+     and prints one warning per implicit deep copy, with file, line, column and the copied type, then a
+     count. The findings come from codegen, which is where copies are decided, so they cannot drift
+     from what actually runs: `own_vals` records a `CopySite` (thread-local log, off unless
+     `start_copy_log` was called) with `Ctx::cur_span`, the expression that kept the value. Reporting
+     the keeper rather than the read is deliberate: `let b = a`, `push(mut s, a)` and a by-value call
+     argument each point at the statement that stores the value. Arena evacuation copies are not
+     reported; they are the block's contract. `benches`: `orders` 2 sites, `words` 2, `life` 1.
+     Top-level bindings stay live for the whole entry (Q6), so reads of them are flagged more often
+     than the same code inside a function.
+   - **Side fix.** `frog build` skipped `insert_aborts` and the conventions pass, so a native build
+     of a `?` over an `Abort` value called a placeholder, and every call was compiled as consuming.
+     `build` and `check --copies` now share `lower_for_object` in `main.rs`.
+   - **Not done:** `#deny(implicit-copy)` per function or module (annotations exist only on `data`
+     fields today, so this needs parser support for function-level annotations), the `copy(x)`
+     silencing builtin (nothing to silence until a lint can be denied), and a REPL setting.
+   - **Tests.** `tests/test_copy_lint.rs` (6), one AOT test in `test_build_cli.rs`. `cargo test
+     --workspace`: 1,296 passed, plain and under `FROG_LEAK_CHECK=1`. Clippy: 18, none new.
 7. **The `with` protocol, second-class handles, the cleanup stack and the resource table.** Then
    `CONCURRENCY.md` stages 2 onward run on this foundation, without stage 1's unwinder, and with
    deferred-init `let` instead of `Task<T>`.

@@ -1,6 +1,6 @@
 use froglang_core::codegen::compile_and_run;
 use froglang_core::runtime::ffi::{frog_str_len, frog_list_len, frog_list_get};
-use froglang_core::runtime::gc::{frog_str_as_str, FrogStr};
+use froglang_core::runtime::heap::{frog_str_as_str, FrogStr};
 
 // ── helper: load a .frog program from tests/programs/ ────────────────────────
 
@@ -588,7 +588,7 @@ fn test_comprehension_of_structs() {
 
 /// GC stress: many struct allocations, each holding a `Str` (heap-pointer)
 /// field, forcing multiple collections — regression test for the list
-/// stride/pointer-mask generalization in `GcHeap::mark` (runtime/gc.rs).
+/// stride/pointer-mask generalization in `Heap::mark` (runtime/heap.rs).
 #[test]
 fn test_list_of_structs_with_str_field_survives_gc() {
     assert_eq!(compile_and_run(

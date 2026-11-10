@@ -32,7 +32,7 @@ pub mod dom;
 use std::cell::RefCell;
 
 use super::ffi::with_heap;
-use super::gc::{GcHeap};
+use super::heap::{Heap};
 use super::read::read_str_arg;
 use dom::{Json, Kind};
 
@@ -94,7 +94,7 @@ fn null_doc() -> Json {
 #[no_mangle]
 pub extern "C" fn frog_json_escape(s: i64) -> i64 {
     let escaped = dom::escape(&read_str_arg(s));
-    with_heap(|heap: &mut GcHeap| {
+    with_heap(|heap: &mut Heap| {
         heap.alloc_str(escaped.as_bytes()) as i64
     })
 }
@@ -105,7 +105,7 @@ pub extern "C" fn frog_json_escape(s: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn frog_json_float_repr(f: f64) -> i64 {
     let s = dom::float(f);
-    with_heap(|heap: &mut GcHeap| {
+    with_heap(|heap: &mut Heap| {
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
@@ -148,7 +148,7 @@ pub extern "C" fn frog_json_offset() -> i64 {
 pub extern "C" fn frog_json_msg() -> i64 {
     let msg = JSON_STATE.with(|st| st.borrow().as_ref().and_then(|s| s.err.clone()).map(|(m, _)| m))
         .unwrap_or_default();
-    with_heap(|heap: &mut GcHeap| {
+    with_heap(|heap: &mut Heap| {
         heap.alloc_str(msg.as_bytes()) as i64
     })
 }
@@ -249,7 +249,7 @@ pub extern "C" fn frog_json_bool(node: i64) -> i8 {
 pub extern "C" fn frog_json_str(node: i64) -> i64 {
     let s: Option<String> = with_node(node, |n| dom::as_str(n).map(str::to_string));
     let s = s.unwrap_or_else(|| { mark_failed("expected a Str"); String::new() });
-    with_heap(|heap: &mut GcHeap| {
+    with_heap(|heap: &mut Heap| {
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
@@ -314,7 +314,7 @@ pub extern "C" fn frog_json_obj_len(node: i64) -> i64 {
 pub extern "C" fn frog_json_key_at(node: i64, i: i64) -> i64 {
     let k: Option<String> = with_node(node, |n| dom::entry_at(n, i as usize).map(|(k, _)| k.to_string()));
     let k = k.unwrap_or_else(|| { mark_failed(format!("missing object member {}", i)); String::new() });
-    with_heap(|heap: &mut GcHeap| {
+    with_heap(|heap: &mut Heap| {
         heap.alloc_str(k.as_bytes()) as i64
     })
 }
@@ -347,10 +347,10 @@ pub extern "C" fn frog_json_expect(node: i64, what: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::gc::FrogStr;
+    use super::super::heap::FrogStr;
 
     fn alloc(s: &str) -> i64 {
-        with_heap(|h: &mut GcHeap| h.alloc_str(s.as_bytes()) as i64)
+        with_heap(|h: &mut Heap| h.alloc_str(s.as_bytes()) as i64)
     }
 
     fn open(s: &str) -> i64 {

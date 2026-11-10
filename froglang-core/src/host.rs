@@ -184,11 +184,11 @@ impl<T: ToFrog> ToFrog for Vec<T> {
             flat.extend_from_slice(&buf);
         }
         // `List`'s pointer columns are per-element-slot (`FrogList`'s
-        // `ptr_mask` doc comment in `gc.rs`) — one bit per leaf of `T`, in
-        // order, which is exactly what `codegen::gc_mask` computes from a
+        // `ptr_mask` doc comment in `heap.rs`) — one bit per leaf of `T`, in
+        // order, which is exactly what `codegen::ptr_mask_of` computes from a
         // leaf-type list. Correct for a multi-leaf (struct-shaped) `T` now,
         // unlike the single-bit shortcut this used to take.
-        let ptr_mask = crate::codegen::gc_mask(&elem_leaves) as u64;
+        let ptr_mask = crate::codegen::ptr_mask_of(&elem_leaves) as u64;
         out[0] = ctx.alloc_list(&flat, stride, ptr_mask);
     }
 }
@@ -234,10 +234,10 @@ impl<K: ToFrog + std::hash::Hash + Eq, V: ToFrog> ToFrog for HashMap<K, V> {
             flat.extend_from_slice(&vbuf);
         }
         // Key columns then value columns, each masked from its own leaf
-        // list — the same per-leaf `gc_mask` `Vec<T>` uses above, just
+        // list — the same per-leaf `ptr_mask_of` `Vec<T>` uses above, just
         // placed at an offset for the value half.
-        let ptr_mask: u64 = (crate::codegen::gc_mask(&k_leaves) as u64)
-            | ((crate::codegen::gc_mask(&v_leaves) as u64) << kstride);
+        let ptr_mask: u64 = (crate::codegen::ptr_mask_of(&k_leaves) as u64)
+            | ((crate::codegen::ptr_mask_of(&v_leaves) as u64) << kstride);
         let key_kind = crate::codegen::key_kind_of(&K::frog_type()) as u32;
         out[0] = ctx.alloc_dict(&flat, kstride, vstride, ptr_mask, key_kind);
     }
@@ -358,7 +358,7 @@ impl<T: FromFrog> FromFrog for Option<T> {
         let (members, member_leaves) = two_member_union(
             "Option<T>", T::frog_type(), T::leaves(), Type::None, Vec::new(),
         );
-        let idx = (slots[0] & crate::runtime::gc::TAG_MASK) as usize - 1;
+        let idx = (slots[0] & crate::runtime::heap::TAG_MASK) as usize - 1;
         let leaf_vals = crate::codegen::unpack_union_member_runtime_of_leaves(&member_leaves, idx, slots);
         if members[idx] == T::frog_type() {
             Some(T::from_frog(ctx, &leaf_vals))
@@ -439,7 +439,7 @@ impl<T: FromFrog, E: FromFrog> FromFrog for Result<T, E> {
         let (members, member_leaves) = two_member_union(
             "Result<T, E>", T::frog_type(), T::leaves(), E::frog_type(), E::leaves(),
         );
-        let idx = (slots[0] & crate::runtime::gc::TAG_MASK) as usize - 1;
+        let idx = (slots[0] & crate::runtime::heap::TAG_MASK) as usize - 1;
         let leaf_vals = crate::codegen::unpack_union_member_runtime_of_leaves(&member_leaves, idx, slots);
         if members[idx] == T::frog_type() {
             Ok(T::from_frog(ctx, &leaf_vals))

@@ -6,9 +6,8 @@ use crate::frontend::parser::ParseError;
 use crate::frontend::modules;
 use crate::frontend::typeck::{Type, TypeChecker};
 use crate::frontend::tokens::Spanned;
-use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
 use crate::frontend::expression::Expression;
-use crate::runtime::gc::{GcHeap, ACTIVE_HEAP};
+use crate::runtime::heap::{Heap, ACTIVE_HEAP};
 use crate::runtime;
 
 // ── Public value type ─────────────────────────────────────────────────────────
@@ -23,7 +22,7 @@ pub enum FrogValue {
     Bool(bool),
     Str(String),
     List(Vec<FrogValue>),
-    /// In insertion order (`runtime::gc::FrogDict`'s doc comment). Like
+    /// In insertion order (`runtime::heap::FrogDict`'s doc comment). Like
     /// `List` above, a struct-typed value decodes wrong (only leaf 0 of
     /// its flattened layout) — the same pre-existing `FrogValue`
     /// limitation `List`'s identical `frog_list_get(.., 0)` already has,
@@ -33,7 +32,7 @@ pub enum FrogValue {
 }
 
 impl FrogValue {
-    pub fn from_bits(bits: i64, ty: &Type, _heap: &GcHeap) -> Self {
+    pub fn from_bits(bits: i64, ty: &Type, _heap: &Heap) -> Self {
         if let Some(inner_ty) = ty.as_list_elem() {
             let len = runtime::ffi::frog_list_len(bits) as usize;
             let elems = (0..len)
@@ -61,7 +60,7 @@ impl FrogValue {
             Type::Bool  => FrogValue::Bool(bits != 0),
             Type::Str   => {
                 let s = unsafe {
-                    runtime::gc::frog_str_as_str(bits as *const runtime::gc::FrogStr)
+                    runtime::heap::frog_str_as_str(bits as *const runtime::heap::FrogStr)
                 };
                 FrogValue::Str(s.to_owned())
             },
@@ -192,7 +191,7 @@ pub struct EntrySource {
 /// All state — heap, type-checker, JIT module, variable environment — is owned here.
 /// Multiple `FrogState`s can coexist on different threads with no coordination.
 pub struct FrogState {
-    pub heap:         GcHeap,
+    pub heap:         Heap,
     pub tc:           TypeChecker,
     pub codegen:      JitCodegen,
     /// One `i64` per flattened leaf field of the binding's type (see
@@ -248,7 +247,7 @@ impl FrogState {
     /// `FrogState::builder()` with the stdlib (`crate::stdlib`) installed —
     /// see `plans/STDLIB.md`. `FrogState::new()` deliberately doesn't do
     /// this itself: it's what the existing test suite calls expecting
-    /// today's minimal (`print`/`push`/`panic`/`gc_dump`-only) surface, so
+    /// today's minimal (`print`/`push`/`panic`/`heap_dump`-only) surface, so
     /// the stdlib is opt-in. The CLI (`main.rs`) opts in.
     pub fn with_stdlib() -> Result<Self, FrogError> {
         crate::stdlib::install(FrogState::builder()).build()
@@ -257,7 +256,7 @@ impl FrogState {
     /// Set `ACTIVE_HEAP` to this state's heap, call `func_ptr` with the
     /// out-buffer pointer, then clear it.
     fn call_jit(&mut self, func_ptr: fn(i64) -> i64, out_ptr: i64) -> i64 {
-        ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut GcHeap));
+        ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut Heap));
         // Publish a `FrogCtx` a host call can fetch via `frog_ctx_current`
         // (`runtime::host`) — built from raw pointers into `self.heap`/
         // `self.tc`'s tables, valid only for the duration of this call
@@ -266,7 +265,7 @@ impl FrogState {
         // sound even though `compile_entry` above may have just grown them.
         let mut host_ctx = unsafe {
             crate::runtime::host::FrogCtx::new(
-                &mut self.heap as *mut GcHeap,
+                &mut self.heap as *mut Heap,
                 self.tc.struct_defs() as *const _,
                 self.tc.union_defs() as *const _,
             )
@@ -323,74 +322,28 @@ impl FrogState {
                 return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
             }
         };
-        if let Err(e) = self.tc.validate_codegen_constraints(&typed) {
-            self.tc.restore(cp);
-            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-        }
-        // `TRAITS.md` Stage 3b: real monomorphization. Clones and
-        // specializes every generic call site's declaration into a
-        // distinctly-named instantiation (mutating `typed` in place —
-        // stripping any raw, un-substituted generic declaration and
-        // inserting its compiled instantiations instead, with every call
-        // site rewritten to the matching mangled name) rather than
-        // rejecting a second concrete type the way Stage 2's gate did.
-        if let Err(e) = self.tc.monomorphize_generics(&mut typed) {
-            self.tc.restore(cp);
-            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-        }
-        // Tier 1 function values: hoist every lambda and nested `func` to
-        // the top level, turn captures into parameters, and specialize
-        // every higher-order callee on the function it was passed. Must
-        // run after monomorphization (a generic higher-order function is
-        // specialized per *type* first, then per function argument) and
-        // before `desugar_notation`, whose synthesized `Var` callables
-        // this pass must not see.
-        if let Err(e) = self.tc.lower_function_values(&mut typed) {
-            self.tc.restore(cp);
-            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-        }
-        // `plans/DATA.md` stage 5: expand every `repr(...)` placeholder
-        // left by `TypeChecker::lower_call`'s `is_repr` arm into its
-        // per-type notation. Must run after monomorphization (every type
-        // in the tree is fully substituted only now — see
-        // `TypeChecker::desugar_notation`'s own doc comment) and before
-        // `number_nodes` (so the nodes it synthesizes get numbered too).
-        if let Err(e) = self.tc.desugar_notation(&mut typed) {
-            self.tc.restore(cp);
-            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-        }
-        // Stamp every node with a fresh id — including whatever
-        // `monomorphize_generics`/`desugar_notation` just cloned or
-        // synthesized in, which starts out unnumbered (`NodeId`'s doc
-        // comment) — before codegen's liveness-dependent passes touch the
-        // tree. Must run after both, not before, so newly-inserted bodies
-        // get real ids too.
-        crate::frontend::liveness::number_nodes(&mut typed);
-
-        // Parameter conventions (plans/NOGC.md §1.2): which arguments a callee
-        // only borrows, so codegen knows who frees them.
+        // Every pass that can still reject the program, and the rewrites
+        // codegen relies on — shared with `frog build`/`check` so they accept
+        // exactly what this does. See `frontend::pipeline`.
+        // Parameter conventions (plans/NOGC.md §1.2), which it also returns,
+        // say which arguments a callee only borrows, so codegen knows who
+        // frees them.
+        let prior_exit_live: crate::frontend::liveness::NameSet = self.env_types.keys().cloned().collect();
         let mut borrowers = crate::frontend::conventions::builtin_borrowers();
         borrowers.extend(self.codegen.imported_callees());
-        let conv = crate::frontend::conventions::infer(&typed, &borrowers, &self.signatures);
+        let conv = match crate::frontend::pipeline::lower_checked(
+            &mut self.tc, &mut typed, &prior_exit_live, &borrowers, &self.signatures,
+        ) {
+            Ok(conv) => conv,
+            Err(e) => {
+                self.tc.restore(cp);
+                return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
+            }
+        };
         if std::env::var_os("FROG_DUMP_CONVENTIONS").is_some() {
             eprint!("{}", conv.dump());
         }
         crate::frontend::conventions::publish(&conv);
-
-        // `TRAITS.md` Part 7: `Linear` violations are type errors, and must
-        // be caught here — before codegen, which has no way to report a
-        // clean `Spanned<TypeError>` (it only ever panics on a bad tree).
-        {
-            let stmts: &[Spanned<TypedExpr>] = match &typed.item.kind {
-                TypedExprKind::Block(s) => s.as_slice(),
-                _ => std::slice::from_ref(&typed),
-            };
-            let prior_exit_live: crate::frontend::liveness::NameSet = self.env_types.keys().cloned().collect();
-            if let Err(e) = crate::frontend::linear::check(stmts, &prior_exit_live, &self.tc) {
-                self.tc.restore(cp);
-                return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-            }
-        }
 
         let result_ty = typed.item.ty.clone();
 
@@ -504,7 +457,7 @@ impl Drop for FrogState {
 /// of these would silently never be called, since the special case wins
 /// before the generic `func_ids` lookup ever runs. Rejected at `build()`
 /// with a clear error instead.
-const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "keys", "values", "remove", "panic", "panic!builtin", "gc_dump", "repr", "read", "json"];
+const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "keys", "values", "remove", "panic", "panic!builtin", "heap_dump", "repr", "read", "json"];
 
 /// Builds a `FrogState` with host (Rust) functions registered before the
 /// JIT module exists — required because `JITBuilder::symbol` only accepts
@@ -617,7 +570,7 @@ impl FrogStateBuilder {
         // primitive's `func_ids` key.
         let codegen = JitCodegen::new_with_hosts(&self.hosts).map_err(FrogError::Type)?;
 
-        let mut heap = GcHeap::new();
+        let mut heap = Heap::new();
         heap.dict_backend = self.dict_backend.clone();
         let mut state = FrogState {
             heap,

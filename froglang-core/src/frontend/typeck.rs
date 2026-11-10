@@ -19,6 +19,23 @@ use crate::frontend::typed_ast::{Arg, IterVia, Place, PlaceSeg, TypedExpr, Typed
 /// `TypeChecker::default_context` and `build_unwrap_arms`.
 const UNWRAP_PANIC_NAME: &str = "panic!builtin";
 
+/// Placeholder call `?` leaves at the head of its error arm. It marks the
+/// edge where live `Abort` values must be aborted (`plans/NOGC.md` §3.8), but
+/// which values those are depends on liveness, which does not exist yet at
+/// typeck time. `linear::insert_aborts` replaces every occurrence with the
+/// real `abort(x)` calls before codegen sees the tree. The `!` keeps user
+/// code from naming it, as with `UNWRAP_PANIC_NAME`.
+pub(crate) const ABORT_EDGE_NAME: &str = "abort!edge";
+
+/// The prefix of the temporary a `match` binds its subject to
+/// (`lower_match_lowered`, `lower_anon_match`). Every read of it is the
+/// match's own machinery — tag tests, field extraction, narrowing — not a
+/// use by the program, which `frontend::linear` relies on: the move into the
+/// temporary is the match's one consumption of its subject.
+pub(crate) const MATCH_SUBJECT_PREFIX: &str = "__match_subject_";
+
+pub(crate) fn is_match_subject(name: &str) -> bool { name.starts_with(MATCH_SUBJECT_PREFIX) }
+
 /// The type-variable name `Self` resolves to inside a `trait` declaration
 /// (`TRAITS.md` Stage 5). A trait member's signature is a template over one
 /// binder, and this is that binder — `resolve_type_name` finds it through
@@ -321,7 +338,7 @@ pub const RANGE_NAME: &str = "Range";
 /// its arity only, so `Dict<K,V>` type-parses, but there is no flattened
 /// leaf layout to derive — see `LIST_NAME`'s doc comment for why `List`
 /// can't ride the generic-struct machinery `Range` uses). A `Dict` value
-/// is a single GC-boxed pointer (`runtime::gc::FrogDict`), exactly like a
+/// is a single GC-boxed pointer (`runtime::heap::FrogDict`), exactly like a
 /// `List` is a single pointer to `FrogList`.
 pub const DICT_NAME: &str = "Dict";
 
@@ -640,7 +657,7 @@ pub fn is_positional_fields(field_defs: &[(String, Type)]) -> bool {
 /// union (the language's only sum type — see `ERRORS.md`): its common
 /// fields (readable on any member without matching) and its members in
 /// declaration order (declaration order fixes each member's runtime tag —
-/// see `Codegen`/`runtime::gc::FrogVariant`). `ty` is the resolved
+/// see `Codegen`/`runtime::heap::FrogVariant`). `ty` is the resolved
 /// `Type::Union` this declaration's name stands for — every member is a
 /// nominal marker `Type::strukt("Name.Member")`, sorted the same way
 /// `Type::normalize()` would sort them, so it can be looked up in
@@ -1448,9 +1465,9 @@ impl TypeChecker {
     /// `Iterable`/`Container` — cloning the two already-hoisted `TraitDef`s
     /// is the same result for a fraction of the cost.
     fn seed_iterable_container_traits(&mut self) {
-        let (iterable, container) = Self::cached_iterable_container_traits();
-        self.traits.insert("Iterable".to_string(), iterable.clone());
-        self.traits.insert("Container".to_string(), container.clone());
+        for def in Self::cached_iterable_container_traits() {
+            self.traits.insert(def.name.clone(), def.clone());
+        }
     }
 
     /// The `Iterable`/`Container` `TraitDef`s, parsed and hoisted exactly
@@ -1459,11 +1476,12 @@ impl TypeChecker {
     /// which would recurse back into `seed_iterable_container_traits`) —
     /// only `traits`/`struct_templates`/`union_defs` matter to hoisting, so
     /// the rest of its fields are never touched.
-    fn cached_iterable_container_traits() -> &'static (TraitDef, TraitDef) {
-        static CACHE: std::sync::OnceLock<(TraitDef, TraitDef)> = std::sync::OnceLock::new();
+    fn cached_iterable_container_traits() -> &'static [TraitDef] {
+        static CACHE: std::sync::OnceLock<Vec<TraitDef>> = std::sync::OnceLock::new();
         CACHE.get_or_init(|| {
             let src = "trait Iterable<Item> { func next(mut s: Self): Item? }\n\
-                        trait Container<Item> { func has(s: Self, x: Item): Bool\nfunc len(s: Self): Int }\n";
+                        trait Container<Item> { func has(s: Self, x: Item): Bool\nfunc len(s: Self): Int }\n\
+                        trait Abort { func abort(x: Self) }\n";
             let ast = crate::frontend::parser::Parser::parse(src)
                 .expect("builtin Iterable/Container trait source must parse");
             let stmts = match ast.item {
@@ -1473,9 +1491,10 @@ impl TypeChecker {
             let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), arena_levels: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
             boot.hoist_trait_names(&stmts).expect("builtin Iterable/Container trait names must hoist");
             boot.hoist_trait_members(&stmts).expect("builtin Iterable/Container trait members must hoist");
-            let iterable = boot.traits.remove("Iterable").expect("hoisted above");
-            let container = boot.traits.remove("Container").expect("hoisted above");
-            (iterable, container)
+            ["Iterable", "Container", "Abort"]
+                .iter()
+                .map(|n| boot.traits.remove(*n).expect("hoisted above"))
+                .collect()
         })
     }
 
@@ -1492,6 +1511,48 @@ impl TypeChecker {
     /// `type_implements` itself to `pub(crate)`.
     pub(crate) fn implements_linear(&self, ty: &Type) -> bool {
         self.type_implements(ty, &Trait::Linear)
+    }
+
+    /// The symbol of `ty`'s `Abort::abort` impl, if `ty` provides `Abort`
+    /// (`plans/NOGC.md` §3.8). `Abort` is an ordinary source-declared trait
+    /// (see `cached_iterable_container_traits`), so the answer is just the
+    /// impl table's entry for the type's declared name.
+    ///
+    /// A union has no key of its own: a nominal union's impl is indexed under
+    /// each of its variants (`impl_index_keys`), all with the one symbol that
+    /// takes the whole union. So a union yields that symbol when every
+    /// variant's impl is the same one, and `None` otherwise: an anonymous
+    /// union of separately-implemented types has no single `abort` to call.
+    pub(crate) fn abort_symbol(&self, ty: &Type) -> Option<String> {
+        let lookup = |t: &Type| -> Option<String> {
+            let key = Self::grant_key(t)?;
+            self.impls.get(&("Abort".to_string(), key))?.get("abort").cloned()
+        };
+        match ty {
+            Type::Union(members) => {
+                let mut symbols = members.iter().map(lookup);
+                let first = symbols.next()??;
+                symbols.all(|s| s.as_ref() == Some(&first)).then_some(first)
+            }
+            _ => lookup(ty),
+        }
+    }
+
+    /// Where an `abort` call for a value of type `ty` goes: the impl's symbol
+    /// and the type its parameter takes. They differ for a variant narrowed
+    /// out of a nominal union (`match r { is A then .. }` rebinds `r` as
+    /// `R.A`): the impl is the union's, indexed under each variant, so the
+    /// value has to be widened back into the union to be passed to it.
+    pub(crate) fn abort_target(&self, ty: &Type) -> Option<(String, Type)> {
+        let symbol = self.abort_symbol(ty)?;
+        let owner = match ty {
+            Type::Named { name, .. } => name.split_once('.')
+                .and_then(|(enum_name, _)| self.union_defs.get(enum_name))
+                .map(|def| def.ty.clone())
+                .filter(|u| matches!(u, Type::Union(ms) if ms.contains(ty))),
+            _ => None,
+        };
+        Some((symbol, owner.unwrap_or_else(|| ty.clone())))
     }
 
     /// `type_implements`'s body, carrying the set of struct types already
@@ -1514,6 +1575,28 @@ impl TypeChecker {
     /// fields that are *not* cyclic.
     fn type_implements_rec(&self, ty: &Type, tr: &Trait, seen: &mut Vec<Type>) -> bool {
         match ty {
+            // `Linear` is granted, and also *contained*: a value holding a
+            // Linear value anywhere inside it is Linear too. Otherwise
+            // wrapping one launders it — `data Keep(r: Res)` could be copied
+            // freely, duplicating the `Res` — and so does `Res | None`,
+            // which the every-member union rule below would call not Linear.
+            // So for `Linear`: a union is Linear iff *any* member is, and a
+            // struct, variant, `List` or `Dict` iff it is granted or any
+            // field or element type is. Re-entering a type is not Linear;
+            // the cyclic field adds nothing the others don't decide.
+            _ if *tr == Trait::Linear => match ty {
+                Type::Union(members) => members.iter().any(|m| self.type_implements_rec(m, tr, seen)),
+                Type::Named { name, args } => {
+                    if self.granted(ty, tr) { return true; }
+                    if seen.contains(ty) { return false; }
+                    seen.push(ty.clone());
+                    let parts = if name == LIST_NAME || name == DICT_NAME { args.clone() } else { self.struct_field_types(name, args) };
+                    let linear = parts.iter().any(|t| self.type_implements_rec(t, tr, seen));
+                    seen.pop();
+                    linear
+                }
+                _ => self.granted(ty, tr),
+            },
             // A union satisfies a trait iff every variant does. For `Eq`
             // that is decided at runtime by `codegen::eq_union`: compare the
             // two tags, then that member's payload. A *recursive* union is
@@ -1522,11 +1605,12 @@ impl TypeChecker {
             // `check_comparable`, with a span, rather than here: "not `Eq`"
             // would be the wrong reason.
             Type::Union(variants) => variants.iter().all(|v| self.type_implements_rec(v, tr, seen)),
-            // `Error`, `Linear`, and every user-declared trait are *granted*,
-            // never structural — a deliberate design choice, not a gap
-            // (`ERRORS.md`, "Why a trait and not an open union"). One arm for
-            // all three, covering primitives as well as named types, because
-            // `provides Shape for Int` is a legitimate standalone impl.
+            // `Error` and every user-declared trait are *granted*, never
+            // structural — a deliberate design choice, not a gap (`ERRORS.md`,
+            // "Why a trait and not an open union"). One arm for them, covering
+            // primitives as well as named types, because `provides Shape for
+            // Int` is a legitimate standalone impl. (`Linear` is granted *or*
+            // contained; its own arm above returns before this one.)
             _ if matches!(tr, Trait::Error | Trait::Linear | Trait::User(_)) => self.granted(ty, tr),
             // `List<T>` is `Eq` iff `T` is. The comparison is structural —
             // lengths, then elements pairwise — not identity, which is what
@@ -1628,6 +1712,33 @@ impl TypeChecker {
             Type::None  => Some("None".to_string()),
             _ => None,
         }
+    }
+
+    /// The first Linear part of `ty` (a struct, variant, or union of them)
+    /// that reading `path` out of it leaves behind, as a dotted field path.
+    /// Reading a field at a value's last use takes the value apart, and any
+    /// other Linear field it holds would be dropped with it.
+    pub(crate) fn linear_left_behind(&self, ty: &Type, path: &[String]) -> Option<String> {
+        let ty = self.lookup(ty);
+        let fields: Vec<(String, Type)> = match &ty {
+            Type::Union(members) => return members.iter().find_map(|m| self.linear_left_behind(m, path)),
+            Type::Named { name, args } if name != LIST_NAME && name != DICT_NAME => {
+                let names = self.struct_templates.get(name).map(|fs| fs.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()).unwrap_or_default();
+                names.into_iter().zip(self.struct_field_types(name, args)).collect()
+            }
+            _ => return None,
+        };
+        let (head, rest) = match path.split_first() {
+            Some((h, r)) => (Some(h), r),
+            None => (None, &[][..]),
+        };
+        fields.iter().find_map(|(fname, fty)| {
+            if Some(fname) == head {
+                if rest.is_empty() { None } else { self.linear_left_behind(fty, rest).map(|p| format!("{}.{}", fname, p)) }
+            } else {
+                self.implements_linear(fty).then(|| fname.clone())
+            }
+        })
     }
 
     /// `materialize_struct`'s read-only counterpart: this instantiation's
@@ -2031,7 +2142,7 @@ impl TypeChecker {
             params: vec![Type::Str],
             result: Box::new(Type::None),
         });
-        ctx.insert("gc_dump".to_string(), Type::Function {
+        ctx.insert("heap_dump".to_string(), Type::Function {
             params: vec![],
             result: Box::new(Type::None),
         });
@@ -2054,6 +2165,10 @@ impl TypeChecker {
         // by, any user binding or `func panic(...)` redefinition — `!`
         // always traps through the real builtin regardless of what's in
         // scope. See `codegen`'s matching `declare_rt` alias.
+        ctx.insert(ABORT_EDGE_NAME.to_string(), Type::Function {
+            params: vec![],
+            result: Box::new(Type::None),
+        });
         ctx.insert(UNWRAP_PANIC_NAME.to_string(), Type::Function {
             params: vec![Type::Str],
             result: Box::new(Type::Never),
@@ -2773,9 +2888,19 @@ impl TypeChecker {
                 }, span));
             }
         }
-        Ok(Self::error_arms(entries, span, |whole| Spanned::from(
-            Expression::return_value(Some(Spanned::from(whole, span))), span,
-        )))
+        // The arm is `{ abort!edge(); return whole }`: the placeholder is
+        // where `linear::insert_aborts` puts `abort(x)` for each owned
+        // `Abort` value (`plans/NOGC.md` §3.8). Only this `?` edge gets one;
+        // `catch` doesn't leave the scope and a plain `return` is ordinary
+        // control flow.
+        Ok(Self::error_arms(entries, span, |whole| {
+            let edge = Spanned::from(Expression::call(
+                Spanned::from(Expression::literal(Token::Identifier(ABORT_EDGE_NAME.to_string())), span),
+                vec![],
+            ), span);
+            let ret = Spanned::from(Expression::return_value(Some(Spanned::from(whole, span))), span);
+            Spanned::from(Expression::Block(vec![edge, ret]), span)
+        }))
     }
 
     fn lower_try(&mut self, inner: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -3080,12 +3205,18 @@ impl TypeChecker {
             return Ok(());
         }
         let mut out: Vec<Spanned<Expression>> = Vec::with_capacity(stmts.len());
+        // Every type this entry made `Linear`: its key, its declared name, and
+        // the grant's span. See `require_abort_for_linear`.
+        let mut linear_grants: Vec<(String, String, Span)> = Vec::new();
         for s in std::mem::take(stmts) {
             let span = s.span;
             match s.item {
                 Expression::ImplDecl(i) => {
                     let self_ty = self.resolve_type_expr(&i.self_ty)?;
+                    let before = self.linear_impl_keys(&i.traits);
                     let members = self.register_impl(&i.traits, &self_ty, i.members, span)?;
+                    let name = i.self_ty.item.to_string();
+                    self.record_linear_grants(before, &name, span, &mut linear_grants);
                     out.extend(members);
                 }
                 Expression::DataDecl(mut d) => {
@@ -3103,15 +3234,64 @@ impl TypeChecker {
                     let provides = d.provides.clone();
                     out.push(Spanned::from(Expression::DataDecl(d), span));
                     if !provides.is_empty() {
+                        let before = self.linear_impl_keys(&provides);
+                        let name = match out.last().map(|s| &s.item) {
+                            Some(Expression::DataDecl(d)) => d.name.clone(),
+                            _ => unreachable!("pushed just above"),
+                        };
                         let lowered = self.register_impl(&provides, &self_ty, members, span)?;
+                        self.record_linear_grants(before, &name, span, &mut linear_grants);
                         out.extend(lowered);
                     }
                 }
                 other => out.push(Spanned::from(other, span)),
             }
         }
+        self.require_abort_for_linear(&linear_grants)?;
         *stmts = out;
         Ok(())
+    }
+
+    /// The keys `Linear` is implemented under, when `traits` is about to
+    /// grant it (`None` otherwise, so the common case costs nothing).
+    fn linear_impl_keys(&self, traits: &[String]) -> Option<HashSet<String>> {
+        traits.iter().any(|t| t == "Linear").then(|| {
+            self.impls.keys().filter(|(t, _)| t == "Linear").map(|(_, k)| k.clone()).collect()
+        })
+    }
+
+    /// Record the `Linear` keys an impl just added (against `before`, from
+    /// `linear_impl_keys`), under the impl's declared type `name`.
+    fn record_linear_grants(
+        &self,
+        before: Option<HashSet<String>>,
+        name: &str,
+        span: Span,
+        grants: &mut Vec<(String, String, Span)>,
+    ) {
+        let Some(before) = before else { return };
+        for (t, k) in self.impls.keys() {
+            if t == "Linear" && !before.contains(k) { grants.push((k.clone(), name.to_string(), span)); }
+        }
+    }
+
+    /// `Linear` requires `Abort` (`plans/NOGC.md` §3.8): a linear value with
+    /// no failure path could not survive a `?` that fires while it is live,
+    /// so there would be nothing for the edge to call. Checked after every
+    /// impl in the entry is registered, so it holds however `Linear` was
+    /// granted (a declaration's or a union's `provides`, or a standalone
+    /// `provides Linear for T`) and wherever in the entry `Abort` was.
+    fn require_abort_for_linear(&self, grants: &[(String, String, Span)]) -> Result<(), Spanned<TypeError>> {
+        match grants.iter().find(|(key, _, _)| !self.impls.contains_key(&("Abort".to_string(), key.clone()))) {
+            Some((_, name, span)) => Err(Spanned::from(TypeError {
+                msg: format!(
+                    "'{}' provides Linear, so it must also provide Abort — \
+                     `?` calls `abort` on a live Linear value when it returns early",
+                    name
+                ),
+            }, *span)),
+            None => Ok(()),
+        }
     }
 
     /// The `member_index`/`impls`/`provides` keys an impl for `self_ty` must
@@ -3813,6 +3993,8 @@ impl TypeChecker {
                             Err(msg) => return Err(Spanned::from(TypeError { msg }, s.span)),
                         }
                     }
+                    // `Linear` requires `Abort`, checked once every impl in the
+                    // entry is registered: `expand_impls`.
                     // A union's `provides` grants every variant the trait
                     // (the doc's "a union satisfies a trait iff every
                     // member does" rule then makes the alias itself
@@ -4052,7 +4234,7 @@ impl TypeChecker {
     /// a heap pointer, not inline storage, so it can't create an
     /// infinite-size cycle the way a direct field can). A `Type::Union`
     /// field is always fine too — a nominal union's member is a single
-    /// boxed pointer (see `runtime::gc::FrogVariant`), so it can't create
+    /// boxed pointer (see `runtime::heap::FrogVariant`), so it can't create
     /// an infinite-size cycle either; this is what makes a recursive union
     /// (e.g. a binary tree, `data Tree is Leaf | Node(l: Tree, r: Tree)`)
     /// legal even though a recursive struct is not.
@@ -6742,7 +6924,7 @@ impl TypeChecker {
     /// generic over mutability because the borrow checker will not let one
     /// function return either — and because the two really are the same
     /// list, a divergence between them is a bug either walk would expose.
-    fn children_mut(expr: &mut Spanned<TypedExpr>) -> Vec<&mut Spanned<TypedExpr>> {
+    pub(crate) fn children_mut(expr: &mut Spanned<TypedExpr>) -> Vec<&mut Spanned<TypedExpr>> {
         let mut out: Vec<&mut Spanned<TypedExpr>> = Vec::new();
         match &mut expr.item.kind {
             TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)
@@ -10290,6 +10472,16 @@ impl TypeChecker {
         Ok((lowered, narrow_target, subject_span))
     }
 
+    /// A match arm that leaves `what` (of type `ty`) unbound drops it, which
+    /// is a leak when it is Linear. Only a Linear value's *parts* can be
+    /// left: taking a value apart with a pattern is what consumes it.
+    fn reject_linear_drop(&self, what: &str, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        if !self.implements_linear(&self.lookup(ty)) { return Ok(()); }
+        Err(Spanned::from(TypeError {
+            msg: format!("this arm drops {}, which is Linear ({}) — bind it and consume it", what, ty),
+        }, span))
+    }
+
     /// `lower_match` with the subject already lowered. Validates the arms
     /// against the subject union (pattern names, bind arity, exhaustiveness)
     /// and then desugars.
@@ -10327,7 +10519,7 @@ impl TypeChecker {
             }, span));
         }
 
-        let subject_name = format!("__match_subject_{}", self.next_id); self.next_id += 1;
+        let subject_name = format!("{}{}", MATCH_SUBJECT_PREFIX, self.next_id); self.next_id += 1;
         // The *resolved* union, not the stored `.ty`: the temporary the
         // subject is bound to below, and every `Var` reading it back, must
         // carry the union type codegen dispatches on, never an unresolved
@@ -10359,6 +10551,21 @@ impl TypeChecker {
                 } },
                 span,
             );
+
+            // What this arm extracts from the subject; whatever it leaves
+            // behind is dropped, which a Linear field may not be. Taking
+            // a value apart this way is what consumes the subject itself.
+            let narrows = arm.pattern.binds.is_empty() && narrow_target.is_some();
+            if !narrows {
+                let binds = &arm.pattern.binds;
+                let dropped = def.common.iter()
+                    .chain(variant_fields.iter().enumerate()
+                        .filter(|(i, _)| binds.get(*i).is_none_or(|b| b == "_"))
+                        .map(|(_, f)| f));
+                for (fname, fty) in dropped {
+                    self.reject_linear_drop(&format!("field '{}'", fname), fty, arm.body.span)?;
+                }
+            }
 
             let mut prelude = Vec::new();
             let mut bindings = Vec::new();
@@ -10637,7 +10844,7 @@ impl TypeChecker {
             }, span));
         }
 
-        let subject_name = format!("__match_subject_{}", self.next_id); self.next_id += 1;
+        let subject_name = format!("{}{}", MATCH_SUBJECT_PREFIX, self.next_id); self.next_id += 1;
         // See the matching note in `lower_match_lowered`.
         let subject_ty = Type::Union(members.clone());
         let subject_assign = Spanned::from(
@@ -10674,6 +10881,9 @@ impl TypeChecker {
             // already yields the whole member value either way.
             let explicit_bind = arm.pattern.binds.first().cloned();
             let bind_name = explicit_bind.clone().or_else(|| narrow_target.clone());
+            if bind_name.as_deref().is_none_or(|b| b == "_") {
+                self.reject_linear_drop("the matched value", &member_ty, arm.body.span)?;
+            }
             if let Some(bind) = bind_name {
                 if bind != "_" {
                     let value = Spanned::from(

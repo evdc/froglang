@@ -16,7 +16,7 @@
 //! revisited later — `Int(x)` could dispatch to these same functions.
 //!
 //! `Str` is UTF-8 and byte-indexed throughout (`len`, Phase 1, already
-//! returns byte length — `runtime/gc.rs`'s `FrogStr.len`), consistently.
+//! returns byte length — `runtime/heap.rs`'s `FrogStr.len`), consistently.
 //! There is deliberately no `s[i]` indexing operator on `Str`: mixing a
 //! byte-based `len`/`slice` with a codepoint- or grapheme-based `[]` would
 //! make `s[len(s) - 1]` silently wrong on any non-ASCII input. `chars`

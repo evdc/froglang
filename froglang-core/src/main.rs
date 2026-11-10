@@ -22,14 +22,14 @@ pub fn repl() {
                 // ── REPL meta-commands (`:cmd`) ───────────────────────────
                 if trimmed.starts_with(':') {
                     match trimmed.as_str() {
-                        ":gc" => {
+                        ":heap" => {
                             state.heap.dump();
                         }
                         ":help" => {
                             println!("REPL commands:");
-                            println!("  :gc    — print the live heap object count to stderr");
+                            println!("  :heap  — print the live heap object count to stderr");
                             println!("  :help  — show this message");
-                            println!("froglang builtins: print(s), gc_dump()");
+                            println!("froglang builtins: print(s), heap_dump()");
                         }
                         other => {
                             println!("Unknown command '{}'. Try :help", other);
@@ -100,23 +100,96 @@ fn check(src: &str, path: Option<&std::path::Path>) {
     };
     let ast = Spanned::from(Expression::Block(stmts), span);
 
+    // `check` should not accept a program `run` rejects, so it runs every
+    // rejecting pass `run` does, not just type-checking.
     let (mut tc, _) = stdlib_checker();
+    let (typed, _) = lower_checked_or_exit(&mut tc, ast, &froglang_core::frontend::conventions::builtin_borrowers());
+    println!(":: {}", typed.item.ty);
+}
+
+/// Type-check `ast` as a whole program and run `frontend::pipeline::
+/// lower_checked`, the same passes `FrogState::eval_with_base` runs. Exits
+/// the process on a type error. Returns the tree and its parameter conventions.
+fn lower_checked_or_exit(
+    tc: &mut froglang_core::frontend::typeck::TypeChecker,
+    ast: froglang_core::frontend::tokens::Spanned<froglang_core::frontend::expression::Expression>,
+    borrowers: &std::collections::HashSet<String>,
+) -> (
+    froglang_core::frontend::tokens::Spanned<froglang_core::frontend::typed_ast::TypedExpr>,
+    froglang_core::frontend::conventions::Conventions,
+) {
     let mut typed = match tc.check_and_lower(ast) {
         Ok(typed) => typed,
         Err(e)    => { println!("Type error: {}", e); process::exit(1); }
     };
-    // `check` should not accept a program `run` rejects. Function values
-    // are decided by a pass that runs *after* lowering (it needs every
-    // type substituted), so checking them means running it — which is
-    // also why `monomorphize_generics` has to come first, exactly as in
-    // `FrogState::eval_with_base`.
-    if let Err(e) = tc.monomorphize_generics(&mut typed)
-        .and_then(|()| tc.lower_function_values(&mut typed))
-    {
-        println!("Type error: {}", e);
-        process::exit(1);
+    match froglang_core::frontend::pipeline::lower_checked(tc, &mut typed, &Default::default(), borrowers, &Default::default()) {
+        Ok(conv) => (typed, conv),
+        Err(e) => { println!("Type error: {}", e); process::exit(1); }
     }
-    println!(":: {}", typed.item.ty);
+}
+
+/// The lowering both native paths (`build`, `check --copies`) run before
+/// object codegen: `lower_checked_or_exit`, then parameter conventions.
+fn lower_for_object(
+    ast: froglang_core::frontend::tokens::Spanned<froglang_core::frontend::expression::Expression>,
+) -> (
+    froglang_core::frontend::typeck::TypeChecker,
+    froglang_core::frontend::tokens::Spanned<froglang_core::frontend::typed_ast::TypedExpr>,
+    froglang_core::codegen::ObjectCodegen,
+) {
+    use froglang_core::codegen::ObjectCodegen;
+    use froglang_core::frontend::conventions;
+
+    let (mut tc, hosts) = stdlib_checker();
+    let codegen = match ObjectCodegen::new_object(&hosts) {
+        Ok(c) => c,
+        Err(e) => { println!("{}", e); process::exit(1); }
+    };
+    let mut borrowers = conventions::builtin_borrowers();
+    borrowers.extend(codegen.imported_callees());
+    let (typed, conv) = lower_checked_or_exit(&mut tc, ast, &borrowers);
+    conventions::publish(&conv);
+    (tc, typed, codegen)
+}
+
+/// `frog check --copies`: compile `src`/`path` to a native object (without
+/// linking or running it) and list every implicit deep copy codegen made,
+/// the `implicit-copy` lint of `plans/NOGC.md` §1.4.
+fn check_copies(src: &str, path: Option<&std::path::Path>) {
+    use froglang_core::frontend::modules;
+    use froglang_core::frontend::expression::Expression;
+    use froglang_core::frontend::tokens::{Span, Spanned};
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let base = path.map(|p| p.to_path_buf()).unwrap_or_else(|| cwd.join("<check>"));
+    let stmts = match path {
+        Some(p) => modules::resolve_file(p),
+        None => modules::resolve_source(src, &base),
+    };
+    let stmts = match stmts {
+        Ok(s) => s,
+        Err(e) => { println!("Module error: {}", e); process::exit(1); }
+    };
+    let span = match (stmts.first(), stmts.last()) {
+        (Some(first), Some(last)) => first.span.merge(last.span),
+        _ => Span::new((0, 0), (0, 0)),
+    };
+    let ast = Spanned::from(Expression::Block(stmts), span);
+
+    let (tc, typed, codegen) = lower_for_object(ast);
+    froglang_core::codegen::start_copy_log();
+    let _ = codegen.build_object(typed, tc.struct_defs(), tc.union_defs());
+    let sites = froglang_core::codegen::take_copy_log();
+
+    let (filename, source) = match path {
+        Some(p) => (p.display().to_string(), std::fs::read_to_string(p).unwrap_or_default()),
+        None => ("<check>".to_string(), src.to_string()),
+    };
+    for site in &sites {
+        let msg = format!("implicit-copy: deep copy of a `{}` value", site.ty);
+        println!("{}", froglang_core::diagnostics::render_span_as("warning", &filename, &source, site.span, &msg));
+    }
+    println!("{} implicit cop{}", sites.len(), if sites.len() == 1 { "y" } else { "ies" });
 }
 
 /// AOT-compile `src`/`path` to a native executable at `out` (`plans/AOT.md`,
@@ -127,7 +200,6 @@ fn build(src: &str, path: Option<&std::path::Path>, out: &std::path::Path) {
     use froglang_core::frontend::modules;
     use froglang_core::frontend::expression::Expression;
     use froglang_core::frontend::tokens::{Span, Spanned};
-    use froglang_core::codegen::ObjectCodegen;
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let base = path.map(|p| p.to_path_buf()).unwrap_or_else(|| cwd.join("<build>"));
@@ -146,26 +218,7 @@ fn build(src: &str, path: Option<&std::path::Path>, out: &std::path::Path) {
     };
     let ast = Spanned::from(Expression::Block(stmts), span);
 
-    let (mut tc, hosts) = stdlib_checker();
-    let mut typed = match tc.check_and_lower(ast) {
-        Ok(typed) => typed,
-        Err(e)    => { println!("Type error: {}", e); process::exit(1); }
-    };
-    // Same lowering pipeline the JIT path runs before codegen — see
-    // `FrogState::eval_with_base`.
-    if let Err(e) = tc.monomorphize_generics(&mut typed)
-        .and_then(|()| tc.lower_function_values(&mut typed))
-        .and_then(|()| tc.desugar_notation(&mut typed))
-    {
-        println!("Type error: {}", e);
-        process::exit(1);
-    }
-    froglang_core::frontend::liveness::number_nodes(&mut typed);
-
-    let codegen = match ObjectCodegen::new_object(&hosts) {
-        Ok(c) => c,
-        Err(e) => { println!("{}", e); process::exit(1); }
-    };
+    let (tc, typed, codegen) = lower_for_object(ast);
     let obj_bytes = codegen.build_object(typed, tc.struct_defs(), tc.union_defs());
 
     let obj_path = out.with_extension("o");
@@ -240,6 +293,15 @@ fn main() {
                 run("", Some(path));
             } else {
                 run(input, None);
+            }
+        }
+        // frog check --copies <expr-or-file>
+        [_, cmd, flag, input] | [_, cmd, input, flag] if cmd == "check" && flag == "--copies" => {
+            let path = std::path::Path::new(input);
+            if path.is_file() {
+                check_copies("", Some(path));
+            } else {
+                check_copies(input, None);
             }
         }
         // frog check <expr-or-file>

@@ -1,7 +1,7 @@
 //! `Dict<K, V>`'s runtime — hashing/equality for the four supported key
 //! types (`Trait::Hash` in `frontend::typeck`), and a swappable index
 //! backend the host embedder can replace (`plans/DATA.md`'s Dict design;
-//! `FrogStateBuilder::dict_backend`). See `runtime::gc::FrogDict` for the
+//! `FrogStateBuilder::dict_backend`). See `runtime::heap::FrogDict` for the
 //! object layout this operates on.
 //!
 //! The backend never sees a froglang value: it maps a hash to candidate
@@ -10,7 +10,7 @@
 //! needs no knowledge of the value representation, the word encoding, or
 //! the GC.
 
-use super::gc::{frog_str_as_str, FrogDict, FrogStr, GcHeap};
+use super::heap::{frog_str_as_str, FrogDict, FrogStr, Heap};
 use super::ffi::{with_heap, frog_abort};
 
 // ── Key hashing / equality ──────────────────────────────────────────────────
@@ -96,11 +96,11 @@ pub trait DictIndex: Send {
     /// Discard everything and rebuild from `entries` (an iterator of
     /// `(hash, entry_index)` pairs) — used after `frog_dict_remove`
     /// compacts the entries buffer (every index after the removed one
-    /// shifts) and by `GcHeap::clone_obj`.
+    /// shifts) and by `Heap::clone_obj`.
     fn rebuild(&mut self, entries: &mut dyn Iterator<Item = (u64, u32)>);
 }
 
-/// Builds the index every `FrogDict` a `GcHeap` allocates uses. The seam
+/// Builds the index every `FrogDict` a `Heap` allocates uses. The seam
 /// an embedder swaps via `FrogStateBuilder::dict_backend` (`state.rs`) —
 /// a replacement needs only these two methods, never touching the GC,
 /// the word encoding, or `hash_key`/`key_eq` above.
@@ -238,7 +238,7 @@ pub extern "C" fn frog_dict_insert(d: i64, key: i64) -> i64 {
 /// Grow `entries` (and the parallel cached-hash `hashes` buffer) if `dict`
 /// is at capacity — same doubling-realloc shape as `frog_list_push`,
 /// sharing its underlying allocate-or-grow primitive (`ffi::grow_raw_buffer`).
-fn grow_if_full(heap: &mut GcHeap, dict: *mut FrogDict, stride: usize) {
+fn grow_if_full(heap: &mut Heap, dict: *mut FrogDict, stride: usize) {
     unsafe {
         if (*dict).len < (*dict).cap { return; }
         let old_cap = (*dict).cap as usize;

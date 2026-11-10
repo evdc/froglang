@@ -258,7 +258,7 @@ f(2)
 
 // ── memory ───────────────────────────────────────────────────────────────────
 
-/// The `bytes` figure `gc_dump()` printed, one per call.
+/// The `bytes` figure `heap_dump()` printed, one per call.
 fn dumped_bytes(stderr: &str) -> Vec<usize> {
     stderr.lines().filter(|l| l.starts_with("=== heap:"))
         .map(|l| l.split(", ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap())
@@ -274,7 +274,7 @@ for i in 0..3000 do {
     let xs = [for k in 0..50 do repr(k) + "-" + repr(i)]
     len(xs)
   }
-  if i == 10 or i == 2999 then gc_dump()
+  if i == 10 or i == 2999 then heap_dump()
 }
 print(total)
 "#;

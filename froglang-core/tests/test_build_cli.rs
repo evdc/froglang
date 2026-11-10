@@ -115,3 +115,64 @@ fn build_runs_arena_blocks() {
         "func pick(n: Int): Str = {\n  let keep = \"k\" + repr(n)\n  let r = with Arena {\n    let s = keep + \"-\" + repr(n * 2)\n    if n > 2 then return s + \"!\"\n    s\n  }\n  r + \".\"\n}\nfor i in 0..5 do { print(pick(i)) }");
     assert_eq!(out, "k0-0.\nk1-2.\nk2-4.\nk3-6!\nk4-8!\n");
 }
+
+/// `?` aborts a live `Abort` value in a native build too: the pass that fills
+/// in the abort calls has to run on this path as well as the JIT's.
+#[test]
+fn build_runs_the_abort_calls_on_a_firing_question_mark() {
+    let out = assert_aot_matches_jit("abort", r#"
+error Bad(msg: Str)
+data Res(id: Int) provides Linear, Abort {
+    func abort(r: Res): None = print("abort ${r.id}")
+}
+func open(id: Int): Res = Res(id=id)
+func close(r: Res): None = print("close ${r.id}")
+func step(n: Int): Int | Bad = if n < 0 then Bad(msg="neg") else n
+func f(n: Int): Int | Bad = {
+    let r = open(1)
+    let v = step(n)?
+    close(r)
+    v
+}
+let a = f(-1)
+let b = f(2)
+print("done")
+"#);
+    assert_eq!(out, "abort 1\nclose 1\ndone\n");
+}
+
+/// Every native path runs the same rejecting passes as `frog run`
+/// (`frontend::pipeline`). A Linear value consumed on only one branch used
+/// to pass `build`, `check` and `check --copies`, because they skipped
+/// `linear::check`.
+const LINEAR_LEAK: &str = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
+                           func consume(b: Buf): Int = b.x\n\
+                           func f(c: Bool): Int = {\n\
+                           let a = Buf(x=1)\n\
+                           if c then consume(a) else 0\n\
+                           }\n\
+                           print(\"${f(true)}\")";
+
+fn assert_rejects_linear_leak(args: &[&str]) {
+    let dir = scratch(&format!("linear_{}", args.join("_").replace('-', "")));
+    let mut cmd = Command::new(FROG);
+    cmd.args(args).arg(LINEAR_LEAK);
+    if args[0] == "build" { cmd.arg("-o").arg(dir.join("prog")); }
+    let out = cmd.output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{:?} accepted a Linear leak:\n{stdout}", args);
+    assert!(stdout.contains("consumed on only one branch"), "{:?}: {stdout}", args);
+}
+
+#[test]
+fn run_rejects_a_linear_leak() { assert_rejects_linear_leak(&["run"]); }
+
+#[test]
+fn build_rejects_a_linear_leak() { assert_rejects_linear_leak(&["build"]); }
+
+#[test]
+fn check_rejects_a_linear_leak() { assert_rejects_linear_leak(&["check"]); }
+
+#[test]
+fn check_copies_rejects_a_linear_leak() { assert_rejects_linear_leak(&["check", "--copies"]); }

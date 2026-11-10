@@ -174,7 +174,7 @@ fn take_unit_then_int(_u: (), n: i64) -> i64 {
 #[test]
 fn a_unit_argument_does_not_misalign_the_argument_after_it() {
     let mut s = FrogState::builder().func(take_unit_then_int_host()).build().unwrap();
-    let (v, _) = s.eval("take_unit_then_int(gc_dump(), 42)").unwrap();
+    let (v, _) = s.eval("take_unit_then_int(heap_dump(), 42)").unwrap();
     assert_eq!(int(&v), 42);
 }
 

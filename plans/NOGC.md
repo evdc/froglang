@@ -1020,6 +1020,36 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    runtime. It adds the trait, the error-arm desugar in typeck, the `Linear` requires `Abort`
    check, and `linear.rs` treating `?` edges as consuming. Also add the `implicit-copy` lint, which
    is useful with or without the GC as a report of where COW marks happen.
+
+   **Status (2026-11-10): 6a (`Abort` and `?`) done; 6b (`implicit-copy` lint) not started.**
+   - **The trait.** `Abort` is an ordinary source-declared trait, seeded next to `Iterable` and
+     `Container` (`trait Abort { func abort(x: Self) }`), so `provides Abort { func abort(...) }`
+     goes through the normal impl path. `data T provides Linear` without `Abort` is a type error at
+     the declaration.
+   - **The `?` edge.** Typeck cannot know which values are owned at a `?`, so the error arm is
+     `{ abort!edge(); return e }`, where `abort!edge` is a reserved builtin. `linear::insert_aborts`
+     runs after `number_nodes` (it reads liveness), replaces each placeholder with `abort(x)` calls,
+     newest binding first, and `number_nodes` runs again. It runs in `FrogState::eval_with_base` and
+     `compile_and_run`. This differs from the plan's "typeck-level desugar", which assumed a live set
+     typeck does not have; codegen still needs nothing new.
+   - **What is aborted.** A binding of the enclosing function (a `let`/`mut` or a non-`mut`
+     parameter) in scope at the edge, whose type provides `Abort`, with no `Move`-classified read
+     before the edge. For `Linear` a move is consumption, so this is exact. For a plain `Abort` type a
+     move is only the last use, so a value whose last use is the failing expression itself is dropped,
+     not aborted. `catch`, `!`, a plain `return` and panic abort nothing.
+   - **Not aborted (conservative, never twice):** a binding shadowed by a later declaration of the
+     same name; a loop or comprehension variable; a union-typed binding (no single impl); and any
+     binding declared outside the enclosing `with Arena` block, since outer places are frozen there.
+   - **`linear.rs` rule 2** no longer counts a branch that ends in `Never` (the `?` error arm), and
+     no longer counts a binding declared inside the branch's own block. The second was an existing bug:
+     a Linear `let` used inside one arm read as "consumed on only one branch".
+   - **Not done:** "failing to consume a Linear value is a compile error" (§3.6) is still not
+     enforced; `linear.rs` checks aliasing and branch balance only. The resource table and panic-time
+     aborts belong to step 7.
+   - **Tests.** `tests/test_abort.rs`, 17 tests, observing order and absence of calls through printing
+     `abort` bodies, all under the leak oracle. `test_linear.rs` gained `Abort` impls. `cargo test
+     --workspace`: 1,289 passed. Clippy: 18 warnings, none new. `orders`, `words` and `life` match the
+     previous commit measured side by side (56/186/17 ms against 56/191/19 on a slower machine day).
 7. **The `with` protocol, second-class handles, the cleanup stack and the resource table.** Then
    `CONCURRENCY.md` stages 2 onward run on this foundation, without stage 1's unwinder, and with
    deferred-init `let` instead of `Task<T>`.

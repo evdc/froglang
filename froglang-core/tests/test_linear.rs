@@ -20,7 +20,7 @@ fn a_type_without_provides_linear_is_unaffected() {
 #[test]
 fn reading_a_linear_value_twice_inside_a_function_body_is_rejected() {
     let mut s = FrogState::new();
-    let src = "data Buf(x: Int) provides Linear\n\
+    let src = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
                func f(): Int = {\n\
                let a = Buf(x=1)\n\
                let b = a\n\
@@ -35,7 +35,7 @@ fn reading_a_linear_value_twice_inside_a_function_body_is_rejected() {
 #[test]
 fn moving_a_linear_value_into_a_new_binding_is_fine_when_never_read_again() {
     let mut s = FrogState::new();
-    let src = "data Buf(x: Int) provides Linear\n\
+    let src = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
                func f(): Int = {\n\
                let a = Buf(x=1)\n\
                let b = a\n\
@@ -49,7 +49,7 @@ fn moving_a_linear_value_into_a_new_binding_is_fine_when_never_read_again() {
 #[test]
 fn a_linear_value_consumed_on_only_one_branch_is_rejected() {
     let mut s = FrogState::new();
-    let src = "data Buf(x: Int) provides Linear\n\
+    let src = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
                func consume(b: Buf): Int = b.x\n\
                func f(): Int = {\n\
                let a = Buf(x=1)\n\
@@ -64,7 +64,7 @@ fn a_linear_value_consumed_on_only_one_branch_is_rejected() {
 #[test]
 fn a_linear_value_consumed_on_every_branch_is_accepted() {
     let mut s = FrogState::new();
-    let src = "data Buf(x: Int) provides Linear\n\
+    let src = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
                func consume(b: Buf): Int = b.x\n\
                func f(): Int = {\n\
                let a = Buf(x=1)\n\
@@ -78,7 +78,7 @@ fn a_linear_value_consumed_on_every_branch_is_accepted() {
 #[test]
 fn a_linear_value_never_consumed_on_either_branch_is_accepted() {
     let mut s = FrogState::new();
-    let src = "data Buf(x: Int) provides Linear\n\
+    let src = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
                func f(): Int = {\n\
                let a = Buf(x=1)\n\
                if true then 1 else 0\n\
@@ -95,7 +95,7 @@ fn a_mut_self_style_parameter_can_read_its_own_field_repeatedly() {
     // `Copy`-classified by `liveness.rs`'s own convention, which would
     // otherwise make this pattern impossible to write at all.
     let mut s = FrogState::new();
-    let src = "data Buf(x: Int) provides Linear\n\
+    let src = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
                func bump(mut b: Buf): Int = {\n\
                b.x = b.x + 1\n\
                b.x\n\
@@ -112,7 +112,7 @@ fn a_mut_self_style_parameter_can_read_its_own_field_repeatedly() {
 #[test]
 fn place_assign_read_modify_write_on_its_own_root_is_not_aliasing() {
     let mut s = FrogState::new();
-    let src = "data Buf(x: Int) provides Linear\n\
+    let src = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
                func f(): Int = {\n\
                mut a = Buf(x=1)\n\
                a.x = a.x + 1\n\
@@ -126,7 +126,7 @@ fn place_assign_read_modify_write_on_its_own_root_is_not_aliasing() {
 #[test]
 fn provides_linear_parses_alongside_error() {
     let mut s = FrogState::new();
-    let (v, _) = s.eval("data E(msg: Str) provides Error, Linear\n1").unwrap();
+    let (v, _) = s.eval("data E(msg: Str) provides Error, Linear, Abort { func abort(e: E): None = none }\n1").unwrap();
     assert_eq!(format!("{:?}", v), "Int(1)");
 }
 

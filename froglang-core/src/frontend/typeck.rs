@@ -18,6 +18,14 @@ use crate::frontend::typed_ast::{Arg, IterVia, Place, PlaceSeg, TypedExpr, Typed
 /// `TypeChecker::default_context` and `build_unwrap_arms`.
 const UNWRAP_PANIC_NAME: &str = "panic!builtin";
 
+/// Placeholder call `?` leaves at the head of its error arm. It marks the
+/// edge where live `Abort` values must be aborted (`plans/NOGC.md` §3.8), but
+/// which values those are depends on liveness, which does not exist yet at
+/// typeck time. `linear::insert_aborts` replaces every occurrence with the
+/// real `abort(x)` calls before codegen sees the tree. The `!` keeps user
+/// code from naming it, as with `UNWRAP_PANIC_NAME`.
+pub(crate) const ABORT_EDGE_NAME: &str = "abort!edge";
+
 /// The type-variable name `Self` resolves to inside a `trait` declaration
 /// (`TRAITS.md` Stage 5). A trait member's signature is a template over one
 /// binder, and this is that binder — `resolve_type_name` finds it through
@@ -1447,9 +1455,9 @@ impl TypeChecker {
     /// `Iterable`/`Container` — cloning the two already-hoisted `TraitDef`s
     /// is the same result for a fraction of the cost.
     fn seed_iterable_container_traits(&mut self) {
-        let (iterable, container) = Self::cached_iterable_container_traits();
-        self.traits.insert("Iterable".to_string(), iterable.clone());
-        self.traits.insert("Container".to_string(), container.clone());
+        for def in Self::cached_iterable_container_traits() {
+            self.traits.insert(def.name.clone(), def.clone());
+        }
     }
 
     /// The `Iterable`/`Container` `TraitDef`s, parsed and hoisted exactly
@@ -1458,11 +1466,12 @@ impl TypeChecker {
     /// which would recurse back into `seed_iterable_container_traits`) —
     /// only `traits`/`struct_templates`/`union_defs` matter to hoisting, so
     /// the rest of its fields are never touched.
-    fn cached_iterable_container_traits() -> &'static (TraitDef, TraitDef) {
-        static CACHE: std::sync::OnceLock<(TraitDef, TraitDef)> = std::sync::OnceLock::new();
+    fn cached_iterable_container_traits() -> &'static [TraitDef] {
+        static CACHE: std::sync::OnceLock<Vec<TraitDef>> = std::sync::OnceLock::new();
         CACHE.get_or_init(|| {
             let src = "trait Iterable<Item> { func next(mut s: Self): Item? }\n\
-                        trait Container<Item> { func has(s: Self, x: Item): Bool\nfunc len(s: Self): Int }\n";
+                        trait Container<Item> { func has(s: Self, x: Item): Bool\nfunc len(s: Self): Int }\n\
+                        trait Abort { func abort(x: Self) }\n";
             let ast = crate::frontend::parser::Parser::parse(src)
                 .expect("builtin Iterable/Container trait source must parse");
             let stmts = match ast.item {
@@ -1472,9 +1481,10 @@ impl TypeChecker {
             let mut boot = TypeChecker { ctx: ScopeStack::new(HashMap::new()), substitutions: HashMap::new(), next_id: 0, struct_defs: HashMap::new(), struct_templates: TypeChecker::initial_struct_templates(), struct_type_params: TypeChecker::initial_struct_type_params(), type_param_scope: HashMap::new(), union_defs: HashMap::new(), union_names: HashMap::new(), variant_owners: HashMap::new(), return_types: Vec::new(), arena_levels: Vec::new(), provides: HashMap::new(), traits: TypeChecker::initial_traits(), impls: HashMap::new(), member_index: HashMap::new(), member_traits: HashMap::new(), func_mut_params: HashMap::new(), host_names: std::collections::HashSet::new(), generic_instantiations: HashMap::new(), generic_templates: HashMap::new(), emitted_instantiations: std::collections::HashSet::new(), fn_templates: HashMap::new(), lifted_captures: HashMap::new(), emitted_specializations: std::collections::HashSet::new(), mut_names: std::collections::HashSet::new(), annotation_defs: HashMap::new(), annotation_defaults: HashMap::new(), struct_field_defaults: HashMap::new() };
             boot.hoist_trait_names(&stmts).expect("builtin Iterable/Container trait names must hoist");
             boot.hoist_trait_members(&stmts).expect("builtin Iterable/Container trait members must hoist");
-            let iterable = boot.traits.remove("Iterable").expect("hoisted above");
-            let container = boot.traits.remove("Container").expect("hoisted above");
-            (iterable, container)
+            ["Iterable", "Container", "Abort"]
+                .iter()
+                .map(|n| boot.traits.remove(*n).expect("hoisted above"))
+                .collect()
         })
     }
 
@@ -1491,6 +1501,18 @@ impl TypeChecker {
     /// `type_implements` itself to `pub(crate)`.
     pub(crate) fn implements_linear(&self, ty: &Type) -> bool {
         self.type_implements(ty, &Trait::Linear)
+    }
+
+    /// The symbol of `ty`'s `Abort::abort` impl, if `ty` provides `Abort`
+    /// (`plans/NOGC.md` §3.8). `Abort` is an ordinary source-declared trait
+    /// (see `cached_iterable_container_traits`), so the answer is just the
+    /// impl table's entry for the type's declared name. A type that only
+    /// satisfies `Abort` structurally (an anonymous union of providers) has no
+    /// single impl to call and yields `None`; so does a nominal union, whose
+    /// impl is indexed under its variants.
+    pub(crate) fn abort_symbol(&self, ty: &Type) -> Option<String> {
+        let key = Self::grant_key(ty)?;
+        self.impls.get(&("Abort".to_string(), key))?.get("abort").cloned()
     }
 
     /// `type_implements`'s body, carrying the set of struct types already
@@ -2053,6 +2075,10 @@ impl TypeChecker {
         // by, any user binding or `func panic(...)` redefinition — `!`
         // always traps through the real builtin regardless of what's in
         // scope. See `codegen`'s matching `declare_rt` alias.
+        ctx.insert(ABORT_EDGE_NAME.to_string(), Type::Function {
+            params: vec![],
+            result: Box::new(Type::None),
+        });
         ctx.insert(UNWRAP_PANIC_NAME.to_string(), Type::Function {
             params: vec![Type::Str],
             result: Box::new(Type::Never),
@@ -2771,9 +2797,19 @@ impl TypeChecker {
                 }, span));
             }
         }
-        Ok(Self::error_arms(entries, span, |whole| Spanned::from(
-            Expression::return_value(Some(Spanned::from(whole, span))), span,
-        )))
+        // The arm is `{ abort!edge(); return whole }`: the placeholder is
+        // where `linear::insert_aborts` puts `abort(x)` for each owned
+        // `Abort` value (`plans/NOGC.md` §3.8). Only this `?` edge gets one;
+        // `catch` doesn't leave the scope and a plain `return` is ordinary
+        // control flow.
+        Ok(Self::error_arms(entries, span, |whole| {
+            let edge = Spanned::from(Expression::call(
+                Spanned::from(Expression::literal(Token::Identifier(ABORT_EDGE_NAME.to_string())), span),
+                vec![],
+            ), span);
+            let ret = Spanned::from(Expression::return_value(Some(Spanned::from(whole, span))), span);
+            Spanned::from(Expression::Block(vec![edge, ret]), span)
+        }))
     }
 
     fn lower_try(&mut self, inner: Spanned<Expression>, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
@@ -3810,6 +3846,19 @@ impl TypeChecker {
                             Ok(t) => traits.push(t),
                             Err(msg) => return Err(Spanned::from(TypeError { msg }, s.span)),
                         }
+                    }
+                    // `Linear` requires `Abort` (`plans/NOGC.md` §3.8): a linear
+                    // value with no failure path could not survive a `?` that
+                    // fires while it is live, so there would be nothing for the
+                    // edge to call.
+                    if d.provides.iter().any(|n| n == "Linear") && !d.provides.iter().any(|n| n == "Abort") {
+                        return Err(Spanned::from(TypeError {
+                            msg: format!(
+                                "'{}' provides Linear, so it must also provide Abort — \
+                                 `?` calls `abort` on a live Linear value when it returns early",
+                                d.name
+                            ),
+                        }, s.span));
                     }
                     // A union's `provides` grants every variant the trait
                     // (the doc's "a union satisfies a trait iff every
@@ -6713,7 +6762,7 @@ impl TypeChecker {
     /// generic over mutability because the borrow checker will not let one
     /// function return either — and because the two really are the same
     /// list, a divergence between them is a bug either walk would expose.
-    fn children_mut(expr: &mut Spanned<TypedExpr>) -> Vec<&mut Spanned<TypedExpr>> {
+    pub(crate) fn children_mut(expr: &mut Spanned<TypedExpr>) -> Vec<&mut Spanned<TypedExpr>> {
         let mut out: Vec<&mut Spanned<TypedExpr>> = Vec::new();
         match &mut expr.item.kind {
             TypedExprKind::IntLit(_) | TypedExprKind::FloatLit(_) | TypedExprKind::BoolLit(_)

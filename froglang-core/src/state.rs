@@ -366,6 +366,10 @@ impl FrogState {
         // tree. Must run after both, not before, so newly-inserted bodies
         // get real ids too.
         crate::frontend::liveness::number_nodes(&mut typed);
+        // `?` aborts live `Abort` values (plans/NOGC.md §3.8). Needs liveness,
+        // so it runs on the numbered tree, and the calls it adds need ids.
+        crate::frontend::linear::insert_aborts(&mut typed, &self.tc);
+        crate::frontend::liveness::number_nodes(&mut typed);
 
         // Parameter conventions (plans/NOGC.md §1.2): which arguments a callee
         // only borrows, so codegen knows who frees them.

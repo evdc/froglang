@@ -54,7 +54,7 @@ use std::collections::HashSet;
 use crate::frontend::liveness::{self, Liveness, NameSet, Ownership};
 use crate::frontend::tokens::{Span, Spanned};
 use crate::frontend::typed_ast::{Arg, PlaceSeg, TypedExpr, TypedExprKind};
-use crate::frontend::typeck::{TypeChecker, TypeError};
+use crate::frontend::typeck::{Type, TypeChecker, TypeError, ABORT_EDGE_NAME};
 
 /// Read-only state threaded through every `walk` call.
 struct Ctx<'a> {
@@ -258,7 +258,17 @@ fn walk(
             Ok(moved)
         }
 
-        TypedExprKind::Block(stmts) => fold(stmts, liveness, ctx, suppress),
+        // A binding declared in a block is out of scope after it, so what the
+        // block did to it cannot unbalance a branch join. Without this, a
+        // Linear `let` inside one arm and consumed there reads as "consumed on
+        // only one branch".
+        TypedExprKind::Block(stmts) => {
+            let mut moved = fold(stmts, liveness, ctx, suppress)?;
+            for s in stmts {
+                if let TypedExprKind::Assign { name, decl: true, .. } = &s.item.kind { moved.remove(name); }
+            }
+            Ok(moved)
+        }
 
         TypedExprKind::StructInit { fields, .. } | TypedExprKind::VariantInit { fields, .. } => {
             let mut moved = HashSet::new();
@@ -321,6 +331,18 @@ fn walk(
                 Some(fb) => walk(fb, liveness, ctx, suppress)?,
                 None => HashSet::new(),
             };
+            // A branch that never falls through (`Never`: it ends in `return`,
+            // as the error arm of `?` does) is not a path to the join, so what
+            // it consumes cannot be unbalanced against the other branch. This
+            // is what lets `?` abort a Linear value (see `insert_aborts`) while
+            // the success path still has to consume it itself.
+            let t_diverges = true_branch.item.ty == Type::Never;
+            let f_diverges = false_branch.as_ref().is_some_and(|fb| fb.item.ty == Type::Never);
+            let (true_moved, false_moved) = match (t_diverges, f_diverges) {
+                (true, false) => (false_moved.clone(), false_moved),
+                (false, true) => (true_moved.clone(), true_moved),
+                _ => (true_moved, false_moved),
+            };
             if let Some(name) = true_moved.symmetric_difference(&false_moved).next() {
                 return Err(branch_join_error(name, e.span));
             }
@@ -328,4 +350,191 @@ fn walk(
             Ok(union(joined, walk(cond, liveness, ctx, suppress)?))
         }
     }
+}
+
+// ── `?` aborts live values (`plans/NOGC.md` §3.8) ────────────────────────────
+
+/// Replace every `abort!edge` placeholder (left by `?`, see
+/// `TypeChecker::build_try_arms`) with `abort(x)` calls for the values that
+/// are owned at that edge, innermost-declared first (reverse order of
+/// acquisition). Run after `number_nodes`, because it reads liveness, and
+/// followed by another `number_nodes`, because it adds nodes.
+///
+/// A value is aborted when its type provides `Abort`, it is a binding of the
+/// enclosing function (a `let`/`mut` or a non-`mut` parameter) in scope at the
+/// edge, and no earlier read of it was a `Move` (its last use: handed to
+/// whoever took it). Moved values are the receiver's to abort or consume. For a
+/// `Linear` value a move is exactly consumption; for a plain `Abort` type it is
+/// the last use, so a value whose last use is the failing expression itself is
+/// dropped rather than aborted. `catch`, `!` and a plain `return` leave their
+/// values alone, and so does a panic (§3.8 sends panics to the resource table).
+///
+/// Limits, all conservative (the value is not aborted, never aborted twice):
+/// a binding shadowed by a later declaration of the same name, a loop,
+/// comprehension or union-typed binding, and anything declared outside the
+/// enclosing `with Arena` block (outer places are frozen there).
+pub fn insert_aborts(root: &mut Spanned<TypedExpr>, tc: &TypeChecker) {
+    sweep(root, tc);
+}
+
+/// Find every function body in the tree, wherever it sits, and fix each one.
+fn sweep(e: &mut Spanned<TypedExpr>, tc: &TypeChecker) {
+    if let TypedExprKind::Function { .. } = &e.item.kind {
+        fix_function(e, tc);
+        return;
+    }
+    for c in TypeChecker::children_mut(e) { sweep(c, tc); }
+}
+
+fn fix_function(f: &mut Spanned<TypedExpr>, tc: &TypeChecker) {
+    let TypedExprKind::Function { params, body, .. } = &mut f.item.kind else { return };
+    let mut_names: NameSet = params.iter().filter(|(_, _, m)| *m).map(|(n, _, _)| n.clone()).collect();
+    let live = liveness::analyze_body(body, &mut_names);
+    let mut fx = Aborts { tc, live, scope: Vec::new(), floor: 0, moved: HashSet::new() };
+    for (name, ty, is_mut) in params.iter() {
+        if !*is_mut { fx.declare(name, ty); }
+    }
+    fx.go(body);
+}
+
+struct Aborted {
+    name: String,
+    ty: Type,
+    symbol: String,
+    /// Set when a later declaration reuses the name: the value is no longer
+    /// reachable by name, so no call can be written for it.
+    hidden: bool,
+}
+
+struct Aborts<'a> {
+    tc: &'a TypeChecker,
+    live: Liveness,
+    /// `Abort`-providing bindings in scope, in acquisition order.
+    scope: Vec<Aborted>,
+    /// Entries below this index belong to a scope the body may not touch.
+    floor: usize,
+    /// Names with a `Move`-classified read on the path to the current point.
+    moved: HashSet<String>,
+}
+
+impl Aborts<'_> {
+    /// A fresh binding of `name`. It shadows (hides) any earlier one, and it
+    /// is owned again even if the name was moved before.
+    fn declare(&mut self, name: &str, ty: &Type) {
+        self.moved.remove(name);
+        for a in self.scope.iter_mut().filter(|a| a.name == name) { a.hidden = true; }
+        if let Some(symbol) = self.tc.abort_symbol(ty) {
+            self.scope.push(Aborted { name: name.to_string(), ty: ty.clone(), symbol, hidden: false });
+        }
+    }
+
+    fn go(&mut self, e: &mut Spanned<TypedExpr>) {
+        let (id, span) = (e.item.id, e.span);
+        match &mut e.item.kind {
+            TypedExprKind::Var(name) => {
+                if self.live.ownership(id) == Ownership::Move { self.moved.insert(name.clone()); }
+            }
+
+            TypedExprKind::Function { .. } => fix_function(e, self.tc),
+
+            TypedExprKind::Call { callable, args } => {
+                if matches!(&callable.item.kind, TypedExprKind::Var(n) if n == ABORT_EDGE_NAME) {
+                    e.item.kind = self.edge(span);
+                    e.item.ty = Type::None;
+                    return;
+                }
+                // The callee names a function, not a binding.
+                for a in args.iter_mut().flat_map(Arg::subexprs_mut) { self.go(a); }
+            }
+
+            TypedExprKind::Assign { name, value, decl } => {
+                let (name, decl) = (name.clone(), *decl);
+                self.go(value);
+                if decl {
+                    let ty = value.item.ty.clone();
+                    self.declare(&name, &ty);
+                } else {
+                    self.moved.remove(&name);
+                }
+            }
+
+            TypedExprKind::Block(stmts) => {
+                let mark = self.scope.len();
+                for s in stmts.iter_mut() { self.go(s); }
+                self.scope.truncate(mark.max(self.floor));
+            }
+
+            TypedExprKind::Conditional { cond, true_branch, false_branch } => {
+                self.go(cond);
+                let before = self.moved.clone();
+                let mark = self.scope.len();
+                let t_diverges = true_branch.item.ty == Type::Never;
+                self.go(true_branch);
+                self.scope.truncate(mark);
+                let after_true = std::mem::replace(&mut self.moved, before);
+                let mut f_diverges = false;
+                if let Some(fb) = false_branch {
+                    f_diverges = fb.item.ty == Type::Never;
+                    self.go(fb);
+                    self.scope.truncate(mark);
+                }
+                // Only a branch that falls through reaches the join. `self.moved`
+                // holds the false branch's set (or the pre-branch one).
+                if f_diverges && !t_diverges {
+                    self.moved = after_true;
+                } else if !(t_diverges && !f_diverges) {
+                    self.moved.extend(after_true);
+                }
+            }
+
+            TypedExprKind::ForLoop { var, iterable, cond, body, .. }
+            | TypedExprKind::Comprehension { var, iterable, cond, body, .. } => {
+                self.go(iterable);
+                let var = var.clone();
+                let mark = self.scope.len();
+                self.declare(&var, &Type::None);
+                if let Some(c) = cond { self.go(c); }
+                self.go(body);
+                self.scope.truncate(mark);
+            }
+
+            TypedExprKind::Arena(body) => {
+                let (old_floor, mark) = (self.floor, self.scope.len());
+                self.floor = mark;
+                self.go(body);
+                self.floor = old_floor;
+                self.scope.truncate(mark);
+            }
+
+            _ => {
+                for c in TypeChecker::children_mut(e) { self.go(c); }
+            }
+        }
+    }
+
+    /// What the edge becomes: `abort(x)` for each owned `Abort` value in
+    /// scope, newest first, or nothing.
+    fn edge(&self, span: Span) -> TypedExprKind {
+        let calls: Vec<Spanned<TypedExpr>> = self.scope[self.floor.min(self.scope.len())..]
+            .iter()
+            .rev()
+            .filter(|a| !a.hidden && !self.moved.contains(&a.name))
+            .map(|a| abort_call(a, span))
+            .collect();
+        if calls.is_empty() { TypedExprKind::NoneLit } else { TypedExprKind::Block(calls) }
+    }
+}
+
+fn abort_call(a: &Aborted, span: Span) -> Spanned<TypedExpr> {
+    let callable = Spanned::from(TypedExpr {
+        id: 0,
+        ty: Type::Function { params: vec![a.ty.clone()], result: Box::new(Type::None) },
+        kind: TypedExprKind::Var(a.symbol.clone()),
+    }, span);
+    let arg = Spanned::from(TypedExpr { id: 0, ty: a.ty.clone(), kind: TypedExprKind::Var(a.name.clone()) }, span);
+    Spanned::from(TypedExpr {
+        id: 0,
+        ty: Type::None,
+        kind: TypedExprKind::Call { callable: Box::new(callable), args: vec![Arg::Value(arg)] },
+    }, span)
 }

@@ -6048,6 +6048,8 @@ pub fn compile_and_run(src: &str) -> i64 {
     tc.lower_function_values(&mut typed).expect("function value error");
     tc.desugar_notation(&mut typed).expect("repr type error");
     crate::frontend::liveness::number_nodes(&mut typed);
+    crate::frontend::linear::insert_aborts(&mut typed, &tc);
+    crate::frontend::liveness::number_nodes(&mut typed);
 
     let mut codegen = JitCodegen::new();
     // The same conventions `FrogState::eval_with_base` infers, so codegen

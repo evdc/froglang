@@ -57,7 +57,7 @@ use crate::frontend::conventions::Conventions;
 use crate::frontend::liveness::{self, Liveness, NameSet, Ownership};
 use crate::frontend::tokens::{Span, Spanned};
 use crate::frontend::typed_ast::{Arg, PlaceSeg, TypedExpr, TypedExprKind};
-use crate::frontend::typeck::{Type, TypeChecker, TypeError, ABORT_EDGE_NAME};
+use crate::frontend::typeck::{is_match_subject, Type, TypeChecker, TypeError, ABORT_EDGE_NAME};
 
 /// Read-only state threaded through every `walk` call.
 struct Ctx<'a> {
@@ -207,8 +207,11 @@ fn walk(
         | TypedExprKind::StrLit(_)
         | TypedExprKind::NoneLit => Ok(HashSet::new()),
 
+        // A match subject's temporary is read once per arm (tag tests, field
+        // extraction, narrowing); that is the match taking its subject apart,
+        // not aliasing. The match's one consumption is the move into it.
         TypedExprKind::Var(name) => {
-            if suppress == Some(name.as_str()) || ctx.mut_exempt.contains(name) {
+            if suppress == Some(name.as_str()) || ctx.mut_exempt.contains(name) || is_match_subject(name) {
                 return Ok(HashSet::new());
             }
             if ctx.tc.implements_linear(&e.item.ty) {
@@ -453,7 +456,11 @@ impl Exits<'_> {
 
             TypedExprKind::Assign { name, value, decl } => {
                 self.go(value)?;
-                if *decl { self.declare(name, &value.item.ty, e.span); } else { self.scope.mark_owned(name); }
+                // A match subject's temporary owes nothing: each arm takes it
+                // apart, and what it binds (or the narrowed subject) owes in
+                // its place.
+                if *decl && is_match_subject(name) { self.scope.declare(name, None); }
+                else if *decl { self.declare(name, &value.item.ty, e.span); } else { self.scope.mark_owned(name); }
             }
 
             TypedExprKind::Block(stmts) => {
@@ -654,10 +661,11 @@ struct Arm {
     diverges: bool,
 }
 
-/// What `insert_aborts` knows about a binding: its type and `abort` symbol
-/// when the type provides `Abort`, `None` otherwise (still tracked, because
-/// it may shadow one that does).
-type AbortInfo = Option<(Type, String)>;
+/// What `insert_aborts` knows about a binding when its type provides
+/// `Abort`: its type, the `abort` symbol and that symbol's parameter type
+/// (see `TypeChecker::abort_target`). `None` otherwise (still tracked,
+/// because it may shadow one that does).
+type AbortInfo = Option<(Type, String, Type)>;
 
 struct Aborts<'a> {
     tc: &'a TypeChecker,
@@ -670,7 +678,7 @@ struct Aborts<'a> {
 
 impl Aborts<'_> {
     fn declare(&mut self, name: &str, ty: &Type) {
-        let info = self.tc.abort_symbol(ty).map(|s| (ty.clone(), s));
+        let info = self.tc.abort_target(ty).map(|(s, param)| (ty.clone(), s, param));
         self.scope.declare(name, info);
     }
 
@@ -699,7 +707,11 @@ impl Aborts<'_> {
             TypedExprKind::Assign { name, value, decl } => {
                 let (name, decl) = (name.clone(), *decl);
                 self.go(value);
-                if decl {
+                // A match subject's temporary is never aborted: inside an
+                // arm, what the arm bound from it holds the value instead.
+                if decl && is_match_subject(&name) {
+                    self.scope.declare(&name, None);
+                } else if decl {
                     let ty = value.item.ty.clone();
                     self.declare(&name, &ty);
                 } else {
@@ -759,20 +771,31 @@ impl Aborts<'_> {
             .filter(|&i| !s.shadowed(i) && !s.is_moved(i))
             .filter_map(|i| {
                 let b = &s.entries[i];
-                b.info.as_ref().map(|(ty, symbol)| abort_call(&b.name, ty, symbol, span))
+                b.info.as_ref().map(|(ty, symbol, param)| abort_call(&b.name, ty, symbol, param, span))
             })
             .collect();
         if calls.is_empty() { TypedExprKind::NoneLit } else { TypedExprKind::Block(calls) }
     }
 }
 
-fn abort_call(name: &str, ty: &Type, symbol: &str, span: Span) -> Spanned<TypedExpr> {
+/// `symbol(name)`, widening `name` (of type `ty`) into `param` when it is a
+/// variant narrowed out of the union `param`.
+fn abort_call(name: &str, ty: &Type, symbol: &str, param: &Type, span: Span) -> Spanned<TypedExpr> {
     let callable = Spanned::from(TypedExpr {
         id: 0,
-        ty: Type::Function { params: vec![ty.clone()], result: Box::new(Type::None) },
+        ty: Type::Function { params: vec![param.clone()], result: Box::new(Type::None) },
         kind: TypedExprKind::Var(symbol.to_string()),
     }, span);
-    let arg = Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Var(name.to_string()) }, span);
+    let mut arg = Spanned::from(TypedExpr { id: 0, ty: ty.clone(), kind: TypedExprKind::Var(name.to_string()) }, span);
+    if let Type::Union(members) = param {
+        if let Some(tag) = members.iter().position(|m| m == ty) {
+            arg = Spanned::from(TypedExpr {
+                id: 0,
+                ty: param.clone(),
+                kind: TypedExprKind::Widen { value: Box::new(arg), tag: tag as u32 },
+            }, span);
+        }
+    }
     Spanned::from(TypedExpr {
         id: 0,
         ty: Type::None,

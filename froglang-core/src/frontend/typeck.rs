@@ -26,6 +26,15 @@ const UNWRAP_PANIC_NAME: &str = "panic!builtin";
 /// code from naming it, as with `UNWRAP_PANIC_NAME`.
 pub(crate) const ABORT_EDGE_NAME: &str = "abort!edge";
 
+/// The prefix of the temporary a `match` binds its subject to
+/// (`lower_match_lowered`, `lower_anon_match`). Every read of it is the
+/// match's own machinery — tag tests, field extraction, narrowing — not a
+/// use by the program, which `frontend::linear` relies on: the move into the
+/// temporary is the match's one consumption of its subject.
+pub(crate) const MATCH_SUBJECT_PREFIX: &str = "__match_subject_";
+
+pub(crate) fn is_match_subject(name: &str) -> bool { name.starts_with(MATCH_SUBJECT_PREFIX) }
+
 /// The type-variable name `Self` resolves to inside a `trait` declaration
 /// (`TRAITS.md` Stage 5). A trait member's signature is a template over one
 /// binder, and this is that binder — `resolve_type_name` finds it through
@@ -1526,6 +1535,23 @@ impl TypeChecker {
             }
             _ => lookup(ty),
         }
+    }
+
+    /// Where an `abort` call for a value of type `ty` goes: the impl's symbol
+    /// and the type its parameter takes. They differ for a variant narrowed
+    /// out of a nominal union (`match r { is A then .. }` rebinds `r` as
+    /// `R.A`): the impl is the union's, indexed under each variant, so the
+    /// value has to be widened back into the union to be passed to it.
+    pub(crate) fn abort_target(&self, ty: &Type) -> Option<(String, Type)> {
+        let symbol = self.abort_symbol(ty)?;
+        let owner = match ty {
+            Type::Named { name, .. } => name.split_once('.')
+                .and_then(|(enum_name, _)| self.union_defs.get(enum_name))
+                .map(|def| def.ty.clone())
+                .filter(|u| matches!(u, Type::Union(ms) if ms.contains(ty))),
+            _ => None,
+        };
+        Some((symbol, owner.unwrap_or_else(|| ty.clone())))
     }
 
     /// `type_implements`'s body, carrying the set of struct types already
@@ -10320,6 +10346,16 @@ impl TypeChecker {
         Ok((lowered, narrow_target, subject_span))
     }
 
+    /// A match arm that leaves `what` (of type `ty`) unbound drops it, which
+    /// is a leak when it is Linear. Only a Linear value's *parts* can be
+    /// left: taking a value apart with a pattern is what consumes it.
+    fn reject_linear_drop(&self, what: &str, ty: &Type, span: Span) -> Result<(), Spanned<TypeError>> {
+        if !self.implements_linear(&self.lookup(ty)) { return Ok(()); }
+        Err(Spanned::from(TypeError {
+            msg: format!("this arm drops {}, which is Linear ({}) — bind it and consume it", what, ty),
+        }, span))
+    }
+
     /// `lower_match` with the subject already lowered. Validates the arms
     /// against the subject union (pattern names, bind arity, exhaustiveness)
     /// and then desugars.
@@ -10357,7 +10393,7 @@ impl TypeChecker {
             }, span));
         }
 
-        let subject_name = format!("__match_subject_{}", self.next_id); self.next_id += 1;
+        let subject_name = format!("{}{}", MATCH_SUBJECT_PREFIX, self.next_id); self.next_id += 1;
         // The *resolved* union, not the stored `.ty`: the temporary the
         // subject is bound to below, and every `Var` reading it back, must
         // carry the union type codegen dispatches on, never an unresolved
@@ -10389,6 +10425,21 @@ impl TypeChecker {
                 } },
                 span,
             );
+
+            // What this arm extracts from the subject; whatever it leaves
+            // behind is dropped, which a Linear field may not be. Taking
+            // a value apart this way is what consumes the subject itself.
+            let narrows = arm.pattern.binds.is_empty() && narrow_target.is_some();
+            if !narrows {
+                let binds = &arm.pattern.binds;
+                let dropped = def.common.iter()
+                    .chain(variant_fields.iter().enumerate()
+                        .filter(|(i, _)| binds.get(*i).is_none_or(|b| b == "_"))
+                        .map(|(_, f)| f));
+                for (fname, fty) in dropped {
+                    self.reject_linear_drop(&format!("field '{}'", fname), fty, arm.body.span)?;
+                }
+            }
 
             let mut prelude = Vec::new();
             let mut bindings = Vec::new();
@@ -10667,7 +10718,7 @@ impl TypeChecker {
             }, span));
         }
 
-        let subject_name = format!("__match_subject_{}", self.next_id); self.next_id += 1;
+        let subject_name = format!("{}{}", MATCH_SUBJECT_PREFIX, self.next_id); self.next_id += 1;
         // See the matching note in `lower_match_lowered`.
         let subject_ty = Type::Union(members.clone());
         let subject_assign = Spanned::from(
@@ -10704,6 +10755,9 @@ impl TypeChecker {
             // already yields the whole member value either way.
             let explicit_bind = arm.pattern.binds.first().cloned();
             let bind_name = explicit_bind.clone().or_else(|| narrow_target.clone());
+            if bind_name.as_deref().is_none_or(|b| b == "_") {
+                self.reject_linear_drop("the matched value", &member_ty, arm.body.span)?;
+            }
             if let Some(bind) = bind_name {
                 if bind != "_" {
                     let value = Spanned::from(

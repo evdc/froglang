@@ -544,9 +544,7 @@ match f(-1) {
 }
 
 /// A nominal union's `abort` is indexed under its variants, so `?` used to
-/// find no impl for the union and could not abort it. The success path
-/// consumes it by moving it into a struct: `match` on a Linear union is a
-/// separate, open gap (its desugared subject is read once per arm).
+/// find no impl for the union and could not abort it.
 #[test]
 fn a_linear_nominal_union_is_aborted() {
     let src = r#"
@@ -555,12 +553,14 @@ func step(n: Int): Int | Bad = if n < 0 then Bad(msg="neg") else n
 data R is A(x: Int) | B(y: Int) provides Linear, Abort {
     func abort(r: R): None = print("abort")
 }
-data Keep(r: R)
+func close(r: R): Int = match r {
+    is A(x) then x
+    is B(y) then y
+}
 func f(n: Int): Int | Bad = {
     let r: R = A(x=1)
     let v = step(n)?
-    let k = Keep(r=r)
-    v
+    close(r) + v - 1
 }
 match f(-1) {
     is Int(v) then print("ok")
@@ -572,4 +572,53 @@ match f(1) {
 }
 "#;
     assert_eq!(run(src), "abort\nerr\nok 1\n");
+}
+
+const UNION: &str = r#"
+error Bad(msg: Str)
+func step(n: Int): Int | Bad = if n < 0 then Bad(msg="neg") else n
+func close(r: R): Int = match r {
+    is A(x) then x
+    is B(y) then y
+}
+data R is A(x: Int) | B(y: Int) provides Linear, Abort {
+    func abort(r: R): None = print("abort ${close(r)}")
+}
+"#;
+
+/// Inside an arm that narrows `r`, the narrowed `r` is what `?` aborts —
+/// widened back into the union for the union's `abort` — and the match's
+/// own subject temporary is not aborted as well.
+#[test]
+fn a_question_mark_inside_a_narrowed_arm_aborts_the_narrowed_value_once() {
+    let src = format!("{}{}", UNION, r#"
+func f(n: Int): Int | Bad = {
+    let r: R = A(x=1)
+    match r {
+        is A then { let v = step(n)?; close(r) + v }
+        is B then close(r)
+    }
+}
+match f(-1) {
+    is Int(v) then print("ok ${v}")
+    is Bad(e) then print("err")
+}
+match f(2) {
+    is Int(v) then print("ok ${v}")
+    is Bad(e) then print("err")
+}
+"#);
+    assert_eq!(run(&src), "abort 1\nerr\nok 3\n");
+}
+
+#[test]
+fn abort_can_be_called_directly_on_a_linear_union() {
+    let src = format!("{}{}", UNION, r#"
+func f(): None = {
+    let r: R = B(y=7)
+    Abort.abort(r)
+}
+f()
+"#);
+    assert_eq!(run(&src), "abort 7\n");
 }

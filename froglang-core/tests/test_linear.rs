@@ -6,7 +6,9 @@
 //! be consumed on every branch or none) and rule 3 (it must be consumed on
 //! every path that doesn't fail before it goes out of scope), plus the two exemptions from rule
 //! 1 that make `mut self`-style usage actually usable: a function's own
-//! `mut` parameter, and a `PlaceAssign`'s own root.
+//! `mut` parameter, and a `PlaceAssign`'s own root. Also how `match` consumes
+//! a Linear subject: once, by taking it apart or by handing the narrowed
+//! subject to the arm.
 
 use froglang_core::state::FrogState;
 
@@ -186,4 +188,82 @@ fn consuming_an_outer_value_before_a_same_named_inner_binding_still_counts() {
                f(true)";
     let err = s.eval(src).unwrap_err().to_string();
     assert!(err.contains("consumed on only one branch"), "{err}");
+}
+
+const RES: &str = "data Res(id: Int) provides Linear, Abort { func abort(r: Res): None = none }\n\
+                   func close(r: Res): Int = r.id\n\
+                   data R is A(r: Res) | B(y: Int) provides Linear, Abort { func abort(u: R): None = none }\n";
+
+fn eval(src: &str) -> Result<String, String> {
+    let mut s = FrogState::new();
+    s.eval(&format!("{RES}{src}")).map(|(v, _)| format!("{:?}", v)).map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_match_that_takes_a_linear_union_apart_consumes_it() {
+    // The desugared match reads its subject once per arm; that used to be
+    // reported as aliasing the subject's temporary.
+    let v = eval("func f(u: R): Int = match u {\n\
+                  is A(r) then close(r)\n\
+                  is B(y) then y\n\
+                  }\n\
+                  f(A(r=Res(id=3))) + f(B(y=4))").unwrap();
+    assert_eq!(v, "Int(7)");
+}
+
+#[test]
+fn a_narrowed_linear_subject_must_be_consumed_in_every_arm() {
+    let ok = eval("func done(u: R): Int = match u {\n\
+                   is A(r) then close(r)\n\
+                   is B(y) then y\n\
+                   }\n\
+                   func f(u: R): Int = match u {\n\
+                   is A then done(u)\n\
+                   is B then done(u) + 10\n\
+                   }\n\
+                   f(B(y=1))").unwrap();
+    assert_eq!(ok, "Int(11)");
+    let err = eval("func done(u: R): Int = match u {\n\
+                   is A(r) then close(r)\n\
+                   is B(y) then y\n\
+                   }\n\
+                    func f(u: R): Int = match u {\n\
+                    is A then 0\n\
+                    is B then done(u)\n\
+                    }\n\
+                    f(B(y=1))").unwrap_err();
+    assert!(err.contains("'u' is Linear and is not consumed on every path"), "{err}");
+}
+
+#[test]
+fn a_pattern_that_drops_a_linear_field_is_rejected() {
+    let err = eval("func f(u: R): Int = match u {\n\
+                    is A(_) then 0\n\
+                    is B(y) then y\n\
+                    }\n\
+                    f(B(y=1))").unwrap_err();
+    assert!(err.contains("this arm drops field 'r', which is Linear"), "{err}");
+}
+
+#[test]
+fn a_bindless_arm_on_an_unnamed_linear_subject_is_rejected() {
+    // Nothing holds the matched `Res` afterwards: no bind, and no name to narrow.
+    let err = eval("func mk(): Res | None = Res(id=1)\n\
+                    func f(): Int = match mk() {\n\
+                    is Res then 1\n\
+                    is None then 0\n\
+                    }\n\
+                    f()").unwrap_err();
+    assert!(err.contains("this arm drops the matched value, which is Linear (Res)"), "{err}");
+}
+
+#[test]
+fn a_guarded_arm_can_bind_a_linear_field() {
+    let v = eval("func f(u: R): Int = match u {\n\
+                  is A(r) and r.id > 5 then close(r)\n\
+                  is A(r) then close(r) + 100\n\
+                  is B(y) then y\n\
+                  }\n\
+                  f(A(r=Res(id=1))) + f(A(r=Res(id=9)))").unwrap();
+    assert_eq!(v, "Int(110)");
 }

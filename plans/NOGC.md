@@ -1021,7 +1021,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    check, and `linear.rs` treating `?` edges as consuming. Also add the `implicit-copy` lint, which
    is useful with or without the GC as a report of where COW marks happen.
 
-   **Status (2026-11-10): 6a (`Abort` and `?`) done; 6b (`implicit-copy` lint) not started.**
+   **Status (2026-11-10): 6a (`Abort` and `?`) and 6b (the `implicit-copy` report) done; the deny annotation and `copy()` are not.**
    - **The trait.** `Abort` is an ordinary source-declared trait, seeded next to `Iterable` and
      `Container` (`trait Abort { func abort(x: Self) }`), so `provides Abort { func abort(...) }`
      goes through the normal impl path. `data T provides Linear` without `Abort` is a type error at
@@ -1050,6 +1050,24 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      `abort` bodies, all under the leak oracle. `test_linear.rs` gained `Abort` impls. `cargo test
      --workspace`: 1,289 passed. Clippy: 18 warnings, none new. `orders`, `words` and `life` match the
      previous commit measured side by side (56/186/17 ms against 56/191/19 on a slower machine day).
+   - **6b, the lint.** `frog check --copies <file|expr>` compiles to a native object (no link, no run)
+     and prints one warning per implicit deep copy, with file, line, column and the copied type, then a
+     count. The findings come from codegen, which is where copies are decided, so they cannot drift
+     from what actually runs: `own_vals` records a `CopySite` (thread-local log, off unless
+     `start_copy_log` was called) with `Ctx::cur_span`, the expression that kept the value. Reporting
+     the keeper rather than the read is deliberate: `let b = a`, `push(mut s, a)` and a by-value call
+     argument each point at the statement that stores the value. Arena evacuation copies are not
+     reported; they are the block's contract. `benches`: `orders` 2 sites, `words` 2, `life` 1.
+     Top-level bindings stay live for the whole entry (Q6), so reads of them are flagged more often
+     than the same code inside a function.
+   - **Side fix.** `frog build` skipped `insert_aborts` and the conventions pass, so a native build
+     of a `?` over an `Abort` value called a placeholder, and every call was compiled as consuming.
+     `build` and `check --copies` now share `lower_for_object` in `main.rs`.
+   - **Not done:** `#deny(implicit-copy)` per function or module (annotations exist only on `data`
+     fields today, so this needs parser support for function-level annotations), the `copy(x)`
+     silencing builtin (nothing to silence until a lint can be denied), and a REPL setting.
+   - **Tests.** `tests/test_copy_lint.rs` (6), one AOT test in `test_build_cli.rs`. `cargo test
+     --workspace`: 1,296 passed, plain and under `FROG_LEAK_CHECK=1`. Clippy: 18, none new.
 7. **The `with` protocol, second-class handles, the cleanup stack and the resource table.** Then
    `CONCURRENCY.md` stages 2 onward run on this foundation, without stage 1's unwinder, and with
    deferred-init `let` instead of `Task<T>`.

@@ -115,3 +115,28 @@ fn build_runs_arena_blocks() {
         "func pick(n: Int): Str = {\n  let keep = \"k\" + repr(n)\n  let r = with Arena {\n    let s = keep + \"-\" + repr(n * 2)\n    if n > 2 then return s + \"!\"\n    s\n  }\n  r + \".\"\n}\nfor i in 0..5 do { print(pick(i)) }");
     assert_eq!(out, "k0-0.\nk1-2.\nk2-4.\nk3-6!\nk4-8!\n");
 }
+
+/// `?` aborts a live `Abort` value in a native build too: the pass that fills
+/// in the abort calls has to run on this path as well as the JIT's.
+#[test]
+fn build_runs_the_abort_calls_on_a_firing_question_mark() {
+    let out = assert_aot_matches_jit("abort", r#"
+error Bad(msg: Str)
+data Res(id: Int) provides Linear, Abort {
+    func abort(r: Res): None = print("abort ${r.id}")
+}
+func open(id: Int): Res = Res(id=id)
+func close(r: Res): None = print("close ${r.id}")
+func step(n: Int): Int | Bad = if n < 0 then Bad(msg="neg") else n
+func f(n: Int): Int | Bad = {
+    let r = open(1)
+    let v = step(n)?
+    close(r)
+    v
+}
+let a = f(-1)
+let b = f(2)
+print("done")
+"#);
+    assert_eq!(out, "abort 1\nclose 1\ndone\n");
+}

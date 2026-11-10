@@ -192,6 +192,36 @@ struct Ctx<'a> {
     /// frames were open outside it. The frames above that index hold arena
     /// objects, whose drops are no-ops, so an early exit skips them.
     arena_marks: Vec<usize>,
+    /// The span of the expression `compile_expr_multi` is working on, so a copy
+    /// made while compiling it can say where it is (`CopySite`).
+    cur_span: Span,
+}
+
+/// One deep copy that codegen made because a consumer kept a value some other
+/// owner still holds (`own_vals`): the `implicit-copy` lint's finding
+/// (`plans/NOGC.md` §1.4, item 5). `span` is the expression that kept the value
+/// (a call whose argument is passed by value, an assignment, a list literal),
+/// and `ty` is the copied value's type.
+#[derive(Debug, Clone)]
+pub struct CopySite {
+    pub span: Span,
+    pub ty: Type,
+}
+
+thread_local! {
+    /// `Some` while a caller wants the copy sites of the compile in progress
+    /// (`frog check --copies`). Off by default, so ordinary compiles log nothing.
+    static COPY_LOG: std::cell::RefCell<Option<Vec<CopySite>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start collecting `CopySite`s on this thread. Pair with `take_copy_log`.
+pub fn start_copy_log() {
+    COPY_LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop collecting and return what was found, in compile order.
+pub fn take_copy_log() -> Vec<CopySite> {
+    COPY_LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
 }
 
 /// One scope of owned slots (see `Ctx::frames`).
@@ -1029,8 +1059,17 @@ fn own_vals(bcx: &mut FunctionBuilder, ctx: &mut Ctx, ty: &Type, vals: Vec<Value
     if bcx.is_unreachable() { return vals; }
     let leafs = struct_fields(ty, ctx.structs);
     let mut out = Vec::with_capacity(vals.len());
+    let mut logged = false;
     for (v, (_, lty)) in vals.into_iter().zip(leafs.iter()) {
         if is_heap_ty(lty) && !ctx.temp_of.contains_key(&v) {
+            if !logged {
+                logged = true;
+                COPY_LOG.with(|l| {
+                    if let Some(log) = l.borrow_mut().as_mut() {
+                        log.push(CopySite { span: ctx.cur_span, ty: ty.clone() });
+                    }
+                });
+            }
             let copy = emit_clone_word(bcx, ctx, v);
             reg_heap(bcx, ctx, lty, &[copy]);
             out.push(copy);
@@ -2724,7 +2763,10 @@ fn compile_expr_multi(
 ) -> Vec<Value> {
     use TypedExprKind as K;
     let discard = std::mem::take(&mut ctx.discard_next);
+    let outer_span = std::mem::replace(&mut ctx.cur_span, expr.span);
     let vals = compile_expr_multi_inner(expr, bcx, vars, ctx, discard);
+    // Back to the caller's expression, which may keep this value next.
+    ctx.cur_span = outer_span;
     // A view registers nothing (the `Var` arm registers a moved value itself),
     // nor does a struct literal, whose leaves are its fields' own, nor a
     // discarded block or conditional, whose temporaries already ended inside it.
@@ -5561,6 +5603,7 @@ impl<M: Module> Codegen<M> {
             owned_vars: VarSet::default(),
             known: Vec::new(),
             arena_marks: Vec::new(),
+            cur_span: Span::new((0, 0), (0, 0)),
         };
         // The function owns every parameter that is not borrowed, and its
         // `mut` parameters too. Those are dropped at its end, or handed back
@@ -5722,6 +5765,7 @@ impl<M: Module> Codegen<M> {
             owned_vars: VarSet::default(),
             known: Vec::new(),
             arena_marks: Vec::new(),
+            cur_span: Span::new((0, 0), (0, 0)),
         };
 
         let mut bindings: Vec<(String, Type)> = Vec::new();

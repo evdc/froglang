@@ -359,6 +359,14 @@ garbage collector. A consumer that keeps a value it only has a view of deep-copi
 a binding's last use hands its value over instead. Freed blocks go onto size-class free
 lists for reuse. Debug builds check at teardown that every object was freed.
 
+Copies are implicit, so `frog check --copies program.frog` lists them: each site where a value
+that is still in use gets deep-copied because something else keeps it, with its location
+and type. Passing a list to a function that only reads it, or using a binding for the last
+time, costs no copy.
+
+When `?` returns early it calls `abort(x)` on each live value whose type `provides Abort`,
+newest first, before returning the error. `provides Linear` requires `Abort`.
+
 - `FrogStr` — immutable, inline bytes after the header; NUL-terminated
 - `FrogList` — header + separate `i64` data buffer; grows via `realloc`
 

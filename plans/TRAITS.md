@@ -673,7 +673,8 @@ No new algorithm class, and reuses infrastructure that already exists:
   silent clone. Emitted at typeck, before codegen ever sees it.
 - At a branch join (`if`/`match`), a `Linear` binding must be consumed on every path or none —
   the same fixpoint the existing `mut`-liveness back-edge analysis (`transfer_loop`) already
-  computes, extended to error rather than merge when the arms disagree.
+  computes, extended to error rather than merge when the arms disagree. (Since tightened by
+  `plans/NOGC.md` §3.6 to "consumed on every success path": consuming it on none is an error too.)
 - No lifetimes, no region variables, no annotation burden beyond what `mut` already asks for.
   froglang has no borrowing (`&`) — `mut` is copy-in/copy-out, never a reference — so this needs
   none of the flow-sensitive lifetime inference that makes Rust's borrow checker (as opposed to

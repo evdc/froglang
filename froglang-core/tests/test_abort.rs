@@ -308,3 +308,133 @@ fn abort_must_be_implemented_when_provided() {
     let err = type_error("data T(x: Int) provides Abort\n1");
     assert!(err.contains("abort"), "{err}");
 }
+
+// ── Exits that leave a Linear value unconsumed ─────────────────────────
+
+fn eval_error(src: &str) -> String {
+    froglang_core::state::FrogState::new().eval(src).unwrap_err().to_string()
+}
+
+#[test]
+fn a_plain_return_with_a_live_linear_value_is_rejected() {
+    let err = eval_error(&prog(r#"
+func f(bad: Bool): Int = {
+    let r = open(1)
+    if bad then { return 0 } else none
+    close(r)
+    1
+}
+f(true)
+"#));
+    assert!(err.contains("'r' is Linear and is not consumed before this return"), "{err}");
+}
+
+#[test]
+fn a_plain_return_opposite_a_consuming_branch_is_rejected() {
+    let err = eval_error(&prog(r#"
+func f(bad: Bool): Int = {
+    let r = open(1)
+    if bad then { return 0 } else { close(r) }
+    1
+}
+f(true)
+"#));
+    assert!(err.contains("'r' is Linear and is not consumed before this return"), "{err}");
+}
+
+#[test]
+fn a_return_after_consuming_is_accepted() {
+    let src = prog(r#"
+func f(bad: Bool): Int = {
+    let r = open(1)
+    if bad then { close(r); return 0 } else { close(r) }
+    1
+}
+print("${f(true)}")
+"#);
+    assert_eq!(run(&src), "close 1\n0\n");
+}
+
+#[test]
+fn returning_the_linear_value_itself_consumes_it() {
+    let src = prog(r#"
+func f(bad: Bool): Res = {
+    let r = open(1)
+    if bad then { return r } else none
+    r
+}
+close(f(true))
+"#);
+    assert_eq!(run(&src), "close 1\n");
+}
+
+#[test]
+fn a_question_mark_that_cannot_reach_a_shadowed_linear_value_is_rejected() {
+    let err = eval_error(&prog(r#"
+func f(n: Int): Int | Bad = {
+    let r = open(1)
+    let r = 5
+    let v = step(n)?
+    v + r
+}
+1
+"#));
+    assert!(err.contains("'r' is Linear and is not consumed before this return"), "{err}");
+    assert!(err.contains("shadows it"), "{err}");
+}
+
+// ── Shadowing inside a nested scope ─────────────────────────────────────
+
+#[test]
+fn an_outer_value_shadowed_only_inside_a_branch_is_still_aborted() {
+    let src = prog(r#"
+func f(n: Int, flag: Bool): Int | Bad = {
+    let r = open(1)
+    if flag then { let r = 5; print("${r}") } else none
+    let v = step(n)?
+    close(r)
+    v
+}
+match f(-1, true) {
+    is Int(v) then print("ok")
+    is Bad(e) then print("err")
+}
+"#);
+    assert_eq!(run(&src), "5\nabort 1\nerr\n");
+}
+
+#[test]
+fn an_outer_value_shadowed_only_inside_a_loop_is_still_aborted() {
+    let src = prog(r#"
+func f(n: Int): Int | Bad = {
+    let r = open(1)
+    for r in 0..1 do print("${r}")
+    let v = step(n)?
+    close(r)
+    v
+}
+match f(-1) {
+    is Int(v) then print("ok")
+    is Bad(e) then print("err")
+}
+"#);
+    assert_eq!(run(&src), "0\nabort 1\nerr\n");
+}
+
+#[test]
+fn an_outer_value_consumed_before_an_inner_rebinding_is_not_aborted() {
+    let src = prog(r#"
+func f(n: Int, flag: Bool): Int | Bad = {
+    let r = open(1)
+    close(r)
+    if flag then { let r = open(2); close(r) } else none
+    let v = step(n)?
+    v
+}
+match f(-1, true) {
+    is Int(v) then print("ok")
+    is Bad(e) then print("err")
+}
+"#);
+    assert_eq!(run(&src), "close 1\nclose 2\nerr\n");
+}

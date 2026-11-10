@@ -1037,15 +1037,23 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      before the edge. For `Linear` a move is consumption, so this is exact. For a plain `Abort` type a
      move is only the last use, so a value whose last use is the failing expression itself is dropped,
      not aborted. `catch`, `!`, a plain `return` and panic abort nothing.
-   - **Not aborted (conservative, never twice):** a binding shadowed by a later declaration of the
-     same name; a loop or comprehension variable; a union-typed binding (no single impl); and any
-     binding declared outside the enclosing `with Arena` block, since outer places are frozen there.
+   - **Not aborted (conservative, never twice):** a binding shadowed, at the edge, by a later
+     declaration of the same name; a loop or comprehension variable; a union-typed binding (no single
+     impl); and any binding declared outside the enclosing `with Arena` block, since outer places are
+     frozen there. A `Linear` value in one of these cases makes the `?` a type error (rule 3 below)
+     rather than a leak. Bindings are tracked per declaration, not per name, so a shadow that has
+     gone out of scope no longer hides the outer binding.
    - **`linear.rs` rule 2** no longer counts a branch that ends in `Never` (the `?` error arm), and
      no longer counts a binding declared inside the branch's own block. The second was an existing bug:
      a Linear `let` used inside one arm read as "consumed on only one branch".
-   - **Not done:** "failing to consume a Linear value is a compile error" (§3.6) is still not
-     enforced; `linear.rs` checks aliasing and branch balance only. The resource table and panic-time
-     aborts belong to step 7.
+   - **`linear.rs` rule 3 (2026-11-10)**, §3.6's "failing to consume is a compile error":
+     `check_exits` requires every `Linear` binding of a function to be consumed before its scope ends
+     by falling through (end of its block, end of the body for a parameter) and before every
+     `return`. The `return` in a `?` arm sees the inserted `abort(x)` calls, so a `?` that cannot abort
+     a live `Linear` value is rejected. Exempt: `mut` parameters (copied out), the argument of a
+     type's own `abort`, and paths that panic. Still loose: a value declared outside a loop and
+     consumed inside it counts as consumed. Top-level entries are unchecked (see `linear.rs`).
+   - **Not done:** the resource table and panic-time aborts belong to step 7.
    - **Tests.** `tests/test_abort.rs`, 17 tests, observing order and absence of calls through printing
      `abort` bodies, all under the leak oracle. `test_linear.rs` gained `Abort` impls. `cargo test
      --workspace`: 1,289 passed. Clippy: 18 warnings, none new. `orders`, `words` and `life` match the

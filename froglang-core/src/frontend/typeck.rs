@@ -1506,13 +1506,26 @@ impl TypeChecker {
     /// The symbol of `ty`'s `Abort::abort` impl, if `ty` provides `Abort`
     /// (`plans/NOGC.md` §3.8). `Abort` is an ordinary source-declared trait
     /// (see `cached_iterable_container_traits`), so the answer is just the
-    /// impl table's entry for the type's declared name. A type that only
-    /// satisfies `Abort` structurally (an anonymous union of providers) has no
-    /// single impl to call and yields `None`; so does a nominal union, whose
-    /// impl is indexed under its variants.
+    /// impl table's entry for the type's declared name.
+    ///
+    /// A union has no key of its own: a nominal union's impl is indexed under
+    /// each of its variants (`impl_index_keys`), all with the one symbol that
+    /// takes the whole union. So a union yields that symbol when every
+    /// variant's impl is the same one, and `None` otherwise: an anonymous
+    /// union of separately-implemented types has no single `abort` to call.
     pub(crate) fn abort_symbol(&self, ty: &Type) -> Option<String> {
-        let key = Self::grant_key(ty)?;
-        self.impls.get(&("Abort".to_string(), key))?.get("abort").cloned()
+        let lookup = |t: &Type| -> Option<String> {
+            let key = Self::grant_key(t)?;
+            self.impls.get(&("Abort".to_string(), key))?.get("abort").cloned()
+        };
+        match ty {
+            Type::Union(members) => {
+                let mut symbols = members.iter().map(lookup);
+                let first = symbols.next()??;
+                symbols.all(|s| s.as_ref() == Some(&first)).then_some(first)
+            }
+            _ => lookup(ty),
+        }
     }
 
     /// `type_implements`'s body, carrying the set of struct types already
@@ -3114,12 +3127,18 @@ impl TypeChecker {
             return Ok(());
         }
         let mut out: Vec<Spanned<Expression>> = Vec::with_capacity(stmts.len());
+        // Every type this entry made `Linear`: its key, its declared name, and
+        // the grant's span. See `require_abort_for_linear`.
+        let mut linear_grants: Vec<(String, String, Span)> = Vec::new();
         for s in std::mem::take(stmts) {
             let span = s.span;
             match s.item {
                 Expression::ImplDecl(i) => {
                     let self_ty = self.resolve_type_expr(&i.self_ty)?;
+                    let before = self.linear_impl_keys(&i.traits);
                     let members = self.register_impl(&i.traits, &self_ty, i.members, span)?;
+                    let name = i.self_ty.item.to_string();
+                    self.record_linear_grants(before, &name, span, &mut linear_grants);
                     out.extend(members);
                 }
                 Expression::DataDecl(mut d) => {
@@ -3137,15 +3156,64 @@ impl TypeChecker {
                     let provides = d.provides.clone();
                     out.push(Spanned::from(Expression::DataDecl(d), span));
                     if !provides.is_empty() {
+                        let before = self.linear_impl_keys(&provides);
+                        let name = match out.last().map(|s| &s.item) {
+                            Some(Expression::DataDecl(d)) => d.name.clone(),
+                            _ => unreachable!("pushed just above"),
+                        };
                         let lowered = self.register_impl(&provides, &self_ty, members, span)?;
+                        self.record_linear_grants(before, &name, span, &mut linear_grants);
                         out.extend(lowered);
                     }
                 }
                 other => out.push(Spanned::from(other, span)),
             }
         }
+        self.require_abort_for_linear(&linear_grants)?;
         *stmts = out;
         Ok(())
+    }
+
+    /// The keys `Linear` is implemented under, when `traits` is about to
+    /// grant it (`None` otherwise, so the common case costs nothing).
+    fn linear_impl_keys(&self, traits: &[String]) -> Option<HashSet<String>> {
+        traits.iter().any(|t| t == "Linear").then(|| {
+            self.impls.keys().filter(|(t, _)| t == "Linear").map(|(_, k)| k.clone()).collect()
+        })
+    }
+
+    /// Record the `Linear` keys an impl just added (against `before`, from
+    /// `linear_impl_keys`), under the impl's declared type `name`.
+    fn record_linear_grants(
+        &self,
+        before: Option<HashSet<String>>,
+        name: &str,
+        span: Span,
+        grants: &mut Vec<(String, String, Span)>,
+    ) {
+        let Some(before) = before else { return };
+        for (t, k) in self.impls.keys() {
+            if t == "Linear" && !before.contains(k) { grants.push((k.clone(), name.to_string(), span)); }
+        }
+    }
+
+    /// `Linear` requires `Abort` (`plans/NOGC.md` §3.8): a linear value with
+    /// no failure path could not survive a `?` that fires while it is live,
+    /// so there would be nothing for the edge to call. Checked after every
+    /// impl in the entry is registered, so it holds however `Linear` was
+    /// granted (a declaration's or a union's `provides`, or a standalone
+    /// `provides Linear for T`) and wherever in the entry `Abort` was.
+    fn require_abort_for_linear(&self, grants: &[(String, String, Span)]) -> Result<(), Spanned<TypeError>> {
+        match grants.iter().find(|(key, _, _)| !self.impls.contains_key(&("Abort".to_string(), key.clone()))) {
+            Some((_, name, span)) => Err(Spanned::from(TypeError {
+                msg: format!(
+                    "'{}' provides Linear, so it must also provide Abort — \
+                     `?` calls `abort` on a live Linear value when it returns early",
+                    name
+                ),
+            }, *span)),
+            None => Ok(()),
+        }
     }
 
     /// The `member_index`/`impls`/`provides` keys an impl for `self_ty` must
@@ -3847,19 +3915,8 @@ impl TypeChecker {
                             Err(msg) => return Err(Spanned::from(TypeError { msg }, s.span)),
                         }
                     }
-                    // `Linear` requires `Abort` (`plans/NOGC.md` §3.8): a linear
-                    // value with no failure path could not survive a `?` that
-                    // fires while it is live, so there would be nothing for the
-                    // edge to call.
-                    if d.provides.iter().any(|n| n == "Linear") && !d.provides.iter().any(|n| n == "Abort") {
-                        return Err(Spanned::from(TypeError {
-                            msg: format!(
-                                "'{}' provides Linear, so it must also provide Abort — \
-                                 `?` calls `abort` on a live Linear value when it returns early",
-                                d.name
-                            ),
-                        }, s.span));
-                    }
+                    // `Linear` requires `Abort`, checked once every impl in the
+                    // entry is registered: `expand_impls`.
                     // A union's `provides` grants every variant the trait
                     // (the doc's "a union satisfies a trait iff every
                     // member does" rule then makes the alias itself

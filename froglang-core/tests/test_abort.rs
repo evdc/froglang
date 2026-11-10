@@ -508,3 +508,68 @@ match g(-1) {
 "#);
     assert_eq!(run(&src), "undo 9\nerr\n");
 }
+
+// ── However `Linear` is granted, it needs `Abort` ───────────────────────
+
+#[test]
+fn a_standalone_linear_grant_without_abort_is_rejected() {
+    let err = eval_error("data T(x: Int)\nprovides Linear for T { }\n1");
+    assert!(err.contains("'T' provides Linear, so it must also provide Abort"), "{err}");
+}
+
+#[test]
+fn a_linear_primitive_without_abort_is_rejected() {
+    let err = eval_error("provides Linear for Int { }\n1");
+    assert!(err.contains("'Int' provides Linear, so it must also provide Abort"), "{err}");
+}
+
+#[test]
+fn linear_and_abort_may_be_granted_separately() {
+    let src = r#"
+error Bad(msg: Str)
+func step(n: Int): Int | Bad = if n < 0 then Bad(msg="neg") else n
+data T(x: Int) provides Linear
+provides Abort for T { func abort(t: T): None = print("abort ${t.x}") }
+func f(n: Int): Int | Bad = {
+    let t = T(x=4)
+    let v = step(n)?
+    t.x + v
+}
+match f(-1) {
+    is Int(v) then print("ok ${v}")
+    is Bad(e) then print("err")
+}
+"#;
+    assert_eq!(run(src), "abort 4\nerr\n");
+}
+
+/// A nominal union's `abort` is indexed under its variants, so `?` used to
+/// find no impl for the union and could not abort it. The success path
+/// consumes it by moving it into a struct: `match` on a Linear union is a
+/// separate, open gap (its desugared subject is read once per arm).
+#[test]
+fn a_linear_nominal_union_is_aborted() {
+    let src = r#"
+error Bad(msg: Str)
+func step(n: Int): Int | Bad = if n < 0 then Bad(msg="neg") else n
+data R is A(x: Int) | B(y: Int) provides Linear, Abort {
+    func abort(r: R): None = print("abort")
+}
+data Keep(r: R)
+func f(n: Int): Int | Bad = {
+    let r: R = A(x=1)
+    let v = step(n)?
+    let k = Keep(r=r)
+    v
+}
+match f(-1) {
+    is Int(v) then print("ok")
+    is Bad(e) then print("err")
+}
+match f(1) {
+    is Int(v) then print("ok ${v}")
+    is Bad(e) then print("err")
+}
+"#;
+    assert_eq!(run(src), "abort\nerr\nok 1\n");
+}

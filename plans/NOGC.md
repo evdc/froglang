@@ -1025,7 +1025,9 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    - **The trait.** `Abort` is an ordinary source-declared trait, seeded next to `Iterable` and
      `Container` (`trait Abort { func abort(x: Self) }`), so `provides Abort { func abort(...) }`
      goes through the normal impl path. `data T provides Linear` without `Abort` is a type error at
-     the declaration.
+     the declaration. The rule is checked once an entry's impls are all registered, so it holds
+     however `Linear` is granted (a declaration's or union's `provides`, or a standalone `provides
+     Linear for T`), and the two may be granted separately.
    - **The `?` edge.** Typeck cannot know which values are owned at a `?`, so the error arm is
      `{ abort!edge(); return e }`, where `abort!edge` is a reserved builtin. `linear::insert_aborts`
      runs after `number_nodes` (it reads liveness), replaces each placeholder with `abort(x)` calls,
@@ -1042,8 +1044,9 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      move is only the last use, so a value whose last use is the failing expression itself is dropped,
      not aborted. `catch`, `!`, a plain `return` and panic abort nothing.
    - **Not aborted (conservative, never twice):** a binding shadowed, at the edge, by a later
-     declaration of the same name; a loop or comprehension variable; a union-typed binding (no single
-     impl); and any binding declared outside the enclosing `with Arena` block, since outer places are
+     declaration of the same name; a loop or comprehension variable; an anonymous-union binding
+     whose members have different `abort` impls (a nominal union's one impl is found through its
+     variants); and any binding declared outside the enclosing `with Arena` block, since outer places are
      frozen there. A `Linear` value in one of these cases makes the `?` a type error (rule 3 below)
      rather than a leak. Bindings are tracked per declaration, not per name, so a shadow that has
      gone out of scope no longer hides the outer binding.

@@ -6,7 +6,6 @@ use crate::frontend::parser::ParseError;
 use crate::frontend::modules;
 use crate::frontend::typeck::{Type, TypeChecker};
 use crate::frontend::tokens::Spanned;
-use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
 use crate::frontend::expression::Expression;
 use crate::runtime::heap::{Heap, ACTIVE_HEAP};
 use crate::runtime;
@@ -323,53 +322,14 @@ impl FrogState {
                 return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
             }
         };
-        if let Err(e) = self.tc.validate_codegen_constraints(&typed) {
+        // Every pass that can still reject the program, and the rewrites
+        // codegen relies on — shared with `frog build`/`check` so they accept
+        // exactly what this does. See `frontend::pipeline`.
+        let prior_exit_live: crate::frontend::liveness::NameSet = self.env_types.keys().cloned().collect();
+        if let Err(e) = crate::frontend::pipeline::lower_checked(&mut self.tc, &mut typed, &prior_exit_live) {
             self.tc.restore(cp);
             return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
         }
-        // `TRAITS.md` Stage 3b: real monomorphization. Clones and
-        // specializes every generic call site's declaration into a
-        // distinctly-named instantiation (mutating `typed` in place —
-        // stripping any raw, un-substituted generic declaration and
-        // inserting its compiled instantiations instead, with every call
-        // site rewritten to the matching mangled name) rather than
-        // rejecting a second concrete type the way Stage 2's gate did.
-        if let Err(e) = self.tc.monomorphize_generics(&mut typed) {
-            self.tc.restore(cp);
-            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-        }
-        // Tier 1 function values: hoist every lambda and nested `func` to
-        // the top level, turn captures into parameters, and specialize
-        // every higher-order callee on the function it was passed. Must
-        // run after monomorphization (a generic higher-order function is
-        // specialized per *type* first, then per function argument) and
-        // before `desugar_notation`, whose synthesized `Var` callables
-        // this pass must not see.
-        if let Err(e) = self.tc.lower_function_values(&mut typed) {
-            self.tc.restore(cp);
-            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-        }
-        // `plans/DATA.md` stage 5: expand every `repr(...)` placeholder
-        // left by `TypeChecker::lower_call`'s `is_repr` arm into its
-        // per-type notation. Must run after monomorphization (every type
-        // in the tree is fully substituted only now — see
-        // `TypeChecker::desugar_notation`'s own doc comment) and before
-        // `number_nodes` (so the nodes it synthesizes get numbered too).
-        if let Err(e) = self.tc.desugar_notation(&mut typed) {
-            self.tc.restore(cp);
-            return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-        }
-        // Stamp every node with a fresh id — including whatever
-        // `monomorphize_generics`/`desugar_notation` just cloned or
-        // synthesized in, which starts out unnumbered (`NodeId`'s doc
-        // comment) — before codegen's liveness-dependent passes touch the
-        // tree. Must run after both, not before, so newly-inserted bodies
-        // get real ids too.
-        crate::frontend::liveness::number_nodes(&mut typed);
-        // `?` aborts live `Abort` values (plans/NOGC.md §3.8). Needs liveness,
-        // so it runs on the numbered tree, and the calls it adds need ids.
-        crate::frontend::linear::insert_aborts(&mut typed, &self.tc);
-        crate::frontend::liveness::number_nodes(&mut typed);
 
         // Parameter conventions (plans/NOGC.md §1.2): which arguments a callee
         // only borrows, so codegen knows who frees them.
@@ -380,21 +340,6 @@ impl FrogState {
             eprint!("{}", conv.dump());
         }
         crate::frontend::conventions::publish(&conv);
-
-        // `TRAITS.md` Part 7: `Linear` violations are type errors, and must
-        // be caught here — before codegen, which has no way to report a
-        // clean `Spanned<TypeError>` (it only ever panics on a bad tree).
-        {
-            let stmts: &[Spanned<TypedExpr>] = match &typed.item.kind {
-                TypedExprKind::Block(s) => s.as_slice(),
-                _ => std::slice::from_ref(&typed),
-            };
-            let prior_exit_live: crate::frontend::liveness::NameSet = self.env_types.keys().cloned().collect();
-            if let Err(e) = crate::frontend::linear::check(stmts, &prior_exit_live, &self.tc) {
-                self.tc.restore(cp);
-                return Err(FrogError::Type(crate::diagnostics::render_span(&filename, src, e.span, &e.item.msg)));
-            }
-        }
 
         let result_ty = typed.item.ty.clone();
 

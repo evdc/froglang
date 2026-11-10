@@ -6078,22 +6078,7 @@ pub fn compile_and_run(src: &str) -> i64 {
     let ast = Parser::parse(src).expect("parse error");
     let mut tc = TypeChecker::new();
     let mut typed = tc.check_and_lower(ast).expect("type error");
-    // `plans/DATA.md` stage 5 — see the matching call in `state.rs`'s
-    // `eval_with_base` for why this runs before `number_nodes`. No
-    // `monomorphize_generics` call precedes it here (this entry point
-    // never monomorphizes at all — a pre-existing limitation, not one
-    // `repr` introduces), so `repr(x)` inside a generic function's body
-    // is unsupported through this path exactly as generics generally are.
-    // Tier 1 function values — see the matching call in `state.rs`. Like
-    // `repr` above, this runs without a preceding `monomorphize_generics`
-    // here, so a *generic* higher-order function is unsupported through
-    // this entry point exactly as generics generally are; a monomorphic
-    // one works.
-    tc.lower_function_values(&mut typed).expect("function value error");
-    tc.desugar_notation(&mut typed).expect("repr type error");
-    crate::frontend::liveness::number_nodes(&mut typed);
-    crate::frontend::linear::insert_aborts(&mut typed, &tc);
-    crate::frontend::liveness::number_nodes(&mut typed);
+    crate::frontend::pipeline::lower_checked(&mut tc, &mut typed, &Default::default()).expect("type error");
 
     let mut codegen = JitCodegen::new();
     // The same conventions `FrogState::eval_with_base` infers, so codegen

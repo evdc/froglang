@@ -100,30 +100,33 @@ fn check(src: &str, path: Option<&std::path::Path>) {
     };
     let ast = Spanned::from(Expression::Block(stmts), span);
 
+    // `check` should not accept a program `run` rejects, so it runs every
+    // rejecting pass `run` does, not just type-checking.
     let (mut tc, _) = stdlib_checker();
+    let typed = lower_checked_or_exit(&mut tc, ast);
+    println!(":: {}", typed.item.ty);
+}
+
+/// Type-check `ast` as a whole program and run `frontend::pipeline::
+/// lower_checked`, the same passes `FrogState::eval_with_base` runs. Exits
+/// the process on a type error.
+fn lower_checked_or_exit(
+    tc: &mut froglang_core::frontend::typeck::TypeChecker,
+    ast: froglang_core::frontend::tokens::Spanned<froglang_core::frontend::expression::Expression>,
+) -> froglang_core::frontend::tokens::Spanned<froglang_core::frontend::typed_ast::TypedExpr> {
     let mut typed = match tc.check_and_lower(ast) {
         Ok(typed) => typed,
         Err(e)    => { println!("Type error: {}", e); process::exit(1); }
     };
-    // `check` should not accept a program `run` rejects. Function values
-    // are decided by a pass that runs *after* lowering (it needs every
-    // type substituted), so checking them means running it — which is
-    // also why `monomorphize_generics` has to come first, exactly as in
-    // `FrogState::eval_with_base`.
-    if let Err(e) = tc.monomorphize_generics(&mut typed)
-        .and_then(|()| tc.lower_function_values(&mut typed))
-    {
+    if let Err(e) = froglang_core::frontend::pipeline::lower_checked(tc, &mut typed, &Default::default()) {
         println!("Type error: {}", e);
         process::exit(1);
     }
-    println!(":: {}", typed.item.ty);
+    typed
 }
 
-/// The lowering pipeline both native paths (`build`, `check --copies`) run
-/// before object codegen — the same steps `FrogState::eval_with_base` runs
-/// before the JIT: type-check, monomorphize, function values, notation, node
-/// numbering, `?` aborts, then parameter conventions. Exits the process on a
-/// type error.
+/// The lowering both native paths (`build`, `check --copies`) run before
+/// object codegen: `lower_checked_or_exit`, then parameter conventions.
 fn lower_for_object(
     ast: froglang_core::frontend::tokens::Spanned<froglang_core::frontend::expression::Expression>,
 ) -> (
@@ -132,23 +135,10 @@ fn lower_for_object(
     froglang_core::codegen::ObjectCodegen,
 ) {
     use froglang_core::codegen::ObjectCodegen;
-    use froglang_core::frontend::{conventions, linear, liveness};
+    use froglang_core::frontend::conventions;
 
     let (mut tc, hosts) = stdlib_checker();
-    let mut typed = match tc.check_and_lower(ast) {
-        Ok(typed) => typed,
-        Err(e)    => { println!("Type error: {}", e); process::exit(1); }
-    };
-    if let Err(e) = tc.monomorphize_generics(&mut typed)
-        .and_then(|()| tc.lower_function_values(&mut typed))
-        .and_then(|()| tc.desugar_notation(&mut typed))
-    {
-        println!("Type error: {}", e);
-        process::exit(1);
-    }
-    liveness::number_nodes(&mut typed);
-    linear::insert_aborts(&mut typed, &tc);
-    liveness::number_nodes(&mut typed);
+    let typed = lower_checked_or_exit(&mut tc, ast);
 
     let codegen = match ObjectCodegen::new_object(&hosts) {
         Ok(c) => c,

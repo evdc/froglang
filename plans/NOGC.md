@@ -1029,8 +1029,8 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    - **The `?` edge.** Typeck cannot know which values are owned at a `?`, so the error arm is
      `{ abort!edge(); return e }`, where `abort!edge` is a reserved builtin. `linear::insert_aborts`
      runs after `number_nodes` (it reads liveness), replaces each placeholder with `abort(x)` calls,
-     newest binding first, and `number_nodes` runs again. It runs in `FrogState::eval_with_base` and
-     `compile_and_run`. This differs from the plan's "typeck-level desugar", which assumed a live set
+     newest binding first, and `number_nodes` runs again. It runs in `frontend::pipeline::lower_checked`,
+     which every compile path (JIT, `frog build`, `check`, `check --copies`) shares. This differs from the plan's "typeck-level desugar", which assumed a live set
      typeck does not have; codegen still needs nothing new.
    - **What is aborted.** A binding of the enclosing function (a `let`/`mut` or a non-`mut`
      parameter) in scope at the edge, whose type provides `Abort`, with no `Move`-classified read

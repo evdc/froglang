@@ -140,3 +140,39 @@ print("done")
 "#);
     assert_eq!(out, "abort 1\nclose 1\ndone\n");
 }
+
+/// Every native path runs the same rejecting passes as `frog run`
+/// (`frontend::pipeline`). A Linear value consumed on only one branch used
+/// to pass `build`, `check` and `check --copies`, because they skipped
+/// `linear::check`.
+const LINEAR_LEAK: &str = "data Buf(x: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
+                           func consume(b: Buf): Int = b.x\n\
+                           func f(c: Bool): Int = {\n\
+                           let a = Buf(x=1)\n\
+                           if c then consume(a) else 0\n\
+                           }\n\
+                           print(\"${f(true)}\")";
+
+fn assert_rejects_linear_leak(args: &[&str]) {
+    let dir = scratch(&format!("linear_{}", args.join("_").replace('-', "")));
+    let mut cmd = Command::new(FROG);
+    cmd.args(args).arg(LINEAR_LEAK);
+    if args[0] == "build" { cmd.arg("-o").arg(dir.join("prog")); }
+    let out = cmd.output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{:?} accepted a Linear leak:\n{stdout}", args);
+    assert!(stdout.contains("consumed on only one branch"), "{:?}: {stdout}", args);
+}
+
+#[test]
+fn run_rejects_a_linear_leak() { assert_rejects_linear_leak(&["run"]); }
+
+#[test]
+fn build_rejects_a_linear_leak() { assert_rejects_linear_leak(&["build"]); }
+
+#[test]
+fn check_rejects_a_linear_leak() { assert_rejects_linear_leak(&["check"]); }
+
+#[test]
+fn check_copies_rejects_a_linear_leak() { assert_rejects_linear_leak(&["check", "--copies"]); }

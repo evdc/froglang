@@ -10,3 +10,4 @@ pub mod modules;
 pub mod liveness;
 pub mod conventions;
 pub mod linear;
+pub mod pipeline;

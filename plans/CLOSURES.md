@@ -1,8 +1,9 @@
 # First-class functions
 
 Status: **tier 1 implemented** (2026-09-06) — `TypeChecker::lower_function_values`
-(`frontend/typeck.rs`), `tests/test_closures.rs`. Tier 2 (escaping closures as runtime
-values) is design only, and the "Foundational choices" table is the part meant to be stable.
+(`frontend/typeck.rs`), `tests/test_closures.rs`. Tier 1.5 (function pointers) and tier 2
+(escaping closures) are design only; see "Beyond tier 1". The "Foundational choices" table
+is the part meant to be stable.
 
 This supersedes the roadmap's "Top-level `let` bindings aren't capturable from functions"
 bullet, and answers the question `plans/MUTABILITY.md` Stage 5 parks on ("closures wait on
@@ -158,23 +159,82 @@ are already roots, so `FROG_GC_STRESS=1` needed nothing new.
 Compile time, measured A/B on a 13,000-statement program: **0.07s → 0.08s**. Noise on
 anything real; not worth a guard.
 
-## Tier 2 — escaping closures
+## Beyond tier 1 — the design space (2026-11-10)
 
-Not built. A function value that leaves the scope that created it needs a real
-`(code pointer, captured environment)` pair with the environment GC-traced, plus an
-indirect call. The cases that need it are rejected today, each naming why: returned from a
-function, stored in a list or a struct/union field, or bound to a `mut`.
+Tier 1 covers passing a function *down*: to a callee the compiler can see, captures
+included. What it rejects is a function value that **escapes**: stored in a list, dict, or
+struct/union field, returned, or bound to a `mut`. That is the ordinary-programming case:
+dispatch tables, a handler held in a struct, a returned configured function.
 
-Two things to decide before building it, both already implied by tier 1:
+Why this is tractable here at all: capture is by value and immutable, and froglang has no
+references, so an environment is an *owned, immutable record*. A closure is a tree like any
+other value: copy copies the record, drop drops it, and no collector or refcount is needed
+(`plans/NOGC.md` §1.4 item 2). The costs that make closures hard elsewhere (Rust's
+lifetimes, Swift's ARC and `@escaping`, Go's loop-variable capture) all come from
+capturing references.
 
-- **The fallback relationship.** Tier 1 has no fallback, so a program that specializes a
-  lot pays for it in code size. Capping specialization (specialize small bodies, fall back
-  otherwise) is the usual answer and needs tier 2 to fall back *to* — which is the main
-  argument for building it beyond expressiveness.
-- **Whether capture stays by value.** It should. An escaping closure with by-reference
-  capture is precisely the aliasing `MUTABILITY.md` exists to prevent, and by-value capture
-  makes the environment a plain immutable record the collector can trace without any
-  write barrier.
+| Option | Representation | Covers | Cost | Fit |
+| --- | --- | --- | --- | --- |
+| A. Status quo | none; a union + `match` by hand | passing down | none | what `SELFHOST.md` plans for `froggc` anyway |
+| **B. Tier 1.5: function pointers** | one word: a capture-free function's code | dict/list dispatch, a named handler in a struct, returning a named function | small | works across REPL entries and for the host |
+| **C. Tier 2: closures** | `{code, env, vtable}`, indirect call | everything, incl. returned capturing closures and partial application | medium–large | the shape `NOGC.md` §1.4 already names |
+| D. Lambda sets (Roc) | per-type set of lambdas → tagged union, call = `match` | everything, no indirect calls | large | **poor** — needs a closed world |
+
+**Lambda sets are rejected.** They look attractive because boxed tagged unions already
+exist to build them on, but they need every lambda that can reach a value to be known when
+that value's code is compiled. `FrogState` compiles one REPL entry at a time: a later
+entry that stores a new lambda into a dict built by an earlier one adds a variant the
+earlier code cannot dispatch on. Host embedding has the same problem. Roc's experience is
+also that lambda-set inference is a long-running source of compiler bugs.
+
+**Plan: build B, and lay it out as the degenerate case of C.** If a function-pointer value
+is `{code, env = null}`, tier 2 later only adds a non-null environment and a vtable. Nothing
+already stored or compiled changes shape. Tier 1 stays the fast path whenever the callee is
+statically known, so the indirect call is only ever paid for a value that really escapes.
+
+### Tier 1.5 — function pointers
+
+- **What qualifies:** a top-level `func`, or a lambda with no captures (after hoisting, the
+  same thing). A capturing function in an escaping position stays rejected, with a message
+  pointing at a union + `match` until tier 2 exists.
+- **Codegen:** a scalar leaf holding the function's address, and Cranelift `call_indirect`
+  with the signature derived from the `Function` type. No drop, and copy is a word copy.
+- **Conventions:** an indirect call has no callee name for `conventions::infer` to resolve,
+  so either the function type fixes the convention (below), or every indirect call is
+  treated as consuming. Starting with "consuming" is safe and only costs copies, which
+  `check --copies` reports.
+- **Traits:** no `Eq`, no `Hash` (so never a dict *key*), no `repr`/JSON/`read`. Structural
+  derivation already makes a struct holding one lose `Eq`.
+- **Also fixes:** `{ "a": f }` today reports "Unknown type 'f'" instead of the "function used
+  as a value" message.
+
+### Tier 2 — escaping closures
+
+A capturing function value that escapes needs `(code, owned env)` plus a per-closure vtable
+(copy, drop, `abort`), because the type `(Int -> Int)` erases what the environment holds. Not
+built. Decide these before building it:
+
+1. **The convention of an indirect call.** Either the function type carries borrow/consume
+   per parameter (precise, but visible in types), or one rule applies to every function
+   value, for example "arguments are borrowed", with a wrapper that copies first when the
+   real body consumes (Swift's reabstraction thunks). Either way the copies show up in
+   `check --copies`.
+2. **Linear and second-class captures.** A closure capturing a `Linear` value would itself be
+   `Linear`, a call-once function, which means linearity in function types. Start by
+   rejecting `Linear` captures in escaping closures. Tier 1 can keep allowing them, because
+   lifting turns them into ordinary arguments. `NOGC.md` §3.3 already rejects capturing a
+   second-class `with` handle in an escaping closure.
+3. **Capture stays by value.** An escaping closure with by-reference capture is precisely the
+   aliasing `MUTABILITY.md` exists to prevent.
+
+The bulk of the work is spread rather than deep: every subsystem that matches on `Type` needs
+a function case. That means heap leaves, copy/drop, union element layouts, `repr`/JSON/`read`
+(likely "unsupported"), `FrogValue` and host marshalling, and the copy lint. Tier 2 is also
+what tier 1's specialization would fall back to, so the code size it adds can be capped.
+
+**What it buys beyond expressiveness:** host callbacks (an opaque function handle in
+`FrogValue`), a `spawn` that takes a function, and nothing awkward for the emit-C backend,
+where it is a function pointer and an env struct.
 
 ## Deferred, by design
 

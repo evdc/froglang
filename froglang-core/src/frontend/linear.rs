@@ -227,6 +227,18 @@ fn walk(
             Ok(HashSet::new())
         }
 
+        // A tag test only inspects its target, whatever the target is.
+        TypedExprKind::TypeTag { target, .. } | TypedExprKind::IsVariant { target, .. }
+            if matches!(target.item.kind, TypedExprKind::Var(_)) => Ok(HashSet::new()),
+
+        TypedExprKind::FieldAccess { .. } => match projection(e) {
+            Some((root, path)) => project(e, root, &path, liveness, ctx, suppress),
+            None => {
+                let TypedExprKind::FieldAccess { target, .. } = &e.item.kind else { unreachable!() };
+                walk(target, liveness, ctx, suppress)
+            }
+        },
+
         TypedExprKind::Unary { expr, .. }
         | TypedExprKind::Truthy(expr)
         | TypedExprKind::Coerce(expr)
@@ -235,8 +247,7 @@ fn walk(
         | TypedExprKind::Narrow { value: expr, .. }
         | TypedExprKind::TypeTag { target: expr, .. }
         | TypedExprKind::IsVariant { target: expr, .. }
-        | TypedExprKind::VariantField { target: expr, .. }
-        | TypedExprKind::FieldAccess { target: expr, .. } => walk(expr, liveness, ctx, suppress),
+        | TypedExprKind::VariantField { target: expr, .. } => walk(expr, liveness, ctx, suppress),
 
         TypedExprKind::Binary { left, right, .. } =>
             Ok(union(walk(left, liveness, ctx, suppress)?, walk(right, liveness, ctx, suppress)?)),
@@ -371,6 +382,52 @@ fn walk(
     }
 }
 
+/// `e` as a field path read out of a binding: `k.a.b` is `(k, [a, b])`.
+fn projection(e: &Spanned<TypedExpr>) -> Option<(&Spanned<TypedExpr>, Vec<String>)> {
+    match &e.item.kind {
+        TypedExprKind::FieldAccess { target, field, .. } => {
+            let (root, mut path) = projection(target)?;
+            path.push(field.clone());
+            Some((root, path))
+        }
+        TypedExprKind::Var(_) => Some((e, Vec::new())),
+        _ => None,
+    }
+}
+
+/// Rule 1 for a field read `e` = `root.path` of a Linear `root`. While
+/// `root` stays live (a `Copy`-classified read), reading a part that is not
+/// Linear only inspects it; pulling a Linear part out would leave `root`
+/// still holding it, which is aliasing. At `root`'s last use the read takes
+/// `root` apart, which consumes it: allowed when nothing else Linear in it is
+/// left behind. This is how a granted-Linear struct with no Linear fields is
+/// consumed at all, like taking a union apart with `match`.
+fn project(
+    e: &Spanned<TypedExpr>,
+    root: &Spanned<TypedExpr>,
+    path: &[String],
+    liveness: &Liveness,
+    ctx: &Ctx,
+    suppress: Option<&str>,
+) -> Result<HashSet<String>, Spanned<TypeError>> {
+    let TypedExprKind::Var(name) = &root.item.kind else { unreachable!() };
+    let exempt = suppress == Some(name.as_str()) || ctx.mut_exempt.contains(name) || is_match_subject(name);
+    if exempt || !ctx.tc.implements_linear(&root.item.ty) { return Ok(HashSet::new()); }
+    match liveness.ownership(root.item.id) {
+        Ownership::Copy if ctx.tc.implements_linear(&e.item.ty) => Err(alias_error(name, root.span)),
+        Ownership::Copy => Ok(HashSet::new()),
+        Ownership::Move => match ctx.tc.linear_left_behind(&root.item.ty, path) {
+            Some(part) => Err(Spanned::from(TypeError {
+                msg: format!(
+                    "reading '{}.{}' at the last use of '{}' takes it apart, which drops '{}.{}', which is Linear — consume that first",
+                    name, path.join("."), name, name, part,
+                ),
+            }, e.span)),
+            None => Ok(HashSet::from([name.clone()])),
+        },
+    }
+}
+
 // ── Every path that doesn't fail consumes its Linear values (`plans/NOGC.md` §3.6) ──
 
 /// Rule 3: "consumed on every *success* path" (§3.6). A `Linear` binding of
@@ -413,29 +470,29 @@ fn check_exits(
 }
 
 /// Walks a function body forward. A binding's `info` is the span of its
-/// declaration when its type is `Linear`, and `None` otherwise.
+/// declaration and its type when the type is `Linear`, and `None` otherwise.
 struct Exits<'a> {
     tc: &'a TypeChecker,
     live: &'a Liveness,
-    scope: Scope<Option<Span>>,
+    scope: Scope<Option<(Span, Type)>>,
 }
 
 impl Exits<'_> {
     fn declare(&mut self, name: &str, ty: &Type, span: Span) {
-        let linear = self.tc.implements_linear(ty).then_some(span);
+        let linear = self.tc.implements_linear(ty).then(|| (span, ty.clone()));
         self.scope.declare(name, linear);
     }
 
     /// The first `Linear` binding from `mark` up that is still owned.
     fn unconsumed(&self, mark: usize) -> Option<(usize, Span)> {
         let s = &self.scope;
-        (mark..s.entries.len()).find_map(|i| s.entries[i].info.filter(|_| !s.is_moved(i)).map(|sp| (i, sp)))
+        (mark..s.entries.len()).find_map(|i| s.entries[i].info.as_ref().filter(|_| !s.is_moved(i)).map(|(sp, _)| (i, *sp)))
     }
 
     /// The bindings from `mark` up go out of scope here, by falling through.
     fn scope_end(&self, mark: usize) -> Result<(), Spanned<TypeError>> {
         match self.unconsumed(mark) {
-            Some((i, span)) => Err(unconsumed_error(&self.scope.entries[i].name, None, span)),
+            Some((i, span)) => Err(unconsumed_error(&self.scope.entries[i].name, None, None, span)),
             None => Ok(()),
         }
     }
@@ -493,7 +550,9 @@ impl Exits<'_> {
             TypedExprKind::Return(value) => {
                 if let Some(v) = value { self.go(v)?; }
                 if let Some((i, _)) = self.unconsumed(0) {
-                    return Err(unconsumed_error(&self.scope.entries[i].name, Some(self.scope.shadowed(i)), e.span));
+                    let b = &self.scope.entries[i];
+                    let unabortable = b.info.as_ref().map(|(_, ty)| ty).filter(|ty| self.tc.abort_symbol(ty).is_none());
+                    return Err(unconsumed_error(&b.name, Some(self.scope.shadowed(i)), unabortable, e.span));
                 }
             }
 
@@ -506,13 +565,18 @@ impl Exits<'_> {
 }
 
 /// `at_return` is `Some(shadowed)` for a `return`, pointing at the `return`;
-/// `None` for a scope end, pointing at the declaration.
-fn unconsumed_error(name: &str, at_return: Option<bool>, span: Span) -> Spanned<TypeError> {
+/// `None` for a scope end, pointing at the declaration. `unabortable` is the
+/// value's type when it has no `abort` for a `?` to call.
+fn unconsumed_error(name: &str, at_return: Option<bool>, unabortable: Option<&Type>, span: Span) -> Spanned<TypeError> {
     let msg = match at_return {
         Some(shadowed) => format!(
-            "'{}' is Linear and is not consumed before this return{}",
+            "'{}' is Linear and is not consumed before this return{}{}",
             name,
             if shadowed { " (a later binding of the same name shadows it, so nothing can consume it by name)" } else { "" },
+            match unabortable {
+                Some(ty) => format!(" ({} has no `abort`, so a `?` here cannot abort it; give it an Abort impl)", ty),
+                None => String::new(),
+            },
         ),
         None => format!("'{}' is Linear and is not consumed on every path before it goes out of scope", name),
     };

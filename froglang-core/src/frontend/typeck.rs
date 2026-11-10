@@ -1574,6 +1574,28 @@ impl TypeChecker {
     /// fields that are *not* cyclic.
     fn type_implements_rec(&self, ty: &Type, tr: &Trait, seen: &mut Vec<Type>) -> bool {
         match ty {
+            // `Linear` is granted, and also *contained*: a value holding a
+            // Linear value anywhere inside it is Linear too. Otherwise
+            // wrapping one launders it — `data Keep(r: Res)` could be copied
+            // freely, duplicating the `Res` — and so does `Res | None`,
+            // which the every-member union rule below would call not Linear.
+            // So for `Linear`: a union is Linear iff *any* member is, and a
+            // struct, variant, `List` or `Dict` iff it is granted or any
+            // field or element type is. Re-entering a type is not Linear;
+            // the cyclic field adds nothing the others don't decide.
+            _ if *tr == Trait::Linear => match ty {
+                Type::Union(members) => members.iter().any(|m| self.type_implements_rec(m, tr, seen)),
+                Type::Named { name, args } => {
+                    if self.granted(ty, tr) { return true; }
+                    if seen.contains(ty) { return false; }
+                    seen.push(ty.clone());
+                    let parts = if name == LIST_NAME || name == DICT_NAME { args.clone() } else { self.struct_field_types(name, args) };
+                    let linear = parts.iter().any(|t| self.type_implements_rec(t, tr, seen));
+                    seen.pop();
+                    linear
+                }
+                _ => self.granted(ty, tr),
+            },
             // A union satisfies a trait iff every variant does. For `Eq`
             // that is decided at runtime by `codegen::eq_union`: compare the
             // two tags, then that member's payload. A *recursive* union is
@@ -1582,11 +1604,12 @@ impl TypeChecker {
             // `check_comparable`, with a span, rather than here: "not `Eq`"
             // would be the wrong reason.
             Type::Union(variants) => variants.iter().all(|v| self.type_implements_rec(v, tr, seen)),
-            // `Error`, `Linear`, and every user-declared trait are *granted*,
-            // never structural — a deliberate design choice, not a gap
-            // (`ERRORS.md`, "Why a trait and not an open union"). One arm for
-            // all three, covering primitives as well as named types, because
-            // `provides Shape for Int` is a legitimate standalone impl.
+            // `Error` and every user-declared trait are *granted*, never
+            // structural — a deliberate design choice, not a gap (`ERRORS.md`,
+            // "Why a trait and not an open union"). One arm for them, covering
+            // primitives as well as named types, because `provides Shape for
+            // Int` is a legitimate standalone impl. (`Linear` is granted *or*
+            // contained; its own arm above returns before this one.)
             _ if matches!(tr, Trait::Error | Trait::Linear | Trait::User(_)) => self.granted(ty, tr),
             // `List<T>` is `Eq` iff `T` is. The comparison is structural —
             // lengths, then elements pairwise — not identity, which is what
@@ -1688,6 +1711,33 @@ impl TypeChecker {
             Type::None  => Some("None".to_string()),
             _ => None,
         }
+    }
+
+    /// The first Linear part of `ty` (a struct, variant, or union of them)
+    /// that reading `path` out of it leaves behind, as a dotted field path.
+    /// Reading a field at a value's last use takes the value apart, and any
+    /// other Linear field it holds would be dropped with it.
+    pub(crate) fn linear_left_behind(&self, ty: &Type, path: &[String]) -> Option<String> {
+        let ty = self.lookup(ty);
+        let fields: Vec<(String, Type)> = match &ty {
+            Type::Union(members) => return members.iter().find_map(|m| self.linear_left_behind(m, path)),
+            Type::Named { name, args } if name != LIST_NAME && name != DICT_NAME => {
+                let names = self.struct_templates.get(name).map(|fs| fs.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()).unwrap_or_default();
+                names.into_iter().zip(self.struct_field_types(name, args)).collect()
+            }
+            _ => return None,
+        };
+        let (head, rest) = match path.split_first() {
+            Some((h, r)) => (Some(h), r),
+            None => (None, &[][..]),
+        };
+        fields.iter().find_map(|(fname, fty)| {
+            if Some(fname) == head {
+                if rest.is_empty() { None } else { self.linear_left_behind(fty, rest).map(|p| format!("{}.{}", fname, p)) }
+            } else {
+                self.implements_linear(fty).then(|| fname.clone())
+            }
+        })
     }
 
     /// `materialize_struct`'s read-only counterpart: this instantiation's

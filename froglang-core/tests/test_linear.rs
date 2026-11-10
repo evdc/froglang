@@ -8,7 +8,9 @@
 //! 1 that make `mut self`-style usage actually usable: a function's own
 //! `mut` parameter, and a `PlaceAssign`'s own root. Also how `match` consumes
 //! a Linear subject: once, by taking it apart or by handing the narrowed
-//! subject to the arm.
+//! subject to the arm; that a value containing a Linear value is Linear
+//! itself; and that reading a field inspects a value unless it is the
+//! value's last use, which takes it apart.
 
 use froglang_core::state::FrogState;
 
@@ -266,4 +268,114 @@ fn a_guarded_arm_can_bind_a_linear_field() {
                   }\n\
                   f(A(r=Res(id=1))) + f(A(r=Res(id=9)))").unwrap();
     assert_eq!(v, "Int(110)");
+}
+
+// ── Linear is contained: a value holding a Linear value is Linear ──────────
+
+const WRAP: &str = "data Keep(r: Res)\n\
+                    data Two(a: Res, n: Int)\n\
+                    data Box<T>(v: T)\n";
+
+fn eval_wrap(src: &str) -> Result<String, String> { eval(&format!("{WRAP}{src}")) }
+
+#[test]
+fn a_struct_holding_a_linear_field_cannot_be_copied() {
+    let err = eval_wrap("func f(): Int = {\n\
+                         let k = Keep(r=Res(id=1))\n\
+                         let k2 = k\n\
+                         close(k.r) + close(k2.r)\n\
+                         }\n\
+                         f()").unwrap_err();
+    assert!(err.contains("'k' is Linear"), "{err}");
+}
+
+#[test]
+fn a_struct_holding_a_linear_field_must_be_consumed() {
+    let err = eval_wrap("func f(): Int = {\n\
+                         let k = Keep(r=Res(id=1))\n\
+                         0\n\
+                         }\n\
+                         f()").unwrap_err();
+    assert!(err.contains("'k' is Linear and is not consumed on every path"), "{err}");
+    let ok = eval_wrap("func f(): Int = {\n\
+                        let k = Keep(r=Res(id=4))\n\
+                        close(k.r)\n\
+                        }\n\
+                        f()").unwrap();
+    assert_eq!(ok, "Int(4)");
+}
+
+#[test]
+fn a_generic_instantiated_with_a_linear_type_is_linear() {
+    let err = eval_wrap("func f(): Int = {\n\
+                         let b = Box(v=Res(id=1))\n\
+                         let c = b\n\
+                         close(b.v) + close(c.v)\n\
+                         }\n\
+                         f()").unwrap_err();
+    assert!(err.contains("'b' is Linear"), "{err}");
+}
+
+#[test]
+fn a_union_with_any_linear_member_is_linear() {
+    // `Res | None` used to need *every* member to be Linear.
+    let err = eval("func f(x: Res | None): Int = 0\nf(none)").unwrap_err();
+    assert!(err.contains("'x' is Linear and is not consumed on every path"), "{err}");
+}
+
+#[test]
+fn a_list_of_linear_values_cannot_be_copied() {
+    let err = eval("func f(): Int = {\n\
+                    let xs = [Res(id=1)]\n\
+                    let ys = xs\n\
+                    close(xs[0]) + close(ys[0])\n\
+                    }\n\
+                    f()").unwrap_err();
+    assert!(err.contains("'xs' is Linear"), "{err}");
+}
+
+// ── Field reads: inspection, or taking the value apart at its last use ────
+
+#[test]
+fn reading_several_fields_of_a_linear_value_is_not_aliasing() {
+    let mut s = FrogState::new();
+    let src = "data Buf(x: Int, y: Int) provides Linear, Abort { func abort(b: Buf): None = none }\n\
+               func f(b: Buf): Int = b.x + b.y\n\
+               f(Buf(x=1, y=2))";
+    let (v, _) = s.eval(src).unwrap();
+    assert_eq!(format!("{:?}", v), "Int(3)");
+}
+
+#[test]
+fn reading_a_field_while_the_value_is_live_inspects_it() {
+    let v = eval_wrap("func f(t: Two): Int = t.n + close(t.a)\n\
+                       f(Two(a=Res(id=1), n=2))").unwrap();
+    assert_eq!(v, "Int(3)");
+}
+
+#[test]
+fn taking_a_value_apart_may_not_drop_a_linear_field() {
+    let err = eval_wrap("func f(t: Two): Int = t.n\n\
+                         f(Two(a=Res(id=1), n=2))").unwrap_err();
+    assert!(err.contains("reading 't.n' at the last use of 't' takes it apart, which drops 't.a'"), "{err}");
+}
+
+#[test]
+fn pulling_a_linear_field_out_of_a_live_value_is_aliasing() {
+    let err = eval_wrap("func f(k: Keep): Int = close(k.r) + close(k.r)\n\
+                         f(Keep(r=Res(id=1)))").unwrap_err();
+    assert!(err.contains("'k' is Linear"), "{err}");
+}
+
+#[test]
+fn a_question_mark_names_a_linear_value_it_cannot_abort() {
+    let err = eval_wrap("error Bad(msg: Str)\n\
+                         func step(n: Int): Int | Bad = if n < 0 then Bad(msg=\"neg\") else n\n\
+                         func f(n: Int): Int | Bad = {\n\
+                         let k = Keep(r=Res(id=1))\n\
+                         let v = step(n)?\n\
+                         close(k.r) + v\n\
+                         }\n\
+                         f(1)").unwrap_err();
+    assert!(err.contains("Keep has no `abort`, so a `?` here cannot abort it"), "{err}");
 }

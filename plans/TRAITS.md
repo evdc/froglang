@@ -638,8 +638,10 @@ property, and it doesn't generalize to "the compiler catches me if I alias one o
 ## `Linear`, not a new trait mechanism
 
 `Linear` is an ordinary marker trait, structurally identical to `Error`: no members, granted by
-`provides`, never structurally derived. Nothing about the trait-resolution machinery in Part 1
-changes.
+`provides`. Nothing about the trait-resolution machinery in Part 1 changes. (Amended 2026-11-10:
+`Linear` is also *contained* — a struct, variant, `List` or `Dict` holding a Linear value is Linear,
+and a union is Linear if any member is. Without that, `data Keep(r: Res)` or `Res | None` copied a
+`Res` freely. See `plans/NOGC.md` step 6.)
 
 ```frog
 data StrBuf(...) provides Sink, Linear
@@ -675,6 +677,9 @@ No new algorithm class, and reuses infrastructure that already exists:
   the same fixpoint the existing `mut`-liveness back-edge analysis (`transfer_loop`) already
   computes, extended to error rather than merge when the arms disagree. (Since tightened by
   `plans/NOGC.md` §3.6 to "consumed on every success path": consuming it on none is an error too.)
+- Taking a value apart consumes it: a `match` arm that binds its fields, or a field read at the
+  value's last use. Neither may leave a Linear part behind. A field read while the value stays live
+  only inspects it, unless it pulls out a Linear part.
 - No lifetimes, no region variables, no annotation burden beyond what `mut` already asks for.
   froglang has no borrowing (`&`) — `mut` is copy-in/copy-out, never a reference — so this needs
   none of the flow-sensitive lifetime inference that makes Rust's borrow checker (as opposed to

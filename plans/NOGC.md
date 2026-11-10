@@ -1060,6 +1060,16 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      a live `Linear` value is rejected. Exempt: `mut` parameters (copied out), the argument of a
      type's own `abort`, and paths that panic. Still loose: a value declared outside a loop and
      consumed inside it counts as consumed. Top-level entries are unchecked (see `linear.rs`).
+   - **`match` and containment (2026-11-10).** A `match` consumes its subject once, at the move into
+     its temporary, whose per-arm reads are exempt from all three passes. The arm owes what it got:
+     the narrowed subject, or each Linear field it bound. Taking a value apart consumes it, so an arm
+     may not leave a Linear part unbound. `?` inside a narrowed arm aborts the narrowed value, widened
+     back into its union. `Linear` is now contained: a struct, variant, `List` or `Dict` holding a
+     Linear value is Linear, and a union is Linear if any member is. A field read inspects a live
+     value; at its last use it takes the value apart, which must not drop another Linear field. A
+     type that is Linear only by containment needs its own `Abort` impl for `?` to abort it (there is
+     no derived one yet). Still open: indexing a `List` of Linear values copies the element, and
+     consuming the list drops the rest.
    - **Not done:** the resource table and panic-time aborts belong to step 7.
    - **Tests.** `tests/test_abort.rs`, 17 tests, observing order and absence of calls through printing
      `abort` bodies, all under the leak oracle. `test_linear.rs` gained `Abort` impls. `cargo test

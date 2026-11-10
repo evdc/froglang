@@ -622,3 +622,25 @@ f()
 "#);
     assert_eq!(run(&src), "abort 7\n");
 }
+
+/// `Keep` is Linear only because it holds a `Res`; an `Abort` impl alone is
+/// what lets `?` abort it.
+#[test]
+fn a_type_linear_by_containment_is_aborted_through_its_own_impl() {
+    let src = prog(r#"
+data Keep(r: Res) provides Abort {
+    func abort(k: Keep): None = Abort.abort(k.r)
+}
+func f(n: Int): Int | Bad = {
+    let k = Keep(r=open(1))
+    let v = step(n)?
+    close(k.r)
+    v
+}
+match f(-1) {
+    is Int(v) then print("ok ${v}")
+    is Bad(e) then print("err ${e.msg}")
+}
+"#);
+    assert_eq!(run(&src), "abort 1\nerr neg\n");
+}

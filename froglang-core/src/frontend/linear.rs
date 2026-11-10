@@ -127,7 +127,7 @@ pub fn check(
     Ok(())
 }
 
-fn alias_error(name: &str, span: Span) -> Spanned<TypeError> {
+pub(crate) fn alias_error(name: &str, span: Span) -> Spanned<TypeError> {
     Spanned::from(
         TypeError { msg: format!("'{}' is Linear; it can only be moved or passed `mut`, not aliased", name) },
         span,

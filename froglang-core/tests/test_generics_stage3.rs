@@ -286,3 +286,41 @@ fn recursion_at_two_different_types_is_rejected() {
     let reported = format!("{}{}", out.stdout, out.stderr);
     assert!(reported.contains("Int") && reported.contains("Str"), "{}", reported);
 }
+
+/// An annotation pins a type argument the constructor itself left open:
+/// `Box(xs=[], n=-1)` synthesizes `Box<~t>`, and `: Box<Int>` must bind
+/// `~t := Int` (rather than failing "Expected Box<Int> got Box<~t>"). The
+/// pinned argument then constrains later writes to the field.
+#[test]
+fn an_annotation_pins_a_generic_structs_open_type_argument() {
+    let src = "\
+        data Box<T>(xs: List<T>, n: Int)\n\
+        mut b: Box<Int> = Box(xs=[], n=-1)\n\
+        b.xs = [4, 5]\n\
+        print(b.xs)";
+    assert_eq!(common::run(src), "[4, 5]\n");
+
+    let src = "\
+        data Box<T>(xs: List<T>, n: Int)\n\
+        mut b: Box<Int> = Box(xs=[], n=-1)\n\
+        b.xs = [\"s\"]";
+    let out = common::run_raw(src);
+    assert_ne!(out.status, Some(0), "expected a type error, got: {}", out.stdout);
+}
+
+/// The open-argument path still rejects a constructor that doesn't fit the
+/// annotation, both a fully resolved mismatch and a partly open one whose
+/// failed unify must not leave its earlier argument bound.
+#[test]
+fn an_annotation_still_rejects_a_mismatched_generic_struct() {
+    for src in [
+        "data Box<T>(xs: List<T>, n: Int)\nlet b: Box<Str> = Box(xs=[1], n=0)",
+        "data Pair<A, B>(a: List<A>, b: B)\nlet p: Pair<Int, Str> = Pair(a=[], b=1)",
+        "data Box<T>(xs: List<T>, n: Int)\nlet b: Box<Int> | Box<Str> = Box(xs=[], n=0)",
+    ] {
+        let out = common::run_raw(src);
+        assert_ne!(out.status, Some(0), "expected a type error for {:?}, got: {}", src, out.stdout);
+        let reported = format!("{}{}", out.stdout, out.stderr);
+        assert!(reported.contains("Expected"), "{}", reported);
+    }
+}

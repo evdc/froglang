@@ -67,6 +67,11 @@ pub fn install(builder: FrogStateBuilder) -> FrogStateBuilder {
     // `key` is `repr(k)`, not `k` itself, so this works for any `Trait::
     // Hash` key type rather than assuming `Str`.
     let builder = builder.prelude("error KeyError(key: Str)");
+    // `Pool<T>` and `Id<T>` (NOGC.md step 5): plain generic structs. Their
+    // operations are typeck builtins in `frontend/typeck/pool.rs`.
+    let builder = crate::frontend::typeck::pool::POOL_PRELUDE
+        .iter()
+        .fold(builder, |b, decl| b.prelude(*decl));
     let builder = str::install(builder);
     fs::install(builder)
 }

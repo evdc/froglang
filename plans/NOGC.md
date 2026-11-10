@@ -1013,6 +1013,33 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
        error, as any such branch does. Dropped-late same-scope redeclaration: the shadowed value
        lives to the end of its block rather than to the redeclaration.
 5. **`Pool<T>`/`Id<T>`.**
+
+   **Step 5 status (2026-11-10): implemented, uncommitted; full workspace run pending.**
+   - **Shape.** Three prelude generic structs, installed by `stdlib::install` from
+     `frontend/typeck/pool.rs`: `__PoolSlot<T>(gen, next, value)`, `Id<T>(index, gen)` and
+     `Pool<T>(slots, head)`. The free list is threaded through `slots` (`head` and each slot's
+     `next`), so no list pop is needed. Nothing new reaches codegen. Each operation is a typeck
+     template parsed from source and lowered through the existing `if`, assign, index and place
+     machinery, the same way `Dict`'s `get`/`remove` are built. A generic `func` cannot read a
+     struct field before instantiation, which is why these are builtins and not prelude functions.
+   - **Surface.** `Pool()`, `g.add(v): Id<T>`, `g.remove(id)`, `g.get(id): T | None`, and `g[id]` as
+     a read and as a place (`g[id] = v`, `g[id].f.push(x)`). A stale id panics on read, write and
+     remove, and `get` returns `none`. The receiver must be a bare `mut` binding, as `remove`
+     already requires on `Dict`. An arena block may read a pool but not mutate an outer one, and
+     this falls out of `check_not_frozen`.
+   - **Deviations.** `remove` cannot release the freed slot's `T`, since there is no placeholder
+     to leave behind. The old value stays in the slot until the slot is reused or the pool is
+     dropped. Id is not `Hash` (`Trait::Hash` is scalar-only), so an Id cannot key a `Dict` yet.
+     `Pool` and `Id` are reserved prelude names, so a user `data Pool` or `data Id` collides with the prelude (the internal slot type is the reserved `__PoolSlot`). A whole `Linear` element cannot be read out of a pool (`let v = g[id]`, `g.get(id)`) since that copies it; field reads (`g[id].f`) are fine. Free
+     `add(mut g, v)` / `remove(mut g, id)` forms are not supported, only the method form.
+   - **Tests.** `tests/test_pool.rs`: 22 tests, passing. Covers basics, scalars and strings,
+     writes through ids, cycles via `List<Id<Node>>`, mut parameters, reuse with a bumped
+     generation, LIFO free list, stale-id panics, heap-value leaks under the oracle, typing
+     errors, and arenas.
+   - **Not yet verified.** `cargo test --workspace` and clippy could not run to completion. The
+     disk filled (about 285 MB free, 20 GB in the worktree's `target/`), and linking failed with
+     `ENOSPC` in unrelated test binaries. The `froglang-core` binary and `test_pool` both build and
+     pass, so the regression run is still owed.
 6. **`Abort` and `?`.** This needs no allocator work and can land early, against today's GC
    runtime. It adds the trait, the error-arm desugar in typeck, the `Linear` requires `Abort`
    check, and `linear.rs` treating `?` edges as consuming. Also add the `implicit-copy` lint, which

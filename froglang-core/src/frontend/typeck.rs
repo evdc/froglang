@@ -10,6 +10,7 @@ use crate::frontend::{
     tokens::{Span, Spanned, Token},
 };
 use crate::frontend::type_expr::TypeExpr;
+pub(crate) mod pool;
 use crate::frontend::typed_ast::{Arg, IterVia, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 
 /// Reserved name for the builtin `panic` alias that `!` desugars to.
@@ -2361,6 +2362,7 @@ impl TypeChecker {
                     || widens_to(&resolved, &expected)
                     || (matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, &expected))
                     || (matches!(expected, Type::TypeVar { .. }) && self.unify(&resolved, &expected))
+                    || self.unify_open_with_expected(&resolved, &expected)
                     || self.unify_with_one_union_member(&resolved, &expected);
                 if !accepted {
                     return Err(Spanned::from(TypeError {
@@ -4408,6 +4410,7 @@ impl TypeChecker {
         if self.is_subtype(&resolved, expected) {
             Ok(resolved)
         } else if (matches!(resolved, Type::TypeVar { .. }) && self.unify(&resolved, expected))
+            || self.unify_open_with_expected(&resolved, expected)
             || self.unify_with_one_union_member(&resolved, expected)
         {
             Ok(self.lookup(&resolved))
@@ -4820,6 +4823,32 @@ impl TypeChecker {
         match winner {
             Some(produced) => { self.substitutions = produced; true },
             None => false,
+        }
+    }
+
+    /// Let an expectation pin type variables nested *inside* a value's type,
+    /// not just a bare one: `Box(xs=[], n=-1)` synthesizes `Box<~t>`, and
+    /// `let b: Box<Int> = ...` has to bind `~t := Int`. The bare-`TypeVar`
+    /// arms in `lower_expected`/`check_ty` never get here for that, since
+    /// neither side is a variable at the top level.
+    ///
+    /// Directional for the same reason as `unify_with_one_union_member`:
+    /// only for an expectation imposed on a value, never for `join_types`'
+    /// peers. It runs only when `actual` still has free variables, so a fully
+    /// resolved mismatch keeps failing exactly as before. A structural unify
+    /// that fails partway can already have bound earlier arguments
+    /// (`Pair<~a, Int>` vs `Pair<Str, Str>` binds `~a` before failing on the
+    /// second one), so a failure restores the snapshot and leaves nothing behind.
+    fn unify_open_with_expected(&mut self, actual: &Type, expected: &Type) -> bool {
+        let mut open = Vec::new();
+        self.free_vars(actual, &mut open);
+        if open.is_empty() { return false; }
+        let snapshot = self.substitutions.clone();
+        if self.unify(actual, expected) {
+            true
+        } else {
+            self.substitutions = snapshot;
+            false
         }
     }
 
@@ -7601,6 +7630,23 @@ impl TypeChecker {
                 RawPlaceSeg::Index(idx_expr) => {
                     let resolved = self.lookup(&cur_ty);
                     let idx_span = idx_expr.span;
+                    if let Some(elem) = pool::pool_elem(&resolved).cloned() {
+                        // `g[id]` on a `Pool` root: the slot's `value`,
+                        // addressed through `slots[checked index]`. Only as
+                        // the first step, since the checked index names the
+                        // pool by its binding.
+                        if !path.is_empty() {
+                            return Err(Spanned::from(TypeError {
+                                msg: "indexing a Pool needs the Pool's own binding, not a field or element of one — bind it to its own 'mut' variable first".to_string()
+                            }, idx_span));
+                        }
+                        let (checked, slot_ty) = self.lower_pool_place_index(&root, &elem, idx_expr, idx_span)?;
+                        path.push(PlaceSeg::Field("slots".to_string()));
+                        path.push(PlaceSeg::Index { index: checked, elem_ty: self.lookup(&slot_ty), is_dict: false });
+                        path.push(PlaceSeg::Field("value".to_string()));
+                        cur_ty = elem;
+                        continue;
+                    }
                     if let Some((key_ty, val_ty)) = resolved.as_dict_kv() {
                         let (key_ty, val_ty) = (key_ty.clone(), val_ty.clone());
                         let lowered_idx = self.check_and_lower(idx_expr)?;
@@ -8123,6 +8169,23 @@ impl TypeChecker {
     }
 
     fn lower_call(&mut self, c: CallExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        // `Pool()` and `g.add/remove/get(...)` on a `Pool` binding: builtins
+        // (`pool.rs`). Checked before anything else so a user function with
+        // one of these names still works on every other receiver.
+        if c.callable.item.get_identifier() == Some(pool::POOL_NAME) && c.args.is_empty()
+            && self.struct_templates.contains_key(pool::POOL_NAME)
+        {
+            let args = TypeChecker::pool_ctor_args(span);
+            return self.lower_call(CallExpr { callable: c.callable, args }, span);
+        }
+        if let Expression::FieldAccess(fa) = &c.callable.item {
+            if TypeChecker::is_pool_method(&fa.field) {
+                if let Some((root, elem)) = self.pool_root(&fa.target.item) {
+                    let method = fa.field.clone();
+                    return self.lower_pool_method(&root, &elem, &method, c.args, span);
+                }
+            }
+        }
         let callee_span = c.callable.span;
         // Captured before `c.callable` is consumed below — only a call
         // through a bare name can have `mut` arguments at all (`mut`
@@ -9694,6 +9757,9 @@ impl TypeChecker {
     }
 
     fn lower_index(&mut self, idx: IndexExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
+        if let Some((root, elem)) = self.pool_root(&idx.target.item) {
+            return self.lower_pool_index(&root, &elem, *idx.index, span);
+        }
         let target_span = idx.target.span;
         let target = self.check_and_lower(*idx.target)?;
         let target_ty = target.item.ty.clone();
@@ -9857,7 +9923,17 @@ impl TypeChecker {
 
     fn lower_field_access(&mut self, fa: FieldAccessExpr, span: Span) -> Result<Spanned<TypedExpr>, Spanned<TypeError>> {
         let target_span = fa.target.span;
-        let target = self.check_and_lower(*fa.target)?;
+        // `g[id].f` on a pool reads one field, not the whole (maybe Linear) element.
+        let pool_proj = match &fa.target.item {
+            Expression::Index(ix) => self.pool_root(&ix.target.item),
+            _ => None,
+        };
+        let target = if let Some((root, elem)) = pool_proj {
+            let Expression::Index(ix) = fa.target.item else { unreachable!() };
+            self.lower_pool_index_unchecked(&root, &elem, *ix.index, target_span)?
+        } else {
+            self.check_and_lower(*fa.target)?
+        };
         let resolved = self.lookup(&target.item.ty);
         // A member read as a value, not called. Froglang has no runtime
         // representation of a function at all (`TRAITS.md` Stage 3's

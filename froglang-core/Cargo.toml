@@ -11,8 +11,8 @@ autobenches = false
 
 [features]
 # Enable verbose GC tracing to stderr (allocations, collections, marks, frees).
-# Usage: cargo test --features gc_trace
-gc_trace = []
+# Usage: cargo test --features heap_trace
+heap_trace = []
 # Swap `json.parse`'s DOM backend from `serde_json` to `simd-json`
 # (`runtime/json/dom.rs`). Same observable behaviour — `tests/test_json.rs`
 # is expected to pass identically under both — but SIMD-accelerated parsing

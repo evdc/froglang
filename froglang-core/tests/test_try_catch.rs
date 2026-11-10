@@ -14,7 +14,7 @@
 // "set subtraction" type rule for free — a `return` arm is `Never`-typed
 // and vanishes from `lower_match`'s union-join, leaving only the
 // non-`Error` members. `e!`'s error arm calls the builtin `panic(msg: Str):
-// Never` (registered in `default_context`, exactly like `print`/`gc_dump`)
+// Never` (registered in `default_context`, exactly like `print`/`heap_dump`)
 // instead of returning — an ordinary function call, not a dedicated node,
 // so user code can call `panic` directly too (see the tests at the bottom
 // of this file). `catch`'s handler is inlined per `Error`-providing member

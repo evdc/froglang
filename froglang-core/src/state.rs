@@ -8,7 +8,7 @@ use crate::frontend::typeck::{Type, TypeChecker};
 use crate::frontend::tokens::Spanned;
 use crate::frontend::typed_ast::{TypedExpr, TypedExprKind};
 use crate::frontend::expression::Expression;
-use crate::runtime::gc::{GcHeap, ACTIVE_HEAP};
+use crate::runtime::heap::{Heap, ACTIVE_HEAP};
 use crate::runtime;
 
 // ── Public value type ─────────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ pub enum FrogValue {
     Bool(bool),
     Str(String),
     List(Vec<FrogValue>),
-    /// In insertion order (`runtime::gc::FrogDict`'s doc comment). Like
+    /// In insertion order (`runtime::heap::FrogDict`'s doc comment). Like
     /// `List` above, a struct-typed value decodes wrong (only leaf 0 of
     /// its flattened layout) — the same pre-existing `FrogValue`
     /// limitation `List`'s identical `frog_list_get(.., 0)` already has,
@@ -33,7 +33,7 @@ pub enum FrogValue {
 }
 
 impl FrogValue {
-    pub fn from_bits(bits: i64, ty: &Type, _heap: &GcHeap) -> Self {
+    pub fn from_bits(bits: i64, ty: &Type, _heap: &Heap) -> Self {
         if let Some(inner_ty) = ty.as_list_elem() {
             let len = runtime::ffi::frog_list_len(bits) as usize;
             let elems = (0..len)
@@ -61,7 +61,7 @@ impl FrogValue {
             Type::Bool  => FrogValue::Bool(bits != 0),
             Type::Str   => {
                 let s = unsafe {
-                    runtime::gc::frog_str_as_str(bits as *const runtime::gc::FrogStr)
+                    runtime::heap::frog_str_as_str(bits as *const runtime::heap::FrogStr)
                 };
                 FrogValue::Str(s.to_owned())
             },
@@ -192,7 +192,7 @@ pub struct EntrySource {
 /// All state — heap, type-checker, JIT module, variable environment — is owned here.
 /// Multiple `FrogState`s can coexist on different threads with no coordination.
 pub struct FrogState {
-    pub heap:         GcHeap,
+    pub heap:         Heap,
     pub tc:           TypeChecker,
     pub codegen:      JitCodegen,
     /// One `i64` per flattened leaf field of the binding's type (see
@@ -248,7 +248,7 @@ impl FrogState {
     /// `FrogState::builder()` with the stdlib (`crate::stdlib`) installed —
     /// see `plans/STDLIB.md`. `FrogState::new()` deliberately doesn't do
     /// this itself: it's what the existing test suite calls expecting
-    /// today's minimal (`print`/`push`/`panic`/`gc_dump`-only) surface, so
+    /// today's minimal (`print`/`push`/`panic`/`heap_dump`-only) surface, so
     /// the stdlib is opt-in. The CLI (`main.rs`) opts in.
     pub fn with_stdlib() -> Result<Self, FrogError> {
         crate::stdlib::install(FrogState::builder()).build()
@@ -257,7 +257,7 @@ impl FrogState {
     /// Set `ACTIVE_HEAP` to this state's heap, call `func_ptr` with the
     /// out-buffer pointer, then clear it.
     fn call_jit(&mut self, func_ptr: fn(i64) -> i64, out_ptr: i64) -> i64 {
-        ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut GcHeap));
+        ACTIVE_HEAP.with(|p| p.set(&mut self.heap as *mut Heap));
         // Publish a `FrogCtx` a host call can fetch via `frog_ctx_current`
         // (`runtime::host`) — built from raw pointers into `self.heap`/
         // `self.tc`'s tables, valid only for the duration of this call
@@ -266,7 +266,7 @@ impl FrogState {
         // sound even though `compile_entry` above may have just grown them.
         let mut host_ctx = unsafe {
             crate::runtime::host::FrogCtx::new(
-                &mut self.heap as *mut GcHeap,
+                &mut self.heap as *mut Heap,
                 self.tc.struct_defs() as *const _,
                 self.tc.union_defs() as *const _,
             )
@@ -504,7 +504,7 @@ impl Drop for FrogState {
 /// of these would silently never be called, since the special case wins
 /// before the generic `func_ids` lookup ever runs. Rejected at `build()`
 /// with a clear error instead.
-const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "keys", "values", "remove", "panic", "panic!builtin", "gc_dump", "repr", "read", "json"];
+const RESERVED_NAMES: &[&str] = &["print", "push", "len", "get", "keys", "values", "remove", "panic", "panic!builtin", "heap_dump", "repr", "read", "json"];
 
 /// Builds a `FrogState` with host (Rust) functions registered before the
 /// JIT module exists — required because `JITBuilder::symbol` only accepts
@@ -617,7 +617,7 @@ impl FrogStateBuilder {
         // primitive's `func_ids` key.
         let codegen = JitCodegen::new_with_hosts(&self.hosts).map_err(FrogError::Type)?;
 
-        let mut heap = GcHeap::new();
+        let mut heap = Heap::new();
         heap.dict_backend = self.dict_backend.clone();
         let mut state = FrogState {
             heap,

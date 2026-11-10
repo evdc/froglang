@@ -586,7 +586,7 @@ fn _derive_frog_union(input: DeriveInput) -> syn::Result<TokenStream> {
                 let __declared: ::std::vec::Vec<(::froglang_core::frontend::typeck::Type, ::std::vec::Vec<::froglang_core::frontend::typeck::Type>)> =
                     ::std::vec![ #( (#marker_exprs, #variant_leaves_from) ),* ];
                 let member_leaves = ::froglang_core::codegen::reorder_member_leaves_by_marker(members, &__declared);
-                let __idx = (slots[0] & ::froglang_core::runtime::gc::TAG_MASK) as usize - 1;
+                let __idx = (slots[0] & ::froglang_core::runtime::heap::TAG_MASK) as usize - 1;
                 let __leaf_vals = ::froglang_core::codegen::unpack_union_member_runtime_of_leaves(&member_leaves, __idx, slots);
                 let __member_ty = &members[__idx];
                 #(#from_frog_arms)*

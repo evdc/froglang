@@ -1,11 +1,11 @@
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::cell::{Cell, RefCell};
 
-/// Zero-cost GC tracing. Enable with `--features gc_trace`.
+/// Zero-cost GC tracing. Enable with `--features heap_trace`.
 /// Expands to an eprintln! at compile time; completely removed without the feature.
-macro_rules! gc_trace {
+macro_rules! heap_trace {
     ($fmt:literal $(, $arg:expr)* $(,)?) => {{
-        #[cfg(feature = "gc_trace")]
+        #[cfg(feature = "heap_trace")]
         eprintln!(concat!("[GC] ", $fmt) $(, $arg)*);
     }};
 }
@@ -19,10 +19,10 @@ pub enum ObjKind { Str = 0, List = 1, Variant = 2, Dict = 3 }
 // ── Object header (prefix for every heap object) ─────────────────────────────
 
 /// Every heap object starts with one of these. Each object has exactly one
-/// owner, which frees it (`GcHeap::drop_tree`), so the header only has to
+/// owner, which frees it (`Heap::drop_tree`), so the header only has to
 /// say what kind of object follows.
 #[repr(C)]
-pub struct GcHeader {
+pub struct ObjHeader {
     pub kind:   ObjKind,
 }
 
@@ -30,7 +30,7 @@ pub struct GcHeader {
 
 #[repr(C)]
 pub struct FrogStr {
-    pub header: GcHeader,
+    pub header: ObjHeader,
     pub len:    u32,
     _data: [u8; 0],  // zero-sized marker; actual bytes live at (ptr + size_of::<FrogStr>())
 }
@@ -48,11 +48,11 @@ pub struct FrogStr {
 //
 // `ptr_mask` marks which of the `stride` per-element slot offsets are heap
 // pointers (bit `i` set => offset `i` within each element block is a
-// pointer) — `GcHeap::for_each_slot` consults this once per element block
+// pointer) — `Heap::for_each_slot` consults this once per element block
 // to find what the list owns.
 #[repr(C)]
 pub struct FrogList {
-    pub header:   GcHeader,
+    pub header:   ObjHeader,
     pub len:      u32,
     pub cap:      u32,
     pub stride:   u32,
@@ -79,7 +79,7 @@ pub struct FrogList {
 // slot directly (no `stride` — a variant is always exactly one "element").
 #[repr(C)]
 pub struct FrogVariant {
-    pub header:   GcHeader,
+    pub header:   ObjHeader,
     pub tag:      u32,
     pub nslots:   u32,
     pub ptr_mask: u64,
@@ -118,7 +118,7 @@ pub struct FrogVariant {
 // explicitly by `free_obj`.
 #[repr(C)]
 pub struct FrogDict {
-    pub header:   GcHeader,
+    pub header:   ObjHeader,
     pub len:      u32,   // live entries (== populated slot-blocks in `entries`)
     pub cap:      u32,   // entry capacity (in slot-blocks) of the `entries` buffer
     pub kstride:  u32,
@@ -191,8 +191,8 @@ pub fn is_heap_ptr(w: i64) -> bool {
 /// The object `w` points at, with any tag bits stripped. Only meaningful
 /// when `is_heap_ptr(w)`.
 #[inline]
-pub fn heap_ptr(w: i64) -> *mut GcHeader {
-    (w & !TAG_MASK) as *mut GcHeader
+pub fn heap_ptr(w: i64) -> *mut ObjHeader {
+    (w & !TAG_MASK) as *mut ObjHeader
 }
 
 /// Encode variant index `tag` as a *boxed* union's unboxed immediate — the
@@ -210,10 +210,10 @@ pub fn immediate_variant_tag(v: i64) -> i64 {
     v >> 3
 }
 
-// ── GcHeap ───────────────────────────────────────────────────────────────────
+// ── Heap ───────────────────────────────────────────────────────────────────
 
 /// One `with Arena` region: a bump allocator whose objects are all released
-/// together. See `GcHeap::arena_enter`.
+/// together. See `Heap::arena_enter`.
 struct Arena {
     /// Every chunk this arena owns, with its size.
     chunks:  Vec<(*mut u8, usize)>,
@@ -236,7 +236,7 @@ struct Arena {
 /// than the next chunk gets a chunk of its own.
 const ARENA_FIRST_CHUNK: usize = 16 * 1024;
 
-pub struct GcHeap {
+pub struct Heap {
     /// Bytes held by live objects, buffers included.
     pub bytes_allocated: usize,
     /// Recycled blocks of freed objects, bucketed by size in 8-byte
@@ -263,7 +263,7 @@ pub struct GcHeap {
     /// Reusable worklist for the tree walks (`drop_tree`, `tree_len`,
     /// `clone_obj`), so a walk is not a `malloc`/`free` pair. None of them
     /// calls another while it holds the list.
-    worklist:        Vec<*mut GcHeader>,
+    worklist:        Vec<*mut ObjHeader>,
     /// `with Arena` regions, innermost last. The first `arenas_active` of them
     /// accept allocations; the one after (at most one) is being evacuated.
     /// While `arenas_active` is non-zero, allocation bumps the top arena and
@@ -287,13 +287,13 @@ pub struct GcHeap {
 thread_local! {
     /// The heap runtime calls allocate into when no `FrogState` is running
     /// (`compile_and_run`, the AOT harness, Rust-side unit tests).
-    pub static GC_HEAP: RefCell<GcHeap> = RefCell::new(GcHeap::new());
-    /// Pointer to the GcHeap of the FrogState currently executing on this thread.
-    /// Null when no froglang code is running (falls back to GC_HEAP).
-    pub static ACTIVE_HEAP: Cell<*mut GcHeap> = const { Cell::new(std::ptr::null_mut()) };
+    pub static TASK_HEAP: RefCell<Heap> = RefCell::new(Heap::new());
+    /// Pointer to the Heap of the FrogState currently executing on this thread.
+    /// Null when no froglang code is running (falls back to TASK_HEAP).
+    pub static ACTIVE_HEAP: Cell<*mut Heap> = const { Cell::new(std::ptr::null_mut()) };
 }
 
-/// Largest block size, in 8-byte words, that `GcHeap::free_bytes` keeps on
+/// Largest block size, in 8-byte words, that `Heap::free_bytes` keeps on
 /// a free list instead of handing back to the system allocator. 64 words is
 /// 512 bytes — comfortably above every `FrogVariant` and `FrogStr` a
 /// realistic program allocates in bulk, and above a short list's data
@@ -315,16 +315,16 @@ fn words_for(size: usize) -> usize {
     size.div_ceil(8).max(1)
 }
 
-impl Default for GcHeap {
+impl Default for Heap {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl GcHeap {
+impl Heap {
     /// Record a newly allocated object.
     #[inline]
-    fn note_alloc(&mut self, obj: *mut GcHeader) {
+    fn note_alloc(&mut self, obj: *mut ObjHeader) {
         self.live_objects += 1;
         if self.track_frees {
             self.freed.remove(&(obj as usize));
@@ -375,7 +375,7 @@ impl GcHeap {
     ///
     /// `obj` must be a live object of this heap that nothing else owns, and
     /// nothing may use it or anything it owns afterwards.
-    pub unsafe fn drop_tree(&mut self, obj: *mut GcHeader) {
+    pub unsafe fn drop_tree(&mut self, obj: *mut ObjHeader) {
         if self.arenas_active != 0 { return; }
         let mut work = std::mem::take(&mut self.worklist);
         work.push(obj);
@@ -394,13 +394,13 @@ impl GcHeap {
     /// # Safety
     ///
     /// `obj` must be a live object of this heap, unused afterwards.
-    pub unsafe fn free_shallow(&mut self, obj: *mut GcHeader) {
+    pub unsafe fn free_shallow(&mut self, obj: *mut ObjHeader) {
         if self.arenas_active != 0 { return; }
         self.free_object(obj);
     }
 
     /// `free_shallow` for a caller that has checked no arena is active.
-    unsafe fn free_object(&mut self, obj: *mut GcHeader) {
+    unsafe fn free_object(&mut self, obj: *mut ObjHeader) {
         if self.track_frees && !self.freed.insert(obj as usize) {
             panic!("double free of heap object {:p}", obj);
         }
@@ -435,7 +435,7 @@ impl GcHeap {
     #[inline(never)]
     fn alloc_slow(&mut self, words: usize) -> *mut u8 {
         if self.arenas_active != 0 { return self.arena_alloc(words * 8); }
-        let layout = Layout::from_size_align(words * 8, 8).expect("gc block layout");
+        let layout = Layout::from_size_align(words * 8, 8).expect("heap block layout");
         // `alloc` signals failure with a null pointer, which every caller
         // here would otherwise write a header through. Route it to the
         // standard OOM handler instead of producing a null object.
@@ -453,7 +453,7 @@ impl GcHeap {
             self.free_lists[words] = ptr;
             return;
         }
-        let layout = Layout::from_size_align(words * 8, 8).expect("gc block layout");
+        let layout = Layout::from_size_align(words * 8, 8).expect("heap block layout");
         unsafe { dealloc(ptr, layout) }
     }
 
@@ -545,7 +545,7 @@ impl GcHeap {
     }
 
     pub fn new() -> Self {
-        GcHeap {
+        Heap {
             bytes_allocated: 0,
             free_lists:      vec![std::ptr::null_mut(); MAX_FREE_WORDS + 1],
             track_frees:     std::env::var_os("FROG_LEAK_CHECK").is_some(),
@@ -562,7 +562,7 @@ impl GcHeap {
     /// Call `f` with a pointer to every pointer slot inside `obj` (the
     /// columns its `ptr_mask` marks), so `drop_tree`, `tree_len` and
     /// `clone_obj` share one idea of what an object owns.
-    unsafe fn for_each_slot(obj: *mut GcHeader, f: &mut impl FnMut(*mut i64)) {
+    unsafe fn for_each_slot(obj: *mut ObjHeader, f: &mut impl FnMut(*mut i64)) {
         match (*obj).kind {
             ObjKind::Str => {}
             ObjKind::List => {
@@ -607,14 +607,14 @@ impl GcHeap {
     /// allocator — see `free_bytes`. The byte counts returned here are the
     /// same rounded sizes the matching `alloc_*` added to
     /// `bytes_allocated`, so the running total stays exact.
-    unsafe fn free_obj(&mut self, obj: *mut GcHeader) -> usize {
+    unsafe fn free_obj(&mut self, obj: *mut ObjHeader) -> usize {
         self.live_objects -= 1;
         match (*obj).kind {
             ObjKind::Str => {
                 let str_ptr = obj as *mut FrogStr;
                 let len = (*str_ptr).len as usize;
                 let total = words_for(std::mem::size_of::<FrogStr>() + len + 1) * 8;
-                gc_trace!("free {:p} Str  {} bytes", obj, total);
+                heap_trace!("free {:p} Str  {} bytes", obj, total);
                 self.free_bytes(obj as *mut u8, total);
                 total
             }
@@ -623,7 +623,7 @@ impl GcHeap {
                 let cap = (*list_ptr).cap as usize;
                 let data_size = cap * std::mem::size_of::<i64>();
                 let list_size = words_for(std::mem::size_of::<FrogList>()) * 8;
-                gc_trace!("free {:p} List {} bytes", obj, list_size + data_size);
+                heap_trace!("free {:p} List {} bytes", obj, list_size + data_size);
                 let data = (*list_ptr).data as *mut u8;
                 self.free_bytes(obj as *mut u8, list_size);
                 if cap > 0 {
@@ -636,7 +636,7 @@ impl GcHeap {
                 let nslots = (*variant_ptr).nslots as usize;
                 let total = words_for(
                     std::mem::size_of::<FrogVariant>() + nslots * std::mem::size_of::<i64>()) * 8;
-                gc_trace!("free {:p} Variant {} bytes", obj, total);
+                heap_trace!("free {:p} Variant {} bytes", obj, total);
                 self.free_bytes(obj as *mut u8, total);
                 total
             }
@@ -647,7 +647,7 @@ impl GcHeap {
                 let entries_size = cap * stride * std::mem::size_of::<i64>();
                 let hashes_size = cap * std::mem::size_of::<u64>();
                 let dict_size = words_for(std::mem::size_of::<FrogDict>()) * 8;
-                gc_trace!("free {:p} Dict {} bytes", obj, dict_size + entries_size + hashes_size);
+                heap_trace!("free {:p} Dict {} bytes", obj, dict_size + entries_size + hashes_size);
                 // Not part of `bytes_allocated`/`free_bytes`'s accounting —
                 // an ordinary Rust `Box`, not a free-listed heap block (see
                 // `FrogDict`'s doc comment on why it's double-boxed).
@@ -681,16 +681,16 @@ impl GcHeap {
         let total = words_for(struct_size + len + 1) * 8;
         let ptr = self.alloc_bytes(total) as *mut FrogStr;
         unsafe {
-            (*ptr).header = GcHeader { kind: ObjKind::Str };
+            (*ptr).header = ObjHeader { kind: ObjKind::Str };
             (*ptr).len = len as u32;
             let dst = (ptr as *mut u8).add(struct_size);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, len);
             *dst.add(len) = 0;  // NUL terminator
         }
 
-        self.note_alloc(ptr as *mut GcHeader);
+        self.note_alloc(ptr as *mut ObjHeader);
         self.bytes_allocated += total;
-        gc_trace!("alloc Str  {} bytes -> {:p}  (total: {} bytes)",
+        heap_trace!("alloc Str  {} bytes -> {:p}  (total: {} bytes)",
             total, ptr, self.bytes_allocated);
         ptr
     }
@@ -717,7 +717,7 @@ impl GcHeap {
         let ptr = self.alloc_bytes(list_size) as *mut FrogList;
 
         unsafe {
-            (*ptr).header = GcHeader { kind: ObjKind::List };
+            (*ptr).header = ObjHeader { kind: ObjKind::List };
             (*ptr).len        = 0;
             (*ptr).cap        = slot_cap as u32;
             (*ptr).stride     = stride as u32;
@@ -725,9 +725,9 @@ impl GcHeap {
             (*ptr).data       = data;
         }
 
-        self.note_alloc(ptr as *mut GcHeader);
+        self.note_alloc(ptr as *mut ObjHeader);
         self.bytes_allocated += list_size + data_size;
-        gc_trace!("alloc List {} bytes -> {:p}  (total: {} bytes)",
+        heap_trace!("alloc List {} bytes -> {:p}  (total: {} bytes)",
             list_size + data_size, ptr, self.bytes_allocated);
         ptr
     }
@@ -742,7 +742,7 @@ impl GcHeap {
         let total = words_for(struct_size + data_size) * 8;
         let ptr = self.alloc_bytes(total) as *mut FrogVariant;
         unsafe {
-            (*ptr).header = GcHeader { kind: ObjKind::Variant };
+            (*ptr).header = ObjHeader { kind: ObjKind::Variant };
             (*ptr).tag        = tag;
             (*ptr).nslots     = nslots as u32;
             (*ptr).ptr_mask   = ptr_mask;
@@ -763,9 +763,9 @@ impl GcHeap {
             }
         }
 
-        self.note_alloc(ptr as *mut GcHeader);
+        self.note_alloc(ptr as *mut ObjHeader);
         self.bytes_allocated += total;
-        gc_trace!("alloc Variant tag={} {} bytes -> {:p}  (total: {} bytes)",
+        heap_trace!("alloc Variant tag={} {} bytes -> {:p}  (total: {} bytes)",
             tag, total, ptr, self.bytes_allocated);
         ptr
     }
@@ -791,7 +791,7 @@ impl GcHeap {
         let boxed: Box<Box<dyn crate::runtime::dict::DictIndex>> = Box::new(index);
 
         unsafe {
-            (*ptr).header = GcHeader { kind: ObjKind::Dict };
+            (*ptr).header = ObjHeader { kind: ObjKind::Dict };
             (*ptr).len       = 0;
             (*ptr).cap       = cap as u32;
             (*ptr).kstride   = kstride as u32;
@@ -806,9 +806,9 @@ impl GcHeap {
         if self.arenas_active != 0 {
             self.arenas[self.arenas_active - 1].dicts.push(ptr);
         }
-        self.note_alloc(ptr as *mut GcHeader);
+        self.note_alloc(ptr as *mut ObjHeader);
         self.bytes_allocated += dict_size + entries_size + hashes_size;
-        gc_trace!("alloc Dict {} bytes -> {:p}  (total: {} bytes)",
+        heap_trace!("alloc Dict {} bytes -> {:p}  (total: {} bytes)",
             dict_size + entries_size + hashes_size, ptr, self.bytes_allocated);
         ptr
     }
@@ -832,7 +832,7 @@ impl GcHeap {
     /// # Safety
     ///
     /// `obj` must be a live heap object of this heap.
-    pub unsafe fn clone_obj(&mut self, obj: *mut GcHeader) -> *mut GcHeader {
+    pub unsafe fn clone_obj(&mut self, obj: *mut ObjHeader) -> *mut ObjHeader {
         let top = self.shallow_copy(obj);
         if !Self::has_slots(top) {
             return top;
@@ -853,7 +853,7 @@ impl GcHeap {
     }
 
     /// Whether `obj` can point at other objects at all.
-    unsafe fn has_slots(obj: *mut GcHeader) -> bool {
+    unsafe fn has_slots(obj: *mut ObjHeader) -> bool {
         match (*obj).kind {
             ObjKind::Str => false,
             ObjKind::List => (*(obj as *mut FrogList)).ptr_mask != 0,
@@ -864,12 +864,12 @@ impl GcHeap {
 
     /// A copy of `obj` alone, its slots still naming `obj`'s children (see
     /// `clone_obj`).
-    unsafe fn shallow_copy(&mut self, obj: *mut GcHeader) -> *mut GcHeader {
+    unsafe fn shallow_copy(&mut self, obj: *mut ObjHeader) -> *mut ObjHeader {
         match (*obj).kind {
             ObjKind::Str => {
                 let len = (*(obj as *const FrogStr)).len as usize;
                 let data = std::slice::from_raw_parts((obj as *const u8).add(std::mem::size_of::<FrogStr>()), len);
-                self.alloc_str(data) as *mut GcHeader
+                self.alloc_str(data) as *mut ObjHeader
             }
             ObjKind::List => {
                 let src = obj as *mut FrogList;
@@ -880,7 +880,7 @@ impl GcHeap {
                     std::ptr::copy_nonoverlapping((*src).data, (*new_list).data, len);
                 }
                 (*new_list).len = len as u32;
-                new_list as *mut GcHeader
+                new_list as *mut ObjHeader
             }
             ObjKind::Dict => {
                 let src = obj as *mut FrogDict;
@@ -903,7 +903,7 @@ impl GcHeap {
                 let index = crate::runtime::dict::dict_index_mut(new_dict);
                 let mut pairs = (0..len).map(|i| (*(*new_dict).hashes.add(i), i as u32));
                 index.rebuild(&mut pairs);
-                new_dict as *mut GcHeader
+                new_dict as *mut ObjHeader
             }
             ObjKind::Variant => {
                 let src = obj as *mut FrogVariant;
@@ -915,7 +915,7 @@ impl GcHeap {
                     (new_variant as *mut u8).add(header) as *mut i64,
                     nslots,
                 );
-                new_variant as *mut GcHeader
+                new_variant as *mut ObjHeader
             }
         }
     }
@@ -929,13 +929,13 @@ impl GcHeap {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Print a summary of the active heap to stderr. Safe to call at any time
-/// from Rust. Also callable as `gc_dump()` from froglang.
-pub fn gc_dump() {
+/// from Rust. Also callable as `heap_dump()` from froglang.
+pub fn heap_dump() {
     let ptr = ACTIVE_HEAP.with(|h| h.get());
     if !ptr.is_null() {
         unsafe { (*ptr).dump(); }
     } else {
-        GC_HEAP.with(|h| h.borrow().dump());
+        TASK_HEAP.with(|h| h.borrow().dump());
     }
 }
 
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn test_alloc_str_bytes_and_len() {
-        GC_HEAP.with(|h| {
+        TASK_HEAP.with(|h| {
             let mut h = h.borrow_mut();
             let s = b"hello";
             let ptr = h.alloc_str(s);
@@ -970,7 +970,7 @@ mod tests {
     // ── Arenas ───────────────────────────────────────────────────────────────
 
     /// A list of `n` strings, as an owning tree (`ptr_mask` 1).
-    fn str_list(h: &mut GcHeap, n: usize) -> *mut FrogList {
+    fn str_list(h: &mut Heap, n: usize) -> *mut FrogList {
         let list = h.alloc_list(n, 1, 1);
         for i in 0..n {
             let s = h.alloc_str(format!("item {i}").as_bytes());
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn arena_frees_nothing_until_release_then_counts_return() {
-        let mut h = GcHeap::new();
+        let mut h = Heap::new();
         let outer = h.alloc_str(b"outer");
         let (bytes, live) = (h.bytes_allocated, h.live_objects());
         h.arena_enter();
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn arena_outer_frees_still_work_after_exit() {
-        let mut h = GcHeap::new();
+        let mut h = Heap::new();
         h.arena_enter();
         h.alloc_str(b"scratch");
         h.arena_evac_begin();
@@ -1012,7 +1012,7 @@ mod tests {
 
     #[test]
     fn arena_oversized_object_gets_its_own_chunk() {
-        let mut h = GcHeap::new();
+        let mut h = Heap::new();
         h.arena_enter();
         let big = vec![b'x'; 3 * ARENA_FIRST_CHUNK];
         let a = h.alloc_str(b"small");
@@ -1030,8 +1030,8 @@ mod tests {
 
     #[test]
     fn arena_list_growth_keeps_contents() {
-        let mut h = GcHeap::new();
-        ACTIVE_HEAP.with(|p| p.set(&mut h as *mut GcHeap));
+        let mut h = Heap::new();
+        ACTIVE_HEAP.with(|p| p.set(&mut h as *mut Heap));
         h.arena_enter();
         let list = h.alloc_list(1, 1, 0);
         for i in 0..1000 { crate::runtime::ffi::frog_list_push(list as i64, i); }
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn arena_nested_evacuates_into_the_enclosing_arena() {
-        let mut h = GcHeap::new();
+        let mut h = Heap::new();
         h.arena_enter();
         let outer_list = str_list(&mut h, 3);
         h.arena_enter();
@@ -1055,7 +1055,7 @@ mod tests {
         let live_inner = h.live_objects();
         h.arena_evac_begin();
         // The copy lands in the outer arena, so it survives the inner release.
-        let copy = unsafe { h.clone_obj(inner as *mut GcHeader) } as *mut FrogList;
+        let copy = unsafe { h.clone_obj(inner as *mut ObjHeader) } as *mut FrogList;
         h.arena_release();
         assert_eq!(h.live_objects(), live_inner - 6 + 6);
         unsafe {
@@ -1070,8 +1070,8 @@ mod tests {
 
     #[test]
     fn arena_evacuates_list_variant_dict_and_str() {
-        let mut h = GcHeap::new();
-        ACTIVE_HEAP.with(|p| p.set(&mut h as *mut GcHeap));
+        let mut h = Heap::new();
+        ACTIVE_HEAP.with(|p| p.set(&mut h as *mut Heap));
         h.arena_enter();
         let list = str_list(&mut h, 4);
         // A variant holding the list, and a dict whose values are variants.
@@ -1083,8 +1083,8 @@ mod tests {
         crate::runtime::dict::frog_dict_set_slot(d, e, 1, var as i64);
         let name = h.alloc_str(b"name");
         h.arena_evac_begin();
-        let dict2 = unsafe { h.clone_obj(dict as *mut GcHeader) };
-        let name2 = unsafe { h.clone_obj(name as *mut GcHeader) };
+        let dict2 = unsafe { h.clone_obj(dict as *mut ObjHeader) };
+        let name2 = unsafe { h.clone_obj(name as *mut ObjHeader) };
         h.arena_release();
         ACTIVE_HEAP.with(|p| p.set(std::ptr::null_mut()));
         // 1 dict + 1 variant + 1 list + 4 strs, and the name.

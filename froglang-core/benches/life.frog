@@ -86,6 +86,6 @@ checksum
 // Note: this benchmark is what turned up MUTABILITY.md Stage 7. Before
 // copy-on-write, `cell_at(rows, ...)` and `neighbours(rows, ...)` deep-copied
 // the entire grid on every call — nine per cell — and 78% of the run was
-// inside `GcHeap::clone_obj`. Marking the alias and copying only at a write
+// inside `Heap::clone_obj`. Marking the alias and copying only at a write
 // took it from 2054ms to 27ms, and closed three value-semantics bugs that
 // eager copying could not afford to fix.

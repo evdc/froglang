@@ -6,7 +6,7 @@
 //! instead of being boxed: pointer columns first (slot 0 carrying the member
 //! tag in its low 3 bits), then scalar columns. Every column's pointer-ness
 //! is then a static property of the column, which is what lets drops and
-//! copies run one uniform `gc::is_heap_ptr` rule over every word.
+//! copies run one uniform `heap::is_heap_ptr` rule over every word.
 //!
 //! What is worth testing here is the boundaries, since the middle of the
 //! range is covered by every other union test in the suite:

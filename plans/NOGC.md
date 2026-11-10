@@ -579,7 +579,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
 2. **Ownership codegen behind a flag:** drops at last use, drop glue from masks, deep copy at
    residual copies, no `shared` bit. Run the whole suite in both modes, with a leak checker
    (allocation count at exit is zero) as the oracle that replaces `FROG_GC_STRESS`.
-   **Status: first slice done, uncommitted** (`FROG_OWNERSHIP`). Every site that marked a list or
+   **Status: first slice done** (`FROG_OWNERSHIP`). Every site that marked a list or
    dict leaf `shared` (`Var` reads, extractions, for-loop elements) now deep-copies it, unless the
    read is a borrowed call argument or a transient target. The `shared` bit is never set in this
    mode. `values(d)` deep-copies its result. The GC still runs and frees nothing explicitly, so
@@ -590,7 +590,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    The COW verifier does not catch a missing copy in `let b = a`, because both bindings share one
    SSA value. The value-semantics tests do catch it: skipping the copy fails 18 of them.
 
-   **Status: second half done, uncommitted.** Drops and frees are in place under `FROG_OWNERSHIP`.
+   **Status: second half done.** Drops and frees are in place under `FROG_OWNERSHIP`.
    - Every owned heap value lives in a slot. A block frame holds bindings, and a statement frame
      holds the temporaries it produced. A consumer that keeps a value takes it out of its frame,
      which clears the slot. Popping a frame frees whatever its slots still hold. An early `return`
@@ -614,13 +614,13 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    - Known, not fixed: default mode (GC) still has the `values(d)` alias that ownership mode fixes.
      Collector unit tests and the GC-stress churn test now run only on a collected heap (`owned`
      is set false, or the sweep check is skipped).
-   **Tuning `orders` (2026-11-05, uncommitted except step 1).** Times are best of 5 in release.
+   **Tuning `orders` (2026-11-05, committed).** Times are best of 5 in release.
 
    | Build | default | ownership |
    |---|---|---|
    | before tuning | 49 ms | 80 ms |
    | step 1: inline immediate check before clone calls (committed, `e9c4cd6`) | 49 ms | 73 ms |
-   | item 1: drop the drop of a temporary taken at its own depth (uncommitted) | 49 ms | 59 ms |
+   | item 1: drop the drop of a temporary taken at its own depth | 49 ms | 59 ms |
 
    Measurements behind the tuning:
    - Runtime counts on `orders` (before step 1): 2,000 `frog_drop` calls reach the runtime, since
@@ -655,7 +655,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    registrations. And several guards in one statement could share one block, to cut block
    splits.
 
-   **Copy on keep (2026-11-05, uncommitted).** Codegen used to copy a value when it was read,
+   **Copy on keep (2026-11-05).** Codegen used to copy a value when it was read,
    unless the reading site marked itself as a view (`view_next`, `compile_operand`, the transient
    helpers). Every read-only site that was not marked made a deep copy, and several were not:
    `if xs` copied the list to read its length, `d[k]` copied the key, `Narrow` copied the payload,
@@ -682,7 +682,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      "z"; "" }`) leaves the earlier operand dangling. Rebinding a name is safe, since liveness
      then makes the earlier read a `Move`.
 
-   **Worklists and leak checking (2026-11-06, uncommitted).**
+   **Worklists and leak checking (2026-11-06).**
    - `drop_tree` and `clone_obj_with` recursed once per level, so dropping or copying a ~20,000-deep
      `Cons` list overflowed the stack. That is the ownership free path itself, so removing the GC
      would not have fixed it. Both now walk a worklist over `for_each_slot`, the slot iterator the
@@ -762,7 +762,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
    - **Out of scope.** Static drop placement at last use, the per-union heap test, sharing guard
      blocks, the operand-view limitation, and RC for `Str`.
 
-   **Status (2026-11-06): done, uncommitted.** Ownership is the only mode and the collector is
+   **Status (2026-11-06): done.** Ownership is the only mode and the collector is
    gone. Net change, excluding `plans/`: 651 lines added, 3,238 deleted (−2,587). Source alone
    is −2,149, tests and benches −431, the README −7.
    - **3a, one mode.** `FROG_OWNERSHIP` and its three readers are gone, and so are the GC-mode
@@ -828,11 +828,14 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      `words` beats the GC now, likely from the smaller headers and from losing the frame
      pointers and spills. `orders` is still 4 ms slower than the GC. Its remaining drop guards
      are the per-union heap test and guard-sharing items above.
-   - **Left open.** `GcHeap`, `gc.rs`, `gc_mask`, `GC_HEAP`, `gc_dump` and the `gc_trace`
-     feature keep their names, so a rename can be its own commit. JIT frames no longer carry
+   - **Renamed (2026-11-10).** `GcHeap` is `Heap`, `gc.rs` is `heap.rs`, `GcHeader` is `ObjHeader`,
+     `GC_HEAP` is `TASK_HEAP`, `gc_mask` is `ptr_mask_of`, `gc_dump` is `heap_dump`, the `gc_trace`
+     feature is `heap_trace`, the REPL command `:gc` is `:heap`, and the `gc_pressure` workload is
+     `alloc_pressure`.
+   - **Left open.** JIT frames no longer carry
      frame pointers, so a native profiler's stack attribution may get worse.
      `FROG_JIT_SYMBOLS` is unaffected. The `pipeline.rs` workload `gc_pressure` keeps its name
-     but no longer measures a collector. `SELFHOST.md` G6 has not been edited.
+     but no longer measures a collector (since renamed). `SELFHOST.md` G6 has not been edited.
 4. **Allocator layer:** segment headers, task heap and bump arena; then `with Arena` with
    `freezes`, and the result allocator.
 
@@ -885,7 +888,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      copy, for now); `Pool<T>`/`Id<T>` (step 5); other `with` forms (`Scope`, `Deadline`, ...);
      an arena lint for loop-carried reallocation; the `gc` rename.
 
-   **Step 4 status (2026-11-08): done, uncommitted.** `with Arena { body }` works in the JIT and
+   **Step 4 status (2026-11-08): done.** `with Arena { body }` works in the JIT and
    the AOT build, and the leak gate holds.
    - **4a, runtime** (`gc.rs`). `GcHeap` has a stack of bump arenas (first chunk 16 KiB, then
      doubling, an oversized object gets a chunk of its own, chunks are taken lazily on the
@@ -961,7 +964,7 @@ That is the dynamic ownership bookkeeping this design exists to avoid. Panics ar
      place, so a block whose result is large pays a copy. No arena lint for loop-carried
      reallocation. No arena-aware `gc_dump` line. (The shadowing hole above is closed: see
      "One variable per name".)
-   - **One variable per name (2026-11-09, uncommitted).** Fixes the conflation found above, so
+   - **One variable per name (2026-11-09).** Fixes the conflation found above, so
      an inner declaration, loop variable, comprehension variable, match binder or `catch` binder
      that shadows an outer name no longer touches it. The arena restriction in `lower_assign`
      and its test are gone.

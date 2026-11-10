@@ -320,7 +320,7 @@ pub const RANGE_NAME: &str = "Range";
 /// its arity only, so `Dict<K,V>` type-parses, but there is no flattened
 /// leaf layout to derive — see `LIST_NAME`'s doc comment for why `List`
 /// can't ride the generic-struct machinery `Range` uses). A `Dict` value
-/// is a single GC-boxed pointer (`runtime::gc::FrogDict`), exactly like a
+/// is a single GC-boxed pointer (`runtime::heap::FrogDict`), exactly like a
 /// `List` is a single pointer to `FrogList`.
 pub const DICT_NAME: &str = "Dict";
 
@@ -639,7 +639,7 @@ pub fn is_positional_fields(field_defs: &[(String, Type)]) -> bool {
 /// union (the language's only sum type — see `ERRORS.md`): its common
 /// fields (readable on any member without matching) and its members in
 /// declaration order (declaration order fixes each member's runtime tag —
-/// see `Codegen`/`runtime::gc::FrogVariant`). `ty` is the resolved
+/// see `Codegen`/`runtime::heap::FrogVariant`). `ty` is the resolved
 /// `Type::Union` this declaration's name stands for — every member is a
 /// nominal marker `Type::strukt("Name.Member")`, sorted the same way
 /// `Type::normalize()` would sort them, so it can be looked up in
@@ -2030,7 +2030,7 @@ impl TypeChecker {
             params: vec![Type::Str],
             result: Box::new(Type::None),
         });
-        ctx.insert("gc_dump".to_string(), Type::Function {
+        ctx.insert("heap_dump".to_string(), Type::Function {
             params: vec![],
             result: Box::new(Type::None),
         });
@@ -4050,7 +4050,7 @@ impl TypeChecker {
     /// a heap pointer, not inline storage, so it can't create an
     /// infinite-size cycle the way a direct field can). A `Type::Union`
     /// field is always fine too — a nominal union's member is a single
-    /// boxed pointer (see `runtime::gc::FrogVariant`), so it can't create
+    /// boxed pointer (see `runtime::heap::FrogVariant`), so it can't create
     /// an infinite-size cycle either; this is what makes a recursive union
     /// (e.g. a binary tree, `data Tree is Leaf | Node(l: Tree, r: Tree)`)
     /// legal even though a recursive struct is not.

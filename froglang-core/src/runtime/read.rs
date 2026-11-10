@@ -30,7 +30,7 @@
 
 use std::cell::RefCell;
 
-use super::gc::{FrogStr, GcHeap};
+use super::heap::{FrogStr, Heap};
 use super::ffi::with_heap;
 use crate::frontend::expression::Expression;
 use crate::frontend::parser::Parser;
@@ -173,7 +173,7 @@ pub extern "C" fn frog_read_offset() -> i64 {
 pub extern "C" fn frog_read_msg() -> i64 {
     let msg = READ_STATE.with(|st| st.borrow().as_ref().and_then(|s| s.err.clone()).map(|(m, _)| m))
         .unwrap_or_default();
-    with_heap(|heap: &mut GcHeap| {
+    with_heap(|heap: &mut Heap| {
         heap.alloc_str(msg.as_bytes()) as i64
     })
 }
@@ -273,7 +273,7 @@ pub extern "C" fn frog_read_str(node: i64) -> i64 {
         _ => Err(n.span.start),
     });
     let s = s.unwrap_or_else(|pos| { mark_failed_at("expected a Str literal", pos); String::new() });
-    with_heap(|heap: &mut GcHeap| {
+    with_heap(|heap: &mut Heap| {
         heap.alloc_str(s.as_bytes()) as i64
     })
 }
@@ -430,7 +430,7 @@ mod tests {
     use super::*;
 
     fn alloc(s: &str) -> i64 {
-        with_heap(|h: &mut GcHeap| h.alloc_str(s.as_bytes()) as i64)
+        with_heap(|h: &mut Heap| h.alloc_str(s.as_bytes()) as i64)
     }
 
     fn open(s: &str) -> i64 {
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_parse_error_is_reported_with_an_offset() {
-        frog_read_open(with_heap(|h: &mut GcHeap| h.alloc_str(b"(") as i64));
+        frog_read_open(with_heap(|h: &mut Heap| h.alloc_str(b"(") as i64));
         assert_eq!(frog_read_failed(), 1);
         frog_read_close();
     }

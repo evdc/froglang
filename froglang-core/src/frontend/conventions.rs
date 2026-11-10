@@ -139,7 +139,7 @@ pub fn is_borrowed_param(body: NodeId, index: usize) -> bool {
 /// arguments, so a call to one borrows them. Runtime primitives and host
 /// functions are added by the caller (`Codegen::imported_callees`).
 pub fn builtin_borrowers() -> HashSet<String> {
-    ["print", "len", "gc_dump", "panic", "keys", "values", "to_list"]
+    ["print", "len", "heap_dump", "panic", "keys", "values", "to_list"]
         .into_iter().map(String::from).collect()
 }
 

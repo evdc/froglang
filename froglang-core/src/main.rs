@@ -22,14 +22,14 @@ pub fn repl() {
                 // ── REPL meta-commands (`:cmd`) ───────────────────────────
                 if trimmed.starts_with(':') {
                     match trimmed.as_str() {
-                        ":gc" => {
+                        ":heap" => {
                             state.heap.dump();
                         }
                         ":help" => {
                             println!("REPL commands:");
-                            println!("  :gc    — print the live heap object count to stderr");
+                            println!("  :heap  — print the live heap object count to stderr");
                             println!("  :help  — show this message");
-                            println!("froglang builtins: print(s), gc_dump()");
+                            println!("froglang builtins: print(s), heap_dump()");
                         }
                         other => {
                             println!("Unknown command '{}'. Try :help", other);

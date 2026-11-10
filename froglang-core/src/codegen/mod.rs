@@ -12,8 +12,8 @@ use crate::frontend::liveness;
 use crate::frontend::tokens::{Span, Spanned, Token};
 use crate::frontend::typed_ast::{Arg, IterVia, Place, PlaceSeg, TypedExpr, TypedExprKind, TypedExprRef};
 use crate::frontend::typeck::{UnionDef, UnionDefs, StructDefs, Type, numeric_join, is_positional_fields};
-use crate::runtime::{ffi, gc, dict};
-use crate::runtime::gc::{FrogList, FrogVariant};
+use crate::runtime::{ffi, heap, dict};
+use crate::runtime::heap::{FrogList, FrogVariant};
 
 /// One entry per top-level `func`/lambda declared by `compile_entry`'s Pass
 /// 1 — `plans/DATA.md` Stage 3's "fn-ptr → span" table. Keyed by declaration
@@ -124,7 +124,7 @@ struct Ctx<'a> {
     /// value flattens to comes from `union_layout`/`struct_fields`, not from
     /// here. An inline union (`union_is_inline`, the common case) is as many
     /// `Value`s as its `UnionLayout` has columns, exactly like a struct;
-    /// only the boxed fallback is a single `runtime::gc::FrogVariant`
+    /// only the boxed fallback is a single `runtime::heap::FrogVariant`
     /// pointer.
     unions:        &'a UnionDefs,
     /// Anonymous-union "shapes" (keyed by their `Debug`-formatted member
@@ -202,7 +202,7 @@ struct Frame {
 }
 
 /// True iff a slot of this type is a pointer column — a word that may own
-/// an object, which drops and clones test with `gc::is_heap_ptr`.
+/// an object, which drops and clones test with `heap::is_heap_ptr`.
 ///
 /// `Type::Union` is included for both shapes: a boxed union's word is a
 /// `FrogVariant` pointer or an immediate, and an inline union's *pointer*
@@ -214,7 +214,7 @@ pub fn is_heap_ty(ty: &Type) -> bool {
 }
 
 /// The largest number of members a union can have and still be laid out
-/// inline. Member tags occupy the low 3 bits of the tag word (see gc.rs's
+/// inline. Member tags occupy the low 3 bits of the tag word (see heap.rs's
 /// "Word encoding"), where `0` is reserved for a plain untagged pointer and
 /// `7` for immediates — leaving `1..=6`. A wider union falls back to the
 /// boxed one-slot representation.
@@ -456,7 +456,7 @@ pub(crate) fn member_slot_map(member: &Type, layout: &UnionLayout, structs: &Str
 /// `leaf_vals` are `member_leaf_types(member_ty)`'s values in declaration
 /// order (empty for a payload-less member — a payload-less member *is* its
 /// tag). Every slot the member does not occupy is written as `0`, which
-/// fails `gc::is_heap_ptr` and so owns nothing. OR-ing the tag into a
+/// fails `heap::is_heap_ptr` and so owns nothing. OR-ing the tag into a
 /// pointer's spare low bits does not change which object it names.
 fn pack_union_member(
     members: &[Type],
@@ -479,7 +479,7 @@ fn pack_union_member(
     for (i, (slot, shares_tag)) in map.iter().enumerate() {
         let mut w = to_i64_repr(bcx, &leaf_tys[i], leaf_vals[i]);
         if *shares_tag {
-            // `gc::heap_ptr` masks the tag off again.
+            // `heap::heap_ptr` masks the tag off again.
             w = bcx.ins().bor_imm_s(w, tag as i64);
         }
         slots[*slot] = Some(w);
@@ -541,7 +541,7 @@ pub fn unpack_union_member_runtime_of_leaves(
     map.iter()
         .map(|(slot, shares_tag)| {
             let w = slots[*slot];
-            if *shares_tag { w & !(gc::TAG_MASK) } else { w }
+            if *shares_tag { w & !(heap::TAG_MASK) } else { w }
         })
         .collect()
 }
@@ -588,7 +588,7 @@ fn unpack_union_member(
     for (i, (slot, shares_tag)) in map.iter().enumerate() {
         let mut w = slots[*slot];
         if *shares_tag {
-            w = bcx.ins().band_imm_s(w, !gc::TAG_MASK);
+            w = bcx.ins().band_imm_s(w, !heap::TAG_MASK);
         }
         out.push(from_i64_repr(bcx, &leaf_tys[i], w));
     }
@@ -599,7 +599,7 @@ fn unpack_union_member(
 /// normalized index `index`" — one `and` and one compare against a constant,
 /// with no load and no branch on representation.
 fn emit_inline_tag_test(bcx: &mut FunctionBuilder, slots: &[Value], index: usize) -> Value {
-    let tag_bits = bcx.ins().band_imm_s(slots[0], gc::TAG_MASK);
+    let tag_bits = bcx.ins().band_imm_s(slots[0], heap::TAG_MASK);
     bcx.ins().icmp_imm_s(IntCC::Equal, tag_bits, member_tag(index) as i64)
 }
 
@@ -634,13 +634,13 @@ fn is_multi_leaf_type(ty: &Type, structs: &StructDefs) -> bool {
 /// `FrogVariant`'s payload, or a `List`'s element stride).
 ///
 /// Bit `i` set means "drop and clone read slot `i` and apply the uniform
-/// `gc::is_heap_ptr`/`gc::heap_ptr` rule". Every word in the system uses one
-/// encoding (gc.rs, "Word encoding"), so there is nothing conditional left to
+/// `heap::is_heap_ptr`/`heap::heap_ptr` rule". Every word in the system uses one
+/// encoding (heap.rs, "Word encoding"), so there is nothing conditional left to
 /// express — this replaces the old `(ptr_mask, cond_mask, boxed_tags)` triple
 /// and the one-scalar-union-shape-per-aggregate restriction that came with
 /// it. A scalar column is *not* marked: a raw `Int` carries no tag bits and
 /// could otherwise be mistaken for an address.
-pub fn gc_mask<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> i64 {
+pub fn ptr_mask_of<'a>(leafs: impl IntoIterator<Item = &'a Type>) -> i64 {
     let mut mask: i64 = 0;
     for (i, t) in leafs.into_iter().enumerate() {
         if is_heap_ty(t) { mask |= 1i64 << i; }
@@ -683,7 +683,7 @@ pub fn struct_fields(ty: &Type, structs: &StructDefs) -> Vec<(String, Type)> {
         // states its column's static pointer-ness: the union type itself
         // for a pointer column (`is_heap_ty` is true for it), plain `Int`
         // for a scalar column. That is the whole trick — every consumer
-        // downstream (`gc_mask`, `heap_leaves`, `reg_heap`) reads
+        // downstream (`ptr_mask_of`, `heap_leaves`, `reg_heap`) reads
         // pointer-ness off the column and needs no tag at all.
         Type::Union(members) if union_is_inline(members, structs) => {
             let l = union_layout(members, structs);
@@ -720,10 +720,10 @@ pub fn union_columns(l: &UnionLayout, union_ty: &Type) -> Vec<Type> {
 
 /// Pick out, from one value's flattened leaves, the raw words that may own
 /// an object — the leaves whose column is a pointer column. An embedder
-/// holding the value frees these (`GcHeap::drop_word`) when it is done.
+/// holding the value frees these (`Heap::drop_word`) when it is done.
 ///
 /// `vals` and `leaf_tys` are aligned 1:1, `leaf_tys` being `struct_fields`'s
-/// output for the value's type. Under the uniform word encoding (gc.rs) this
+/// output for the value's type. Under the uniform word encoding (heap.rs) this
 /// is a straight filter on the column type: `drop_word` applies
 /// `is_heap_ptr` itself, so a tag-only or immediate word is harmless.
 pub fn heap_leaves(vals: &[i64], leaf_tys: &[(String, Type)]) -> Vec<i64> {
@@ -851,12 +851,12 @@ fn push_frame(ctx: &mut Ctx, block: bool) {
 }
 
 /// A deep copy of the heap word `v` (`frog_clone`), or `v`
-/// itself when it holds no heap object. The test is `gc::is_heap_ptr`, done
+/// itself when it holds no heap object. The test is `heap::is_heap_ptr`, done
 /// inline, since most union words are immediates and a call for them is wasted.
 fn emit_clone_word(bcx: &mut FunctionBuilder, ctx: &mut Ctx, v: Value) -> Value {
-    let tag = bcx.ins().band_imm_s(v, gc::TAG_MASK);
-    let not_immediate = bcx.ins().icmp_imm_s(IntCC::NotEqual, tag, gc::TAG_IMMEDIATE);
-    let addr = bcx.ins().band_imm_s(v, !gc::TAG_MASK);
+    let tag = bcx.ins().band_imm_s(v, heap::TAG_MASK);
+    let not_immediate = bcx.ins().icmp_imm_s(IntCC::NotEqual, tag, heap::TAG_IMMEDIATE);
+    let addr = bcx.ins().band_imm_s(v, !heap::TAG_MASK);
     let has_object = bcx.ins().icmp_imm_s(IntCC::NotEqual, addr, 0);
     let go = bcx.ins().band(not_immediate, has_object);
     let call_bb = bcx.create_block();
@@ -877,14 +877,14 @@ fn emit_clone_word(bcx: &mut FunctionBuilder, ctx: &mut Ctx, v: Value) -> Value 
 }
 
 /// Call `frog_drop` on the word `v`, but only when it holds a heap object, which
-/// is the test `gc::is_heap_ptr` makes: an immediate (tag 7) or a null word has
+/// is the test `heap::is_heap_ptr` makes: an immediate (tag 7) or a null word has
 /// nothing to free, and most union words are immediates. The check is inline so
 /// that a dead slot costs a few instructions and no call.
 fn emit_drop_word(bcx: &mut FunctionBuilder, ctx: &mut Ctx, v: Value) {
     let id = ctx.func_ids["frog_drop"];
-    let tag = bcx.ins().band_imm_s(v, gc::TAG_MASK);
-    let not_immediate = bcx.ins().icmp_imm_s(IntCC::NotEqual, tag, gc::TAG_IMMEDIATE);
-    let addr = bcx.ins().band_imm_s(v, !gc::TAG_MASK);
+    let tag = bcx.ins().band_imm_s(v, heap::TAG_MASK);
+    let not_immediate = bcx.ins().icmp_imm_s(IntCC::NotEqual, tag, heap::TAG_IMMEDIATE);
+    let addr = bcx.ins().band_imm_s(v, !heap::TAG_MASK);
     let has_object = bcx.ins().icmp_imm_s(IntCC::NotEqual, addr, 0);
     let go = bcx.ins().band(not_immediate, has_object);
     let call_bb = bcx.create_block();
@@ -1161,7 +1161,7 @@ fn emit_list_push(bcx: &mut FunctionBuilder, ctx: &mut Ctx, list: Value, vals: &
 /// value of `def`'s enum, as an `I8` boolean.
 ///
 /// Which code this needs comes down to which representations `val` can
-/// actually have (see gc.rs's "Immediate (unboxed) values"):
+/// actually have (see heap.rs's "Immediate (unboxed) values"):
 ///
 ///   * the tested variant is payload-less — then it is unboxed, and every
 ///     other value of this enum (boxed or not) has a different bit pattern,
@@ -1181,7 +1181,7 @@ fn emit_is_variant(bcx: &mut FunctionBuilder, val: Value, def: &UnionDef, tag: u
 
 /// Shared by `emit_is_variant` (a nominal union's own declared tag scheme)
 /// and codegen's anonymous-union `TypeTag` test — same runtime shapes
-/// (see gc.rs's "Immediate (unboxed) values"), different source of the
+/// (see heap.rs's "Immediate (unboxed) values"), different source of the
 /// `target_is_immediate`/`any_immediate` facts (a nominal union's
 /// `UnionDef` vs. an anonymous union's flat `Type::Union` member list,
 /// where the only immediate member can ever be `Type::None` — see
@@ -1200,7 +1200,7 @@ fn emit_is_variant(bcx: &mut FunctionBuilder, val: Value, def: &UnionDef, tag: u
 ///     load is guarded by the low-bit test.
 fn emit_tag_test(bcx: &mut FunctionBuilder, val: Value, target_is_immediate: bool, any_immediate: bool, tag: u32) -> Value {
     if target_is_immediate {
-        return bcx.ins().icmp_imm_s(IntCC::Equal, val, gc::immediate_variant(tag));
+        return bcx.ins().icmp_imm_s(IntCC::Equal, val, heap::immediate_variant(tag));
     }
 
     if !any_immediate {
@@ -1212,8 +1212,8 @@ fn emit_tag_test(bcx: &mut FunctionBuilder, val: Value, target_is_immediate: boo
     let done_bb  = bcx.create_block();
     bcx.append_block_param(done_bb, types::I8);
 
-    let tag_bits = bcx.ins().band_imm_s(val, gc::TAG_MASK);
-    let is_immediate = bcx.ins().icmp_imm_s(IntCC::Equal, tag_bits, gc::TAG_IMMEDIATE);
+    let tag_bits = bcx.ins().band_imm_s(val, heap::TAG_MASK);
+    let is_immediate = bcx.ins().icmp_imm_s(IntCC::Equal, tag_bits, heap::TAG_IMMEDIATE);
     let no = bcx.ins().iconst(types::I8, 0);
     bcx.ins().brif(is_immediate, done_bb, &[BlockArg::from(no)], boxed_bb, &[]);
 
@@ -1237,7 +1237,7 @@ fn emit_tag_test(bcx: &mut FunctionBuilder, val: Value, target_is_immediate: boo
 fn box_into_variant(tag: u32, flat_vals: &[Value], flat_types: &[Type], bcx: &mut FunctionBuilder, ctx: &mut Ctx) -> Value {
     let tag_val    = bcx.ins().iconst(types::I64, tag as i64);
     let nslots_val = bcx.ins().iconst(types::I64, flat_vals.len() as i64);
-    let mask_val   = bcx.ins().iconst(types::I64, gc_mask(flat_types));
+    let mask_val   = bcx.ins().iconst(types::I64, ptr_mask_of(flat_types));
 
     let alloc_id  = ctx.func_ids["frog_alloc_variant"];
     let alloc_ref = ctx.module.declare_func_in_func(alloc_id, bcx.func);
@@ -2975,7 +2975,7 @@ fn compile_expr_multi_inner(
         TypedExprKind::Comprehension { var, iterable, cond, body, iter_via } => {
             let leafs = struct_fields(&body.item.ty, ctx.structs);
             let collect = LoopOutput::Collect {
-                ptr_mask: gc_mask(leafs.iter().map(|(_, t)| t)),
+                ptr_mask: ptr_mask_of(leafs.iter().map(|(_, t)| t)),
                 stride: leafs.len().max(1) as i64,
             };
             let result_list = compile_for_loop(var, iterable, iter_via, cond, body, collect, bcx, vars, ctx)
@@ -3067,7 +3067,7 @@ fn compile_expr_multi_inner(
 
         TypedExprKind::Return(value) => compile_return(value, bcx, vars, ctx),
 
-        TypedExprKind::NoneLit => vec![bcx.ins().iconst(types::I64, gc::IMMEDIATE_NONE)],
+        TypedExprKind::NoneLit => vec![bcx.ins().iconst(types::I64, heap::IMMEDIATE_NONE)],
 
         TypedExprKind::Widen { value, tag } => compile_widen(&expr.item.ty, value, *tag, bcx, vars, ctx),
 
@@ -3988,7 +3988,7 @@ fn compile_host_call(func_name: &str, callable: &Spanned<TypedExpr>, args: &[&Sp
 fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut FunctionBuilder, vars: &mut Vars, ctx: &mut Ctx) -> Vec<Value> {
     let elem_ty = list_ty.as_list_elem().cloned().unwrap_or(Type::Int);
     let leafs = struct_fields(&elem_ty, ctx.structs);
-    let ptr_mask = gc_mask(leafs.iter().map(|(_, t)| t));
+    let ptr_mask = ptr_mask_of(leafs.iter().map(|(_, t)| t));
     let stride = (leafs.len().max(1)) as i64;
 
     let n = elems.len() as i64;
@@ -4010,11 +4010,11 @@ fn compile_list_lit(list_ty: &Type, elems: &[Spanned<TypedExpr>], bcx: &mut Func
         // A struct element compiles to `leafs.len()` values, pushed
         // back-to-back — matching `stride` exactly is what makes the
         // list's flat backing store self-describing (see FrogList's
-        // doc comment in runtime/gc.rs).
+        // doc comment in runtime/heap.rs).
         let evs = compile_expr_multi(elem, bcx, vars, ctx);
         let evs = own_vals(bcx, ctx, &elem.item.ty, evs);
         // The list's backing store is a flat i64 buffer (see FrogList in
-        // runtime/gc.rs); Float and Bool elements need the same
+        // runtime/heap.rs); Float and Bool elements need the same
         // bitcast/zero-extend conversion applied to every other
         // i64-wire-format value (see to_i64_repr and push_element).
         push_element(bcx, ctx, list_ptr, &evs, &leafs);
@@ -4063,7 +4063,7 @@ fn compile_dict_lit(
     let vstride = val_leafs.len() as i64;
     let mut all_leaf_tys: Vec<Type> = key_leafs.iter().map(|(_, t)| t.clone()).collect();
     all_leaf_tys.extend(val_leafs.iter().map(|(_, t)| t.clone()));
-    let ptr_mask = gc_mask(all_leaf_tys.iter());
+    let ptr_mask = ptr_mask_of(all_leaf_tys.iter());
 
     let n = pairs.len() as i64;
     let cap_val      = bcx.ins().iconst(types::I64, n);
@@ -4141,7 +4141,7 @@ fn compile_dict_keys_or_values(
     let kstride = key_leafs.len().max(1) as i64;
     let (leafs, base_offset) = if wants_keys { (&key_leafs, 0) } else { (&val_leafs, kstride) };
     let out_stride = (leafs.len().max(1)) as i64;
-    let out_ptr_mask = gc_mask(leafs.iter().map(|(_, t)| t));
+    let out_ptr_mask = ptr_mask_of(leafs.iter().map(|(_, t)| t));
 
     let len_callee = ctx.module.declare_func_in_func(ctx.func_ids["frog_dict_len"], bcx.func);
     let len_call = bcx.ins().call(len_callee, &[dict_val]);
@@ -4237,9 +4237,9 @@ fn compile_variant_init(
     // A boxed union's variant with no fields at all — neither its own nor
     // common ones its enum declares — carries no information beyond its
     // tag, so it needs no heap object: emit the tag as an immediate. See
-    // gc.rs's "Word encoding" for why the GC can tell the two apart.
+    // heap.rs's "Word encoding" for why the GC can tell the two apart.
     if fields.is_empty() {
-        return vec![bcx.ins().iconst(types::I64, gc::immediate_variant(tag))];
+        return vec![bcx.ins().iconst(types::I64, heap::immediate_variant(tag))];
     }
     vec![box_into_variant(tag, &flat_vals, &flat_types, bcx, ctx)]
 }
@@ -4305,14 +4305,14 @@ fn compile_widen(union_ty: &Type, value: &Spanned<TypedExpr>, tag: u32, bcx: &mu
     // self-referential). `tag` is the boxed representation's tag directly:
     // a payload-less member is an immediate, everything else a `FrogVariant`.
     if value.item.ty == Type::None {
-        // `None`'s own compiled form (`gc::IMMEDIATE_NONE`) isn't reused
+        // `None`'s own compiled form (`heap::IMMEDIATE_NONE`) isn't reused
         // directly: this union's own sorted member list may place `None` at
         // a different tag than the standalone unit value's encoding, so it
         // is re-encoded with *this* union's tag. Still compile `value`
         // first for any side effects (none today, but `Widen` shouldn't
         // assume that).
         let _ = compile_expr_multi(value, bcx, vars, ctx);
-        return vec![bcx.ins().iconst(types::I64, gc::immediate_variant(tag))];
+        return vec![bcx.ins().iconst(types::I64, heap::immediate_variant(tag))];
     }
     let flat_vals = compile_expr_multi(value, bcx, vars, ctx);
     let flat_vals = keep_vals(bcx, ctx, &value.item.ty, flat_vals);
@@ -5081,7 +5081,7 @@ impl Codegen<JITModule> {
         builder.symbol("frog_dict_set_slot",  dict::frog_dict_set_slot  as *const u8);
         builder.symbol("frog_dict_remove",    dict::frog_dict_remove    as *const u8);
         builder.symbol("frog_dict_key_missing", dict::frog_dict_key_missing as *const u8);
-        builder.symbol("frog_gc_dump",     ffi::frog_gc_dump     as *const u8);
+        builder.symbol("frog_heap_dump",     ffi::frog_heap_dump     as *const u8);
         builder.symbol("frog_alloc_variant", ffi::frog_alloc_variant as *const u8);
         builder.symbol("frog_variant_tag", ffi::frog_variant_tag as *const u8);
         builder.symbol("frog_variant_get", ffi::frog_variant_get as *const u8);
@@ -5250,7 +5250,7 @@ fn declare_runtime_imports(
     declare_rt(module, &mut func_ids, "frog_dict_set_slot",    "frog_dict_set_slot",    &[I64, I64, I64, I64],      None);
     declare_rt(module, &mut func_ids, "frog_dict_remove",      "frog_dict_remove",      &[I64, I64],                Some(I64));
     declare_rt(module, &mut func_ids, "frog_dict_key_missing", "frog_dict_key_missing", &[I64, I64],                None);
-    declare_rt(module, &mut func_ids, "frog_gc_dump",    "gc_dump",         &[],               None);
+    declare_rt(module, &mut func_ids, "frog_heap_dump",    "heap_dump",         &[],               None);
     declare_rt(module, &mut func_ids, "frog_alloc_variant", "frog_alloc_variant", &[I64, I64, I64], Some(I64));
     declare_rt(module, &mut func_ids, "frog_variant_tag", "frog_variant_tag", &[I64], Some(I64));
     declare_rt(module, &mut func_ids, "frog_variant_get", "frog_variant_get", &[I64, I64], Some(I64));
@@ -6069,12 +6069,12 @@ pub fn compile_and_run(src: &str) -> i64 {
         .map(|(_, ty)| struct_fields(ty, tc.struct_defs()).len())
         .sum();
     let mut out_buf: Vec<i64> = vec![0i64; total_slots];
-    let live_before = gc::GC_HEAP.with(|h| h.borrow().live_objects());
+    let live_before = heap::TASK_HEAP.with(|h| h.borrow().live_objects());
     let result = f(out_buf.as_mut_ptr() as i64);
     // The bindings are this call's to free, as in `FrogState`'s teardown.
     // The result is left live for the caller to read, so the leak check
     // allows exactly its objects.
-    gc::GC_HEAP.with(|h| {
+    heap::TASK_HEAP.with(|h| {
         let mut heap = h.borrow_mut();
         let mut i = 0;
         for (_, ty) in &bindings {
